@@ -1,0 +1,14 @@
+[discord]
+guild_id = 123456789          # 전용 서버 ID
+owner_id = 987654321          # 소유자 Discord ID
+# token은 환경변수 PIDORY_DISCORD_TOKEN으로 설정
+
+[claude]
+binary_path = "claude"        # claude CLI 경로
+default_disallowed_tools = [] # 기본 차단 도구 목록
+subprocess_timeout_secs = 600 # 10분
+max_concurrent = 6
+
+[response]
+max_chunk_length = 1900       # Discord 2000자 여유분
+max_chunks = 10               # 초과 시 파일 첨부

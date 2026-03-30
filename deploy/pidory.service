@@ -1,0 +1,27 @@
+[Unit]
+Description=pidory — Discord ↔ Claude Code Bridge
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=deokdory
+WorkingDirectory=/home/deokdory/claude/projects/deokdory/pidory
+ExecStart=/home/deokdory/claude/projects/deokdory/pidory/target/release/pidory
+Restart=on-failure
+RestartSec=10
+
+# Config
+Environment=PIDORY_CONFIG=/home/deokdory/claude/projects/deokdory/pidory/config.toml
+Environment=RUST_LOG=info
+
+# Discord token은 deok-guard로 주입
+EnvironmentFile=-/home/deokdory/claude/projects/deokdory/pidory/.env
+
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/home/deokdory/claude/projects/deokdory/pidory /home/deokdory/.claude
+
+[Install]
+WantedBy=multi-user.target
