@@ -45,6 +45,11 @@ pub enum StreamEvent {
         total_cost_usd: f64,
         num_turns: u32,
     },
+    UserReplay {
+        content: String,
+        session_id: String,
+        timestamp: Option<String>,
+    },
     Unknown {
         raw: Value,
     },
@@ -58,6 +63,7 @@ impl StreamEvent {
             StreamEvent::User { session_id, .. } => Some(session_id),
             StreamEvent::RateLimit { session_id, .. } => Some(session_id),
             StreamEvent::Result { session_id, .. } => Some(session_id),
+            StreamEvent::UserReplay { session_id, .. } => Some(session_id),
             StreamEvent::Unknown { .. } => None,
         }
     }
@@ -82,6 +88,10 @@ impl StreamEvent {
         } else {
             None
         }
+    }
+
+    pub fn is_user_replay(&self) -> bool {
+        matches!(self, StreamEvent::UserReplay { .. })
     }
 
     pub fn is_result(&self) -> bool {
@@ -196,6 +206,34 @@ mod tests {
     fn parse_malformed_json() {
         let result = parse_line("not json");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn parse_user_replay() {
+        let line = r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"say hello"}]},"isReplay":true,"timestamp":"2026-03-31T00:00:00Z","session_id":"abc"}"#;
+        let event = parse_line(line).unwrap();
+        if let StreamEvent::UserReplay { content, session_id, timestamp } = event {
+            assert_eq!(content, "say hello");
+            assert_eq!(session_id, "abc");
+            assert_eq!(timestamp, Some("2026-03-31T00:00:00Z".to_string()));
+        } else {
+            panic!("Expected UserReplay, got {:?}", event);
+        }
+    }
+
+    #[test]
+    fn parse_user_replay_vs_tool_result() {
+        // isReplay가 없는 기존 tool_result는 User variant로
+        let line = r#"{"type":"user","session_id":"abc","message":{"content":[{"type":"tool_result","tool_use_id":"t1","content":"hello","is_error":false}]}}"#;
+        let event = parse_line(line).unwrap();
+        assert!(matches!(event, StreamEvent::User { .. }));
+    }
+
+    #[test]
+    fn user_replay_session_id() {
+        let line = r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"hi"}]},"isReplay":true,"session_id":"my-session"}"#;
+        let event = parse_line(line).unwrap();
+        assert_eq!(event.session_id(), Some("my-session"));
     }
 
     #[test]
@@ -323,41 +361,71 @@ pub fn parse_line(line: &str) -> Result<StreamEvent, serde_json::Error> {
                 .and_then(|s| s.as_str())
                 .unwrap_or("")
                 .to_string();
-            let content_arr = v
-                .get("message")
-                .and_then(|m| m.get("content"))
-                .and_then(|c| c.as_array());
-            let mut tool_results = Vec::new();
-            if let Some(arr) = content_arr {
-                for block in arr {
-                    let block_type = block.get("type").and_then(|t| t.as_str()).unwrap_or("");
-                    if block_type == "tool_result" {
-                        let tool_use_id = block
-                            .get("tool_use_id")
-                            .and_then(|t| t.as_str())
-                            .unwrap_or("")
-                            .to_string();
-                        let content_str = block
-                            .get("content")
-                            .and_then(|c| c.as_str())
-                            .unwrap_or("")
-                            .to_string();
-                        let is_error = block
-                            .get("is_error")
-                            .and_then(|e| e.as_bool())
-                            .unwrap_or(false);
-                        tool_results.push(ToolResult {
-                            tool_use_id,
-                            content: content_str,
-                            is_error,
-                        });
+
+            let is_replay = v.get("isReplay").and_then(|r| r.as_bool()).unwrap_or(false);
+
+            if is_replay {
+                let text = v
+                    .get("message")
+                    .and_then(|m| m.get("content"))
+                    .and_then(|c| c.as_array())
+                    .and_then(|arr| {
+                        arr.iter().find_map(|b| {
+                            if b.get("type").and_then(|t| t.as_str()) == Some("text") {
+                                b.get("text").and_then(|t| t.as_str()).map(|s| s.to_string())
+                            } else {
+                                None
+                            }
+                        })
+                    })
+                    .unwrap_or_default();
+                let timestamp = v
+                    .get("timestamp")
+                    .and_then(|t| t.as_str())
+                    .map(|s| s.to_string());
+                Ok(StreamEvent::UserReplay {
+                    content: text,
+                    session_id,
+                    timestamp,
+                })
+            } else {
+                let content_arr = v
+                    .get("message")
+                    .and_then(|m| m.get("content"))
+                    .and_then(|c| c.as_array());
+                let mut tool_results = Vec::new();
+                if let Some(arr) = content_arr {
+                    for block in arr {
+                        let block_type =
+                            block.get("type").and_then(|t| t.as_str()).unwrap_or("");
+                        if block_type == "tool_result" {
+                            let tool_use_id = block
+                                .get("tool_use_id")
+                                .and_then(|t| t.as_str())
+                                .unwrap_or("")
+                                .to_string();
+                            let content_str = block
+                                .get("content")
+                                .and_then(|c| c.as_str())
+                                .unwrap_or("")
+                                .to_string();
+                            let is_error = block
+                                .get("is_error")
+                                .and_then(|e| e.as_bool())
+                                .unwrap_or(false);
+                            tool_results.push(ToolResult {
+                                tool_use_id,
+                                content: content_str,
+                                is_error,
+                            });
+                        }
                     }
                 }
+                Ok(StreamEvent::User {
+                    tool_results,
+                    session_id,
+                })
             }
-            Ok(StreamEvent::User {
-                tool_results,
-                session_id,
-            })
         }
         "rate_limit_event" => {
             let session_id = v

@@ -15,7 +15,7 @@ use tracing_subscriber::{EnvFilter, fmt};
 
 use config::Config;
 use error::PidoryError;
-use subprocess::manager::SubprocessManager;
+use subprocess::session_manager::SessionManager;
 
 type Error = PidoryError;
 type Context<'a> = poise::Context<'a, Data, Error>;
@@ -23,7 +23,7 @@ type Context<'a> = poise::Context<'a, Data, Error>;
 pub struct Data {
     pub config: Arc<Config>,
     pub db: SqlitePool,
-    pub subprocess: Arc<SubprocessManager>,
+    pub sessions: Arc<SessionManager>,
 }
 
 #[tokio::main]
@@ -73,13 +73,15 @@ async fn main() -> Result<(), PidoryError> {
                     info!("Reset {} orphaned running sessions", reset_count);
                 }
 
-                let subprocess =
-                    Arc::new(SubprocessManager::new(Arc::new(config.claude.clone())));
+                let sessions = Arc::new(SessionManager::new(
+                    Arc::new(config.claude.clone()),
+                    config.claude.max_sessions,
+                ));
 
                 Ok(Data {
                     config,
                     db,
-                    subprocess,
+                    sessions,
                 })
             })
         })

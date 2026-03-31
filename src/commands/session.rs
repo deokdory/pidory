@@ -140,8 +140,8 @@ pub async fn del(
         return Ok(());
     }
 
-    // Kill subprocess if running (ignore failure — process may have already exited)
-    let _ = ctx.data().subprocess.kill(&tid).await;
+    // Kill session if running (ignore failure — process may have already exited)
+    let _ = ctx.data().sessions.kill_session(&tid).await;
 
     repository::delete_session(&ctx.data().db, &tid).await?;
 

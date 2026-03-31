@@ -262,6 +262,7 @@ pub fn format_tool_use(name: &str, input: &serde_json::Value) -> String {
     }
 }
 
+#[allow(dead_code)]
 pub fn format_tool_result(result: &ToolResult) -> Option<String> {
     format_tool_result_with_name(result, None)
 }

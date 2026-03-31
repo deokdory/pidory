@@ -7,7 +7,7 @@ owner_id = 987654321          # 소유자 Discord ID
 binary_path = "claude"        # claude CLI 경로
 default_disallowed_tools = [] # 기본 차단 도구 목록
 subprocess_timeout_secs = 600 # 10분
-max_concurrent = 6
+max_sessions = 10             # 동시 세션 상한
 
 [response]
 max_chunk_length = 1900       # Discord 2000자 여유분

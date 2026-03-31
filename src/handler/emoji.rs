@@ -7,6 +7,7 @@ pub enum ReactionStatus {
     Running,
     Done,
     Error,
+    #[allow(dead_code)]
     Timeout,
 }
 
@@ -21,7 +22,7 @@ impl ReactionStatus {
     }
 }
 
-const ALL_EMOJIS: &[&str] = &["🔄", "✅", "❌", "⏰"];
+const ALL_EMOJIS: &[&str] = &["🔄", "✅", "❌", "⏰", "📨"];
 
 pub async fn set_reaction(
     ctx: &Context,
