@@ -1,6 +1,8 @@
 # pidory
 
-![pidory_image](https://github.com/user-attachments/assets/473af1d5-65b4-430e-bbf5-178f6abf0e37)
+<p align="center">
+  <img src="https://github.com/user-attachments/assets/473af1d5-65b4-430e-bbf5-178f6abf0e37" width="128">
+</p>
 
 **English** | [한국어](README.ko.md)
 
