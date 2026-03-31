@@ -46,7 +46,7 @@ pub fn format_response(events: &[StreamEvent]) -> String {
                 duration_ms,
                 ..
             } => {
-                parts.push(format!("-# {}ms", duration_ms));
+                parts.push(format!("-# {}", format_duration(*duration_ms)));
             }
             _ => {}
         }
@@ -202,7 +202,7 @@ mod tests {
     fn format_tool_result_error() {
         let tr = ToolResult { tool_use_id: "t1".into(), content: "err".into(), is_error: true };
         let result = format_tool_result(&tr).unwrap();
-        assert!(result.starts_with("❌"));
+        assert!(result.contains("❌"));
     }
 
     #[test]
@@ -214,6 +214,18 @@ mod tests {
     }
 }
 
+pub fn format_duration(ms: u64) -> String {
+    if ms < 1000 {
+        format!("{}ms", ms)
+    } else if ms < 60_000 {
+        format!("{:.1}s", ms as f64 / 1000.0)
+    } else {
+        let minutes = ms / 60_000;
+        let seconds = (ms % 60_000) / 1000;
+        format!("{}m{}s", minutes, seconds)
+    }
+}
+
 pub fn format_tool_use(name: &str, input: &serde_json::Value) -> String {
     match name {
         "Bash" => {
@@ -221,44 +233,44 @@ pub fn format_tool_use(name: &str, input: &serde_json::Value) -> String {
                 .get("command")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
-            format!("> 🔧 **Bash**\n```\n{}\n```", command)
+            format!("-# 🔧 **Bash**\n```\n{}\n```", command)
         }
         "Edit" => {
             let file_path = input
                 .get("file_path")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
-            format!("> 🔧 **Edit** {}", file_path)
+            format!("-# 🔧 **Edit** {}", file_path)
         }
         "Read" => {
             let file_path = input
                 .get("file_path")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
-            format!("> 🔧 **Read** {}", file_path)
+            format!("-# 🔧 **Read** {}", file_path)
         }
         "Write" => {
             let file_path = input
                 .get("file_path")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
-            format!("> 🔧 **Write** {}", file_path)
+            format!("-# 🔧 **Write** {}", file_path)
         }
         "Grep" => {
             let pattern = input
                 .get("pattern")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
-            format!("> 🔧 **Grep** {}", pattern)
+            format!("-# 🔧 **Grep** {}", pattern)
         }
         "Glob" => {
             let pattern = input
                 .get("pattern")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
-            format!("> 🔧 **Glob** {}", pattern)
+            format!("-# 🔧 **Glob** {}", pattern)
         }
-        _ => format!("> 🔧 **{}**", name),
+        _ => format!("-# 🔧 **{}**", name),
     }
 }
 
@@ -273,6 +285,13 @@ pub fn format_tool_result_with_name(result: &ToolResult, tool_name: Option<&str>
     }
 
     const TRUNCATE_LEN: usize = 500;
+
+    let is_short = !result.content.contains('\n') && result.content.len() <= 200;
+
+    if is_short {
+        let prefix = if result.is_error { "❌ " } else { "" };
+        return Some(format!("-# {}{}", prefix, result.content));
+    }
 
     let prefix = if result.is_error { "❌ " } else { "" };
 

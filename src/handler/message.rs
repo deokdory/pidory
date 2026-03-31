@@ -1,4 +1,6 @@
 use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use poise::serenity_prelude::{ChannelId, Context, FullEvent, GuildId, MessageId, UserId};
@@ -322,6 +324,8 @@ async fn process_turn_events(
     // 2. typing indicator task 시작
     let cancel = CancellationToken::new();
     let cancel_clone = cancel.clone();
+    let typing_paused = Arc::new(AtomicBool::new(false));
+    let typing_paused_clone = typing_paused.clone();
     let ctx_clone = ctx.clone();
     let typing_channel = channel_id;
     tokio::spawn(async move {
@@ -329,7 +333,9 @@ async fn process_turn_events(
             tokio::select! {
                 _ = cancel_clone.cancelled() => break,
                 _ = tokio::time::sleep(Duration::from_secs(8)) => {
-                    let _ = typing_channel.broadcast_typing(&ctx_clone).await;
+                    if !typing_paused_clone.load(Ordering::Relaxed) {
+                        let _ = typing_channel.broadcast_typing(&ctx_clone).await;
+                    }
                 }
             }
         }
@@ -392,6 +398,7 @@ async fn process_turn_events(
                         }
                     } => {
                         if let Some(perm_req) = perm {
+                            typing_paused.store(true, Ordering::Relaxed);
                             handle_permission_request(
                                 ctx,
                                 channel_id,
@@ -413,6 +420,7 @@ async fn process_turn_events(
 
             match stream_event {
                 Some(Ok(stream_event)) => {
+                    typing_paused.store(false, Ordering::Relaxed);
                     status.update(ctx, &stream_event).await.ok();
                     if stream_event.is_result() {
                         got_result = true;

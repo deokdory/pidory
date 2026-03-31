@@ -89,10 +89,10 @@ pub async fn disable_permission_buttons(
     tool_name: &str,
 ) -> Result<(), PidoryError> {
     let label = match chosen_action {
-        "allow" => format!("✅ {} — Allowed", tool_name),
-        "always" => format!("🔓 {} — Always Allowed", tool_name),
-        "deny" => format!("❌ {} — Denied", tool_name),
-        _ => format!("{} — {}", tool_name, chosen_action),
+        "allow" => format!("-# ✅ {} — Allowed", tool_name),
+        "always" => format!("-# 🔓 {} — Always Allowed", tool_name),
+        "deny" => format!("-# ❌ {} — Denied", tool_name),
+        _ => format!("-# {} — {}", tool_name, chosen_action),
     };
 
     let edit = EditMessage::new().content(label).components(vec![]);

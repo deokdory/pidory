@@ -119,7 +119,7 @@ impl StatusMessage {
         ctx: &serenity::Context,
         error: &str,
     ) -> Result<(), PidoryError> {
-        let text = format!("❌ 오류 — {}", error);
+        let text = format!("-# ❌ 오류 — {}", error);
         self.pending_text = text;
         self.needs_update = true;
         self.last_edit = Instant::now() - Duration::from_secs(60);
@@ -188,19 +188,19 @@ fn format_tool_entry(name: &str, input: &serde_json::Value) -> String {
 }
 
 fn build_text(tool_history: &[String]) -> String {
-    let mut lines = vec!["⏳ 작업 중...".to_string()];
+    let mut lines = vec!["-# ⏳ 작업 중...".to_string()];
 
     const MAX_SHOWN: usize = 5;
 
     if tool_history.len() > MAX_SHOWN {
         let hidden = tool_history.len() - MAX_SHOWN;
-        lines.push(format!("... +{} more", hidden));
+        lines.push(format!("-# ... +{} more", hidden));
         for entry in &tool_history[tool_history.len() - MAX_SHOWN..] {
-            lines.push(entry.clone());
+            lines.push(format!("-# {}", entry));
         }
     } else {
         for entry in tool_history {
-            lines.push(entry.clone());
+            lines.push(format!("-# {}", entry));
         }
     }
 
@@ -214,7 +214,7 @@ mod tests {
     #[test]
     fn build_text_empty() {
         let text = build_text(&[]);
-        assert_eq!(text, "⏳ 작업 중...");
+        assert_eq!(text, "-# ⏳ 작업 중...");
     }
 
     #[test]
@@ -224,7 +224,7 @@ mod tests {
             "📝 Edit: src/main.rs".to_string(),
         ];
         let text = build_text(&tools);
-        assert!(text.contains("⏳ 작업 중..."));
+        assert!(text.contains("-# ⏳ 작업 중..."));
         assert!(text.contains("🔧 Bash"));
         assert!(text.contains("📝 Edit"));
     }
