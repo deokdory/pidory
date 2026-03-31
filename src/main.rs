@@ -3,6 +3,7 @@ mod config;
 mod db;
 mod error;
 mod handler;
+mod ratelimit;
 mod subprocess;
 
 use std::collections::{HashMap, HashSet};
@@ -95,6 +96,40 @@ async fn main() -> Result<(), PidoryError> {
                 let pending_permissions = Arc::new(Mutex::new(HashMap::new()));
                 let session_skills = Arc::new(Mutex::new(HashMap::new()));
                 let skill_descriptions = load_skill_descriptions();
+
+                // Rate limit monitor (config.ratelimit.file_path가 Some일 때만)
+                if let Some(ref file_path) = config.ratelimit.file_path {
+                    let ctx_for_rl = ctx.clone();
+                    let file_path = file_path.clone();
+                    let interval_secs = config.ratelimit.update_interval_secs;
+                    let thresholds = config.ratelimit.alert_thresholds.clone();
+                    let notification_channel = config.discord.notification_channel_id
+                        .map(poise::serenity_prelude::ChannelId::new);
+                    tokio::spawn(async move {
+                        let mut monitor = crate::ratelimit::RateLimitMonitor::new(thresholds);
+                        let mut interval = tokio::time::interval(
+                            std::time::Duration::from_secs(interval_secs)
+                        );
+                        tracing::info!("Rate limit monitor started (file: {file_path}, interval: {interval_secs}s)");
+                        loop {
+                            interval.tick().await;
+                            match crate::ratelimit::read_ratelimit_file(&file_path) {
+                                Some(info) => {
+                                    let text = crate::ratelimit::RateLimitMonitor::format_presence(&info);
+                                    ctx_for_rl.set_activity(Some(
+                                        poise::serenity_prelude::ActivityData::watching(&text)
+                                    ));
+                                    if let Some(channel_id) = notification_channel {
+                                        monitor.check_and_alert(&info, &ctx_for_rl, channel_id).await;
+                                    }
+                                }
+                                None => {
+                                    ctx_for_rl.set_activity(None);
+                                }
+                            }
+                        }
+                    });
+                }
 
                 Ok(Data {
                     config,
