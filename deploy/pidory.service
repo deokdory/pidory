@@ -5,23 +5,22 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=deokdory
-WorkingDirectory=local path/claude/projects/deokdory/pidory
-ExecStart=local path/claude/projects/deokdory/pidory/target/release/pidory
+User=__USER__
+WorkingDirectory=__PROJECT_DIR__
+ExecStart=__PROJECT_DIR__/target/release/pidory
 Restart=on-failure
 RestartSec=10
 
 # Config
-Environment=PIDORY_CONFIG=local path/claude/projects/deokdory/pidory/config.toml
+Environment=PIDORY_CONFIG=__PROJECT_DIR__/config.toml
 Environment=RUST_LOG=info
 
-# Discord token은 deok-guard로 주입
-EnvironmentFile=-local path/claude/projects/deokdory/pidory/.env
+EnvironmentFile=-__PROJECT_DIR__/.env
 
 # Security hardening
 NoNewPrivileges=true
 ProtectSystem=strict
-ReadWritePaths=local path/claude/projects/deokdory/pidory local path/.claude
+ReadWritePaths=__PROJECT_DIR__ __HOME_DIR__/.claude
 
 [Install]
 WantedBy=multi-user.target
