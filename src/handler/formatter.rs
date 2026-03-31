@@ -42,12 +42,6 @@ pub fn format_response(events: &[StreamEvent]) -> String {
                     parts.push("⚠️ Rate limit reached".to_string());
                 }
             }
-            StreamEvent::Result {
-                duration_ms,
-                ..
-            } => {
-                parts.push(format!("-# {}", format_duration(*duration_ms)));
-            }
             _ => {}
         }
     }
