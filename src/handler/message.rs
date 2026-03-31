@@ -12,8 +12,7 @@ use crate::db::repository;
 use crate::error::PidoryError;
 use crate::handler::{emoji, formatter, permission_ui};
 use crate::handler::emoji::ReactionStatus;
-use crate::handler::status::StatusMessage;
-use crate::subprocess::parser::StreamEvent;
+use crate::subprocess::parser::{ContentBlock, StreamEvent};
 use crate::subprocess::permission::{PermissionDecision, PermissionRequest};
 use crate::subprocess::session_manager::QueuedMessage;
 use crate::{Data, PendingPermission};
@@ -320,10 +319,7 @@ pub async fn process_turn_events(
     owner_id: u64,
     session_skills: std::sync::Arc<tokio::sync::Mutex<HashMap<String, Vec<String>>>>,
 ) -> Option<mpsc::Receiver<PermissionRequest>> {
-    // 1. StatusMessage 생성
-    let mut status = StatusMessage::new(channel_id);
-
-    // 2. typing indicator task 시작
+    // 1. typing indicator task 시작
     let cancel = CancellationToken::new();
     let cancel_clone = cancel.clone();
     let typing_paused = Arc::new(AtomicBool::new(false));
@@ -376,10 +372,14 @@ pub async fn process_turn_events(
         }
     }
 
-    // 4. 빠른 완료가 아니면 상태 메시지 + 나머지 이벤트 루프
+    // 4. 빠른 완료가 아니면 나머지 이벤트 루프
+    let mut tool_use_names: HashMap<String, String> = HashMap::new();
+    let mut used_tools: Vec<String> = Vec::new();
+
     if !fast_complete {
+        // 버퍼링된 이벤트 먼저 전송
         for event in &events {
-            status.update(ctx, event).await.ok();
+            send_event_to_discord(ctx, channel_id, event, &mut tool_use_names, &mut used_tools).await;
         }
 
         loop {
@@ -423,7 +423,8 @@ pub async fn process_turn_events(
             match stream_event {
                 Some(Ok(stream_event)) => {
                     typing_paused.store(false, Ordering::Relaxed);
-                    status.update(ctx, &stream_event).await.ok();
+                    send_event_to_discord(ctx, channel_id, &stream_event, &mut tool_use_names, &mut used_tools).await;
+
                     if stream_event.is_result() {
                         got_result = true;
                     }
@@ -468,7 +469,7 @@ pub async fn process_turn_events(
     // 6. 에러 체크
     let has_cli_error = events.iter().any(|e| e.is_error());
 
-    // 7. 상태 메시지 최종 처리
+    // 7. 최종 처리
     if fast_complete {
         if has_cli_error || !got_result {
             emoji::set_reaction(ctx, channel_id, msg_id, ReactionStatus::Error)
@@ -485,67 +486,77 @@ pub async fn process_turn_events(
                 .await
                 .ok();
         }
-    } else {
-        status.flush(ctx).await.ok();
-
-        if has_cli_error {
-            let error_msgs: Vec<String> = events
-                .iter()
-                .filter_map(|e| {
-                    if let StreamEvent::Result { is_error, errors, .. } = e {
-                        if *is_error {
-                            Some(errors.join(", "))
-                        } else {
-                            None
-                        }
+    } else if has_cli_error {
+        let error_msgs: Vec<String> = events
+            .iter()
+            .filter_map(|e| {
+                if let StreamEvent::Result { is_error, errors, .. } = e {
+                    if *is_error {
+                        Some(errors.join(", "))
                     } else {
                         None
                     }
-                })
-                .collect();
-            let error_text = error_msgs
-                .first()
-                .cloned()
-                .unwrap_or_else(|| "unknown error".to_string());
-            status.set_error(ctx, &error_text).await.ok();
-            emoji::set_reaction(ctx, channel_id, msg_id, ReactionStatus::Error)
-                .await
-                .ok();
-            repository::update_session_status(db, thread_id, "error")
-                .await
-                .ok();
-        } else if !got_result {
-            status
-                .set_error(ctx, "프로세스가 비정상 종료되었습니다")
-                .await
-                .ok();
-            emoji::set_reaction(ctx, channel_id, msg_id, ReactionStatus::Error)
-                .await
-                .ok();
-            repository::update_session_status(db, thread_id, "error")
-                .await
-                .ok();
-        } else {
-            status.finalize(ctx).await.ok();
-            emoji::set_reaction(ctx, channel_id, msg_id, ReactionStatus::Done)
-                .await
-                .ok();
-            repository::update_session_status(db, thread_id, "idle")
-                .await
-                .ok();
+                } else {
+                    None
+                }
+            })
+            .collect();
+        if let Some(error_text) = error_msgs.first() {
+            channel_id.say(ctx, &format!("-# ❌ {}", error_text)).await.ok();
         }
+        emoji::set_reaction(ctx, channel_id, msg_id, ReactionStatus::Error)
+            .await
+            .ok();
+        repository::update_session_status(db, thread_id, "error")
+            .await
+            .ok();
+    } else if !got_result {
+        channel_id.say(ctx, "-# ❌ 프로세스가 비정상 종료되었습니다").await.ok();
+        emoji::set_reaction(ctx, channel_id, msg_id, ReactionStatus::Error)
+            .await
+            .ok();
+        repository::update_session_status(db, thread_id, "error")
+            .await
+            .ok();
+    } else {
+        // 정상 완료: 요약 전송
+        let duration_ms = events.iter().find_map(|e| {
+            if let StreamEvent::Result { duration_ms, .. } = e {
+                Some(*duration_ms)
+            } else {
+                None
+            }
+        }).unwrap_or(0);
+
+        let duration = formatter::format_duration(duration_ms);
+        let summary = if used_tools.is_empty() {
+            format!("-# {}", duration)
+        } else {
+            used_tools.dedup();
+            format!("-# 🔧 {} — {}", used_tools.join(", "), duration)
+        };
+        channel_id.say(ctx, &summary).await.ok();
+
+        emoji::set_reaction(ctx, channel_id, msg_id, ReactionStatus::Done)
+            .await
+            .ok();
+        repository::update_session_status(db, thread_id, "idle")
+            .await
+            .ok();
     }
 
     repository::update_last_active(db, thread_id).await.ok();
 
-    // 8. 최종 응답 전송
-    let response = formatter::format_response(&events);
-    if !response.trim().is_empty()
-        && let Err(e) =
-            formatter::send_response(ctx, channel_id, &response, max_chunk_length, max_chunks)
-                .await
-    {
-        error!("Failed to send response for thread {}: {}", thread_id, e);
+    // 8. fast-complete path: 기존 format_response + send_response (한 메시지)
+    if fast_complete {
+        let response = formatter::format_response(&events);
+        if !response.trim().is_empty()
+            && let Err(e) =
+                formatter::send_response(ctx, channel_id, &response, max_chunk_length, max_chunks)
+                    .await
+        {
+            error!("Failed to send response for thread {}: {}", thread_id, e);
+        }
     }
 
     permission_rx
@@ -620,6 +631,53 @@ pub async fn execute_in_session(
     }
 
     Ok(())
+}
+
+async fn send_event_to_discord(
+    ctx: &Context,
+    channel_id: ChannelId,
+    event: &StreamEvent,
+    tool_use_names: &mut HashMap<String, String>,
+    used_tools: &mut Vec<String>,
+) {
+    match event {
+        StreamEvent::Assistant { content, .. } => {
+            for block in content {
+                match block {
+                    ContentBlock::Text(text) if !text.trim().is_empty() => {
+                        channel_id.say(ctx, text).await.ok();
+                    }
+                    ContentBlock::ToolUse { id, name, input } => {
+                        tool_use_names.insert(id.clone(), name.clone());
+                        if !used_tools.contains(name) {
+                            used_tools.push(name.clone());
+                        }
+                        let formatted = formatter::format_tool_use(name, input);
+                        channel_id.say(ctx, &formatted).await.ok();
+                    }
+                    _ => {} // Thinking 또는 빈 Text — 무시
+                }
+            }
+        }
+        StreamEvent::User { tool_results, .. } => {
+            for result in tool_results {
+                let tool_name = tool_use_names.get(&result.tool_use_id).map(|s| s.as_str());
+                // Read/Grep/Glob 결과는 생략 (에러만 표시)
+                if matches!(tool_name, Some("Read" | "Grep" | "Glob")) && !result.is_error {
+                    continue;
+                }
+                if let Some(formatted) = formatter::format_tool_result_with_name(result, tool_name) {
+                    channel_id.say(ctx, &formatted).await.ok();
+                }
+            }
+        }
+        StreamEvent::RateLimit { status, .. } => {
+            if status != "allowed" {
+                channel_id.say(ctx, "⚠️ Rate limit reached").await.ok();
+            }
+        }
+        _ => {} // Init, ControlRequest, UserReplay, Result, Unknown — 무시
+    }
 }
 
 async fn handle_permission_request(
