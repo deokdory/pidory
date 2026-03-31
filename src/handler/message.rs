@@ -468,10 +468,24 @@ pub async fn process_turn_events(
 
     // 6. 에러 체크
     let has_cli_error = events.iter().any(|e| e.is_error());
+    let is_interrupted = events.iter().any(|e| {
+        if let StreamEvent::Result { errors, .. } = e {
+            errors.iter().any(|err| err.contains("aborted"))
+        } else {
+            false
+        }
+    });
 
     // 7. 최종 처리
     if fast_complete {
-        if has_cli_error || !got_result {
+        if is_interrupted {
+            emoji::set_reaction(ctx, channel_id, msg_id, ReactionStatus::Interrupted)
+                .await
+                .ok();
+            repository::update_session_status(db, thread_id, "idle")
+                .await
+                .ok();
+        } else if has_cli_error || !got_result {
             emoji::set_reaction(ctx, channel_id, msg_id, ReactionStatus::Error)
                 .await
                 .ok();
@@ -486,6 +500,13 @@ pub async fn process_turn_events(
                 .await
                 .ok();
         }
+    } else if is_interrupted {
+        emoji::set_reaction(ctx, channel_id, msg_id, ReactionStatus::Interrupted)
+            .await
+            .ok();
+        repository::update_session_status(db, thread_id, "idle")
+            .await
+            .ok();
     } else if has_cli_error {
         let error_msgs: Vec<String> = events
             .iter()
