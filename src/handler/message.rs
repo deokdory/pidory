@@ -571,17 +571,23 @@ pub async fn process_turn_events(
     // 8. fast-complete path: 기존 format_response + send_response (한 메시지)
     if fast_complete {
         let response = formatter::format_response(&events);
-        if !response.trim().is_empty()
-            && let Err(e) =
-                formatter::send_response(ctx, channel_id, &response, max_chunk_length, max_chunks)
-                    .await
-        {
-            error!("Failed to send response for thread {}: {}", thread_id, e);
-        }
+        let send_ok = if !response.trim().is_empty() {
+            match formatter::send_response(ctx, channel_id, &response, max_chunk_length, max_chunks)
+                .await
+            {
+                Ok(()) => true,
+                Err(e) => {
+                    error!("Failed to send response for thread {}: {}", thread_id, e);
+                    false
+                }
+            }
+        } else {
+            true
+        };
 
         // 완료 알림 (mention)
         if !is_interrupted {
-            if has_cli_error || !got_result {
+            if has_cli_error || !got_result || !send_ok {
                 channel_id.say(ctx, &format!("-# <@{}> ❌ 에러 발생", owner_id)).await.ok();
             } else {
                 let duration_ms = events.iter().find_map(|e| {
