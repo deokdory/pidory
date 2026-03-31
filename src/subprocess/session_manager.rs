@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use poise::serenity_prelude::{ChannelId, MessageId};
+use poise::serenity_prelude::{ChannelId, Context, MessageId};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command, ChildStdin};
 use tokio::sync::{mpsc, Mutex};
@@ -12,8 +12,11 @@ use tokio::task::JoinHandle;
 use std::process::Stdio;
 
 use crate::config::ClaudeConfig;
+use crate::db::repository;
 use crate::error::PidoryError;
-use super::parser::{parse_line, StreamEvent, build_control_response_allow, build_control_response_deny};
+use crate::handler::formatter;
+use super::background::BackgroundTaskTracker;
+use super::parser::{parse_line, StreamEvent, ContentBlock, build_control_response_allow, build_control_response_deny};
 use super::permission::{PermissionCache, PermissionDecision, PermissionRequest};
 
 pub struct QueuedMessage {
@@ -47,12 +50,16 @@ impl SessionManager {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn get_or_create(
         &self,
         thread_id: &str,
         project_path: &str,
         session_id: Option<&str>,
         disallowed_tools: &[String],
+        ctx: Context,
+        channel_id: ChannelId,
+        db: sqlx::SqlitePool,
     ) -> Result<Option<mpsc::Receiver<PermissionRequest>>, PidoryError> {
         let mut sessions = self.sessions.lock().await;
 
@@ -116,6 +123,9 @@ impl SessionManager {
         let sessions_clone = Arc::clone(&self.sessions);
         let thread_id_for_worker = thread_id.to_string();
         let permission_tx_for_worker = permission_tx.clone();
+        let ctx_for_worker = ctx;
+        let channel_id_for_worker = channel_id;
+        let db_for_worker = db;
         let worker_task = tokio::spawn(async move {
             let mut stdin = stdin;
             let mut reader = BufReader::new(stdout);
@@ -123,10 +133,229 @@ impl SessionManager {
             let mut queue_rx = queue_rx;
             let permission_tx = permission_tx_for_worker;
             let mut permission_cache = PermissionCache::new();
+            let mut tracker = BackgroundTaskTracker::new();
             // interrupt_rx is moved into this closure
             let interrupt_rx = &mut interrupt_rx;
 
-            while let Some(msg) = queue_rx.recv().await {
+            loop {
+                line.clear();
+                let msg = tokio::select! {
+                    biased;
+                    // stdout 우선: background task 이벤트 감지
+                    read_result = reader.read_line(&mut line) => {
+                        match read_result {
+                            Ok(0) => {
+                                tracing::info!(
+                                    "Process stdout EOF (between turns) for thread {}",
+                                    thread_id_for_worker
+                                );
+                                break;
+                            }
+                            Ok(_) => {
+                                let trimmed = line.trim_end();
+                                if trimmed.is_empty() { continue; }
+                                match parse_line(trimmed) {
+                                    Ok(StreamEvent::TaskStarted { ref task_id, ref task_type, ref description, .. }) => {
+                                        tracker.track_started(task_id, task_type, description);
+                                        tracing::info!("Background task started: {} ({})", task_id, task_type);
+                                        let start_msg = format!("-# 🔔 Background task started: {}", description);
+                                        channel_id_for_worker.say(&ctx_for_worker, &start_msg).await.ok();
+                                        continue;
+                                    }
+                                    Ok(StreamEvent::TaskProgress { ref task_id, ref description, .. }) => {
+                                        tracker.track_progress(task_id, description);
+                                        continue;
+                                    }
+                                    Ok(StreamEvent::TaskNotification { ref task_id, ref status, ref summary, .. }) => {
+                                        tracker.track_completed(task_id);
+                                        let notify_msg = if status == "completed" {
+                                            format!("-# 🔔 {}", summary)
+                                        } else {
+                                            format!("-# ❌ {}", summary)
+                                        };
+                                        channel_id_for_worker.say(&ctx_for_worker, &notify_msg).await.ok();
+
+                                        repository::update_session_status(&db_for_worker, &thread_id_for_worker, "running").await.ok();
+
+                                        // bg mini-loop: background turn 이벤트 처리
+                                        'bg_turn: loop {
+                                            line.clear();
+                                            tokio::select! {
+                                                read_result = reader.read_line(&mut line) => {
+                                                    match read_result {
+                                                        Ok(0) => {
+                                                            repository::update_session_status(&db_for_worker, &thread_id_for_worker, "idle").await.ok();
+                                                            break 'bg_turn;
+                                                        }
+                                                        Ok(_) => {
+                                                            let trimmed = line.trim_end();
+                                                            if trimmed.is_empty() { continue 'bg_turn; }
+                                                            match parse_line(trimmed) {
+                                                                Ok(StreamEvent::Result { .. }) => {
+                                                                    repository::update_session_status(&db_for_worker, &thread_id_for_worker, "idle").await.ok();
+                                                                    break 'bg_turn;
+                                                                }
+                                                                Ok(StreamEvent::Assistant { ref content, .. }) => {
+                                                                    for block in content {
+                                                                        match block {
+                                                                            ContentBlock::Text(text) if !text.trim().is_empty() => {
+                                                                                let bg_text = format!("-# 🔔 [Background]\n{}", text);
+                                                                                channel_id_for_worker.say(&ctx_for_worker, &bg_text).await.ok();
+                                                                            }
+                                                                            ContentBlock::ToolUse { name, input, .. } => {
+                                                                                let formatted = formatter::format_tool_use(name, input);
+                                                                                let bg_text = format!("-# 🔔 [Background]\n{}", formatted);
+                                                                                channel_id_for_worker.say(&ctx_for_worker, &bg_text).await.ok();
+                                                                            }
+                                                                            _ => {}
+                                                                        }
+                                                                    }
+                                                                }
+                                                                Ok(StreamEvent::User { ref tool_results, .. }) => {
+                                                                    for result in tool_results {
+                                                                        if result.is_error {
+                                                                            if let Some(formatted) = formatter::format_tool_result_with_name(result, None) {
+                                                                                let bg_text = format!("-# 🔔 [Background]\n{}", formatted);
+                                                                                channel_id_for_worker.say(&ctx_for_worker, &bg_text).await.ok();
+                                                                            }
+                                                                        }
+                                                                    }
+                                                                }
+                                                                Ok(StreamEvent::ControlRequest { ref request_id, ref tool_name, ref input, .. }) => {
+                                                                    let resp = if permission_cache.is_always_allowed(tool_name) {
+                                                                        build_control_response_allow(request_id, input)
+                                                                    } else {
+                                                                        let deny_msg = format!(
+                                                                            "-# ⚠️ [Background] Permission denied: {} (not in cache)",
+                                                                            tool_name
+                                                                        );
+                                                                        channel_id_for_worker.say(&ctx_for_worker, &deny_msg).await.ok();
+                                                                        build_control_response_deny(request_id, "Background: permission not cached")
+                                                                    };
+                                                                    if let Err(e) = stdin.write_all(resp.as_bytes()).await {
+                                                                        tracing::error!("stdin write error (bg turn): {}", e);
+                                                                        repository::update_session_status(&db_for_worker, &thread_id_for_worker, "idle").await.ok();
+                                                                        break 'bg_turn;
+                                                                    }
+                                                                    let _ = stdin.flush().await;
+                                                                }
+                                                                Ok(StreamEvent::TaskStarted { ref task_id, ref task_type, ref description, .. }) => {
+                                                                    tracker.track_started(task_id, task_type, description);
+                                                                }
+                                                                Ok(StreamEvent::TaskProgress { ref task_id, ref description, .. }) => {
+                                                                    tracker.track_progress(task_id, description);
+                                                                }
+                                                                Ok(_) => {}
+                                                                Err(e) => {
+                                                                    tracing::warn!("Parse error (bg turn): {}", e);
+                                                                }
+                                                            }
+                                                        }
+                                                        Err(e) => {
+                                                            tracing::error!("stdout read error (bg turn): {}", e);
+                                                            repository::update_session_status(&db_for_worker, &thread_id_for_worker, "idle").await.ok();
+                                                            break 'bg_turn;
+                                                        }
+                                                    }
+                                                }
+                                                // bg turn 중 queue 메시지 → mid-turn inject
+                                                new_msg = queue_rx.recv() => {
+                                                    match new_msg {
+                                                        Some(m) => {
+                                                            queue_size_for_worker.fetch_sub(1, Ordering::Relaxed);
+                                                            let inject_json = serde_json::json!({
+                                                                "type": "user",
+                                                                "message": {
+                                                                    "role": "user",
+                                                                    "content": [{"type": "text", "text": m.content}]
+                                                                }
+                                                            });
+                                                            let inject_line = format!("{}\n", inject_json);
+                                                            if let Err(e) = stdin.write_all(inject_line.as_bytes()).await {
+                                                                tracing::error!("mid-turn stdin write error (bg turn): {}", e);
+                                                                repository::update_session_status(&db_for_worker, &thread_id_for_worker, "idle").await.ok();
+                                                                break 'bg_turn;
+                                                            }
+                                                            let _ = stdin.flush().await;
+                                                        }
+                                                        None => {
+                                                            repository::update_session_status(&db_for_worker, &thread_id_for_worker, "idle").await.ok();
+                                                            break 'bg_turn;
+                                                        }
+                                                    }
+                                                }
+                                                // bg turn 중 interrupt
+                                                _ = interrupt_rx.recv() => {
+                                                    let interrupt_msg = serde_json::json!({
+                                                        "type": "control_request",
+                                                        "request_id": format!("interrupt_{}", std::time::SystemTime::now()
+                                                            .duration_since(std::time::UNIX_EPOCH)
+                                                            .unwrap_or_default()
+                                                            .as_millis()),
+                                                        "request": {"subtype": "interrupt"}
+                                                    });
+                                                    let interrupt_line = format!("{}\n", interrupt_msg);
+                                                    if let Err(e) = stdin.write_all(interrupt_line.as_bytes()).await {
+                                                        tracing::error!("interrupt write error (bg turn): {}", e);
+                                                    } else {
+                                                        let _ = stdin.flush().await;
+                                                    }
+                                                }
+                                            }
+                                        }
+
+                                        continue;
+                                    }
+                                    Ok(StreamEvent::ControlRequest { ref request_id, ref tool_name, ref input, .. }) => {
+                                        let resp = if permission_cache.is_always_allowed(tool_name) {
+                                            build_control_response_allow(request_id, input)
+                                        } else {
+                                            let deny_msg = format!(
+                                                "-# ⚠️ [Background] Permission denied: {} (not in cache)",
+                                                tool_name
+                                            );
+                                            channel_id_for_worker.say(&ctx_for_worker, &deny_msg).await.ok();
+                                            build_control_response_deny(request_id, "Background: permission not cached")
+                                        };
+                                        if let Err(e) = stdin.write_all(resp.as_bytes()).await {
+                                            tracing::error!("stdin write error (between turns): {}", e);
+                                            break;
+                                        }
+                                        let _ = stdin.flush().await;
+                                        continue;
+                                    }
+                                    Ok(event) => {
+                                        tracing::debug!("Between-turns event drained: {:?}", event);
+                                        continue;
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!("Parse error (between turns): {}", e);
+                                        continue;
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                tracing::error!(
+                                    "stdout read error (between turns) for thread {}: {}",
+                                    thread_id_for_worker,
+                                    e
+                                );
+                                break;
+                            }
+                        }
+                    }
+                    _ = interrupt_rx.recv() => {
+                        tracing::debug!("Stale interrupt consumed between turns");
+                        continue;
+                    }
+                    msg = queue_rx.recv() => {
+                        match msg {
+                            Some(m) => m,
+                            None => break,
+                        }
+                    }
+                };
+
                 queue_size_for_worker.fetch_sub(1, Ordering::Relaxed);
 
                 let json_msg = serde_json::json!({
@@ -154,6 +383,7 @@ impl SessionManager {
 
                 // primary 메시지: result까지 stdout 읽기 + mid-turn inject 동시 처리
                 let mut timeout_deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
+                let mut bg_turn_active = false;
                 'turn: loop {
                     line.clear();
                     tokio::select! {
@@ -220,6 +450,88 @@ impl SessionManager {
                                     }
                                     match parse_line(trimmed) {
                                         Ok(event) => {
+                                            // Background task 이벤트: user turn 중에도 올 수 있음
+                                            match &event {
+                                                StreamEvent::TaskStarted { task_id, task_type, description, .. } => {
+                                                    tracker.track_started(task_id, task_type, description);
+                                                    let start_msg = format!("-# 🔔 Background task started: {}", description);
+                                                    channel_id_for_worker.say(&ctx_for_worker, &start_msg).await.ok();
+                                                    continue 'turn;
+                                                }
+                                                StreamEvent::TaskProgress { task_id, description, .. } => {
+                                                    tracker.track_progress(task_id, description);
+                                                    continue 'turn;
+                                                }
+                                                StreamEvent::TaskNotification { task_id, status, summary, .. } => {
+                                                    tracker.track_completed(task_id);
+                                                    let notify_msg = if status == "completed" {
+                                                        format!("-# 🔔 {}", summary)
+                                                    } else {
+                                                        format!("-# ❌ {}", summary)
+                                                    };
+                                                    channel_id_for_worker.say(&ctx_for_worker, &notify_msg).await.ok();
+                                                    bg_turn_active = true;
+                                                    continue 'turn;
+                                                }
+                                                _ => {}
+                                            }
+
+                                            // bg turn 이벤트 처리: bg_turn_active일 때 기존 코드로 안 넘김
+                                            if bg_turn_active {
+                                                match &event {
+                                                    StreamEvent::Result { .. } => {
+                                                        bg_turn_active = false;
+                                                        timeout_deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
+                                                        continue 'turn; // bg turn 끝 — user turn은 계속
+                                                    }
+                                                    StreamEvent::Assistant { content, .. } => {
+                                                        for block in content {
+                                                            match block {
+                                                                ContentBlock::Text(text) if !text.trim().is_empty() => {
+                                                                    let bg_text = format!("-# 🔔 [Background]\n{}", text);
+                                                                    channel_id_for_worker.say(&ctx_for_worker, &bg_text).await.ok();
+                                                                }
+                                                                ContentBlock::ToolUse { name, input, .. } => {
+                                                                    let formatted = formatter::format_tool_use(name, input);
+                                                                    let bg_text = format!("-# 🔔 [Background]\n{}", formatted);
+                                                                    channel_id_for_worker.say(&ctx_for_worker, &bg_text).await.ok();
+                                                                }
+                                                                _ => {}
+                                                            }
+                                                        }
+                                                        continue 'turn;
+                                                    }
+                                                    StreamEvent::User { tool_results, .. } => {
+                                                        for result in tool_results {
+                                                            if result.is_error {
+                                                                if let Some(formatted) = formatter::format_tool_result_with_name(result, None) {
+                                                                    let bg_text = format!("-# 🔔 [Background]\n{}", formatted);
+                                                                    channel_id_for_worker.say(&ctx_for_worker, &bg_text).await.ok();
+                                                                }
+                                                            }
+                                                        }
+                                                        continue 'turn;
+                                                    }
+                                                    StreamEvent::ControlRequest { request_id, tool_name, input, .. } => {
+                                                        let resp = if permission_cache.is_always_allowed(tool_name) {
+                                                            build_control_response_allow(request_id, input)
+                                                        } else {
+                                                            let deny_msg = format!("-# ⚠️ [Background] Permission denied: {} (not in cache)", tool_name);
+                                                            channel_id_for_worker.say(&ctx_for_worker, &deny_msg).await.ok();
+                                                            build_control_response_deny(request_id, "Background: permission not cached")
+                                                        };
+                                                        if let Err(e) = stdin.write_all(resp.as_bytes()).await {
+                                                            tracing::error!("stdin write error (bg turn in user turn): {}", e);
+                                                            break 'turn;
+                                                        }
+                                                        let _ = stdin.flush().await;
+                                                        continue 'turn;
+                                                    }
+                                                    _ => { continue 'turn; } // Init, RateLimit 등 skip
+                                                }
+                                            }
+
+                                            // 기존 user turn 이벤트 처리 (bg_turn_active == false)
                                             if let StreamEvent::ControlRequest {
                                                 ref request_id,
                                                 ref tool_name,

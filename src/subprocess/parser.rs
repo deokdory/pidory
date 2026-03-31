@@ -58,6 +58,28 @@ pub enum StreamEvent {
         input: Value,
         decision_reason: Option<String>,
     },
+    TaskStarted {
+        task_id: String,
+        tool_use_id: String,
+        description: String,
+        task_type: String,
+        session_id: String,
+    },
+    TaskProgress {
+        task_id: String,
+        tool_use_id: String,
+        description: String,
+        last_tool_name: Option<String>,
+        session_id: String,
+    },
+    TaskNotification {
+        task_id: String,
+        tool_use_id: String,
+        status: String,
+        summary: String,
+        output_file: Option<String>,
+        session_id: String,
+    },
     Unknown {
         raw: Value,
     },
@@ -73,6 +95,9 @@ impl StreamEvent {
             StreamEvent::Result { session_id, .. } => Some(session_id),
             StreamEvent::UserReplay { session_id, .. } => Some(session_id),
             StreamEvent::ControlRequest { .. } => None,
+            StreamEvent::TaskStarted { session_id, .. } => Some(session_id),
+            StreamEvent::TaskProgress { session_id, .. } => Some(session_id),
+            StreamEvent::TaskNotification { session_id, .. } => Some(session_id),
             StreamEvent::Unknown { .. } => None,
         }
     }
@@ -109,6 +134,10 @@ impl StreamEvent {
 
     pub fn is_result(&self) -> bool {
         matches!(self, StreamEvent::Result { .. })
+    }
+
+    pub fn is_task_notification(&self) -> bool {
+        matches!(self, StreamEvent::TaskNotification { .. })
     }
 
     pub fn is_error(&self) -> bool {
@@ -360,6 +389,141 @@ mod tests {
         let resp = build_control_response_deny("r", "no");
         assert!(resp.ends_with('\n'));
     }
+
+    #[test]
+    fn parse_task_started() {
+        let line = r#"{"type":"system","subtype":"task_started","task_id":"buyj7z5o7","tool_use_id":"toolu_012daJxCZsawPJKJYF6WxmtC","description":"Sleep 3 seconds then print bg_task_done","task_type":"local_bash","session_id":"40746b0a-41c2-4f62-9ea6-d683612ad9ae"}"#;
+        let event = parse_line(line).unwrap();
+        if let StreamEvent::TaskStarted { task_id, tool_use_id, description, task_type, session_id } = event {
+            assert_eq!(task_id, "buyj7z5o7");
+            assert_eq!(tool_use_id, "toolu_012daJxCZsawPJKJYF6WxmtC");
+            assert_eq!(description, "Sleep 3 seconds then print bg_task_done");
+            assert_eq!(task_type, "local_bash");
+            assert_eq!(session_id, "40746b0a-41c2-4f62-9ea6-d683612ad9ae");
+        } else {
+            panic!("Expected TaskStarted, got {:?}", event);
+        }
+    }
+
+    #[test]
+    fn parse_task_started_agent_type() {
+        let line = r#"{"type":"system","subtype":"task_started","task_id":"a7ca5a342d867c971","tool_use_id":"toolu_01CWFNoUWUwyfyMqVJ42F96Z","description":"Read /etc/hostname content","task_type":"local_agent","session_id":"a352a7c9-4254-465e-b444-b804c6099892"}"#;
+        let event = parse_line(line).unwrap();
+        if let StreamEvent::TaskStarted { task_type, .. } = event {
+            assert_eq!(task_type, "local_agent");
+        } else {
+            panic!("Expected TaskStarted");
+        }
+    }
+
+    #[test]
+    fn parse_task_started_session_id() {
+        let line = r#"{"type":"system","subtype":"task_started","task_id":"t1","tool_use_id":"tu1","description":"d","task_type":"local_bash","session_id":"sess-abc"}"#;
+        let event = parse_line(line).unwrap();
+        assert_eq!(event.session_id(), Some("sess-abc"));
+    }
+
+    #[test]
+    fn parse_task_started_missing_fields() {
+        let line = r#"{"type":"system","subtype":"task_started","task_id":"t1","session_id":"s1"}"#;
+        let event = parse_line(line).unwrap();
+        if let StreamEvent::TaskStarted { tool_use_id, description, task_type, .. } = event {
+            assert_eq!(tool_use_id, "");
+            assert_eq!(description, "");
+            assert_eq!(task_type, "");
+        } else {
+            panic!("Expected TaskStarted");
+        }
+    }
+
+    #[test]
+    fn parse_task_progress() {
+        let line = r#"{"type":"system","subtype":"task_progress","task_id":"a7ca5a342d867c971","tool_use_id":"toolu_01CWFNoUWUwyfyMqVJ42F96Z","description":"Reading /etc/hostname","usage":{"total_tokens":10950},"last_tool_name":"Read","session_id":"a352a7c9-4254-465e-b444-b804c6099892"}"#;
+        let event = parse_line(line).unwrap();
+        if let StreamEvent::TaskProgress { task_id, tool_use_id, description, last_tool_name, session_id } = event {
+            assert_eq!(task_id, "a7ca5a342d867c971");
+            assert_eq!(tool_use_id, "toolu_01CWFNoUWUwyfyMqVJ42F96Z");
+            assert_eq!(description, "Reading /etc/hostname");
+            assert_eq!(last_tool_name, Some("Read".to_string()));
+            assert_eq!(session_id, "a352a7c9-4254-465e-b444-b804c6099892");
+        } else {
+            panic!("Expected TaskProgress, got {:?}", event);
+        }
+    }
+
+    #[test]
+    fn parse_task_progress_no_last_tool_name() {
+        let line = r#"{"type":"system","subtype":"task_progress","task_id":"t1","tool_use_id":"tu1","description":"doing stuff","session_id":"s1"}"#;
+        let event = parse_line(line).unwrap();
+        if let StreamEvent::TaskProgress { last_tool_name, .. } = event {
+            assert_eq!(last_tool_name, None);
+        } else {
+            panic!("Expected TaskProgress");
+        }
+    }
+
+    #[test]
+    fn parse_task_progress_session_id() {
+        let line = r#"{"type":"system","subtype":"task_progress","task_id":"t1","tool_use_id":"tu1","description":"d","session_id":"my-session"}"#;
+        let event = parse_line(line).unwrap();
+        assert_eq!(event.session_id(), Some("my-session"));
+    }
+
+    #[test]
+    fn parse_task_notification_completed() {
+        let line = r#"{"type":"system","subtype":"task_notification","task_id":"buyj7z5o7","tool_use_id":"toolu_012daJxCZsawPJKJYF6WxmtC","status":"completed","output_file":"/tmp/claude-1000/tasks/buyj7z5o7.output","summary":"Background command completed (exit code 0)","session_id":"40746b0a-41c2-4f62-9ea6-d683612ad9ae"}"#;
+        let event = parse_line(line).unwrap();
+        if let StreamEvent::TaskNotification { task_id, tool_use_id, status, summary, output_file, session_id } = event {
+            assert_eq!(task_id, "buyj7z5o7");
+            assert_eq!(tool_use_id, "toolu_012daJxCZsawPJKJYF6WxmtC");
+            assert_eq!(status, "completed");
+            assert_eq!(summary, "Background command completed (exit code 0)");
+            assert_eq!(output_file, Some("/tmp/claude-1000/tasks/buyj7z5o7.output".to_string()));
+            assert_eq!(session_id, "40746b0a-41c2-4f62-9ea6-d683612ad9ae");
+        } else {
+            panic!("Expected TaskNotification, got {:?}", event);
+        }
+    }
+
+    #[test]
+    fn parse_task_notification_failed_no_output_file() {
+        let line = r#"{"type":"system","subtype":"task_notification","task_id":"bf2vp1kx2","status":"failed","summary":"Background command failed with exit code 1","session_id":"sess-xyz"}"#;
+        let event = parse_line(line).unwrap();
+        if let StreamEvent::TaskNotification { task_id, tool_use_id, status, output_file, .. } = event {
+            assert_eq!(task_id, "bf2vp1kx2");
+            assert_eq!(tool_use_id, "");
+            assert_eq!(status, "failed");
+            assert_eq!(output_file, None);
+        } else {
+            panic!("Expected TaskNotification");
+        }
+    }
+
+    #[test]
+    fn parse_task_notification_session_id() {
+        let line = r#"{"type":"system","subtype":"task_notification","task_id":"t1","status":"completed","summary":"done","session_id":"sid-123"}"#;
+        let event = parse_line(line).unwrap();
+        assert_eq!(event.session_id(), Some("sid-123"));
+    }
+
+    #[test]
+    fn is_task_notification_true() {
+        let line = r#"{"type":"system","subtype":"task_notification","task_id":"t1","status":"completed","summary":"done","session_id":"s1"}"#;
+        let event = parse_line(line).unwrap();
+        assert!(event.is_task_notification());
+        assert!(!event.is_result());
+    }
+
+    #[test]
+    fn is_task_notification_false_for_others() {
+        let line = r#"{"type":"system","subtype":"task_started","task_id":"t1","tool_use_id":"tu1","description":"d","task_type":"local_bash","session_id":"s1"}"#;
+        let event = parse_line(line).unwrap();
+        assert!(!event.is_task_notification());
+
+        let line2 = r#"{"type":"result","subtype":"success","session_id":"abc","is_error":false,"duration_ms":0,"total_cost_usd":0,"num_turns":0}"#;
+        let event2 = parse_line(line2).unwrap();
+        assert!(!event2.is_task_notification());
+    }
 }
 
 pub fn parse_line(line: &str) -> Result<StreamEvent, serde_json::Error> {
@@ -412,6 +576,109 @@ pub fn parse_line(line: &str) -> Result<StreamEvent, serde_json::Error> {
                     tools,
                     model,
                     skills,
+                })
+            } else if subtype == "task_started" {
+                let task_id = v
+                    .get("task_id")
+                    .and_then(|s| s.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let tool_use_id = v
+                    .get("tool_use_id")
+                    .and_then(|s| s.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let description = v
+                    .get("description")
+                    .and_then(|s| s.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let task_type = v
+                    .get("task_type")
+                    .and_then(|s| s.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let session_id = v
+                    .get("session_id")
+                    .and_then(|s| s.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                Ok(StreamEvent::TaskStarted {
+                    task_id,
+                    tool_use_id,
+                    description,
+                    task_type,
+                    session_id,
+                })
+            } else if subtype == "task_progress" {
+                let task_id = v
+                    .get("task_id")
+                    .and_then(|s| s.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let tool_use_id = v
+                    .get("tool_use_id")
+                    .and_then(|s| s.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let description = v
+                    .get("description")
+                    .and_then(|s| s.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let last_tool_name = v
+                    .get("last_tool_name")
+                    .and_then(|s| s.as_str())
+                    .map(|s| s.to_string());
+                let session_id = v
+                    .get("session_id")
+                    .and_then(|s| s.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                Ok(StreamEvent::TaskProgress {
+                    task_id,
+                    tool_use_id,
+                    description,
+                    last_tool_name,
+                    session_id,
+                })
+            } else if subtype == "task_notification" {
+                let task_id = v
+                    .get("task_id")
+                    .and_then(|s| s.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let tool_use_id = v
+                    .get("tool_use_id")
+                    .and_then(|s| s.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let status = v
+                    .get("status")
+                    .and_then(|s| s.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let summary = v
+                    .get("summary")
+                    .and_then(|s| s.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let output_file = v
+                    .get("output_file")
+                    .and_then(|s| s.as_str())
+                    .map(|s| s.to_string());
+                let session_id = v
+                    .get("session_id")
+                    .and_then(|s| s.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                Ok(StreamEvent::TaskNotification {
+                    task_id,
+                    tool_use_id,
+                    status,
+                    summary,
+                    output_file,
+                    session_id,
                 })
             } else {
                 Ok(StreamEvent::Unknown { raw: v })
