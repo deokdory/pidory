@@ -26,6 +26,8 @@ pub struct ClaudeConfig {
     pub subprocess_timeout_secs: u64,
     #[serde(default = "default_max_concurrent")]
     pub max_concurrent: usize,
+    #[serde(default = "default_max_sessions")]
+    pub max_sessions: usize,
 }
 
 #[derive(Debug, Deserialize)]
@@ -42,6 +44,10 @@ fn default_subprocess_timeout_secs() -> u64 {
 
 fn default_max_concurrent() -> usize {
     6
+}
+
+fn default_max_sessions() -> usize {
+    10
 }
 
 fn default_max_chunk_length() -> usize {

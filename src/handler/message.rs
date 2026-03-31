@@ -1,6 +1,7 @@
 use std::time::{Duration, Instant};
 
-use poise::serenity_prelude::{Context, FullEvent, GuildId, UserId};
+use poise::serenity_prelude::{ChannelId, Context, FullEvent, GuildId, MessageId, UserId};
+use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, warn};
 
@@ -9,7 +10,8 @@ use crate::error::PidoryError;
 use crate::handler::{emoji, formatter};
 use crate::handler::emoji::ReactionStatus;
 use crate::handler::status::StatusMessage;
-use crate::subprocess::parser::{ContentBlock, StreamEvent};
+use crate::subprocess::parser::StreamEvent;
+use crate::subprocess::session_manager::QueuedMessage;
 use crate::Data;
 
 pub async fn handle_event(
@@ -71,7 +73,7 @@ pub async fn handle_event(
     let channel_id = new_message.channel_id;
     let msg_id = new_message.id;
 
-    // 세션 확인/생성
+    // 세션 DB 확인/생성
     let session = match repository::get_session_by_thread(db, &thread_id).await? {
         Some(s) => s,
         None => {
@@ -79,21 +81,6 @@ pub async fn handle_event(
             repository::create_session(db, &thread_id, &parent_channel_id).await?
         }
     };
-
-    // 원자적 acquire: running이 아닌 경우에만 running으로 전환
-    let acquired = repository::try_acquire_session(db, &thread_id).await?;
-    if !acquired {
-        channel_id
-            .say(ctx, "⏳ 이전 작업이 진행 중입니다")
-            .await
-            .map_err(|e| PidoryError::Discord(Box::new(e)))?;
-        return Ok(());
-    }
-
-    // subprocess 실행 직전에 🔄 리액션 설정
-    emoji::set_reaction(ctx, channel_id, msg_id, ReactionStatus::Running)
-        .await
-        .ok();
 
     // disallowed_tools 결정
     let disallowed_tools: Vec<String> = match &project.disallowed_tools {
@@ -104,199 +91,291 @@ pub async fn handle_event(
         None => data.config.claude.default_disallowed_tools.clone(),
     };
 
-    tracing::info!(
-        "Spawning subprocess for thread {} project {}",
-        thread_id, project.path
-    );
-
-    let spawn_result = data
-        .subprocess
-        .spawn(
+    // SessionManager: 세션 생성 또는 기존 재사용
+    if let Err(e) = data
+        .sessions
+        .get_or_create(
             &thread_id,
             &project.path,
-            &new_message.content,
             session.session_id.as_deref(),
             &disallowed_tools,
         )
-        .await;
-
-    match spawn_result {
-        Ok((mut rx, _handle)) => {
-            // 1. StatusMessage 생성
-            let mut status = StatusMessage::new(channel_id);
-
-            // 2. typing indicator task 시작
-            let cancel = CancellationToken::new();
-            let cancel_clone = cancel.clone();
-            let ctx_clone = ctx.clone();
-            let typing_channel = channel_id;
-            tokio::spawn(async move {
-                loop {
-                    tokio::select! {
-                        _ = cancel_clone.cancelled() => break,
-                        _ = tokio::time::sleep(Duration::from_secs(8)) => {
-                            let _ = typing_channel.broadcast_typing(&ctx_clone).await;
-                        }
-                    }
-                }
-            });
-
-            // 3. 500ms 빠른 완료 감지
-            let mut events: Vec<StreamEvent> = Vec::new();
-            let mut got_result = false;
-            let mut fast_complete = false;
-
-            // 500ms 동안 이벤트 수집 (빠른 완료 감지)
-            let deadline = Instant::now() + Duration::from_millis(500);
-            loop {
-                let remaining = deadline.saturating_duration_since(Instant::now());
-                if remaining.is_zero() {
-                    break; // 500ms 경과
-                }
-                match tokio::time::timeout(remaining, rx.recv()).await {
-                    Ok(Some(event)) => {
-                        if let StreamEvent::Result { .. } = &event {
-                            got_result = true;
-                        }
-                        events.push(event);
-                        if got_result {
-                            fast_complete = true;
-                            break; // Result 수신 → 빠른 완료
-                        }
-                    }
-                    Ok(None) => {
-                        // sender dropped (프로세스 종료)
-                        fast_complete = true;
-                        break;
-                    }
-                    Err(_) => {
-                        break; // 500ms timeout
-                    }
-                }
-            }
-
-            // 4. 빠른 완료가 아니면 상태 메시지 + 나머지 이벤트 루프
-            if !fast_complete {
-                // 버퍼링된 이벤트에 대해 상태 업데이트
-                for event in &events {
-                    status.update(ctx, event).await.ok();
-                }
-
-                // 나머지 이벤트 계속 수신
-                while let Some(stream_event) = rx.recv().await {
-                    status.update(ctx, &stream_event).await.ok();
-                    if let StreamEvent::Result { .. } = &stream_event {
-                        got_result = true;
-                    }
-                    events.push(stream_event);
-                }
-            }
-
-            // 5. typing indicator 취소
-            cancel.cancel();
-
-            // session_id 추출
-            for event in &events {
-                if let StreamEvent::Result { session_id, .. } = event
-                    && !session_id.is_empty()
-                {
-                    if let Err(e) = repository::update_session_id(db, &thread_id, session_id).await {
-                        warn!("Failed to update session_id: {}", e);
-                    }
-                    break;
-                }
-            }
-
-            // 6. 에러 체크
-            let has_cli_error = events.iter().any(|e| e.is_error());
-
-            // 7. 상태 메시지 최종 처리
-            if fast_complete {
-                // 빠른 완료: 상태 메시지가 생성되지 않았으므로 finalize/set_error 호출 안 함
-                if has_cli_error || !got_result {
-                    emoji::set_reaction(ctx, channel_id, msg_id, ReactionStatus::Error).await.ok();
-                    repository::update_session_status(db, &thread_id, "error").await?;
-                } else {
-                    emoji::set_reaction(ctx, channel_id, msg_id, ReactionStatus::Done).await.ok();
-                    repository::update_session_status(db, &thread_id, "idle").await?;
-                }
-            } else {
-                // 마지막 debounce 반영
-                status.flush(ctx).await.ok();
-
-                if has_cli_error {
-                    let error_msgs: Vec<String> = events.iter().filter_map(|e| {
-                        if let StreamEvent::Result { is_error, errors, .. } = e {
-                            if *is_error { Some(errors.join(", ")) } else { None }
-                        } else {
-                            None
-                        }
-                    }).collect();
-                    let error_text = error_msgs.first().cloned().unwrap_or_else(|| "unknown error".to_string());
-                    status.set_error(ctx, &error_text).await.ok();
-                    emoji::set_reaction(ctx, channel_id, msg_id, ReactionStatus::Error).await.ok();
-                    repository::update_session_status(db, &thread_id, "error").await?;
-                } else if !got_result {
-                    // Result 없이 종료 = crash 또는 timeout
-                    status.set_error(ctx, "프로세스가 비정상 종료되었습니다").await.ok();
-                    emoji::set_reaction(ctx, channel_id, msg_id, ReactionStatus::Error).await.ok();
-                    repository::update_session_status(db, &thread_id, "error").await?;
-                } else {
-                    // 성공 — 상태 메시지 삭제
-                    status.finalize(ctx).await.ok();
-                    emoji::set_reaction(ctx, channel_id, msg_id, ReactionStatus::Done).await.ok();
-                    repository::update_session_status(db, &thread_id, "idle").await?;
-                }
-            }
-
-            repository::update_last_active(db, &thread_id).await?;
-
-            // 8. 최종 응답 전송
-            let response = formatter::format_response(&events);
-            if !response.trim().is_empty() {
-                formatter::send_response(
-                    ctx,
-                    channel_id,
-                    &response,
-                    data.config.response.max_chunk_length,
-                    data.config.response.max_chunks,
-                )
-                .await?;
-            }
-        }
-        Err(e) => {
-            // spawn 자체 실패 (concurrent limit 등)
-            error!("Subprocess error for thread {}: {}", thread_id, e);
-            let (reaction, error_msg) = classify_error(&e, data.config.claude.subprocess_timeout_secs);
-            emoji::set_reaction(ctx, channel_id, msg_id, reaction).await.ok();
-            repository::update_session_status(db, &thread_id, "error").await?;
-            channel_id
-                .say(ctx, error_msg)
-                .await
-                .map_err(|e| PidoryError::Discord(Box::new(e)))?;
-        }
+        .await
+    {
+        error!("Failed to get_or_create session for thread {}: {}", thread_id, e);
+        channel_id
+            .say(ctx, format!("❌ 세션 생성 실패: {}", e))
+            .await
+            .map_err(|e| PidoryError::Discord(Box::new(e)))?;
+        return Ok(());
     }
+
+    // 원자적 acquire: running이 아닌 경우에만 running으로 전환
+    let acquired = repository::try_acquire_session(db, &thread_id).await?;
+
+    if !acquired {
+        // mid-turn inject: event_tx 없이 전송
+        let msg = QueuedMessage {
+            content: new_message.content.clone(),
+            channel_id,
+            message_id: msg_id,
+            event_tx: None,
+        };
+
+        match data.sessions.send_message(&thread_id, msg).await {
+            Ok(()) => {
+                let _ = channel_id
+                    .create_reaction(
+                        ctx,
+                        msg_id,
+                        poise::serenity_prelude::ReactionType::Unicode("✅".to_string()),
+                    )
+                    .await;
+            }
+            Err(e) if e.to_string().contains("queue full") => {
+                channel_id
+                    .say(ctx, "❌ 대기열이 가득 찼습니다")
+                    .await
+                    .map_err(|e| PidoryError::Discord(Box::new(e)))?;
+                return Ok(());
+            }
+            Err(e) => {
+                channel_id
+                    .say(ctx, format!("❌ 오류: {}", e))
+                    .await
+                    .map_err(|e| PidoryError::Discord(Box::new(e)))?;
+                return Ok(());
+            }
+        }
+
+        return Ok(());
+    }
+
+    // 직접 실행 경로
+    emoji::set_reaction(ctx, channel_id, msg_id, ReactionStatus::Running)
+        .await
+        .ok();
+
+    let (event_tx, event_rx) = mpsc::channel::<StreamEvent>(64);
+    let msg = QueuedMessage {
+        content: new_message.content.clone(),
+        channel_id,
+        message_id: msg_id,
+        event_tx: Some(event_tx),
+    };
+
+    if let Err(e) = data.sessions.send_message(&thread_id, msg).await {
+        error!("Failed to send message to session {}: {}", thread_id, e);
+        emoji::set_reaction(ctx, channel_id, msg_id, ReactionStatus::Error)
+            .await
+            .ok();
+        repository::update_session_status(db, &thread_id, "error").await?;
+        channel_id
+            .say(ctx, format!("❌ 메시지 전송 실패: {}", e))
+            .await
+            .map_err(|e| PidoryError::Discord(Box::new(e)))?;
+        return Ok(());
+    }
+
+    process_turn_events(
+        ctx,
+        event_rx,
+        channel_id,
+        msg_id,
+        &thread_id,
+        db,
+        data.config.response.max_chunk_length,
+        data.config.response.max_chunks,
+    )
+    .await;
 
     Ok(())
 }
 
-fn classify_error(error: &PidoryError, timeout_secs: u64) -> (ReactionStatus, String) {
-    match error {
-        PidoryError::Subprocess(msg) if msg == "timeout" => (
-            ReactionStatus::Timeout,
-            format!("⏰ 작업 시간이 초과되었습니다 ({}분)", timeout_secs / 60),
-        ),
-        PidoryError::Subprocess(msg) if msg.contains("max concurrent") => (
-            ReactionStatus::Error,
-            "⚠️ 동시 실행 상한에 도달했습니다. 잠시 후 다시 시도해주세요.".to_string(),
-        ),
-        PidoryError::Subprocess(msg) => (
-            ReactionStatus::Error,
-            format!("❌ Claude 프로세스 오류: {}", msg),
-        ),
-        _ => (
-            ReactionStatus::Error,
-            format!("❌ 오류가 발생했습니다: {}", error),
-        ),
+#[allow(clippy::too_many_arguments)]
+async fn process_turn_events(
+    ctx: &Context,
+    mut event_rx: mpsc::Receiver<StreamEvent>,
+    channel_id: ChannelId,
+    msg_id: MessageId,
+    thread_id: &str,
+    db: &sqlx::SqlitePool,
+    max_chunk_length: usize,
+    max_chunks: usize,
+) {
+    // 1. StatusMessage 생성
+    let mut status = StatusMessage::new(channel_id);
+
+    // 2. typing indicator task 시작
+    let cancel = CancellationToken::new();
+    let cancel_clone = cancel.clone();
+    let ctx_clone = ctx.clone();
+    let typing_channel = channel_id;
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = cancel_clone.cancelled() => break,
+                _ = tokio::time::sleep(Duration::from_secs(8)) => {
+                    let _ = typing_channel.broadcast_typing(&ctx_clone).await;
+                }
+            }
+        }
+    });
+
+    // 3. 500ms 빠른 완료 감지
+    let mut events: Vec<StreamEvent> = Vec::new();
+    let mut got_result = false;
+    let mut fast_complete = false;
+
+    let deadline = Instant::now() + Duration::from_millis(500);
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match tokio::time::timeout(remaining, event_rx.recv()).await {
+            Ok(Some(event)) => {
+                if event.is_result() {
+                    got_result = true;
+                }
+                events.push(event);
+                if got_result {
+                    fast_complete = true;
+                    break;
+                }
+            }
+            Ok(None) => {
+                // sender dropped (worker done or process died)
+                fast_complete = true;
+                break;
+            }
+            Err(_) => {
+                break; // 500ms timeout
+            }
+        }
+    }
+
+    // 4. 빠른 완료가 아니면 상태 메시지 + 나머지 이벤트 루프
+    if !fast_complete {
+        for event in &events {
+            status.update(ctx, event).await.ok();
+        }
+
+        loop {
+            match event_rx.recv().await {
+                Some(stream_event) => {
+                    status.update(ctx, &stream_event).await.ok();
+                    if stream_event.is_result() {
+                        got_result = true;
+                    }
+                    let is_result = stream_event.is_result();
+                    events.push(stream_event);
+                    if is_result {
+                        break;
+                    }
+                }
+                None => {
+                    // sender dropped (worker done or process died)
+                    break;
+                }
+            }
+        }
+    }
+
+    // 5. typing indicator 취소
+    cancel.cancel();
+
+    // session_id 추출
+    for event in &events {
+        if let StreamEvent::Result { session_id, .. } = event
+            && !session_id.is_empty() {
+            if let Err(e) = repository::update_session_id(db, thread_id, session_id).await {
+                warn!("Failed to update session_id: {}", e);
+            }
+            break;
+        }
+    }
+
+    // 6. 에러 체크
+    let has_cli_error = events.iter().any(|e| e.is_error());
+
+    // 7. 상태 메시지 최종 처리
+    if fast_complete {
+        if has_cli_error || !got_result {
+            emoji::set_reaction(ctx, channel_id, msg_id, ReactionStatus::Error)
+                .await
+                .ok();
+            repository::update_session_status(db, thread_id, "error")
+                .await
+                .ok();
+        } else {
+            emoji::set_reaction(ctx, channel_id, msg_id, ReactionStatus::Done)
+                .await
+                .ok();
+            repository::update_session_status(db, thread_id, "idle")
+                .await
+                .ok();
+        }
+    } else {
+        status.flush(ctx).await.ok();
+
+        if has_cli_error {
+            let error_msgs: Vec<String> = events
+                .iter()
+                .filter_map(|e| {
+                    if let StreamEvent::Result { is_error, errors, .. } = e {
+                        if *is_error {
+                            Some(errors.join(", "))
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            let error_text = error_msgs
+                .first()
+                .cloned()
+                .unwrap_or_else(|| "unknown error".to_string());
+            status.set_error(ctx, &error_text).await.ok();
+            emoji::set_reaction(ctx, channel_id, msg_id, ReactionStatus::Error)
+                .await
+                .ok();
+            repository::update_session_status(db, thread_id, "error")
+                .await
+                .ok();
+        } else if !got_result {
+            status
+                .set_error(ctx, "프로세스가 비정상 종료되었습니다")
+                .await
+                .ok();
+            emoji::set_reaction(ctx, channel_id, msg_id, ReactionStatus::Error)
+                .await
+                .ok();
+            repository::update_session_status(db, thread_id, "error")
+                .await
+                .ok();
+        } else {
+            status.finalize(ctx).await.ok();
+            emoji::set_reaction(ctx, channel_id, msg_id, ReactionStatus::Done)
+                .await
+                .ok();
+            repository::update_session_status(db, thread_id, "idle")
+                .await
+                .ok();
+        }
+    }
+
+    repository::update_last_active(db, thread_id).await.ok();
+
+    // 8. 최종 응답 전송
+    let response = formatter::format_response(&events);
+    if !response.trim().is_empty()
+        && let Err(e) =
+            formatter::send_response(ctx, channel_id, &response, max_chunk_length, max_chunks)
+                .await
+    {
+        error!("Failed to send response for thread {}: {}", thread_id, e);
     }
 }
