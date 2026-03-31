@@ -50,6 +50,7 @@ impl SessionManager {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn get_or_create(
         &self,
         thread_id: &str,
@@ -314,8 +315,11 @@ impl SessionManager {
                                             channel_id_for_worker.say(&ctx_for_worker, &deny_msg).await.ok();
                                             build_control_response_deny(request_id, "Background: permission not cached")
                                         };
-                                        stdin.write_all(resp.as_bytes()).await.ok();
-                                        stdin.flush().await.ok();
+                                        if let Err(e) = stdin.write_all(resp.as_bytes()).await {
+                                            tracing::error!("stdin write error (between turns): {}", e);
+                                            break;
+                                        }
+                                        let _ = stdin.flush().await;
                                         continue;
                                     }
                                     Ok(event) => {
