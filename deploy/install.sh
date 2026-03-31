@@ -3,23 +3,24 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
+USER_NAME="$(whoami)"
+HOME_DIR="$HOME"
 
 echo "=== pidory deployment ==="
 
-# Build
+# 1. Build
 echo "[1/4] Building release binary..."
 cd "$PROJECT_DIR"
 cargo build --release
 
-# Create .env with token (using deok-guard)
-echo "[2/4] Setting up environment..."
-if ! command -v deok-guard &>/dev/null; then
-    echo "WARNING: deok-guard not found. Set PIDORY_DISCORD_TOKEN manually in .env"
-else
-    deok-guard env inject PIDORY_DISCORD_TOKEN --from secret:pidory/discord-token > "$PROJECT_DIR/.env"
+# 2. Check .env
+echo "[2/4] Checking environment..."
+if [ ! -f "$PROJECT_DIR/.env" ]; then
+    echo "WARNING: .env not found."
+    echo "Create it with: echo 'PIDORY_DISCORD_TOKEN=your_token' > $PROJECT_DIR/.env"
 fi
 
-# Copy config if not exists
+# 3. Copy config if not exists
 if [ ! -f "$PROJECT_DIR/config.toml" ]; then
     echo "[3/4] Creating config.toml from example..."
     cp "$PROJECT_DIR/config.toml.example" "$PROJECT_DIR/config.toml"
@@ -28,9 +29,12 @@ else
     echo "[3/4] config.toml already exists, skipping"
 fi
 
-# Install systemd service
+# 4. Install systemd service (sed 치환)
 echo "[4/4] Installing systemd service..."
-sudo cp "$SCRIPT_DIR/pidory.service" /etc/systemd/system/pidory.service
+sed -e "s|__USER__|$USER_NAME|g" \
+    -e "s|__PROJECT_DIR__|$PROJECT_DIR|g" \
+    -e "s|__HOME_DIR__|$HOME_DIR|g" \
+    "$SCRIPT_DIR/pidory.service" | sudo tee /etc/systemd/system/pidory.service > /dev/null
 sudo systemctl daemon-reload
 sudo systemctl enable pidory
 
@@ -42,4 +46,4 @@ echo "Logs:    journalctl -u pidory -f"
 echo ""
 echo "Don't forget to:"
 echo "  1. Edit config.toml with your Discord guild_id and owner_id"
-echo "  2. Set Discord token: deok-guard secret set pidory/discord-token YOUR_TOKEN"
+echo "  2. Set Discord token in .env: echo 'PIDORY_DISCORD_TOKEN=your_token' > .env"
