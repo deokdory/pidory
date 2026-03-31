@@ -301,7 +301,7 @@ pub fn format_tool_result_with_name(result: &ToolResult, tool_name: Option<&str>
     let body = if result.content.len() <= TRUNCATE_LEN {
         format!("{}\n{}\n```", fence, result.content)
     } else {
-        let truncated = &result.content[..TRUNCATE_LEN];
+        let truncated: String = result.content.chars().take(TRUNCATE_LEN).collect();
         format!("{}\n{}\n```\n...(truncated)", fence, truncated)
     };
 
