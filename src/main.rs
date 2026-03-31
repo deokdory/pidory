@@ -6,6 +6,7 @@ mod handler;
 mod subprocess;
 
 use std::collections::{HashMap, HashSet};
+use commands::skill::load_skill_descriptions;
 use std::sync::Arc;
 
 use poise::serenity_prelude as serenity;
@@ -34,6 +35,8 @@ pub struct Data {
     pub sessions: Arc<SessionManager>,
     pub permission_rxs: Arc<Mutex<HashMap<String, mpsc::Receiver<PermissionRequest>>>>,
     pub pending_permissions: Arc<Mutex<HashMap<String, PendingPermission>>>,
+    pub session_skills: Arc<Mutex<HashMap<String, Vec<String>>>>,
+    pub skill_descriptions: HashMap<String, String>,
 }
 
 #[tokio::main]
@@ -90,6 +93,8 @@ async fn main() -> Result<(), PidoryError> {
 
                 let permission_rxs = Arc::new(Mutex::new(HashMap::new()));
                 let pending_permissions = Arc::new(Mutex::new(HashMap::new()));
+                let session_skills = Arc::new(Mutex::new(HashMap::new()));
+                let skill_descriptions = load_skill_descriptions();
 
                 Ok(Data {
                     config,
@@ -97,6 +102,8 @@ async fn main() -> Result<(), PidoryError> {
                     sessions,
                     permission_rxs,
                     pending_permissions,
+                    session_skills,
+                    skill_descriptions,
                 })
             })
         })

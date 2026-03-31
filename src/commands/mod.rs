@@ -1,5 +1,6 @@
 pub mod register;
 pub mod session;
+pub mod skill;
 
 use crate::{Data, Error};
 
@@ -10,5 +11,6 @@ pub fn all_commands() -> Vec<poise::Command<Data, Error>> {
         session::list(),
         session::del(),
         session::status(),
+        skill::skill(),
     ]
 }

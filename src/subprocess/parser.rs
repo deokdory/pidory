@@ -21,6 +21,7 @@ pub enum StreamEvent {
         cwd: String,
         tools: Vec<String>,
         model: String,
+        skills: Vec<String>,
     },
     Assistant {
         content: Vec<ContentBlock>,
@@ -125,15 +126,38 @@ mod tests {
 
     #[test]
     fn parse_init_event() {
-        let line = r#"{"type":"system","subtype":"init","session_id":"abc-123","cwd":"/tmp","tools":["Bash","Read"],"model":"claude-opus-4-6"}"#;
+        let line = r#"{"type":"system","subtype":"init","session_id":"abc-123","cwd":"/tmp","tools":["Bash","Read"],"model":"claude-opus-4-6","skills":["craft","verify"]}"#;
         let event = parse_line(line).unwrap();
-        if let StreamEvent::Init { session_id, cwd, tools, model } = event {
+        if let StreamEvent::Init { session_id, cwd, tools, model, skills } = event {
             assert_eq!(session_id, "abc-123");
             assert_eq!(cwd, "/tmp");
             assert_eq!(tools, vec!["Bash", "Read"]);
             assert_eq!(model, "claude-opus-4-6");
+            assert_eq!(skills, vec!["craft", "verify"]);
         } else {
             panic!("Expected Init event");
+        }
+    }
+
+    #[test]
+    fn parse_init_with_skills() {
+        let line = r#"{"type":"system","subtype":"init","session_id":"abc","cwd":"/tmp","tools":["Bash"],"model":"claude-opus-4-6","skills":["craft","verify","build"]}"#;
+        let event = parse_line(line).unwrap();
+        if let StreamEvent::Init { skills, .. } = event {
+            assert_eq!(skills, vec!["craft", "verify", "build"]);
+        } else {
+            panic!("Expected Init");
+        }
+    }
+
+    #[test]
+    fn parse_init_without_skills() {
+        let line = r#"{"type":"system","subtype":"init","session_id":"abc","cwd":"/tmp","tools":["Bash"],"model":"opus"}"#;
+        let event = parse_line(line).unwrap();
+        if let StreamEvent::Init { skills, .. } = event {
+            assert!(skills.is_empty());
+        } else {
+            panic!("Expected Init");
         }
     }
 
@@ -377,11 +401,17 @@ pub fn parse_line(line: &str) -> Result<StreamEvent, serde_json::Error> {
                     .and_then(|s| s.as_str())
                     .unwrap_or("")
                     .to_string();
+                let skills = v
+                    .get("skills")
+                    .and_then(|s| s.as_array())
+                    .map(|arr| arr.iter().filter_map(|s| s.as_str().map(|s| s.to_string())).collect())
+                    .unwrap_or_default();
                 Ok(StreamEvent::Init {
                     session_id,
                     cwd,
                     tools,
                     model,
+                    skills,
                 })
             } else {
                 Ok(StreamEvent::Unknown { raw: v })

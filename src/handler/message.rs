@@ -215,6 +215,7 @@ async fn handle_message(
         permission_rx,
         data.pending_permissions.clone(),
         data.config.discord.owner_id,
+        data.session_skills.clone(),
     )
     .await;
 
@@ -305,7 +306,7 @@ async fn handle_interaction(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn process_turn_events(
+pub async fn process_turn_events(
     ctx: &Context,
     mut event_rx: mpsc::Receiver<StreamEvent>,
     channel_id: ChannelId,
@@ -317,6 +318,7 @@ async fn process_turn_events(
     mut permission_rx: Option<mpsc::Receiver<PermissionRequest>>,
     pending_permissions: std::sync::Arc<tokio::sync::Mutex<HashMap<String, PendingPermission>>>,
     owner_id: u64,
+    session_skills: std::sync::Arc<tokio::sync::Mutex<HashMap<String, Vec<String>>>>,
 ) -> Option<mpsc::Receiver<PermissionRequest>> {
     // 1. StatusMessage 생성
     let mut status = StatusMessage::new(channel_id);
@@ -453,6 +455,16 @@ async fn process_turn_events(
         }
     }
 
+    // Init skills 캡처
+    for event in &events {
+        if let StreamEvent::Init { skills, .. } = event {
+            if !skills.is_empty() {
+                session_skills.lock().await.insert(thread_id.to_string(), skills.clone());
+            }
+            break;
+        }
+    }
+
     // 6. 에러 체크
     let has_cli_error = events.iter().any(|e| e.is_error());
 
@@ -537,6 +549,77 @@ async fn process_turn_events(
     }
 
     permission_rx
+}
+
+pub async fn execute_in_session(
+    ctx: &Context,
+    data: &Data,
+    thread_id: &str,
+    channel_id: ChannelId,
+    msg_id: MessageId,
+    content: &str,
+) -> Result<(), PidoryError> {
+    let db = &data.db;
+
+    let acquired = repository::try_acquire_session(db, thread_id).await?;
+
+    if !acquired {
+        // mid-turn inject: event_tx 없이 전송
+        let msg = QueuedMessage {
+            content: content.to_string(),
+            channel_id,
+            message_id: msg_id,
+            event_tx: None,
+        };
+        data.sessions.send_message(thread_id, msg).await?;
+        return Ok(());
+    }
+
+    // 직접 실행
+    emoji::set_reaction(ctx, channel_id, msg_id, ReactionStatus::Running)
+        .await
+        .ok();
+
+    let (event_tx, event_rx) = mpsc::channel::<StreamEvent>(64);
+    let msg = QueuedMessage {
+        content: content.to_string(),
+        channel_id,
+        message_id: msg_id,
+        event_tx: Some(event_tx),
+    };
+
+    if let Err(e) = data.sessions.send_message(thread_id, msg).await {
+        error!("Failed to send message to session {}: {}", thread_id, e);
+        emoji::set_reaction(ctx, channel_id, msg_id, ReactionStatus::Error)
+            .await
+            .ok();
+        repository::update_session_status(db, thread_id, "error").await?;
+        return Err(e);
+    }
+
+    let permission_rx = data.permission_rxs.lock().await.remove(thread_id);
+
+    let permission_rx = process_turn_events(
+        ctx,
+        event_rx,
+        channel_id,
+        msg_id,
+        thread_id,
+        db,
+        data.config.response.max_chunk_length,
+        data.config.response.max_chunks,
+        permission_rx,
+        data.pending_permissions.clone(),
+        data.config.discord.owner_id,
+        data.session_skills.clone(),
+    )
+    .await;
+
+    if let Some(rx) = permission_rx {
+        data.permission_rxs.lock().await.insert(thread_id.to_string(), rx);
+    }
+
+    Ok(())
 }
 
 async fn handle_permission_request(
