@@ -153,6 +153,30 @@ pub async fn del(
     Ok(())
 }
 
+/// 진행 중인 Claude Code 작업 중단
+#[poise::command(slash_command, guild_only, owners_only)]
+pub async fn stop(ctx: Context<'_>) -> Result<(), Error> {
+    let channel_id = ctx.channel_id();
+    let thread_id = channel_id.to_string();
+    let data = ctx.data();
+
+    if !data.sessions.session_exists(&thread_id).await {
+        ctx.say("❌ 이 스레드에 활성 세션이 없습니다").await?;
+        return Ok(());
+    }
+
+    match data.sessions.interrupt_session(&thread_id).await {
+        Ok(()) => {
+            ctx.say("-# ⛔ Interrupted").await?;
+        }
+        Err(e) => {
+            ctx.say(format!("❌ 중단 실패: {}", e)).await?;
+        }
+    }
+
+    Ok(())
+}
+
 #[poise::command(slash_command, guild_only, owners_only)]
 pub async fn status(
     ctx: Context<'_>,
