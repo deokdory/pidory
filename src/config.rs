@@ -8,6 +8,8 @@ pub struct Config {
     pub discord: DiscordConfig,
     pub claude: ClaudeConfig,
     pub response: ResponseConfig,
+    #[serde(default)]
+    pub database: DatabaseConfig,
 }
 
 #[derive(Debug, Deserialize)]
@@ -36,6 +38,24 @@ pub struct ResponseConfig {
     pub max_chunk_length: usize,
     #[serde(default = "default_max_chunks")]
     pub max_chunks: usize,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct DatabaseConfig {
+    #[serde(default = "default_db_path")]
+    pub path: String,
+}
+
+impl Default for DatabaseConfig {
+    fn default() -> Self {
+        Self {
+            path: default_db_path(),
+        }
+    }
+}
+
+fn default_db_path() -> String {
+    "pidory.db".to_string()
 }
 
 fn default_subprocess_timeout_secs() -> u64 {
@@ -102,6 +122,7 @@ binary_path = "claude"
         assert_eq!(config.claude.max_concurrent, 6);
         assert_eq!(config.response.max_chunk_length, 1900);
         assert_eq!(config.response.max_chunks, 10);
+        assert_eq!(config.database.path, "pidory.db");
     }
 
     #[test]
@@ -125,6 +146,26 @@ max_chunks = 5
         assert_eq!(config.claude.default_disallowed_tools, vec!["Bash", "Edit"]);
         assert_eq!(config.claude.subprocess_timeout_secs, 300);
         assert_eq!(config.response.max_chunk_length, 1800);
+        assert_eq!(config.database.path, "pidory.db"); // default when [database] omitted
+    }
+
+    #[test]
+    fn parse_config_with_database_path() {
+        let toml_str = r#"
+[discord]
+guild_id = 123
+owner_id = 456
+
+[claude]
+binary_path = "claude"
+
+[database]
+path = "pidory-dev.db"
+
+[response]
+"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.database.path, "pidory-dev.db");
     }
 
     #[test]

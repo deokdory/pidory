@@ -76,7 +76,7 @@ async fn main() -> Result<(), PidoryError> {
                     .await
                     .map_err(|e| PidoryError::Discord(Box::new(e)))?;
 
-                let db = db::init_pool("pidory.db").await?;
+                let db = db::init_pool(&config.database.path).await?;
 
                 info!("Database initialized");
 
