@@ -27,8 +27,8 @@ payload=$(echo "$input" | jq -c --argjson now "$(date +%s)" '
   .rate_limits // empty |
   if . == null then empty else
     {
-      five_hour_pct: (.five_hour.used_percentage // 0),
-      seven_day_pct: (.seven_day.used_percentage // 0),
+      five_hour_pct: ((.five_hour.used_percentage // 0) | round),
+      seven_day_pct: ((.seven_day.used_percentage // 0) | round),
       five_hour_reset: (.five_hour.resets_at // 0),
       seven_day_reset: (.seven_day.resets_at // 0),
       updated_at: $now
