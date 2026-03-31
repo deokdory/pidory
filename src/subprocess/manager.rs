@@ -4,7 +4,8 @@ use std::time::Duration;
 
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
-use tokio::sync::Mutex;
+use tokio::sync::{mpsc, Mutex};
+use tokio::task::JoinHandle;
 
 use std::process::Stdio;
 
@@ -36,7 +37,8 @@ impl SubprocessManager {
         prompt: &str,
         session_id: Option<&str>,
         disallowed_tools: &[String],
-    ) -> Result<Vec<StreamEvent>, PidoryError> {
+    ) -> Result<(mpsc::Receiver<StreamEvent>, JoinHandle<Result<(), PidoryError>>), PidoryError>
+    {
         {
             let active = self.active.lock().await;
             if active.len() >= self.max_concurrent {
@@ -81,15 +83,14 @@ impl SubprocessManager {
             active.insert(thread_id.to_string(), child);
         }
 
+        let (tx, rx) = mpsc::channel(64);
+
         let active_clone = Arc::clone(&self.active);
         let thread_id_owned = thread_id.to_string();
-        let timeout_secs = self.config.subprocess_timeout_secs;
 
-        let collect_future = async move {
+        let handle = tokio::spawn(async move {
             let mut reader = BufReader::new(stdout);
             let mut line = String::new();
-            let mut events = Vec::new();
-
             loop {
                 line.clear();
                 let n = reader
@@ -99,37 +100,42 @@ impl SubprocessManager {
                 if n == 0 {
                     break;
                 }
-                let event = parse_line(line.trim_end())?;
-                events.push(event);
-            }
-
-            Ok::<Vec<StreamEvent>, PidoryError>(events)
-        };
-
-        let result =
-            tokio::time::timeout(Duration::from_secs(timeout_secs), collect_future).await;
-
-        match result {
-            Ok(Ok(events)) => {
-                let mut active = active_clone.lock().await;
-                active.remove(&thread_id_owned);
-                Ok(events)
-            }
-            Ok(Err(e)) => {
-                let mut active = active_clone.lock().await;
-                if let Some(mut child) = active.remove(&thread_id_owned) {
-                    let _ = child.kill().await;
+                let trimmed = line.trim_end();
+                if trimmed.is_empty() {
+                    continue;
                 }
-                Err(e)
-            }
-            Err(_elapsed) => {
-                let mut active = active_clone.lock().await;
-                if let Some(mut child) = active.remove(&thread_id_owned) {
-                    let _ = child.kill().await;
+                match parse_line(trimmed) {
+                    Ok(event) => {
+                        if tx.send(event).await.is_err() {
+                            break; // receiver dropped
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!("Failed to parse stream-json line: {}", e);
+                    }
                 }
-                Err(PidoryError::Subprocess("timeout".to_string()))
             }
-        }
+            // 파싱 완료 → active에서 제거
+            let mut active = active_clone.lock().await;
+            if let Some(mut child) = active.remove(&thread_id_owned) {
+                let _ = child.wait().await;
+            }
+            Ok(())
+        });
+
+        // timeout task
+        let active_for_timeout = Arc::clone(&self.active);
+        let thread_id_for_timeout = thread_id.to_string();
+        let timeout_secs = self.config.subprocess_timeout_secs;
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(timeout_secs)).await;
+            let mut active = active_for_timeout.lock().await;
+            if let Some(mut child) = active.remove(&thread_id_for_timeout) {
+                let _ = child.kill().await;
+            }
+        });
+
+        Ok((rx, handle))
     }
 
     pub async fn kill(&self, thread_id: &str) -> Result<(), PidoryError> {
