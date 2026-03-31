@@ -15,6 +15,7 @@ Discord ↔ Claude Code CLI bridge. Send messages in a Discord thread and get Cl
 - Tool permission approve/deny with Discord buttons (Allow / Always Allow / Deny)
 - Real-time intermediate status display
 - Code block-aware message splitting for Discord's 2000 char limit
+- Rate limit monitoring — bot presence shows current usage %, with configurable threshold alerts
 
 ## Prerequisites
 
@@ -100,7 +101,9 @@ All commands are owner-only (restricted to the `owner_id` set in `config.toml`).
 | `/unregister` | Unregister the project from the current channel |
 | `/list [channel]` | List active sessions for a channel |
 | `/del [thread_id]` | Delete a session (defaults to current thread) |
+| `/stop` | Stop the current session's Claude Code process |
 | `/status [thread_id]` | Show session status (defaults to current thread) |
+| `/skill <name>` | Send a slash command (e.g. `/commit`) to the Claude Code session |
 
 ### Chatting with Claude Code
 
@@ -124,10 +127,49 @@ All commands are owner-only (restricted to the `owner_id` set in `config.toml`).
 | `claude.default_disallowed_tools` | Tools to block by default | `[]` |
 | `claude.subprocess_timeout_secs` | Max time per Claude Code subprocess | `600` |
 | `claude.max_sessions` | Max concurrent sessions | `10` |
+| `discord.notification_channel_id` | Channel ID for rate limit alerts (optional) | — |
 | `response.max_chunk_length` | Max characters per Discord message | `1900` |
 | `response.max_chunks` | Chunks before falling back to file attachment | `10` |
+| `ratelimit.file_path` | Path to the rate limit JSON file (optional) | — |
+| `ratelimit.update_interval_secs` | How often to read the rate limit file | `60` |
+| `ratelimit.alert_thresholds` | 5h usage % thresholds that trigger alerts | `[50, 80]` |
 
 The Discord token is read from the `PIDORY_DISCORD_TOKEN` environment variable (or `.env` file) — never put it in `config.toml`.
+
+## Rate Limit Monitoring
+
+pidory can display Claude Code's API rate limit usage as a Discord bot presence (e.g. `Watching 5h: 42%(1h30m) | 7d: 38%`) and send alerts when thresholds are exceeded.
+
+### How it works
+
+```
+Claude Code statusLine hook → writes /tmp/pidory-ratelimits.json
+pidory reads the file periodically → updates bot presence + sends alerts
+```
+
+Claude Code's `statusLine` receives rate limit data as JSON on stdin. A helper script extracts the usage percentages and writes them to a file that pidory monitors.
+
+### Setup
+
+1. Add the ratelimit writer to your Claude Code statusLine script (`~/.claude/settings.json`):
+
+```bash
+# In your statusLine script, after reading stdin:
+input=$(cat)
+echo "$input" | bash /path/to/pidory/scripts/statusline-ratelimit-writer.sh 2>/dev/null
+# ... rest of your statusLine script
+```
+
+2. Enable monitoring in `config.toml`:
+
+```toml
+[ratelimit]
+file_path = "/tmp/pidory-ratelimits.json"
+# update_interval_secs = 60
+# alert_thresholds = [50, 80]
+```
+
+3. Optionally set `notification_channel_id` under `[discord]` to receive threshold alerts in a specific channel.
 
 ## License
 
