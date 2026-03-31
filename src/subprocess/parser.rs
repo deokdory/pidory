@@ -50,6 +50,13 @@ pub enum StreamEvent {
         session_id: String,
         timestamp: Option<String>,
     },
+    ControlRequest {
+        request_id: String,
+        tool_name: String,
+        tool_use_id: String,
+        input: Value,
+        decision_reason: Option<String>,
+    },
     Unknown {
         raw: Value,
     },
@@ -64,6 +71,7 @@ impl StreamEvent {
             StreamEvent::RateLimit { session_id, .. } => Some(session_id),
             StreamEvent::Result { session_id, .. } => Some(session_id),
             StreamEvent::UserReplay { session_id, .. } => Some(session_id),
+            StreamEvent::ControlRequest { .. } => None,
             StreamEvent::Unknown { .. } => None,
         }
     }
@@ -92,6 +100,10 @@ impl StreamEvent {
 
     pub fn is_user_replay(&self) -> bool {
         matches!(self, StreamEvent::UserReplay { .. })
+    }
+
+    pub fn is_control_request(&self) -> bool {
+        matches!(self, StreamEvent::ControlRequest { .. })
     }
 
     pub fn is_result(&self) -> bool {
@@ -252,6 +264,77 @@ mod tests {
         } else {
             panic!("Expected Assistant");
         }
+    }
+
+    #[test]
+    fn parse_control_request() {
+        let line = r#"{"type":"control_request","request_id":"e5c3058b-6794-4a0d-b445-7729855cb810","request":{"subtype":"can_use_tool","tool_name":"Write","input":{"file_path":"/tmp/test.txt","content":"hello"},"permission_suggestions":[],"decision_reason":"Path is outside allowed working directories","tool_use_id":"toolu_01BKN27SrcApvHEMYi7A1ik4"}}"#;
+        let event = parse_line(line).unwrap();
+        if let StreamEvent::ControlRequest { request_id, tool_name, tool_use_id, input, decision_reason } = event {
+            assert_eq!(request_id, "e5c3058b-6794-4a0d-b445-7729855cb810");
+            assert_eq!(tool_name, "Write");
+            assert_eq!(tool_use_id, "toolu_01BKN27SrcApvHEMYi7A1ik4");
+            assert_eq!(input["file_path"], "/tmp/test.txt");
+            assert_eq!(decision_reason, Some("Path is outside allowed working directories".to_string()));
+        } else {
+            panic!("Expected ControlRequest, got {:?}", event);
+        }
+    }
+
+    #[test]
+    fn parse_control_request_is_control_request() {
+        let line = r#"{"type":"control_request","request_id":"abc","request":{"subtype":"can_use_tool","tool_name":"Bash","input":{"command":"ls"},"tool_use_id":"t1"}}"#;
+        let event = parse_line(line).unwrap();
+        assert!(event.is_control_request());
+        assert!(!event.is_result());
+        assert_eq!(event.session_id(), None);
+    }
+
+    #[test]
+    fn parse_control_request_no_decision_reason() {
+        let line = r#"{"type":"control_request","request_id":"abc","request":{"subtype":"can_use_tool","tool_name":"Read","input":{"file_path":"/tmp/f"},"tool_use_id":"t1"}}"#;
+        let event = parse_line(line).unwrap();
+        if let StreamEvent::ControlRequest { decision_reason, .. } = event {
+            assert_eq!(decision_reason, None);
+        } else {
+            panic!("Expected ControlRequest");
+        }
+    }
+
+    #[test]
+    fn build_allow_response_format() {
+        let input = serde_json::json!({"file_path": "/tmp/test.txt", "content": "hello"});
+        let resp = build_control_response_allow("req_123", &input);
+        let parsed: serde_json::Value = serde_json::from_str(resp.trim()).unwrap();
+        assert_eq!(parsed["type"], "control_response");
+        assert_eq!(parsed["response"]["subtype"], "success");
+        assert_eq!(parsed["response"]["request_id"], "req_123");
+        assert_eq!(parsed["response"]["response"]["behavior"], "allow");
+        assert_eq!(parsed["response"]["response"]["updatedInput"]["file_path"], "/tmp/test.txt");
+    }
+
+    #[test]
+    fn build_deny_response_format() {
+        let resp = build_control_response_deny("req_456", "User rejected");
+        let parsed: serde_json::Value = serde_json::from_str(resp.trim()).unwrap();
+        assert_eq!(parsed["type"], "control_response");
+        assert_eq!(parsed["response"]["subtype"], "success");
+        assert_eq!(parsed["response"]["request_id"], "req_456");
+        assert_eq!(parsed["response"]["response"]["behavior"], "deny");
+        assert_eq!(parsed["response"]["response"]["message"], "User rejected");
+    }
+
+    #[test]
+    fn build_allow_response_ends_with_newline() {
+        let input = serde_json::json!({});
+        let resp = build_control_response_allow("r", &input);
+        assert!(resp.ends_with('\n'));
+    }
+
+    #[test]
+    fn build_deny_response_ends_with_newline() {
+        let resp = build_control_response_deny("r", "no");
+        assert!(resp.ends_with('\n'));
     }
 }
 
@@ -499,6 +582,71 @@ pub fn parse_line(line: &str) -> Result<StreamEvent, serde_json::Error> {
                 num_turns,
             })
         }
+        "control_request" => {
+            let request_id = v
+                .get("request_id")
+                .and_then(|s| s.as_str())
+                .unwrap_or("")
+                .to_string();
+            let request = v.get("request");
+            let tool_name = request
+                .and_then(|r| r.get("tool_name"))
+                .and_then(|s| s.as_str())
+                .unwrap_or("")
+                .to_string();
+            let tool_use_id = request
+                .and_then(|r| r.get("tool_use_id"))
+                .and_then(|s| s.as_str())
+                .unwrap_or("")
+                .to_string();
+            let input = request
+                .and_then(|r| r.get("input"))
+                .cloned()
+                .unwrap_or(Value::Null);
+            let decision_reason = request
+                .and_then(|r| r.get("decision_reason"))
+                .and_then(|s| s.as_str())
+                .map(|s| s.to_string());
+            Ok(StreamEvent::ControlRequest {
+                request_id,
+                tool_name,
+                tool_use_id,
+                input,
+                decision_reason,
+            })
+        }
         _ => Ok(StreamEvent::Unknown { raw: v }),
     }
+}
+
+#[allow(dead_code)]
+pub fn build_control_response_allow(request_id: &str, input: &serde_json::Value) -> String {
+    let response = serde_json::json!({
+        "type": "control_response",
+        "response": {
+            "subtype": "success",
+            "request_id": request_id,
+            "response": {
+                "behavior": "allow",
+                "updatedInput": input
+            }
+        }
+    });
+    format!("{}\n", response)
+}
+
+#[allow(dead_code)]
+pub fn build_control_response_deny(request_id: &str, message: &str) -> String {
+    let response = serde_json::json!({
+        "type": "control_response",
+        "response": {
+            "subtype": "success",
+            "request_id": request_id,
+            "response": {
+                "behavior": "deny",
+                "message": message
+            }
+        }
+    });
+    format!("{}\n", response)
 }

@@ -13,7 +13,8 @@ use std::process::Stdio;
 
 use crate::config::ClaudeConfig;
 use crate::error::PidoryError;
-use super::parser::{parse_line, StreamEvent};
+use super::parser::{parse_line, StreamEvent, build_control_response_allow, build_control_response_deny};
+use super::permission::{PermissionCache, PermissionDecision, PermissionRequest};
 
 pub struct QueuedMessage {
     pub content: String,
@@ -27,6 +28,7 @@ struct SessionInner {
     queue_tx: mpsc::Sender<QueuedMessage>,
     queue_size: Arc<AtomicUsize>,
     worker_task: JoinHandle<()>,
+    permission_tx: mpsc::Sender<PermissionRequest>,
 }
 
 pub struct SessionManager {
@@ -50,11 +52,11 @@ impl SessionManager {
         project_path: &str,
         session_id: Option<&str>,
         disallowed_tools: &[String],
-    ) -> Result<(), PidoryError> {
+    ) -> Result<Option<mpsc::Receiver<PermissionRequest>>, PidoryError> {
         let mut sessions = self.sessions.lock().await;
 
         if sessions.contains_key(thread_id) {
-            return Ok(());
+            return Ok(None);
         }
 
         if sessions.len() >= self.max_sessions {
@@ -71,6 +73,8 @@ impl SessionManager {
             .arg("--output-format")
             .arg("stream-json")
             .arg("--verbose")
+            .arg("--permission-prompt-tool")
+            .arg("stdio")
             .arg("--replay-user-messages");
 
         if let Some(sid) = session_id {
@@ -102,17 +106,21 @@ impl SessionManager {
 
         let (queue_tx, queue_rx) = mpsc::channel::<QueuedMessage>(5);
         let queue_size = Arc::new(AtomicUsize::new(0));
+        let (permission_tx, permission_rx) = mpsc::channel::<PermissionRequest>(8);
 
         // Combined worker task: reads queue, writes stdin, reads stdout until result, streams events
         let queue_size_for_worker = Arc::clone(&queue_size);
         let timeout_secs = self.config.subprocess_timeout_secs;
         let sessions_clone = Arc::clone(&self.sessions);
         let thread_id_for_worker = thread_id.to_string();
+        let permission_tx_for_worker = permission_tx.clone();
         let worker_task = tokio::spawn(async move {
             let mut stdin = stdin;
             let mut reader = BufReader::new(stdout);
             let mut line = String::new();
             let mut queue_rx = queue_rx;
+            let permission_tx = permission_tx_for_worker;
+            let mut permission_cache = PermissionCache::new();
 
             while let Some(msg) = queue_rx.recv().await {
                 queue_size_for_worker.fetch_sub(1, Ordering::Relaxed);
@@ -141,8 +149,8 @@ impl SessionManager {
                 };
 
                 // primary 메시지: result까지 stdout 읽기 + mid-turn inject 동시 처리
-                let timeout_deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
-                loop {
+                let mut timeout_deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
+                'turn: loop {
                     line.clear();
                     tokio::select! {
                         // 큐에서 새 메시지 (mid-turn inject)
@@ -160,7 +168,7 @@ impl SessionManager {
                                     let inject_line = format!("{}\n", inject_json);
                                     if let Err(e) = stdin.write_all(inject_line.as_bytes()).await {
                                         tracing::error!("mid-turn stdin write error: {}", e);
-                                        break;
+                                        break 'turn;
                                     }
                                     let _ = stdin.flush().await;
                                     // m.event_tx는 None이므로 drop됨
@@ -168,7 +176,7 @@ impl SessionManager {
                                 }
                                 None => {
                                     // queue closed (kill_session)
-                                    break;
+                                    break 'turn;
                                 }
                             }
                         }
@@ -181,19 +189,180 @@ impl SessionManager {
                                         thread_id_for_worker
                                     );
                                     queue_rx.close();
-                                    break;
+                                    break 'turn;
                                 }
                                 Ok(Ok(_)) => {
                                     let trimmed = line.trim_end();
                                     if trimmed.is_empty() {
-                                        continue;
+                                        continue 'turn;
                                     }
                                     match parse_line(trimmed) {
                                         Ok(event) => {
+                                            if let StreamEvent::ControlRequest {
+                                                ref request_id,
+                                                ref tool_name,
+                                                ref tool_use_id,
+                                                ref input,
+                                                ref decision_reason,
+                                            } = event {
+                                                // Clone all fields before any move
+                                                let saved_request_id = request_id.clone();
+                                                let saved_tool_name = tool_name.clone();
+                                                let saved_tool_use_id = tool_use_id.clone();
+                                                let saved_input = input.clone();
+                                                let saved_decision_reason = decision_reason.clone();
+
+                                                if permission_cache.is_always_allowed(&saved_tool_name) {
+                                                    // auto-allow from cache
+                                                    let resp = build_control_response_allow(&saved_request_id, &saved_input);
+                                                    if let Err(e) = stdin.write_all(resp.as_bytes()).await {
+                                                        tracing::error!("stdin write error (auto-allow): {}", e);
+                                                        break 'turn;
+                                                    }
+                                                    let _ = stdin.flush().await;
+                                                    continue 'turn;
+                                                }
+
+                                                // event_tx로 ControlRequest 전달 (handler에서 버튼 표시)
+                                                let _ = event_tx.send(event).await;
+
+                                                // permission 요청 생성
+                                                let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
+                                                let perm_req = PermissionRequest {
+                                                    request_id: saved_request_id.clone(),
+                                                    tool_name: saved_tool_name.clone(),
+                                                    tool_use_id: saved_tool_use_id,
+                                                    input: saved_input.clone(),
+                                                    decision_reason: saved_decision_reason,
+                                                    response_tx: resp_tx,
+                                                };
+
+                                                if permission_tx.send(perm_req).await.is_err() {
+                                                    tracing::error!("permission_tx closed, denying");
+                                                    let resp = build_control_response_deny(&saved_request_id, "Permission handler unavailable");
+                                                    let _ = stdin.write_all(resp.as_bytes()).await;
+                                                    let _ = stdin.flush().await;
+                                                    break 'turn;
+                                                }
+
+                                                // permission 대기 루프 (timeout 없음)
+                                                tokio::pin!(resp_rx);
+                                                let mut perm_deny_reason: Option<String> = None;
+                                                let mut perm_allow = false;
+                                                let mut perm_always_allow_tool: Option<String> = None;
+
+                                                'perm: loop {
+                                                    line.clear();
+                                                    tokio::select! {
+                                                        decision = &mut resp_rx => {
+                                                            match decision {
+                                                                Ok(PermissionDecision::Allow) => {
+                                                                    perm_allow = true;
+                                                                }
+                                                                Ok(PermissionDecision::AlwaysAllow) => {
+                                                                    perm_allow = true;
+                                                                    perm_always_allow_tool = Some(saved_tool_name.clone());
+                                                                }
+                                                                Ok(PermissionDecision::Deny) => {
+                                                                    perm_deny_reason = Some("User rejected this action".to_string());
+                                                                }
+                                                                Err(_) => {
+                                                                    perm_deny_reason = Some("Permission handler unavailable".to_string());
+                                                                }
+                                                            }
+                                                            break 'perm;
+                                                        }
+                                                        // mid-turn inject during permission wait
+                                                        new_msg = queue_rx.recv() => {
+                                                            match new_msg {
+                                                                Some(m) => {
+                                                                    queue_size_for_worker.fetch_sub(1, Ordering::Relaxed);
+                                                                    let inject_json = serde_json::json!({
+                                                                        "type": "user",
+                                                                        "message": {
+                                                                            "role": "user",
+                                                                            "content": [{"type": "text", "text": m.content}]
+                                                                        }
+                                                                    });
+                                                                    let inject_line = format!("{}\n", inject_json);
+                                                                    if let Err(e) = stdin.write_all(inject_line.as_bytes()).await {
+                                                                        tracing::error!("mid-turn stdin write error (perm wait): {}", e);
+                                                                        perm_deny_reason = Some("Permission handler unavailable".to_string());
+                                                                        break 'perm;
+                                                                    }
+                                                                    let _ = stdin.flush().await;
+                                                                }
+                                                                None => {
+                                                                    perm_deny_reason = Some("Permission handler unavailable".to_string());
+                                                                    break 'perm;
+                                                                }
+                                                            }
+                                                        }
+                                                        // stdout events during permission wait (no timeout)
+                                                        read = reader.read_line(&mut line) => {
+                                                            match read {
+                                                                Ok(0) => {
+                                                                    tracing::info!(
+                                                                        "Process stdout EOF during perm wait for thread {}",
+                                                                        thread_id_for_worker
+                                                                    );
+                                                                    queue_rx.close();
+                                                                    perm_deny_reason = Some("Process exited".to_string());
+                                                                    break 'perm;
+                                                                }
+                                                                Ok(_) => {
+                                                                    let t = line.trim_end();
+                                                                    if !t.is_empty() {
+                                                                        match parse_line(t) {
+                                                                            Ok(ev) => {
+                                                                                let _ = event_tx.send(ev).await;
+                                                                            }
+                                                                            Err(e) => {
+                                                                                tracing::warn!("Parse error (perm wait): {}", e);
+                                                                            }
+                                                                        }
+                                                                    }
+                                                                }
+                                                                Err(e) => {
+                                                                    tracing::error!("stdout read error (perm wait): {}", e);
+                                                                    queue_rx.close();
+                                                                    perm_deny_reason = Some("stdout read error".to_string());
+                                                                    break 'perm;
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+
+                                                if perm_allow {
+                                                    let resp = build_control_response_allow(&saved_request_id, &saved_input);
+                                                    if let Err(e) = stdin.write_all(resp.as_bytes()).await {
+                                                        tracing::error!("stdin write error (allow): {}", e);
+                                                        break 'turn;
+                                                    }
+                                                    let _ = stdin.flush().await;
+                                                    if let Some(t) = perm_always_allow_tool {
+                                                        permission_cache.add_always_allow(&t);
+                                                    }
+                                                } else if let Some(reason) = perm_deny_reason {
+                                                    let resp = build_control_response_deny(&saved_request_id, &reason);
+                                                    if let Err(e) = stdin.write_all(resp.as_bytes()).await {
+                                                        tracing::error!("stdin write error (deny): {}", e);
+                                                        break 'turn;
+                                                    }
+                                                    let _ = stdin.flush().await;
+                                                }
+
+                                                // timeout 리셋
+                                                timeout_deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
+                                                continue 'turn;
+                                            }
+
+                                            // 일반 이벤트 처리
                                             let is_result = event.is_result();
                                             let _ = event_tx.send(event).await;
                                             if is_result {
-                                                break; // turn complete
+                                                break 'turn;
                                             }
                                         }
                                         Err(e) => {
@@ -208,11 +377,11 @@ impl SessionManager {
                                         e
                                     );
                                     queue_rx.close();
-                                    break;
+                                    break 'turn;
                                 }
                                 Err(_) => {
                                     tracing::error!("Turn timeout for thread {}", thread_id_for_worker);
-                                    break;
+                                    break 'turn;
                                 }
                             }
                         }
@@ -235,10 +404,11 @@ impl SessionManager {
                 queue_tx,
                 queue_size,
                 worker_task,
+                permission_tx,
             },
         );
 
-        Ok(())
+        Ok(Some(permission_rx))
     }
 
     pub async fn send_message(
