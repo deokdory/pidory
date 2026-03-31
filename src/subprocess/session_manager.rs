@@ -29,6 +29,7 @@ struct SessionInner {
     queue_size: Arc<AtomicUsize>,
     worker_task: JoinHandle<()>,
     permission_tx: mpsc::Sender<PermissionRequest>,
+    interrupt_tx: mpsc::Sender<()>,
 }
 
 pub struct SessionManager {
@@ -107,6 +108,7 @@ impl SessionManager {
         let (queue_tx, queue_rx) = mpsc::channel::<QueuedMessage>(5);
         let queue_size = Arc::new(AtomicUsize::new(0));
         let (permission_tx, permission_rx) = mpsc::channel::<PermissionRequest>(8);
+        let (interrupt_tx, mut interrupt_rx) = mpsc::channel::<()>(1);
 
         // Combined worker task: reads queue, writes stdin, reads stdout until result, streams events
         let queue_size_for_worker = Arc::clone(&queue_size);
@@ -121,6 +123,8 @@ impl SessionManager {
             let mut queue_rx = queue_rx;
             let permission_tx = permission_tx_for_worker;
             let mut permission_cache = PermissionCache::new();
+            // interrupt_rx is moved into this closure
+            let interrupt_rx = &mut interrupt_rx;
 
             while let Some(msg) = queue_rx.recv().await {
                 queue_size_for_worker.fetch_sub(1, Ordering::Relaxed);
@@ -153,6 +157,24 @@ impl SessionManager {
                 'turn: loop {
                     line.clear();
                     tokio::select! {
+                        // interrupt 요청
+                        _ = interrupt_rx.recv() => {
+                            let interrupt_msg = serde_json::json!({
+                                "type": "control_request",
+                                "request_id": format!("interrupt_{}", std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .unwrap_or_default()
+                                    .as_millis()),
+                                "request": {"subtype": "interrupt"}
+                            });
+                            let interrupt_line = format!("{}\n", interrupt_msg);
+                            if let Err(e) = stdin.write_all(interrupt_line.as_bytes()).await {
+                                tracing::error!("interrupt write error: {}", e);
+                                break 'turn;
+                            }
+                            let _ = stdin.flush().await;
+                            // result 이벤트는 기존 stdout 읽기에서 처리됨
+                        }
                         // 큐에서 새 메시지 (mid-turn inject)
                         new_msg = queue_rx.recv() => {
                             match new_msg {
@@ -254,6 +276,25 @@ impl SessionManager {
                                                 'perm: loop {
                                                     line.clear();
                                                     tokio::select! {
+                                                        // interrupt 요청 (permission 대기 중)
+                                                        _ = interrupt_rx.recv() => {
+                                                            let interrupt_msg = serde_json::json!({
+                                                                "type": "control_request",
+                                                                "request_id": format!("interrupt_{}", std::time::SystemTime::now()
+                                                                    .duration_since(std::time::UNIX_EPOCH)
+                                                                    .unwrap_or_default()
+                                                                    .as_millis()),
+                                                                "request": {"subtype": "interrupt"}
+                                                            });
+                                                            let interrupt_line = format!("{}\n", interrupt_msg);
+                                                            if let Err(e) = stdin.write_all(interrupt_line.as_bytes()).await {
+                                                                tracing::error!("interrupt write error (perm wait): {}", e);
+                                                            } else {
+                                                                let _ = stdin.flush().await;
+                                                            }
+                                                            perm_deny_reason = Some("Interrupted by user".to_string());
+                                                            break 'perm;
+                                                        }
                                                         decision = &mut resp_rx => {
                                                             match decision {
                                                                 Ok(PermissionDecision::Allow) => {
@@ -405,6 +446,7 @@ impl SessionManager {
                 queue_size,
                 worker_task,
                 permission_tx,
+                interrupt_tx,
             },
         );
 
@@ -464,5 +506,15 @@ impl SessionManager {
     pub async fn session_count(&self) -> usize {
         let sessions = self.sessions.lock().await;
         sessions.len()
+    }
+
+    pub async fn interrupt_session(&self, thread_id: &str) -> Result<(), PidoryError> {
+        let sessions = self.sessions.lock().await;
+        let inner = sessions.get(thread_id).ok_or_else(|| {
+            PidoryError::NotFound(format!("no active session: {}", thread_id))
+        })?;
+        inner.interrupt_tx.try_send(())
+            .map_err(|_| PidoryError::Subprocess("interrupt send failed".to_string()))?;
+        Ok(())
     }
 }
