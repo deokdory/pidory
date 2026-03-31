@@ -6,4 +6,5 @@
 config.toml
 config.dev.toml
 .env
+*.env
 .sisyphus/
