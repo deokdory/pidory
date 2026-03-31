@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use poise::serenity_prelude::{ChannelId, Context, FullEvent, GuildId, MessageId, UserId};
@@ -7,22 +8,33 @@ use tracing::{error, warn};
 
 use crate::db::repository;
 use crate::error::PidoryError;
-use crate::handler::{emoji, formatter};
+use crate::handler::{emoji, formatter, permission_ui};
 use crate::handler::emoji::ReactionStatus;
 use crate::handler::status::StatusMessage;
 use crate::subprocess::parser::StreamEvent;
+use crate::subprocess::permission::{PermissionDecision, PermissionRequest};
 use crate::subprocess::session_manager::QueuedMessage;
-use crate::Data;
+use crate::{Data, PendingPermission};
 
 pub async fn handle_event(
     ctx: &Context,
     event: &FullEvent,
     data: &Data,
 ) -> Result<(), PidoryError> {
-    let FullEvent::Message { new_message } = event else {
-        return Ok(());
-    };
+    match event {
+        FullEvent::Message { new_message } => handle_message(ctx, new_message, data).await,
+        FullEvent::InteractionCreate { interaction } => {
+            handle_interaction(ctx, interaction, data).await
+        }
+        _ => Ok(()),
+    }
+}
 
+async fn handle_message(
+    ctx: &Context,
+    new_message: &poise::serenity_prelude::Message,
+    data: &Data,
+) -> Result<(), PidoryError> {
     // bot 자신의 메시지 무시
     if new_message.author.bot {
         return Ok(());
@@ -92,7 +104,7 @@ pub async fn handle_event(
     };
 
     // SessionManager: 세션 생성 또는 기존 재사용
-    if let Err(e) = data
+    match data
         .sessions
         .get_or_create(
             &thread_id,
@@ -102,12 +114,21 @@ pub async fn handle_event(
         )
         .await
     {
-        error!("Failed to get_or_create session for thread {}: {}", thread_id, e);
-        channel_id
-            .say(ctx, format!("❌ 세션 생성 실패: {}", e))
-            .await
-            .map_err(|e| PidoryError::Discord(Box::new(e)))?;
-        return Ok(());
+        Ok(Some(rx)) => {
+            // 새 세션 — permission_rx 보관
+            data.permission_rxs.lock().await.insert(thread_id.clone(), rx);
+        }
+        Ok(None) => {
+            // 기존 세션 — permission_rx 이미 보관됨
+        }
+        Err(e) => {
+            error!("Failed to get_or_create session for thread {}: {}", thread_id, e);
+            channel_id
+                .say(ctx, format!("❌ 세션 생성 실패: {}", e))
+                .await
+                .map_err(|e| PidoryError::Discord(Box::new(e)))?;
+            return Ok(());
+        }
     }
 
     // 원자적 acquire: running이 아닌 경우에만 running으로 전환
@@ -177,7 +198,10 @@ pub async fn handle_event(
         return Ok(());
     }
 
-    process_turn_events(
+    // permission_rx를 꺼내서 process_turn_events에 넘김 (turn 종료 후 다시 넣음)
+    let permission_rx = data.permission_rxs.lock().await.remove(&thread_id);
+
+    let permission_rx = process_turn_events(
         ctx,
         event_rx,
         channel_id,
@@ -186,8 +210,94 @@ pub async fn handle_event(
         db,
         data.config.response.max_chunk_length,
         data.config.response.max_chunks,
+        permission_rx,
+        data.pending_permissions.clone(),
+        data.config.discord.owner_id,
     )
     .await;
+
+    // permission_rx를 다시 보관 (다음 turn에서 사용)
+    if let Some(rx) = permission_rx {
+        data.permission_rxs.lock().await.insert(thread_id.clone(), rx);
+    }
+
+    Ok(())
+}
+
+async fn handle_interaction(
+    ctx: &Context,
+    interaction: &poise::serenity_prelude::Interaction,
+    data: &Data,
+) -> Result<(), PidoryError> {
+    let component = match interaction {
+        poise::serenity_prelude::Interaction::Component(c) => c,
+        _ => return Ok(()),
+    };
+
+    let (request_id, action) =
+        match permission_ui::parse_permission_custom_id(&component.data.custom_id) {
+            Some(parsed) => parsed,
+            None => return Ok(()),
+        };
+
+    // owner 검증
+    if component.user.id != UserId::new(data.config.discord.owner_id) {
+        component
+            .create_response(
+                ctx,
+                poise::serenity_prelude::CreateInteractionResponse::Message(
+                    poise::serenity_prelude::CreateInteractionResponseMessage::new()
+                        .content("❌ 권한이 없습니다")
+                        .ephemeral(true),
+                ),
+            )
+            .await
+            .ok();
+        return Ok(());
+    }
+
+    // interaction defer — 메시지 업데이트로 응답 (3초 제약)
+    component
+        .create_response(
+            ctx,
+            poise::serenity_prelude::CreateInteractionResponse::UpdateMessage(
+                poise::serenity_prelude::CreateInteractionResponseMessage::new(),
+            ),
+        )
+        .await
+        .ok();
+
+    let decision = match action.as_str() {
+        "allow" => PermissionDecision::Allow,
+        "always" => PermissionDecision::AlwaysAllow,
+        "deny" => PermissionDecision::Deny,
+        _ => return Ok(()),
+    };
+
+    // pending_permissions에서 꺼내서 oneshot 전송
+    let pending = data
+        .pending_permissions
+        .lock()
+        .await
+        .remove(&request_id);
+
+    if let Some(p) = pending {
+        let tool_name = p.tool_name.clone();
+        let message_id = p.message_id;
+        // decision 전송 (실패해도 무시)
+        let _ = p.response_tx.send(decision);
+
+        // 버튼 disable
+        permission_ui::disable_permission_buttons(
+            ctx,
+            component.channel_id,
+            message_id,
+            &action,
+            &tool_name,
+        )
+        .await
+        .ok();
+    }
 
     Ok(())
 }
@@ -202,7 +312,10 @@ async fn process_turn_events(
     db: &sqlx::SqlitePool,
     max_chunk_length: usize,
     max_chunks: usize,
-) {
+    mut permission_rx: Option<mpsc::Receiver<PermissionRequest>>,
+    pending_permissions: std::sync::Arc<tokio::sync::Mutex<HashMap<String, PendingPermission>>>,
+    owner_id: u64,
+) -> Option<mpsc::Receiver<PermissionRequest>> {
     // 1. StatusMessage 생성
     let mut status = StatusMessage::new(channel_id);
 
@@ -262,8 +375,44 @@ async fn process_turn_events(
         }
 
         loop {
-            match event_rx.recv().await {
-                Some(stream_event) => {
+            // permission_rx가 있으면 select, 없으면 event_rx만
+            let stream_event = if permission_rx.is_some() {
+                tokio::select! {
+                    ev = event_rx.recv() => {
+                        match ev {
+                            Some(e) => Some(Ok(e)),
+                            None => Some(Err(())),
+                        }
+                    }
+                    perm = async {
+                        if let Some(rx) = permission_rx.as_mut() {
+                            rx.recv().await
+                        } else {
+                            std::future::pending().await
+                        }
+                    } => {
+                        if let Some(perm_req) = perm {
+                            handle_permission_request(
+                                ctx,
+                                channel_id,
+                                perm_req,
+                                &pending_permissions,
+                                owner_id,
+                            )
+                            .await;
+                        }
+                        continue;
+                    }
+                }
+            } else {
+                match event_rx.recv().await {
+                    Some(e) => Some(Ok(e)),
+                    None => Some(Err(())),
+                }
+            };
+
+            match stream_event {
+                Some(Ok(stream_event)) => {
                     status.update(ctx, &stream_event).await.ok();
                     if stream_event.is_result() {
                         got_result = true;
@@ -274,8 +423,8 @@ async fn process_turn_events(
                         break;
                     }
                 }
-                None => {
-                    // sender dropped (worker done or process died)
+                Some(Err(())) | None => {
+                    // sender dropped
                     break;
                 }
             }
@@ -377,5 +526,43 @@ async fn process_turn_events(
                 .await
     {
         error!("Failed to send response for thread {}: {}", thread_id, e);
+    }
+
+    permission_rx
+}
+
+async fn handle_permission_request(
+    ctx: &Context,
+    channel_id: ChannelId,
+    perm_req: PermissionRequest,
+    pending_permissions: &std::sync::Arc<tokio::sync::Mutex<HashMap<String, PendingPermission>>>,
+    _owner_id: u64,
+) {
+    let msg = permission_ui::create_permission_message(
+        &perm_req.tool_name,
+        &perm_req.input,
+        &perm_req.request_id,
+        perm_req.decision_reason.as_deref(),
+    );
+
+    match channel_id.send_message(ctx, msg).await {
+        Ok(sent) => {
+            let pending = PendingPermission {
+                response_tx: perm_req.response_tx,
+                tool_name: perm_req.tool_name,
+                message_id: sent.id,
+            };
+            pending_permissions
+                .lock()
+                .await
+                .insert(perm_req.request_id, pending);
+        }
+        Err(e) => {
+            warn!("Failed to send permission message: {}", e);
+            // 전송 실패 시 deny
+            let _ = perm_req
+                .response_tx
+                .send(PermissionDecision::Deny);
+        }
     }
 }

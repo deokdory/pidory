@@ -5,25 +5,35 @@ mod error;
 mod handler;
 mod subprocess;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use poise::serenity_prelude as serenity;
 use sqlx::SqlitePool;
+use tokio::sync::{Mutex, mpsc, oneshot};
 use tracing::info;
 use tracing_subscriber::{EnvFilter, fmt};
 
 use config::Config;
 use error::PidoryError;
+use subprocess::permission::{PermissionDecision, PermissionRequest};
 use subprocess::session_manager::SessionManager;
 
 type Error = PidoryError;
 type Context<'a> = poise::Context<'a, Data, Error>;
 
+pub struct PendingPermission {
+    pub response_tx: oneshot::Sender<PermissionDecision>,
+    pub tool_name: String,
+    pub message_id: serenity::MessageId,
+}
+
 pub struct Data {
     pub config: Arc<Config>,
     pub db: SqlitePool,
     pub sessions: Arc<SessionManager>,
+    pub permission_rxs: Arc<Mutex<HashMap<String, mpsc::Receiver<PermissionRequest>>>>,
+    pub pending_permissions: Arc<Mutex<HashMap<String, PendingPermission>>>,
 }
 
 #[tokio::main]
@@ -78,10 +88,15 @@ async fn main() -> Result<(), PidoryError> {
                     config.claude.max_sessions,
                 ));
 
+                let permission_rxs = Arc::new(Mutex::new(HashMap::new()));
+                let pending_permissions = Arc::new(Mutex::new(HashMap::new()));
+
                 Ok(Data {
                     config,
                     db,
                     sessions,
+                    permission_rxs,
+                    pending_permissions,
                 })
             })
         })
