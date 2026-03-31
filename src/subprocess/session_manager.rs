@@ -158,6 +158,8 @@ impl SessionManager {
                                     Ok(StreamEvent::TaskStarted { ref task_id, ref task_type, ref description, .. }) => {
                                         tracker.track_started(task_id, task_type, description);
                                         tracing::info!("Background task started: {} ({})", task_id, task_type);
+                                        let start_msg = format!("-# 🔔 Background task started: {}", description);
+                                        channel_id_for_worker.say(&ctx_for_worker, &start_msg).await.ok();
                                         continue;
                                     }
                                     Ok(StreamEvent::TaskProgress { ref task_id, ref description, .. }) => {
@@ -381,6 +383,7 @@ impl SessionManager {
 
                 // primary 메시지: result까지 stdout 읽기 + mid-turn inject 동시 처리
                 let mut timeout_deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
+                let mut bg_turn_active = false;
                 'turn: loop {
                     line.clear();
                     tokio::select! {
@@ -447,6 +450,88 @@ impl SessionManager {
                                     }
                                     match parse_line(trimmed) {
                                         Ok(event) => {
+                                            // Background task 이벤트: user turn 중에도 올 수 있음
+                                            match &event {
+                                                StreamEvent::TaskStarted { task_id, task_type, description, .. } => {
+                                                    tracker.track_started(task_id, task_type, description);
+                                                    let start_msg = format!("-# 🔔 Background task started: {}", description);
+                                                    channel_id_for_worker.say(&ctx_for_worker, &start_msg).await.ok();
+                                                    continue 'turn;
+                                                }
+                                                StreamEvent::TaskProgress { task_id, description, .. } => {
+                                                    tracker.track_progress(task_id, description);
+                                                    continue 'turn;
+                                                }
+                                                StreamEvent::TaskNotification { task_id, status, summary, .. } => {
+                                                    tracker.track_completed(task_id);
+                                                    let notify_msg = if status == "completed" {
+                                                        format!("-# 🔔 {}", summary)
+                                                    } else {
+                                                        format!("-# ❌ {}", summary)
+                                                    };
+                                                    channel_id_for_worker.say(&ctx_for_worker, &notify_msg).await.ok();
+                                                    bg_turn_active = true;
+                                                    continue 'turn;
+                                                }
+                                                _ => {}
+                                            }
+
+                                            // bg turn 이벤트 처리: bg_turn_active일 때 기존 코드로 안 넘김
+                                            if bg_turn_active {
+                                                match &event {
+                                                    StreamEvent::Result { .. } => {
+                                                        bg_turn_active = false;
+                                                        timeout_deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
+                                                        continue 'turn; // bg turn 끝 — user turn은 계속
+                                                    }
+                                                    StreamEvent::Assistant { content, .. } => {
+                                                        for block in content {
+                                                            match block {
+                                                                ContentBlock::Text(text) if !text.trim().is_empty() => {
+                                                                    let bg_text = format!("-# 🔔 [Background]\n{}", text);
+                                                                    channel_id_for_worker.say(&ctx_for_worker, &bg_text).await.ok();
+                                                                }
+                                                                ContentBlock::ToolUse { name, input, .. } => {
+                                                                    let formatted = formatter::format_tool_use(name, input);
+                                                                    let bg_text = format!("-# 🔔 [Background]\n{}", formatted);
+                                                                    channel_id_for_worker.say(&ctx_for_worker, &bg_text).await.ok();
+                                                                }
+                                                                _ => {}
+                                                            }
+                                                        }
+                                                        continue 'turn;
+                                                    }
+                                                    StreamEvent::User { tool_results, .. } => {
+                                                        for result in tool_results {
+                                                            if result.is_error {
+                                                                if let Some(formatted) = formatter::format_tool_result_with_name(result, None) {
+                                                                    let bg_text = format!("-# 🔔 [Background]\n{}", formatted);
+                                                                    channel_id_for_worker.say(&ctx_for_worker, &bg_text).await.ok();
+                                                                }
+                                                            }
+                                                        }
+                                                        continue 'turn;
+                                                    }
+                                                    StreamEvent::ControlRequest { request_id, tool_name, input, .. } => {
+                                                        let resp = if permission_cache.is_always_allowed(tool_name) {
+                                                            build_control_response_allow(request_id, input)
+                                                        } else {
+                                                            let deny_msg = format!("-# ⚠️ [Background] Permission denied: {} (not in cache)", tool_name);
+                                                            channel_id_for_worker.say(&ctx_for_worker, &deny_msg).await.ok();
+                                                            build_control_response_deny(request_id, "Background: permission not cached")
+                                                        };
+                                                        if let Err(e) = stdin.write_all(resp.as_bytes()).await {
+                                                            tracing::error!("stdin write error (bg turn in user turn): {}", e);
+                                                            break 'turn;
+                                                        }
+                                                        let _ = stdin.flush().await;
+                                                        continue 'turn;
+                                                    }
+                                                    _ => { continue 'turn; } // Init, RateLimit 등 skip
+                                                }
+                                            }
+
+                                            // 기존 user turn 이벤트 처리 (bg_turn_active == false)
                                             if let StreamEvent::ControlRequest {
                                                 ref request_id,
                                                 ref tool_name,
