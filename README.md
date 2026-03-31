@@ -1,5 +1,7 @@
 # pidory
 
+![pidory_image](https://github.com/user-attachments/assets/473af1d5-65b4-430e-bbf5-178f6abf0e37)
+
 **English** | [한국어](README.ko.md)
 
 Discord ↔ Claude Code CLI bridge. Send messages in a Discord thread and get Claude Code responses — tool permission prompts appear as interactive buttons, and long outputs are split or attached automatically.
