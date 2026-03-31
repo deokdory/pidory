@@ -1,0 +1,17 @@
+[discord]
+guild_id = 123456789          # dev 서버 ID (prod와 같거나 별도)
+owner_id = 987654321          # 소유자 Discord ID
+# token은 환경변수 PIDORY_DISCORD_TOKEN으로 설정
+
+[claude]
+binary_path = "claude"
+default_disallowed_tools = []
+subprocess_timeout_secs = 600
+max_sessions = 5              # dev는 낮게
+
+[database]
+path = "pidory-dev.db"        # prod DB와 분리
+
+[response]
+max_chunk_length = 1900
+max_chunks = 10
