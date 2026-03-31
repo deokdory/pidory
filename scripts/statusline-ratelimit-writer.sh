@@ -22,24 +22,21 @@ OUTPUT_FILE="${PIDORY_RATELIMIT_FILE:-/tmp/pidory-ratelimits.json}"
 
 input=$(cat)
 
-# Bail silently if rate_limits field is absent
-if ! echo "$input" | jq -e '.rate_limits' >/dev/null 2>&1; then
-    exit 0
-fi
+# Extract all fields in a single jq call (avoids 6 separate forks)
+payload=$(echo "$input" | jq -c --argjson now "$(date +%s)" '
+  .rate_limits // empty |
+  if . == null then empty else
+    {
+      five_hour_pct: (.five_hour.used_percentage // 0),
+      seven_day_pct: (.seven_day.used_percentage // 0),
+      five_hour_reset: (.five_hour.resets_at // 0),
+      seven_day_reset: (.seven_day.resets_at // 0),
+      updated_at: $now
+    }
+  end
+' 2>/dev/null) || exit 0
 
-five_hour_pct=$(echo "$input" | jq -r '.rate_limits.five_hour.used_percentage // empty')
-seven_day_pct=$(echo "$input" | jq -r '.rate_limits.seven_day.used_percentage // empty')
-five_hour_reset=$(echo "$input" | jq -r '.rate_limits.five_hour.resets_at // empty')
-seven_day_reset=$(echo "$input" | jq -r '.rate_limits.seven_day.resets_at // empty')
-updated_at=$(date +%s)
-
-payload=$(jq -n \
-    --argjson five_hour_pct "${five_hour_pct:-0}" \
-    --argjson seven_day_pct "${seven_day_pct:-0}" \
-    --argjson five_hour_reset "${five_hour_reset:-0}" \
-    --argjson seven_day_reset "${seven_day_reset:-0}" \
-    --argjson updated_at "$updated_at" \
-    '{five_hour_pct: $five_hour_pct, seven_day_pct: $seven_day_pct, five_hour_reset: $five_hour_reset, seven_day_reset: $seven_day_reset, updated_at: $updated_at}')
+[ -z "$payload" ] && exit 0
 
 tmp=$(mktemp "${OUTPUT_FILE}.XXXXXX")
 printf '%s\n' "$payload" > "$tmp"
