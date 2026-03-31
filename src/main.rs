@@ -50,8 +50,8 @@ async fn main() -> Result<(), PidoryError> {
     let config = Config::load_from_env()?;
     let config = Arc::new(config);
 
-    let token = std::env::var("PIDORY_DISCORD_TOKEN")
-        .map_err(|_| PidoryError::Config("PIDORY_DISCORD_TOKEN environment variable not set".to_string()))?;
+    let token = std::env::var(&config.discord.token_env)
+        .map_err(|_| PidoryError::Config(format!("{} environment variable not set", config.discord.token_env)))?;
 
     let guild_id = serenity::GuildId::new(config.discord.guild_id);
     let owner_id = serenity::UserId::new(config.discord.owner_id);

@@ -16,7 +16,12 @@ pub struct Config {
 pub struct DiscordConfig {
     pub guild_id: u64,
     pub owner_id: u64,
-    // token은 환경변수 PIDORY_DISCORD_TOKEN으로 설정
+    #[serde(default = "default_token_env")]
+    pub token_env: String,
+}
+
+fn default_token_env() -> String {
+    "PIDORY_DISCORD_TOKEN".to_string()
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -123,6 +128,7 @@ binary_path = "claude"
         assert_eq!(config.response.max_chunk_length, 1900);
         assert_eq!(config.response.max_chunks, 10);
         assert_eq!(config.database.path, "pidory.db");
+        assert_eq!(config.discord.token_env, "PIDORY_DISCORD_TOKEN");
     }
 
     #[test]
@@ -147,6 +153,24 @@ max_chunks = 5
         assert_eq!(config.claude.subprocess_timeout_secs, 300);
         assert_eq!(config.response.max_chunk_length, 1800);
         assert_eq!(config.database.path, "pidory.db"); // default when [database] omitted
+        assert_eq!(config.discord.token_env, "PIDORY_DISCORD_TOKEN"); // default
+    }
+
+    #[test]
+    fn parse_config_with_token_env() {
+        let toml_str = r#"
+[discord]
+guild_id = 123
+owner_id = 456
+token_env = "PIDORY_DEV_DISCORD_TOKEN"
+
+[claude]
+binary_path = "claude"
+
+[response]
+"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.discord.token_env, "PIDORY_DEV_DISCORD_TOKEN");
     }
 
     #[test]
