@@ -523,7 +523,7 @@ pub async fn process_turn_events(
             })
             .collect();
         if let Some(error_text) = error_msgs.first() {
-            channel_id.say(ctx, &format!("-# ❌ {}", error_text)).await.ok();
+            channel_id.say(ctx, &format!("-# <@{}> ❌ {}", owner_id, error_text)).await.ok();
         }
         emoji::set_reaction(ctx, channel_id, msg_id, ReactionStatus::Error)
             .await
@@ -532,7 +532,7 @@ pub async fn process_turn_events(
             .await
             .ok();
     } else if !got_result {
-        channel_id.say(ctx, "-# ❌ 프로세스가 비정상 종료되었습니다").await.ok();
+        channel_id.say(ctx, &format!("-# <@{}> ❌ 프로세스가 비정상 종료되었습니다", owner_id)).await.ok();
         emoji::set_reaction(ctx, channel_id, msg_id, ReactionStatus::Error)
             .await
             .ok();
@@ -551,10 +551,10 @@ pub async fn process_turn_events(
 
         let duration = formatter::format_duration(duration_ms);
         let summary = if used_tools.is_empty() {
-            format!("-# {}", duration)
+            format!("-# <@{}> ✅ {}", owner_id, duration)
         } else {
             used_tools.dedup();
-            format!("-# 🔧 {} — {}", used_tools.join(", "), duration)
+            format!("-# <@{}> 🔧 {} — {}", owner_id, used_tools.join(", "), duration)
         };
         channel_id.say(ctx, &summary).await.ok();
 
@@ -577,6 +577,23 @@ pub async fn process_turn_events(
                     .await
         {
             error!("Failed to send response for thread {}: {}", thread_id, e);
+        }
+
+        // 완료 알림 (mention)
+        if !is_interrupted {
+            if has_cli_error || !got_result {
+                channel_id.say(ctx, &format!("-# <@{}> ❌ 에러 발생", owner_id)).await.ok();
+            } else {
+                let duration_ms = events.iter().find_map(|e| {
+                    if let StreamEvent::Result { duration_ms, .. } = e {
+                        Some(*duration_ms)
+                    } else {
+                        None
+                    }
+                }).unwrap_or(0);
+                let duration = formatter::format_duration(duration_ms);
+                channel_id.say(ctx, &format!("-# <@{}> ✅ {}", owner_id, duration)).await.ok();
+            }
         }
     }
 
@@ -706,13 +723,14 @@ async fn handle_permission_request(
     channel_id: ChannelId,
     perm_req: PermissionRequest,
     pending_permissions: &std::sync::Arc<tokio::sync::Mutex<HashMap<String, PendingPermission>>>,
-    _owner_id: u64,
+    owner_id: u64,
 ) {
     let msg = permission_ui::create_permission_message(
         &perm_req.tool_name,
         &perm_req.input,
         &perm_req.request_id,
         perm_req.decision_reason.as_deref(),
+        owner_id,
     );
 
     match channel_id.send_message(ctx, msg).await {
