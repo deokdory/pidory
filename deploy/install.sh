@@ -5,8 +5,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 USER_NAME="$(whoami)"
 HOME_DIR="$HOME"
+OS="$(uname -s)"
 
-echo "=== pidory deployment ==="
+echo "=== pidory deployment ($OS) ==="
 
 # 1. Build
 echo "[1/4] Building release binary..."
@@ -29,20 +30,60 @@ else
     echo "[3/4] config.toml already exists, skipping"
 fi
 
-# 4. Install systemd service (sed 치환)
-echo "[4/4] Installing systemd service..."
-sed -e "s|__USER__|$USER_NAME|g" \
-    -e "s|__PROJECT_DIR__|$PROJECT_DIR|g" \
-    -e "s|__HOME_DIR__|$HOME_DIR|g" \
-    "$SCRIPT_DIR/pidory.service" | sudo tee /etc/systemd/system/pidory.service > /dev/null
-sudo systemctl daemon-reload
-sudo systemctl enable pidory
+# 4. Install service
+echo "[4/4] Installing service..."
 
-echo ""
-echo "=== Done ==="
-echo "Start:   sudo systemctl start pidory"
-echo "Status:  sudo systemctl status pidory"
-echo "Logs:    journalctl -u pidory -f"
+if [ "$OS" = "Darwin" ]; then
+    # macOS — launchd
+    PLIST_DIR="$HOME_DIR/Library/LaunchAgents"
+    PLIST_NAME="com.pidory.bot.plist"
+    LOG_DIR="$HOME_DIR/.pidory"
+
+    mkdir -p "$PLIST_DIR" "$LOG_DIR"
+
+    # .env에서 토큰 읽기
+    DISCORD_TOKEN=""
+    if [ -f "$PROJECT_DIR/.env" ]; then
+        DISCORD_TOKEN=$(grep -oP 'PIDORY_DISCORD_TOKEN=\K.*' "$PROJECT_DIR/.env" 2>/dev/null || \
+                        sed -n 's/^PIDORY_DISCORD_TOKEN=//p' "$PROJECT_DIR/.env")
+    fi
+
+    if [ -z "$DISCORD_TOKEN" ]; then
+        echo "WARNING: Could not read PIDORY_DISCORD_TOKEN from .env"
+        echo "You will need to edit $PLIST_DIR/$PLIST_NAME manually"
+        DISCORD_TOKEN="YOUR_TOKEN_HERE"
+    fi
+
+    sed -e "s|__PROJECT_DIR__|$PROJECT_DIR|g" \
+        -e "s|__HOME_DIR__|$HOME_DIR|g" \
+        -e "s|__DISCORD_TOKEN__|$DISCORD_TOKEN|g" \
+        "$SCRIPT_DIR/com.pidory.bot.plist" > "$PLIST_DIR/$PLIST_NAME"
+
+    # 기존 서비스 언로드 (실패해도 무시)
+    launchctl bootout "gui/$(id -u)/$PLIST_NAME" 2>/dev/null || true
+
+    echo ""
+    echo "=== Done ==="
+    echo "Start:   launchctl load $PLIST_DIR/$PLIST_NAME"
+    echo "Stop:    launchctl unload $PLIST_DIR/$PLIST_NAME"
+    echo "Logs:    tail -f $LOG_DIR/stderr.log"
+
+else
+    # Linux — systemd
+    sed -e "s|__USER__|$USER_NAME|g" \
+        -e "s|__PROJECT_DIR__|$PROJECT_DIR|g" \
+        -e "s|__HOME_DIR__|$HOME_DIR|g" \
+        "$SCRIPT_DIR/pidory.service" | sudo tee /etc/systemd/system/pidory.service > /dev/null
+    sudo systemctl daemon-reload
+    sudo systemctl enable pidory
+
+    echo ""
+    echo "=== Done ==="
+    echo "Start:   sudo systemctl start pidory"
+    echo "Status:  sudo systemctl status pidory"
+    echo "Logs:    journalctl -u pidory -f"
+fi
+
 echo ""
 echo "Don't forget to:"
 echo "  1. Edit config.toml with your Discord guild_id and owner_id"
