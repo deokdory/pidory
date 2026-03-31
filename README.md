@@ -21,7 +21,7 @@ Discord ↔ Claude Code CLI bridge. Send messages in a Discord thread and get Cl
 - Rust 1.85+ (2024 edition)
 - [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code) — requires Anthropic Max subscription
 - Discord Bot Token
-- Linux (for systemd deployment)
+- Linux or macOS
 
 ## Quick Start
 
@@ -63,18 +63,27 @@ echo 'PIDORY_DISCORD_TOKEN=your_token_here' > .env
 # Direct
 cargo run --release
 
-# Or with systemd (Linux)
-./deploy/install.sh
-sudo systemctl start pidory
+# Or as a service
+./deploy/install.sh   # auto-detects Linux (systemd) or macOS (launchd)
 ```
 
-## Systemd Deployment
+## Service Deployment
+
+### Linux (systemd)
 
 ```bash
 ./deploy/install.sh
 sudo systemctl start pidory
 sudo systemctl status pidory
 journalctl -u pidory -f
+```
+
+### macOS (launchd)
+
+```bash
+./deploy/install.sh
+launchctl load ~/Library/LaunchAgents/com.pidory.bot.plist
+tail -f ~/.pidory/stderr.log
 ```
 
 `install.sh` builds the release binary, copies `config.toml.example` if no config exists, installs the service file, and enables it on boot.
