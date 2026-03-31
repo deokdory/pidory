@@ -32,8 +32,8 @@ done
 
 input=$(cat)
 
-# Write ratelimit file (silent, background)
-echo "$input" | bash "$(dirname "$0")/statusline-ratelimit-writer.sh" 2>/dev/null &
+# Write ratelimit file (synchronous — fast enough, avoids background job noise)
+echo "$input" | bash "$(dirname "$0")/statusline-ratelimit-writer.sh" 2>/dev/null
 
 # Chain to original statusLine script (or just pass through)
 if [ -n "$CHAIN_CMD" ]; then

@@ -27,7 +27,24 @@ impl RateLimitMonitor {
     }
 
     pub fn format_presence(info: &RateLimitInfo) -> String {
-        format!("5h: {}% | 7d: {}%", info.five_hour_pct, info.seven_day_pct)
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        let five_h_remaining = if info.five_hour_reset > now {
+            let diff = info.five_hour_reset - now;
+            let h = diff / 3600;
+            let m = (diff % 3600) / 60;
+            format!("({}h{}m)", h, m)
+        } else {
+            String::new()
+        };
+
+        format!(
+            "5h: {}%{} | 7d: {}%",
+            info.five_hour_pct, five_h_remaining, info.seven_day_pct
+        )
     }
 
     /// Returns the list of thresholds that should trigger alerts (not yet alerted in this reset
@@ -146,7 +163,28 @@ mod tests {
     }
 
     #[test]
-    fn test_format_presence() {
+    fn test_format_presence_with_remaining() {
+        // reset이 미래 시점이면 남은 시간 표시
+        let future_reset = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 3600 + 1800; // 1h30m from now
+        let info = RateLimitInfo {
+            five_hour_pct: 42,
+            seven_day_pct: 38,
+            five_hour_reset: future_reset,
+            seven_day_reset: 456,
+            updated_at: 789,
+        };
+        let s = RateLimitMonitor::format_presence(&info);
+        assert!(s.starts_with("5h: 42%(1h"), "got: {s}");
+        assert!(s.contains("| 7d: 38%"), "got: {s}");
+    }
+
+    #[test]
+    fn test_format_presence_past_reset() {
+        // reset이 과거면 남은 시간 없이 표시
         let info = make_info(42, 38, 123);
         let s = RateLimitMonitor::format_presence(&info);
         assert_eq!(s, "5h: 42% | 7d: 38%");
