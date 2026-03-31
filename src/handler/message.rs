@@ -112,6 +112,9 @@ async fn handle_message(
             &project.path,
             session.session_id.as_deref(),
             &disallowed_tools,
+            ctx.clone(),
+            channel_id,
+            data.db.clone(),
         )
         .await
     {
