@@ -1,5 +1,9 @@
 # pidory
 
+<p align="center">
+  <img src="https://github.com/user-attachments/assets/a26cf722-5b40-4e06-9e9f-b35ddb4f9551" width="256" alt="pidory">
+</p>
+
 [English](README.md) | **한국어**
 
 Discord ↔ Claude Code CLI 브릿지. Discord 스레드에서 메시지를 보내면 Claude Code가 응답하며, 도구 권한 요청은 버튼으로 처리하고 긴 출력은 자동으로 분할하거나 파일로 첨부합니다.
