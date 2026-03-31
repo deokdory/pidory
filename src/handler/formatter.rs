@@ -44,13 +44,9 @@ pub fn format_response(events: &[StreamEvent]) -> String {
             }
             StreamEvent::Result {
                 duration_ms,
-                total_cost_usd,
                 ..
             } => {
-                parts.push(format!(
-                    "-# ⏱️ {}ms | 💰 ${:.4}",
-                    duration_ms, total_cost_usd
-                ));
+                parts.push(format!("-# {}ms", duration_ms));
             }
             _ => {}
         }
