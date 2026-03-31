@@ -74,8 +74,20 @@ impl RateLimitMonitor {
     ) {
         let triggered = self.check_thresholds(info);
         for threshold in triggered {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            let remaining = if info.five_hour_reset > now {
+                let diff = info.five_hour_reset - now;
+                let h = diff / 3600;
+                let m = (diff % 3600) / 60;
+                format!(" — resets in {}h{}m", h, m)
+            } else {
+                String::new()
+            };
             let msg = format!(
-                "⚠️ Rate limit alert: 5h usage at {}% (threshold: {}%)",
+                "⚠️ Rate limit alert: 5h usage at {}% (threshold: {}%){remaining}",
                 info.five_hour_pct, threshold
             );
             if let Err(e) = channel_id.say(ctx, &msg).await {
