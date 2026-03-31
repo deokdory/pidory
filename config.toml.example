@@ -9,6 +9,9 @@ default_disallowed_tools = [] # 기본 차단 도구 목록
 subprocess_timeout_secs = 600 # 10분
 max_sessions = 10             # 동시 세션 상한
 
+[database]
+path = "pidory.db"            # SQLite DB 경로
+
 [response]
 max_chunk_length = 1900       # Discord 2000자 여유분
 max_chunks = 10               # 초과 시 파일 첨부
