@@ -12,14 +12,15 @@ pub fn create_permission_message(
     input: &serde_json::Value,
     request_id: &str,
     decision_reason: Option<&str>,
+    owner_id: u64,
 ) -> CreateMessage {
     let summary = format_tool_input_summary(tool_name, input);
     let reason = decision_reason
         .map(|r| format!("\n> {}", r))
         .unwrap_or_default();
     let content = format!(
-        "🔒 **{}** 실행 허가 요청\n{}{}",
-        tool_name, summary, reason
+        "<@{}> 🔒 **{}** 실행 허가 요청\n{}{}",
+        owner_id, tool_name, summary, reason
     );
 
     let allow_btn = CreateButton::new(format!("perm:{}:allow", request_id))
