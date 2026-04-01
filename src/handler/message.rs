@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use poise::serenity_prelude::{ChannelId, Context, FullEvent, GuildId, MessageId, UserId};
+use poise::serenity_prelude::{ChannelId, Context, CreateMessage, FullEvent, GuildId, MessageFlags, MessageId, UserId};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, warn};
@@ -684,6 +684,13 @@ pub async fn execute_in_session(
     Ok(())
 }
 
+async fn say_silent(ctx: &Context, channel_id: ChannelId, content: impl Into<String>) {
+    let msg = CreateMessage::new()
+        .content(content)
+        .flags(MessageFlags::SUPPRESS_NOTIFICATIONS);
+    channel_id.send_message(ctx, msg).await.ok();
+}
+
 async fn send_event_to_discord(
     ctx: &Context,
     channel_id: ChannelId,
@@ -696,7 +703,7 @@ async fn send_event_to_discord(
             for block in content {
                 match block {
                     ContentBlock::Text(text) if !text.trim().is_empty() => {
-                        channel_id.say(ctx, text).await.ok();
+                        say_silent(ctx, channel_id, text.clone()).await;
                     }
                     ContentBlock::ToolUse { id, name, input } => {
                         tool_use_names.insert(id.clone(), name.clone());
@@ -704,7 +711,7 @@ async fn send_event_to_discord(
                             used_tools.push(name.clone());
                         }
                         let formatted = formatter::format_tool_use(name, input);
-                        channel_id.say(ctx, &formatted).await.ok();
+                        say_silent(ctx, channel_id, formatted).await;
                     }
                     _ => {} // Thinking 또는 빈 Text — 무시
                 }
@@ -718,13 +725,13 @@ async fn send_event_to_discord(
                     continue;
                 }
                 if let Some(formatted) = formatter::format_tool_result_with_name(result, tool_name) {
-                    channel_id.say(ctx, &formatted).await.ok();
+                    say_silent(ctx, channel_id, formatted).await;
                 }
             }
         }
         StreamEvent::RateLimit { status, .. } => {
             if status == "rate_limited" {
-                channel_id.say(ctx, "⚠️ Rate limit reached").await.ok();
+                say_silent(ctx, channel_id, "⚠️ Rate limit reached").await;
             } else if status != "allowed" && !status.is_empty() {
                 tracing::warn!(status, "Unknown rate limit status");
             }
