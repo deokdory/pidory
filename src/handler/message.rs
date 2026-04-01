@@ -719,8 +719,10 @@ async fn send_event_to_discord(
             }
         }
         StreamEvent::RateLimit { status, .. } => {
-            if status != "allowed" {
+            if status == "rate_limited" {
                 channel_id.say(ctx, "⚠️ Rate limit reached").await.ok();
+            } else if status != "allowed" && !status.is_empty() {
+                tracing::warn!(status, "Unknown rate limit status");
             }
         }
         _ => {} // Init, ControlRequest, UserReplay, Result, Unknown — 무시
