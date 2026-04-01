@@ -157,7 +157,7 @@ async fn handle_message(
                     .create_reaction(
                         ctx,
                         msg_id,
-                        poise::serenity_prelude::ReactionType::Unicode("✅".to_string()),
+                        poise::serenity_prelude::ReactionType::Unicode("📨".to_string()),
                     )
                     .await;
             }
