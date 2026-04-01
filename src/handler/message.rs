@@ -719,7 +719,7 @@ async fn send_event_to_discord(
             }
         }
         StreamEvent::RateLimit { status, .. } => {
-            if status != "allowed" {
+            if status == "rate_limited" {
                 channel_id.say(ctx, "⚠️ Rate limit reached").await.ok();
             }
         }
