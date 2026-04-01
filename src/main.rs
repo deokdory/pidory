@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use poise::serenity_prelude as serenity;
 use sqlx::SqlitePool;
-use tokio::sync::{Mutex, mpsc, oneshot};
+use tokio::sync::{Mutex, mpsc, oneshot, watch};
 use tracing::info;
 use tracing_subscriber::{EnvFilter, fmt};
 
@@ -38,6 +38,9 @@ pub struct Data {
     pub pending_permissions: Arc<Mutex<HashMap<String, PendingPermission>>>,
     pub session_skills: Arc<Mutex<HashMap<String, Vec<String>>>>,
     pub skill_descriptions: HashMap<String, String>,
+    /// Event handler가 fresh Context를 background task에 전달하는 채널.
+    /// Shard reconnect 후에도 최신 ShardMessenger를 사용할 수 있게 해준다.
+    pub ctx_watch: watch::Sender<serenity::Context>,
 }
 
 #[tokio::main]
@@ -97,9 +100,13 @@ async fn main() -> Result<(), PidoryError> {
                 let session_skills = Arc::new(Mutex::new(HashMap::new()));
                 let skill_descriptions = load_skill_descriptions();
 
+                // watch channel: event handler → background task로 fresh Context 전달
+                // shard reconnect 후에도 최신 ShardMessenger 사용 가능
+                let (ctx_tx, ctx_rx) = watch::channel(ctx.clone());
+
                 // Rate limit monitor (config.ratelimit.file_path가 Some일 때만)
                 if let Some(ref file_path) = config.ratelimit.file_path {
-                    let ctx_for_rl = ctx.clone();
+                    let mut ctx_rx = ctx_rx;
                     let file_path = file_path.clone();
                     let interval_secs = config.ratelimit.update_interval_secs;
                     let thresholds = config.ratelimit.alert_thresholds.clone();
@@ -113,18 +120,21 @@ async fn main() -> Result<(), PidoryError> {
                         tracing::info!("Rate limit monitor started (file: {file_path}, interval: {interval_secs}s)");
                         loop {
                             interval.tick().await;
+                            // watch에서 최신 값이 있으면 갱신 (non-blocking)
+                            ctx_rx.mark_changed();
+                            let fresh_ctx = ctx_rx.borrow_and_update().clone();
                             match crate::ratelimit::read_ratelimit_file(&file_path) {
                                 Some(info) => {
                                     let text = crate::ratelimit::RateLimitMonitor::format_presence(&info);
-                                    ctx_for_rl.set_activity(Some(
+                                    fresh_ctx.set_activity(Some(
                                         poise::serenity_prelude::ActivityData::watching(&text)
                                     ));
                                     if let Some(channel_id) = notification_channel {
-                                        monitor.check_and_alert(&info, &ctx_for_rl, channel_id).await;
+                                        monitor.check_and_alert(&info, &fresh_ctx, channel_id).await;
                                     }
                                 }
                                 None => {
-                                    ctx_for_rl.set_activity(None);
+                                    fresh_ctx.set_activity(None);
                                 }
                             }
                         }
@@ -139,6 +149,7 @@ async fn main() -> Result<(), PidoryError> {
                     pending_permissions,
                     session_skills,
                     skill_descriptions,
+                    ctx_watch: ctx_tx,
                 })
             })
         })

@@ -22,6 +22,10 @@ pub async fn handle_event(
     event: &FullEvent,
     data: &Data,
 ) -> Result<(), PidoryError> {
+    // Background task (rate limit monitor 등)에 fresh Context 전달.
+    // Shard reconnect 후 stale ShardMessenger 문제 방지.
+    let _ = data.ctx_watch.send(ctx.clone());
+
     match event {
         FullEvent::Message { new_message } => handle_message(ctx, new_message, data).await,
         FullEvent::InteractionCreate { interaction } => {
