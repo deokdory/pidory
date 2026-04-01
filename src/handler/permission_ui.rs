@@ -78,7 +78,23 @@ pub fn format_tool_input_summary(tool_name: &str, input: &serde_json::Value) -> 
                 .unwrap_or("");
             format!("`{}`", pattern)
         }
-        _ => String::new(),
+        "WebFetch" => {
+            let url = input.get("url").and_then(|v| v.as_str()).unwrap_or("");
+            format!("`{}`", url)
+        }
+        "WebSearch" => {
+            let query = input.get("query").and_then(|v| v.as_str()).unwrap_or("");
+            format!("`{}`", query)
+        }
+        _ => input
+            .as_object()
+            .and_then(|obj| {
+                obj.values().find_map(|v| v.as_str()).map(|s| {
+                    let truncated: String = s.chars().take(100).collect();
+                    format!("`{}`", truncated)
+                })
+            })
+            .unwrap_or_default(),
     }
 }
 
@@ -169,5 +185,34 @@ mod tests {
         let input = serde_json::json!({});
         let result = format_tool_input_summary("Unknown", &input);
         assert_eq!(result, "");
+    }
+
+    #[test]
+    fn format_webfetch_summary() {
+        let input = serde_json::json!({"url": "https://example.com/page"});
+        let result = format_tool_input_summary("WebFetch", &input);
+        assert_eq!(result, "`https://example.com/page`");
+    }
+
+    #[test]
+    fn format_websearch_summary() {
+        let input = serde_json::json!({"query": "rust async tokio"});
+        let result = format_tool_input_summary("WebSearch", &input);
+        assert_eq!(result, "`rust async tokio`");
+    }
+
+    #[test]
+    fn format_unknown_with_string_field() {
+        let input = serde_json::json!({"some_field": "some value"});
+        let result = format_tool_input_summary("UnknownTool", &input);
+        assert_eq!(result, "`some value`");
+    }
+
+    #[test]
+    fn format_unknown_with_long_string_field() {
+        let long_str = "a".repeat(150);
+        let input = serde_json::json!({"field": long_str});
+        let result = format_tool_input_summary("UnknownTool", &input);
+        assert_eq!(result, format!("`{}`", "a".repeat(100)));
     }
 }
