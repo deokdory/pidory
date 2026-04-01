@@ -38,8 +38,10 @@ pub fn format_response(events: &[StreamEvent]) -> String {
                 }
             }
             StreamEvent::RateLimit { status, .. } => {
-                if status != "allowed" {
+                if status == "rate_limited" {
                     parts.push("⚠️ Rate limit reached".to_string());
+                } else if status != "allowed" && !status.is_empty() {
+                    tracing::warn!(status, "Unknown rate limit status");
                 }
             }
             _ => {}
