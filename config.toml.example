@@ -9,6 +9,7 @@ binary_path = "claude"        # claude CLI 경로
 default_disallowed_tools = [] # 기본 차단 도구 목록
 subprocess_timeout_secs = 600 # 10분
 max_sessions = 10             # 동시 세션 상한
+idle_timeout_secs = 7200      # 유휴 세션 타임아웃 (초), 0 to disable
 
 [database]
 path = "pidory.db"            # SQLite DB 경로
