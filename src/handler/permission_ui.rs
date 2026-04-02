@@ -6,6 +6,7 @@ use poise::serenity_prelude::{
 };
 
 use crate::error::PidoryError;
+use crate::i18n::Lang;
 
 pub fn create_permission_message(
     tool_name: &str,
@@ -13,26 +14,27 @@ pub fn create_permission_message(
     request_id: &str,
     decision_reason: Option<&str>,
     owner_id: u64,
+    lang: Lang,
 ) -> CreateMessage {
     let summary = format_tool_input_summary(tool_name, input);
     let reason = decision_reason
         .map(|r| format!("\n> {}", r))
         .unwrap_or_default();
     let content = format!(
-        "<@{}> 🔒 **{}** 실행 허가 요청\n{}{}",
-        owner_id, tool_name, summary, reason
+        "<@{}> 🔒 **{}** {}\n{}{}",
+        owner_id, tool_name, lang.permission_request_label(), summary, reason
     );
 
     let allow_btn = CreateButton::new(format!("perm:{}:allow", request_id))
-        .label("Allow")
+        .label(lang.btn_allow())
         .style(ButtonStyle::Success)
         .emoji('✅');
     let always_btn = CreateButton::new(format!("perm:{}:always", request_id))
-        .label("Always Allow")
+        .label(lang.btn_always_allow())
         .style(ButtonStyle::Success)
         .emoji('🔓');
     let deny_btn = CreateButton::new(format!("perm:{}:deny", request_id))
-        .label("Deny")
+        .label(lang.btn_deny())
         .style(ButtonStyle::Danger)
         .emoji('❌');
 
@@ -104,11 +106,12 @@ pub async fn disable_permission_buttons(
     message_id: MessageId,
     chosen_action: &str,
     tool_name: &str,
+    lang: Lang,
 ) -> Result<(), PidoryError> {
     let label = match chosen_action {
-        "allow" => format!("-# ✅ {} — Allowed", tool_name),
-        "always" => format!("-# 🔓 {} — Always Allowed", tool_name),
-        "deny" => format!("-# ❌ {} — Denied", tool_name),
+        "allow" => format!("-# ✅ {}", lang.perm_allowed(tool_name)),
+        "always" => format!("-# 🔓 {}", lang.perm_always_allowed(tool_name)),
+        "deny" => format!("-# ❌ {}", lang.perm_denied(tool_name)),
         _ => format!("-# {} — {}", tool_name, chosen_action),
     };
 

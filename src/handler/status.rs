@@ -3,6 +3,7 @@ use std::time::{Duration, Instant};
 use poise::serenity_prelude::{self as serenity, ChannelId, MessageId};
 
 use crate::error::PidoryError;
+use crate::i18n::Lang;
 use crate::subprocess::parser::{ContentBlock, StreamEvent};
 
 pub struct StatusMessage {
@@ -12,10 +13,11 @@ pub struct StatusMessage {
     last_edit: Instant,
     tool_history: Vec<String>,
     needs_update: bool,
+    lang: Lang,
 }
 
 impl StatusMessage {
-    pub fn new(channel_id: ChannelId) -> Self {
+    pub fn new(channel_id: ChannelId, lang: Lang) -> Self {
         Self {
             channel_id,
             message_id: None,
@@ -23,6 +25,7 @@ impl StatusMessage {
             last_edit: Instant::now(),
             tool_history: Vec::new(),
             needs_update: false,
+            lang,
         }
     }
 
@@ -46,14 +49,14 @@ impl StatusMessage {
 
     fn rebuild_text(&mut self) {
         loop {
-            let text = build_text(&self.tool_history);
+            let text = build_text(&self.tool_history, self.lang);
             if text.len() <= 2000 {
                 self.pending_text = text;
                 self.needs_update = true;
                 break;
             }
             if self.tool_history.is_empty() {
-                self.pending_text = "⏳ 작업 중...".to_string();
+                self.pending_text = format!("⏳ {}", self.lang.working());
                 self.needs_update = true;
                 break;
             }
@@ -119,7 +122,7 @@ impl StatusMessage {
         ctx: &serenity::Context,
         error: &str,
     ) -> Result<(), PidoryError> {
-        let text = format!("-# ❌ 오류 — {}", error);
+        let text = format!("-# ❌ {}", self.lang.status_error(error));
         self.pending_text = text;
         self.needs_update = true;
         self.last_edit = Instant::now() - Duration::from_secs(60);
@@ -187,14 +190,14 @@ fn format_tool_entry(name: &str, input: &serde_json::Value) -> String {
     }
 }
 
-fn build_text(tool_history: &[String]) -> String {
-    let mut lines = vec!["-# ⏳ 작업 중...".to_string()];
+fn build_text(tool_history: &[String], lang: Lang) -> String {
+    let mut lines = vec![format!("-# ⏳ {}", lang.working())];
 
     const MAX_SHOWN: usize = 5;
 
     if tool_history.len() > MAX_SHOWN {
         let hidden = tool_history.len() - MAX_SHOWN;
-        lines.push(format!("-# ... +{} more", hidden));
+        lines.push(format!("-# {}", lang.more_items(hidden)));
         for entry in &tool_history[tool_history.len() - MAX_SHOWN..] {
             lines.push(format!("-# {}", entry));
         }
@@ -213,8 +216,14 @@ mod tests {
 
     #[test]
     fn build_text_empty() {
-        let text = build_text(&[]);
-        assert_eq!(text, "-# ⏳ 작업 중...");
+        let text = build_text(&[], Lang::Ko);
+        assert!(text.contains("작업 중..."));
+    }
+
+    #[test]
+    fn build_text_empty_en() {
+        let text = build_text(&[], Lang::En);
+        assert!(text.contains("Working..."));
     }
 
     #[test]
@@ -223,8 +232,8 @@ mod tests {
             "🔧 Bash: `echo hello`".to_string(),
             "📝 Edit: src/main.rs".to_string(),
         ];
-        let text = build_text(&tools);
-        assert!(text.contains("-# ⏳ 작업 중..."));
+        let text = build_text(&tools, Lang::Ko);
+        assert!(text.contains("작업 중..."));
         assert!(text.contains("🔧 Bash"));
         assert!(text.contains("📝 Edit"));
     }
@@ -232,8 +241,8 @@ mod tests {
     #[test]
     fn build_text_overflow_shows_recent() {
         let tools: Vec<String> = (0..7).map(|i| format!("🔧 Tool{}", i)).collect();
-        let text = build_text(&tools);
-        assert!(text.contains("... +2 more"));
+        let text = build_text(&tools, Lang::Ko);
+        assert!(text.contains("... +2 더보기"));
         assert!(text.contains("Tool2")); // 최근 5개
         assert!(text.contains("Tool6"));
         assert!(!text.contains("Tool0")); // 오래된 것은 안 보임
@@ -243,7 +252,7 @@ mod tests {
     #[test]
     fn build_text_under_2000_chars() {
         let tools: Vec<String> = (0..100).map(|i| format!("🔧 Tool {}", i)).collect();
-        let text = build_text(&tools);
+        let text = build_text(&tools, Lang::Ko);
         assert!(text.len() <= 2000);
     }
 
@@ -295,7 +304,7 @@ mod tests {
     #[test]
     fn status_message_initial_state() {
         use poise::serenity_prelude::ChannelId;
-        let status = StatusMessage::new(ChannelId::new(123));
+        let status = StatusMessage::new(ChannelId::new(123), Lang::Ko);
         assert!(!status.has_message());
     }
 }

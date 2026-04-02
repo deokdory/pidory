@@ -3,6 +3,7 @@ use std::time::Duration;
 
 use crate::{Context, Error};
 use crate::db::repository;
+use crate::i18n::Lang;
 
 /// Parse a naive datetime string "YYYY-MM-DD HH:MM:SS[.f]" into Unix seconds.
 /// Returns None if parsing fails.
@@ -37,9 +38,9 @@ fn parse_datetime_secs(dt_str: &str) -> Option<i64> {
     Some(days_since_epoch * 86400 + hour * 3600 + min * 60 + sec)
 }
 
-/// Format an ISO-8601 datetime string as "Xm ago" relative to now.
+/// Format an ISO-8601 datetime string as relative time.
 /// Falls back to the raw string if parsing fails.
-fn format_relative(dt_str: &str) -> String {
+fn format_relative(dt_str: &str, lang: Lang) -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     let then_secs = match parse_datetime_secs(dt_str) {
@@ -53,32 +54,14 @@ fn format_relative(dt_str: &str) -> String {
         .unwrap_or(0);
 
     let diff = (now_secs - then_secs).max(0) as u64;
-    if diff < 60 {
-        format!("{diff}s ago")
-    } else if diff < 3600 {
-        format!("{}m ago", diff / 60)
-    } else if diff < 86400 {
-        format!("{}h ago", diff / 3600)
-    } else {
-        format!("{}d ago", diff / 86400)
-    }
-}
-
-fn format_idle_duration(d: Duration) -> String {
-    let secs = d.as_secs();
-    if secs < 60 {
-        format!("idle {}s", secs)
-    } else if secs < 3600 {
-        format!("idle {}m", secs / 60)
-    } else {
-        format!("idle {}h{}m", secs / 3600, (secs % 3600) / 60)
-    }
+    lang.format_relative_time(diff)
 }
 
 /// 전역 세션 현황 조회
 #[poise::command(slash_command, guild_only, owners_only)]
 pub async fn sessions(ctx: Context<'_>) -> Result<(), Error> {
     let data = ctx.data();
+    let lang = data.config.language;
     let infos = data.sessions.get_session_info().await;
     let max_sessions = data.config.claude.max_sessions;
 
@@ -86,22 +69,22 @@ pub async fn sessions(ctx: Context<'_>) -> Result<(), Error> {
         ctx.send(
             poise::CreateReply::default()
                 .ephemeral(true)
-                .content(format!("📊 Active Sessions (0/{})\n활성 세션 없음", max_sessions)),
+                .content(format!("{}\n{}", lang.active_sessions_header(0, max_sessions), lang.no_active_sessions_short())),
         )
         .await?;
         return Ok(());
     }
 
     let idle_timeout = Duration::from_secs(data.config.claude.idle_timeout_secs);
-    let mut lines = vec![format!("📊 Active Sessions ({}/{})", infos.len(), max_sessions)];
+    let mut lines = vec![lang.active_sessions_header(infos.len(), max_sessions)];
 
     for info in &infos {
         let status = if info.is_turn_active {
-            "🔄 running".to_string()
+            lang.running_status().to_string()
         } else {
-            format_idle_duration(info.idle_duration)
+            lang.format_idle(info.idle_duration.as_secs())
         };
-        let bg = if info.has_bg_tasks { " — bg tasks" } else { "" };
+        let bg = if info.has_bg_tasks { lang.bg_tasks_suffix() } else { "" };
         let warn = if !info.is_turn_active
             && idle_timeout.as_secs() > 0
             && info.idle_duration > idle_timeout * 80 / 100
@@ -130,30 +113,28 @@ pub async fn list(
     let channel_id = channel
         .unwrap_or_else(|| ctx.channel_id())
         .to_string();
+    let lang = ctx.data().config.language;
 
     let sessions =
         repository::list_sessions_by_channel(&ctx.data().db, &channel_id).await?;
 
     let content = if sessions.is_empty() {
-        "No active sessions".to_string()
+        lang.no_active_sessions_short().to_string()
     } else {
-        let mut lines = vec!["📋 Active Sessions:".to_string()];
+        let mut lines = vec![lang.active_sessions_list_header().to_string()];
         for s in &sessions {
             let thread_mention = format!("<#{}>", s.thread_id);
             let since = s
                 .last_active_at
                 .as_deref()
-                .map(|t| format!(" — since: {}", format_relative(t)))
+                .map(|t| lang.session_list_since(&format_relative(t, lang)))
                 .unwrap_or_default();
             let session_short = s
                 .session_id
                 .as_deref()
-                .map(|id| format!(" — session: {}…", &id[..id.len().min(8)]))
+                .map(|id| lang.session_list_id(&id[..id.len().min(8)]))
                 .unwrap_or_default();
-            lines.push(format!(
-                "• {} — status: {}{}{}",
-                thread_mention, s.status, session_short, since
-            ));
+            lines.push(lang.session_list_row(&thread_mention, &s.status, &session_short, &since));
         }
         lines.join("\n")
     };
@@ -171,6 +152,7 @@ pub async fn del(
     ctx: Context<'_>,
     #[description = "Thread ID (defaults to current thread)"] thread_id: Option<String>,
 ) -> Result<(), Error> {
+    let lang = ctx.data().config.language;
     let tid = match thread_id {
         Some(id) => id,
         None => {
@@ -181,7 +163,7 @@ pub async fn del(
                 }
                 _ => {
                     let reply = poise::CreateReply::default()
-                        .content("❌ Not in a thread. Provide a thread ID explicitly.")
+                        .content(format!("❌ {}", lang.not_in_thread()))
                         .ephemeral(true);
                     ctx.send(reply).await?;
                     return Ok(());
@@ -193,7 +175,7 @@ pub async fn del(
     let session = repository::get_session_by_thread(&ctx.data().db, &tid).await?;
     if session.is_none() {
         let reply = poise::CreateReply::default()
-            .content(format!("❌ No session found for thread `{tid}`"))
+            .content(format!("❌ {}", lang.no_session_found(&tid)))
             .ephemeral(true);
         ctx.send(reply).await?;
         return Ok(());
@@ -205,7 +187,7 @@ pub async fn del(
     repository::delete_session(&ctx.data().db, &tid).await?;
 
     let reply = poise::CreateReply::default()
-        .content("✅ Session deleted")
+        .content(format!("✅ {}", lang.session_deleted()))
         .ephemeral(true);
     ctx.send(reply).await?;
 
@@ -218,18 +200,19 @@ pub async fn stop(ctx: Context<'_>) -> Result<(), Error> {
     let channel_id = ctx.channel_id();
     let thread_id = channel_id.to_string();
     let data = ctx.data();
+    let lang = data.config.language;
 
     if !data.sessions.session_exists(&thread_id).await {
-        ctx.say("❌ 이 스레드에 활성 세션이 없습니다").await?;
+        ctx.say(format!("❌ {}", lang.no_session_in_thread())).await?;
         return Ok(());
     }
 
     match data.sessions.interrupt_session(&thread_id).await {
         Ok(()) => {
-            ctx.say("-# ⛔ Interrupted").await?;
+            ctx.say(format!("-# ⛔ {}", lang.interrupted())).await?;
         }
         Err(e) => {
-            ctx.say(format!("❌ 중단 실패: {}", e)).await?;
+            ctx.say(format!("❌ {}", lang.interrupt_failed(&e))).await?;
         }
     }
 
@@ -245,25 +228,23 @@ pub async fn status(
         Some(id) => id,
         None => ctx.channel_id().to_string(),
     };
+    let lang = ctx.data().config.language;
 
     let session = repository::get_session_by_thread(&ctx.data().db, &tid).await?;
 
     let content = match session {
-        None => format!("❌ No session found for thread `{tid}`"),
+        None => format!("❌ {}", lang.no_session_found(&tid)),
         Some(s) => {
             let session_id_line = s
                 .session_id
                 .as_deref()
-                .unwrap_or("(none)");
+                .unwrap_or(lang.none_placeholder());
             let last_active_line = s
                 .last_active_at
                 .as_deref()
-                .map(format_relative)
-                .unwrap_or_else(|| "(never)".to_string());
-            format!(
-                "📊 Session Status\nThread: <#{}>\nStatus: {}\nSession ID: {}\nLast Active: {}",
-                s.thread_id, s.status, session_id_line, last_active_line
-            )
+                .map(|t| format_relative(t, lang))
+                .unwrap_or_else(|| lang.never_placeholder().to_string());
+            lang.session_status_display(&s.thread_id, &s.status, session_id_line, &last_active_line)
         }
     };
 
@@ -281,21 +262,25 @@ mod tests {
 
     #[test]
     fn format_idle_seconds() {
-        assert_eq!(format_idle_duration(Duration::from_secs(30)), "idle 30s");
+        assert_eq!(Lang::En.format_idle(30), "idle 30s");
+        assert_eq!(Lang::Ko.format_idle(30), "유휴 30초");
     }
 
     #[test]
     fn format_idle_minutes() {
-        assert_eq!(format_idle_duration(Duration::from_secs(150)), "idle 2m");
+        assert_eq!(Lang::En.format_idle(150), "idle 2m");
+        assert_eq!(Lang::Ko.format_idle(150), "유휴 2분");
     }
 
     #[test]
     fn format_idle_hours() {
-        assert_eq!(format_idle_duration(Duration::from_secs(7200)), "idle 2h0m");
+        assert_eq!(Lang::En.format_idle(7200), "idle 2h0m");
+        assert_eq!(Lang::Ko.format_idle(7200), "유휴 2시간0분");
     }
 
     #[test]
     fn format_idle_hours_minutes() {
-        assert_eq!(format_idle_duration(Duration::from_secs(5430)), "idle 1h30m");
+        assert_eq!(Lang::En.format_idle(5430), "idle 1h30m");
+        assert_eq!(Lang::Ko.format_idle(5430), "유휴 1시간30분");
     }
 }

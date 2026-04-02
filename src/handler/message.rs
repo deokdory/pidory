@@ -12,6 +12,7 @@ use crate::db::repository;
 use crate::error::PidoryError;
 use crate::handler::{emoji, formatter, permission_ui};
 use crate::handler::emoji::ReactionStatus;
+use crate::i18n::Lang;
 use crate::subprocess::parser::{ContentBlock, StreamEvent};
 use crate::subprocess::permission::{PermissionDecision, PermissionRequest};
 use crate::subprocess::session_manager::QueuedMessage;
@@ -54,6 +55,8 @@ async fn handle_message(
     if new_message.author.id != UserId::new(data.config.discord.owner_id) {
         return Ok(());
     }
+
+    let lang = data.config.language;
 
     // 스레드인지 확인
     let channel = match new_message.channel_id.to_channel(ctx).await {
@@ -120,6 +123,7 @@ async fn handle_message(
             ctx.clone(),
             channel_id,
             data.db.clone(),
+            lang,
         )
         .await
     {
@@ -139,7 +143,7 @@ async fn handle_message(
                 repository::update_session_status(db, &evicted_tid, "idle").await.ok();
                 if let Ok(id) = evicted_tid.parse::<u64>() {
                     ChannelId::new(id)
-                        .say(ctx, "-# ⚠️ 세션이 새 요청을 위해 정리되었습니다. 메시지를 보내면 자동으로 재개됩니다.")
+                        .say(ctx, format!("-# ⚠️ {}", lang.session_evicted()))
                         .await
                         .ok();
                 }
@@ -148,7 +152,7 @@ async fn handle_message(
         Err(e) => {
             error!("Failed to get_or_create session for thread {}: {}", thread_id, e);
             channel_id
-                .say(ctx, format!("❌ 세션 생성 실패: {}", e))
+                .say(ctx, format!("❌ {}", lang.session_create_failed(&e)))
                 .await
                 .map_err(|e| PidoryError::Discord(Box::new(e)))?;
             return Ok(());
@@ -179,14 +183,14 @@ async fn handle_message(
             }
             Err(e) if e.to_string().contains("queue full") => {
                 channel_id
-                    .say(ctx, "❌ 대기열이 가득 찼습니다")
+                    .say(ctx, format!("❌ {}", lang.queue_full()))
                     .await
                     .map_err(|e| PidoryError::Discord(Box::new(e)))?;
                 return Ok(());
             }
             Err(e) => {
                 channel_id
-                    .say(ctx, format!("❌ 오류: {}", e))
+                    .say(ctx, format!("❌ {}", lang.error_with(&e)))
                     .await
                     .map_err(|e| PidoryError::Discord(Box::new(e)))?;
                 return Ok(());
@@ -216,7 +220,7 @@ async fn handle_message(
             .ok();
         repository::update_session_status(db, &thread_id, "error").await?;
         channel_id
-            .say(ctx, format!("❌ 메시지 전송 실패: {}", e))
+            .say(ctx, format!("❌ {}", lang.message_send_failed(&e)))
             .await
             .map_err(|e| PidoryError::Discord(Box::new(e)))?;
         return Ok(());
@@ -239,6 +243,7 @@ async fn handle_message(
         data.config.discord.owner_id,
         data.session_skills.clone(),
         data.config.ratelimit.file_path.as_deref(),
+        lang,
     )
     .await;
 
@@ -266,6 +271,8 @@ async fn handle_interaction(
             None => return Ok(()),
         };
 
+    let lang = data.config.language;
+
     // owner 검증
     if component.user.id != UserId::new(data.config.discord.owner_id) {
         component
@@ -273,7 +280,7 @@ async fn handle_interaction(
                 ctx,
                 poise::serenity_prelude::CreateInteractionResponse::Message(
                     poise::serenity_prelude::CreateInteractionResponseMessage::new()
-                        .content("❌ 권한이 없습니다")
+                        .content(format!("❌ {}", lang.no_permission()))
                         .ephemeral(true),
                 ),
             )
@@ -320,6 +327,7 @@ async fn handle_interaction(
             message_id,
             &action,
             &tool_name,
+            lang,
         )
         .await
         .ok();
@@ -343,6 +351,7 @@ pub async fn process_turn_events(
     owner_id: u64,
     session_skills: std::sync::Arc<tokio::sync::Mutex<HashMap<String, Vec<String>>>>,
     ratelimit_file: Option<&str>,
+    lang: Lang,
 ) -> Option<mpsc::Receiver<PermissionRequest>> {
     // 1. typing indicator task 시작
     let cancel = CancellationToken::new();
@@ -404,7 +413,7 @@ pub async fn process_turn_events(
     if !fast_complete {
         // 버퍼링된 이벤트 먼저 전송
         for event in &events {
-            send_event_to_discord(ctx, channel_id, event, &mut tool_use_names, &mut used_tools).await;
+            send_event_to_discord(ctx, channel_id, event, &mut tool_use_names, &mut used_tools, lang).await;
         }
 
         loop {
@@ -432,6 +441,7 @@ pub async fn process_turn_events(
                                 perm_req,
                                 &pending_permissions,
                                 owner_id,
+                                lang,
                             )
                             .await;
                         }
@@ -448,7 +458,7 @@ pub async fn process_turn_events(
             match stream_event {
                 Some(Ok(stream_event)) => {
                     typing_paused.store(false, Ordering::Relaxed);
-                    send_event_to_discord(ctx, channel_id, &stream_event, &mut tool_use_names, &mut used_tools).await;
+                    send_event_to_discord(ctx, channel_id, &stream_event, &mut tool_use_names, &mut used_tools, lang).await;
 
                     if stream_event.is_result() {
                         got_result = true;
@@ -560,7 +570,7 @@ pub async fn process_turn_events(
         repository::update_session_status(db, thread_id, "error")
             .await
             .ok();
-        channel_id.say(ctx, &format!("-# ❌ 프로세스가 비정상 종료되었습니다 <@{}>", owner_id)).await.ok();
+        channel_id.say(ctx, &format!("-# ❌ {} <@{}>", lang.process_abnormal_exit(), owner_id)).await.ok();
         emoji::set_reaction(ctx, channel_id, msg_id, ReactionStatus::Error)
             .await
             .ok();
@@ -596,9 +606,9 @@ pub async fn process_turn_events(
 
     // 8. fast-complete path: 기존 format_response + send_response (한 메시지)
     if fast_complete {
-        let response = formatter::format_response(&events);
+        let response = formatter::format_response(&events, lang);
         let send_ok = if !response.trim().is_empty() {
-            match formatter::send_response(ctx, channel_id, &response, max_chunk_length, max_chunks)
+            match formatter::send_response(ctx, channel_id, &response, max_chunk_length, max_chunks, lang)
                 .await
             {
                 Ok(()) => true,
@@ -614,7 +624,7 @@ pub async fn process_turn_events(
         // 완료 알림 (mention)
         if !is_interrupted {
             if has_cli_error || !got_result || !send_ok {
-                channel_id.say(ctx, &format!("-# ❌ 에러 발생 <@{}>", owner_id)).await.ok();
+                channel_id.say(ctx, &format!("-# ❌ {} <@{}>", lang.error_occurred(), owner_id)).await.ok();
             } else {
                 let duration_ms = events.iter().find_map(|e| {
                     if let StreamEvent::Result { duration_ms, .. } = e {
@@ -703,6 +713,7 @@ pub async fn execute_in_session(
         data.config.discord.owner_id,
         data.session_skills.clone(),
         data.config.ratelimit.file_path.as_deref(),
+        data.config.language,
     )
     .await;
 
@@ -726,6 +737,7 @@ async fn send_event_to_discord(
     event: &StreamEvent,
     tool_use_names: &mut HashMap<String, String>,
     used_tools: &mut Vec<String>,
+    lang: Lang,
 ) {
     match event {
         StreamEvent::Assistant { content, .. } => {
@@ -753,14 +765,14 @@ async fn send_event_to_discord(
                 if matches!(tool_name, Some("Read" | "Grep" | "Glob")) && !result.is_error {
                     continue;
                 }
-                if let Some(formatted) = formatter::format_tool_result_with_name(result, tool_name) {
+                if let Some(formatted) = formatter::format_tool_result_with_name(result, tool_name, lang) {
                     say_silent(ctx, channel_id, formatted).await;
                 }
             }
         }
         StreamEvent::RateLimit { status, .. } => {
             if status == "rate_limited" {
-                say_silent(ctx, channel_id, "⚠️ Rate limit reached").await;
+                say_silent(ctx, channel_id, lang.rate_limit_reached()).await;
             } else if status != "allowed" && !status.is_empty() {
                 tracing::warn!(status, "Unknown rate limit status");
             }
@@ -775,6 +787,7 @@ async fn handle_permission_request(
     perm_req: PermissionRequest,
     pending_permissions: &std::sync::Arc<tokio::sync::Mutex<HashMap<String, PendingPermission>>>,
     owner_id: u64,
+    lang: Lang,
 ) {
     let msg = permission_ui::create_permission_message(
         &perm_req.tool_name,
@@ -782,6 +795,7 @@ async fn handle_permission_request(
         &perm_req.request_id,
         perm_req.decision_reason.as_deref(),
         owner_id,
+        lang,
     );
 
     match channel_id.send_message(ctx, msg).await {
