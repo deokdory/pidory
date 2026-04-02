@@ -417,6 +417,7 @@ impl SessionManager {
                 };
 
                 is_turn_clone.store(true, Ordering::Relaxed);
+                tracing::info!(thread_id = %thread_id_for_worker, timeout_secs, "Primary turn started");
 
                 // primary 메시지: result까지 stdout 읽기 + mid-turn inject 동시 처리
                 let mut timeout_deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
@@ -484,12 +485,23 @@ impl SessionManager {
                                 }
                                 Ok(Ok(_)) => {
                                     timeout_deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
+                                    tracing::debug!(thread_id = %thread_id_for_worker, "Timeout deadline reset");
                                     let trimmed = line.trim_end();
                                     if trimmed.is_empty() {
                                         continue 'turn;
                                     }
                                     match parse_line(trimmed) {
                                         Ok(event) => {
+                                            let event_name = match &event {
+                                                StreamEvent::Assistant { .. } => "assistant",
+                                                StreamEvent::User { .. } => "user",
+                                                StreamEvent::Result { .. } => "result",
+                                                StreamEvent::ControlRequest { .. } => "control_request",
+                                                StreamEvent::RateLimit { .. } => "rate_limit",
+                                                StreamEvent::Init { .. } => "init",
+                                                _ => "other",
+                                            };
+                                            tracing::debug!(thread_id = %thread_id_for_worker, event = event_name, "stdout event");
                                             // Background task 이벤트: user turn 중에도 올 수 있음
                                             match &event {
                                                 StreamEvent::TaskStarted { task_id, task_type, description, .. } => {
@@ -524,6 +536,7 @@ impl SessionManager {
                                                     StreamEvent::Result { .. } => {
                                                         bg_turn_active = false;
                                                         timeout_deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
+                                                        tracing::debug!(thread_id = %thread_id_for_worker, "Timeout deadline reset");
                                                         continue 'turn; // bg turn 끝 — user turn은 계속
                                                     }
                                                     StreamEvent::Assistant { content, .. } => {
@@ -750,6 +763,7 @@ impl SessionManager {
 
                                                 // timeout 리셋
                                                 timeout_deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
+                                                tracing::debug!(thread_id = %thread_id_for_worker, "Timeout deadline reset");
                                                 continue 'turn;
                                             }
 
@@ -780,6 +794,11 @@ impl SessionManager {
                                     if !soft_timeout_fired {
                                         // Soft timeout: nudge 주입
                                         soft_timeout_fired = true;
+                                        tracing::warn!(
+                                            thread_id = %thread_id_for_worker,
+                                            timeout_secs,
+                                            "Soft timeout fired — sending nudge"
+                                        );
                                         let nudge = serde_json::json!({
                                             "type": "user",
                                             "message": {
@@ -803,11 +822,20 @@ impl SessionManager {
                                         // 짧은 재대기 (timeout_secs / 5, 최소 60초)
                                         let retry_secs = (timeout_secs / 5).max(60);
                                         timeout_deadline = tokio::time::Instant::now() + Duration::from_secs(retry_secs);
+                                        tracing::info!(
+                                            thread_id = %thread_id_for_worker,
+                                            retry_secs,
+                                            "Nudge sent, retry deadline set"
+                                        );
 
                                         continue 'turn;
                                     } else {
                                         // Hard timeout
-                                        tracing::error!("Hard turn timeout for thread {}", thread_id_for_worker);
+                                        tracing::error!(
+                                            thread_id = %thread_id_for_worker,
+                                            timeout_secs,
+                                            "Hard turn timeout — killing turn"
+                                        );
                                         channel_id_for_worker.say(
                                             &ctx_for_worker,
                                             "⚠️ 응답 시간 초과로 턴을 종료합니다. 다시 시도해 주세요."
@@ -821,6 +849,7 @@ impl SessionManager {
                 }
                 // 'turn loop 종료 후 항상 리셋 (정상/비정상 모든 break 경로 커버)
                 is_turn_clone.store(false, Ordering::Relaxed);
+                tracing::info!(thread_id = %thread_id_for_worker, soft_timeout_fired, "Turn ended");
                 // event_tx dropped → handler의 recv() returns None
             }
 

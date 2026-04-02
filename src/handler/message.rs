@@ -87,6 +87,7 @@ async fn handle_message(
     };
 
     let thread_id = new_message.channel_id.to_string();
+    tracing::info!(thread_id = %thread_id, "Message received in thread");
     let channel_id = new_message.channel_id;
     let msg_id = new_message.id;
 
@@ -123,6 +124,12 @@ async fn handle_message(
         .await
     {
         Ok(result) => {
+            tracing::info!(
+                thread_id = %thread_id,
+                new_session = result.permission_rx.is_some(),
+                evicted = result.evicted_thread_id.as_deref(),
+                "Session get_or_create completed"
+            );
             if let Some(rx) = result.permission_rx {
                 data.permission_rxs.lock().await.insert(thread_id.clone(), rx);
             }
