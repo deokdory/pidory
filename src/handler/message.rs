@@ -495,32 +495,32 @@ pub async fn process_turn_events(
     // 7. 최종 처리
     if fast_complete {
         if is_interrupted {
+            repository::update_session_status(db, thread_id, "idle")
+                .await
+                .ok();
             emoji::set_reaction(ctx, channel_id, msg_id, ReactionStatus::Interrupted)
                 .await
                 .ok();
-            repository::update_session_status(db, thread_id, "idle")
-                .await
-                .ok();
         } else if has_cli_error || !got_result {
-            emoji::set_reaction(ctx, channel_id, msg_id, ReactionStatus::Error)
-                .await
-                .ok();
             repository::update_session_status(db, thread_id, "error")
                 .await
                 .ok();
-        } else {
-            emoji::set_reaction(ctx, channel_id, msg_id, ReactionStatus::Done)
+            emoji::set_reaction(ctx, channel_id, msg_id, ReactionStatus::Error)
                 .await
                 .ok();
+        } else {
             repository::update_session_status(db, thread_id, "idle")
+                .await
+                .ok();
+            emoji::set_reaction(ctx, channel_id, msg_id, ReactionStatus::Done)
                 .await
                 .ok();
         }
     } else if is_interrupted {
-        emoji::set_reaction(ctx, channel_id, msg_id, ReactionStatus::Interrupted)
+        repository::update_session_status(db, thread_id, "idle")
             .await
             .ok();
-        repository::update_session_status(db, thread_id, "idle")
+        emoji::set_reaction(ctx, channel_id, msg_id, ReactionStatus::Interrupted)
             .await
             .ok();
     } else if has_cli_error {
@@ -538,21 +538,21 @@ pub async fn process_turn_events(
                 }
             })
             .collect();
+        repository::update_session_status(db, thread_id, "error")
+            .await
+            .ok();
         if let Some(error_text) = error_msgs.first() {
             channel_id.say(ctx, &format!("-# <@{}> ❌ {}", owner_id, error_text)).await.ok();
         }
         emoji::set_reaction(ctx, channel_id, msg_id, ReactionStatus::Error)
             .await
             .ok();
+    } else if !got_result {
         repository::update_session_status(db, thread_id, "error")
             .await
             .ok();
-    } else if !got_result {
         channel_id.say(ctx, &format!("-# <@{}> ❌ 프로세스가 비정상 종료되었습니다", owner_id)).await.ok();
         emoji::set_reaction(ctx, channel_id, msg_id, ReactionStatus::Error)
-            .await
-            .ok();
-        repository::update_session_status(db, thread_id, "error")
             .await
             .ok();
     } else {
@@ -572,12 +572,12 @@ pub async fn process_turn_events(
             used_tools.dedup();
             format!("-# <@{}> 🔧 {} — {}", owner_id, used_tools.join(", "), duration)
         };
+        repository::update_session_status(db, thread_id, "idle")
+            .await
+            .ok();
         channel_id.say(ctx, &summary).await.ok();
 
         emoji::set_reaction(ctx, channel_id, msg_id, ReactionStatus::Done)
-            .await
-            .ok();
-        repository::update_session_status(db, thread_id, "idle")
             .await
             .ok();
     }
