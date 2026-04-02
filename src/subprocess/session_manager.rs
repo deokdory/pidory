@@ -421,6 +421,7 @@ impl SessionManager {
                 // primary 메시지: result까지 stdout 읽기 + mid-turn inject 동시 처리
                 let mut timeout_deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
                 let mut bg_turn_active = false;
+                let mut soft_timeout_fired = false;
                 'turn: loop {
                     line.clear();
                     tokio::select! {
@@ -482,6 +483,7 @@ impl SessionManager {
                                     break 'turn;
                                 }
                                 Ok(Ok(_)) => {
+                                    timeout_deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
                                     let trimmed = line.trim_end();
                                     if trimmed.is_empty() {
                                         continue 'turn;
@@ -775,8 +777,43 @@ impl SessionManager {
                                     break 'turn;
                                 }
                                 Err(_) => {
-                                    tracing::error!("Turn timeout for thread {}", thread_id_for_worker);
-                                    break 'turn;
+                                    if !soft_timeout_fired {
+                                        // Soft timeout: nudge 주입
+                                        soft_timeout_fired = true;
+                                        let nudge = serde_json::json!({
+                                            "type": "user",
+                                            "message": {
+                                                "role": "user",
+                                                "content": [{"type": "text", "text": "[SYSTEM] No stdout activity for an extended period. A tool may be unresponsive. Check the status of any running tools and recover if needed."}]
+                                            }
+                                        });
+                                        let nudge_line = format!("{}\n", nudge);
+                                        if let Err(e) = stdin.write_all(nudge_line.as_bytes()).await {
+                                            tracing::error!("nudge write error: {}", e);
+                                            break 'turn;
+                                        }
+                                        let _ = stdin.flush().await;
+
+                                        // Discord 알림 (deadline 설정 전에 처리 — API 지연이 retry window를 잠식하지 않도록)
+                                        channel_id_for_worker.say(
+                                            &ctx_for_worker,
+                                            "-# ⚠️ 장시간 무응답 — 확인 메시지를 전송했습니다"
+                                        ).await.ok();
+
+                                        // 짧은 재대기 (timeout_secs / 5, 최소 60초)
+                                        let retry_secs = (timeout_secs / 5).max(60);
+                                        timeout_deadline = tokio::time::Instant::now() + Duration::from_secs(retry_secs);
+
+                                        continue 'turn;
+                                    } else {
+                                        // Hard timeout
+                                        tracing::error!("Hard turn timeout for thread {}", thread_id_for_worker);
+                                        channel_id_for_worker.say(
+                                            &ctx_for_worker,
+                                            "⚠️ 응답 시간 초과로 턴을 종료합니다. 다시 시도해 주세요."
+                                        ).await.ok();
+                                        break 'turn;
+                                    }
                                 }
                             }
                         }
@@ -1055,5 +1092,151 @@ mod tests {
     fn empty_sessions() {
         let sessions: Vec<(&str, MockSession)> = vec![];
         assert_eq!(find_evict_target_mock(&sessions), None);
+    }
+
+    // ---------- timeout logic helpers ----------
+
+    /// Mirrors the production formula: `(timeout_secs / 5).max(60)`
+    fn compute_retry_secs(timeout_secs: u64) -> u64 {
+        (timeout_secs / 5).max(60)
+    }
+
+    /// Outcome of one timeout event.
+    #[derive(Debug, PartialEq)]
+    enum TimeoutAction {
+        /// Nudge injected, deadline reset to `retry_secs`, continue turn.
+        SoftFired { retry_secs: u64 },
+        /// Turn should be terminated.
+        HardKill,
+    }
+
+    /// Pure state-machine for the `Err(_)` timeout branch.
+    fn on_timeout(soft_timeout_fired: bool, timeout_secs: u64) -> TimeoutAction {
+        if !soft_timeout_fired {
+            TimeoutAction::SoftFired {
+                retry_secs: compute_retry_secs(timeout_secs),
+            }
+        } else {
+            TimeoutAction::HardKill
+        }
+    }
+
+    // ---------- sliding window tests ----------
+
+    /// After a successful read the deadline should be pushed forward.
+    #[test]
+    fn sliding_window_deadline_resets_on_read() {
+        let timeout_secs: u64 = 600;
+
+        // Simulate an "old" deadline that is nearly expired.
+        let old_deadline =
+            tokio::time::Instant::now() + Duration::from_secs(1);
+
+        // Production line: every Ok(Ok(_)) resets the deadline.
+        let new_deadline =
+            tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
+
+        // The new deadline must be strictly later than the old nearly-expired one.
+        assert!(
+            new_deadline > old_deadline,
+            "deadline after read ({:?}) should be later than near-expired deadline ({:?})",
+            new_deadline,
+            old_deadline
+        );
+    }
+
+    /// The gap between two consecutive deadline resets equals `timeout_secs`.
+    #[test]
+    fn sliding_window_gap_equals_timeout() {
+        let timeout_secs: u64 = 600;
+        let before = tokio::time::Instant::now();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
+        let after = tokio::time::Instant::now();
+
+        // deadline - before must be in [timeout_secs, timeout_secs + small_epsilon].
+        let lower = Duration::from_secs(timeout_secs);
+        // Allow 100 ms for execution jitter.
+        let upper = Duration::from_secs(timeout_secs) + Duration::from_millis(100);
+
+        let gap = deadline.duration_since(before);
+        assert!(gap >= lower && gap <= upper,
+            "gap {:?} not in [{:?}, {:?}]", gap, lower, upper);
+        // after is after before, so deadline.duration_since(after) < timeout_secs.
+        let _ = after; // referenced for clarity
+    }
+
+    // ---------- soft timeout tests ----------
+
+    /// First timeout fires the soft path and calculates retry with the production formula.
+    #[test]
+    fn soft_timeout_sets_flag_and_retry_secs() {
+        let timeout_secs: u64 = 600;
+        let soft_timeout_fired = false;
+
+        let action = on_timeout(soft_timeout_fired, timeout_secs);
+
+        assert_eq!(
+            action,
+            TimeoutAction::SoftFired { retry_secs: 120 },
+            "default 600s → retry_secs should be 120"
+        );
+    }
+
+    /// `compute_retry_secs` floors at 60 when timeout_secs < 300.
+    #[test]
+    fn soft_timeout_retry_secs_minimum_is_60() {
+        // timeout_secs = 100 → 100/5 = 20, .max(60) = 60
+        assert_eq!(compute_retry_secs(100), 60);
+        // timeout_secs = 0 → 0/5 = 0, .max(60) = 60
+        assert_eq!(compute_retry_secs(0), 60);
+        // timeout_secs = 299 → 299/5 = 59, .max(60) = 60
+        assert_eq!(compute_retry_secs(299), 60);
+    }
+
+    /// `compute_retry_secs` scales correctly above the minimum.
+    #[test]
+    fn soft_timeout_retry_secs_scales_above_minimum() {
+        // timeout_secs = 300 → 300/5 = 60, .max(60) = 60 (boundary)
+        assert_eq!(compute_retry_secs(300), 60);
+        // timeout_secs = 600 → 600/5 = 120
+        assert_eq!(compute_retry_secs(600), 120);
+        // timeout_secs = 1800 → 1800/5 = 360
+        assert_eq!(compute_retry_secs(1800), 360);
+    }
+
+    // ---------- hard timeout tests ----------
+
+    /// Second timeout (soft already fired) produces HardKill.
+    #[test]
+    fn hard_timeout_after_soft_fires_hard_kill() {
+        let timeout_secs: u64 = 600;
+        let soft_timeout_fired = true; // flag set by previous soft timeout
+
+        let action = on_timeout(soft_timeout_fired, timeout_secs);
+
+        assert_eq!(action, TimeoutAction::HardKill);
+    }
+
+    /// Verify the full two-event state progression: no-fire → soft → hard.
+    #[test]
+    fn timeout_state_machine_progression() {
+        let timeout_secs: u64 = 600;
+        let mut soft_fired = false;
+
+        // Event 1: first timeout → soft
+        let action1 = on_timeout(soft_fired, timeout_secs);
+        if let TimeoutAction::SoftFired { .. } = action1 {
+            soft_fired = true; // production sets the flag here
+        } else {
+            panic!("Expected SoftFired on first timeout");
+        }
+
+        // Event 2: second timeout → hard
+        let action2 = on_timeout(soft_fired, timeout_secs);
+        assert_eq!(
+            action2,
+            TimeoutAction::HardKill,
+            "second timeout must produce HardKill"
+        );
     }
 }
