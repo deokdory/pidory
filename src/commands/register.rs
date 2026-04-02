@@ -12,10 +12,11 @@ pub async fn register(
     #[description = "Display name (optional)"] name: Option<String>,
 ) -> Result<(), Error> {
     let channel_id = ctx.channel_id().to_string();
+    let lang = ctx.data().config.language;
 
     if !Path::new(&path).exists() {
         let reply = poise::CreateReply::default()
-            .content(format!("❌ Path does not exist: `{path}`"))
+            .content(format!("❌ {}", lang.path_not_exist(&path)))
             .ephemeral(true);
         ctx.send(reply).await?;
         return Ok(());
@@ -23,10 +24,7 @@ pub async fn register(
 
     if let Some(existing) = repository::get_project_by_channel(&ctx.data().db, &channel_id).await? {
         let reply = poise::CreateReply::default()
-            .content(format!(
-                "❌ This channel is already registered to `{}`. Use `/unregister` first.",
-                existing.path
-            ))
+            .content(format!("❌ {}", lang.already_registered(&existing.path)))
             .ephemeral(true);
         ctx.send(reply).await?;
         return Ok(());
@@ -35,7 +33,7 @@ pub async fn register(
     repository::register_project(&ctx.data().db, &channel_id, &path, name.as_deref()).await?;
 
     let reply = poise::CreateReply::default()
-        .content(format!("✅ Registered `{path}` to this channel"))
+        .content(format!("✅ {}", lang.registered(&path)))
         .ephemeral(true);
     ctx.send(reply).await?;
 
@@ -51,13 +49,14 @@ pub async fn register(
 #[poise::command(slash_command, guild_only, owners_only)]
 pub async fn unregister(ctx: Context<'_>) -> Result<(), Error> {
     let channel_id = ctx.channel_id().to_string();
+    let lang = ctx.data().config.language;
 
     let project =
         repository::get_project_by_channel(&ctx.data().db, &channel_id).await?;
 
     if project.is_none() {
         let reply = poise::CreateReply::default()
-            .content("❌ No project registered to this channel")
+            .content(format!("❌ {}", lang.not_registered()))
             .ephemeral(true);
         ctx.send(reply).await?;
         return Ok(());
@@ -66,7 +65,7 @@ pub async fn unregister(ctx: Context<'_>) -> Result<(), Error> {
     repository::unregister_project(&ctx.data().db, &channel_id).await?;
 
     let reply = poise::CreateReply::default()
-        .content("✅ Unregistered project from this channel")
+        .content(format!("✅ {}", lang.unregistered()))
         .ephemeral(true);
     ctx.send(reply).await?;
 

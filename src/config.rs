@@ -2,9 +2,12 @@ use serde::Deserialize;
 use std::fs;
 
 use crate::error::PidoryError;
+use crate::i18n::Lang;
 
 #[derive(Debug, Deserialize)]
 pub struct Config {
+    #[serde(default)]
+    pub language: Lang,
     pub discord: DiscordConfig,
     pub claude: ClaudeConfig,
     pub response: ResponseConfig,
@@ -174,6 +177,7 @@ binary_path = "claude"
         assert_eq!(config.response.max_chunks, 10);
         assert_eq!(config.database.path, "pidory.db");
         assert_eq!(config.discord.token_env, "PIDORY_DISCORD_TOKEN");
+        assert_eq!(config.language, Lang::Ko); // default
     }
 
     #[test]
@@ -348,5 +352,39 @@ path = ""
         let result = Config::load(path.to_str().unwrap());
         assert!(result.is_err());
         std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn parse_config_with_language_en() {
+        let toml_str = r#"
+language = "en"
+
+[discord]
+guild_id = 123
+owner_id = 456
+
+[claude]
+binary_path = "claude"
+
+[response]
+"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.language, Lang::En);
+    }
+
+    #[test]
+    fn parse_config_without_language_defaults_ko() {
+        let toml_str = r#"
+[discord]
+guild_id = 123
+owner_id = 456
+
+[claude]
+binary_path = "claude"
+
+[response]
+"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.language, Lang::Ko);
     }
 }

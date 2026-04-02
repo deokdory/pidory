@@ -2,9 +2,10 @@ use poise::serenity_prelude as serenity;
 use tokio::time::{sleep, Duration};
 
 use crate::error::PidoryError;
+use crate::i18n::Lang;
 use crate::subprocess::parser::{ContentBlock, StreamEvent, ToolResult};
 
-pub fn format_response(events: &[StreamEvent]) -> String {
+pub fn format_response(events: &[StreamEvent], lang: Lang) -> String {
     let mut parts: Vec<String> = Vec::new();
     // Maps tool_use_id -> tool name for matching results to their tool calls
     let mut tool_use_names: std::collections::HashMap<String, String> = std::collections::HashMap::new();
@@ -32,14 +33,14 @@ pub fn format_response(events: &[StreamEvent]) -> String {
             StreamEvent::User { tool_results, .. } => {
                 for result in tool_results {
                     let tool_name = tool_use_names.get(&result.tool_use_id).map(|s| s.as_str());
-                    if let Some(formatted) = format_tool_result_with_name(result, tool_name) {
+                    if let Some(formatted) = format_tool_result_with_name(result, tool_name, lang) {
                         parts.push(formatted);
                     }
                 }
             }
             StreamEvent::RateLimit { status, .. } => {
                 if status == "rate_limited" {
-                    parts.push("⚠️ Rate limit reached".to_string());
+                    parts.push(lang.rate_limit_reached().to_string());
                 } else if status != "allowed" && !status.is_empty() {
                     tracing::warn!(status, "Unknown rate limit status");
                 }
@@ -183,13 +184,13 @@ mod tests {
     #[test]
     fn format_tool_result_empty() {
         let tr = ToolResult { tool_use_id: "t1".into(), content: "".into(), is_error: false };
-        assert!(format_tool_result(&tr).is_none());
+        assert!(format_tool_result_with_name(&tr, None, Lang::default()).is_none());
     }
 
     #[test]
     fn format_tool_result_short() {
         let tr = ToolResult { tool_use_id: "t1".into(), content: "output".into(), is_error: false };
-        let result = format_tool_result(&tr).unwrap();
+        let result = format_tool_result_with_name(&tr, None, Lang::default()).unwrap();
         assert!(result.contains("output"));
         assert!(!result.contains("❌"));
     }
@@ -197,7 +198,7 @@ mod tests {
     #[test]
     fn format_tool_result_error() {
         let tr = ToolResult { tool_use_id: "t1".into(), content: "err".into(), is_error: true };
-        let result = format_tool_result(&tr).unwrap();
+        let result = format_tool_result_with_name(&tr, None, Lang::default()).unwrap();
         assert!(result.contains("❌"));
     }
 
@@ -205,8 +206,10 @@ mod tests {
     fn format_tool_result_truncated() {
         let long_content = "x".repeat(600);
         let tr = ToolResult { tool_use_id: "t1".into(), content: long_content, is_error: false };
-        let result = format_tool_result(&tr).unwrap();
-        assert!(result.contains("truncated"));
+        let result = format_tool_result_with_name(&tr, None, Lang::Ko).unwrap();
+        assert!(result.contains("잘림"));
+        let result_en = format_tool_result_with_name(&tr, None, Lang::En).unwrap();
+        assert!(result_en.contains("truncated"));
     }
 }
 
@@ -270,12 +273,7 @@ pub fn format_tool_use(name: &str, input: &serde_json::Value) -> String {
     }
 }
 
-#[allow(dead_code)]
-pub fn format_tool_result(result: &ToolResult) -> Option<String> {
-    format_tool_result_with_name(result, None)
-}
-
-pub fn format_tool_result_with_name(result: &ToolResult, tool_name: Option<&str>) -> Option<String> {
+pub fn format_tool_result_with_name(result: &ToolResult, tool_name: Option<&str>, lang: Lang) -> Option<String> {
     if result.content.is_empty() {
         return None;
     }
@@ -298,7 +296,7 @@ pub fn format_tool_result_with_name(result: &ToolResult, tool_name: Option<&str>
         format!("{}\n{}\n```", fence, result.content)
     } else {
         let truncated: String = result.content.chars().take(TRUNCATE_LEN).collect();
-        format!("{}\n{}\n```\n...(truncated)", fence, truncated)
+        format!("{}\n{}\n```\n{}", fence, truncated, lang.truncated_suffix())
     };
 
     Some(format!("{}{}", prefix, body))
@@ -310,6 +308,7 @@ pub async fn send_response(
     text: &str,
     max_chunk_len: usize,
     max_chunks: usize,
+    lang: Lang,
 ) -> Result<(), PidoryError> {
     let chunks = split_message(text, max_chunk_len);
 
@@ -334,7 +333,7 @@ pub async fn send_response(
             "response_overflow.txt",
         );
         let message = serenity::CreateMessage::new()
-            .content("*(response continues in attachment)*")
+            .content(lang.response_continues())
             .add_file(attachment);
         channel_id.send_message(ctx, message).await?;
     }

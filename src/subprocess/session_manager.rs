@@ -16,6 +16,7 @@ use crate::config::ClaudeConfig;
 use crate::db::repository;
 use crate::error::PidoryError;
 use crate::handler::formatter;
+use crate::i18n::Lang;
 use super::background::BackgroundTaskTracker;
 use super::parser::{parse_line, StreamEvent, ContentBlock, build_control_response_allow, build_control_response_deny};
 use super::permission::{PermissionCache, PermissionDecision, PermissionRequest};
@@ -76,6 +77,7 @@ impl SessionManager {
         ctx: Context,
         channel_id: ChannelId,
         db: sqlx::SqlitePool,
+        lang: Lang,
     ) -> Result<SessionCreateResult, PidoryError> {
         let mut sessions = self.sessions.lock().await;
 
@@ -191,7 +193,7 @@ impl SessionManager {
                                         tracker.track_started(task_id, task_type, description);
                                         has_bg_tasks_clone.store(tracker.has_active_tasks(), Ordering::Relaxed);
                                         tracing::info!("Background task started: {} ({})", task_id, task_type);
-                                        let start_msg = format!("-# 🔔 Background task started: {}", description);
+                                        let start_msg = lang.bg_task_started(description);
                                         channel_id_for_worker.say(&ctx_for_worker, &start_msg).await.ok();
                                         continue;
                                     }
@@ -233,12 +235,12 @@ impl SessionManager {
                                                                     for block in content {
                                                                         match block {
                                                                             ContentBlock::Text(text) if !text.trim().is_empty() => {
-                                                                                let bg_text = format!("-# 🔔 [Background]\n{}", text);
+                                                                                let bg_text = lang.bg_notification(text);
                                                                                 channel_id_for_worker.say(&ctx_for_worker, &bg_text).await.ok();
                                                                             }
                                                                             ContentBlock::ToolUse { name, input, .. } => {
                                                                                 let formatted = formatter::format_tool_use(name, input);
-                                                                                let bg_text = format!("-# 🔔 [Background]\n{}", formatted);
+                                                                                let bg_text = lang.bg_notification(&formatted);
                                                                                 channel_id_for_worker.say(&ctx_for_worker, &bg_text).await.ok();
                                                                             }
                                                                             _ => {}
@@ -248,8 +250,8 @@ impl SessionManager {
                                                                 Ok(StreamEvent::User { ref tool_results, .. }) => {
                                                                     for result in tool_results {
                                                                         if result.is_error {
-                                                                            if let Some(formatted) = formatter::format_tool_result_with_name(result, None) {
-                                                                                let bg_text = format!("-# 🔔 [Background]\n{}", formatted);
+                                                                            if let Some(formatted) = formatter::format_tool_result_with_name(result, None, lang) {
+                                                                                let bg_text = lang.bg_notification(&formatted);
                                                                                 channel_id_for_worker.say(&ctx_for_worker, &bg_text).await.ok();
                                                                             }
                                                                         }
@@ -259,12 +261,9 @@ impl SessionManager {
                                                                     let resp = if permission_cache.is_always_allowed(tool_name) {
                                                                         build_control_response_allow(request_id, input)
                                                                     } else {
-                                                                        let deny_msg = format!(
-                                                                            "-# ⚠️ [Background] Permission denied: {} (not in cache)",
-                                                                            tool_name
-                                                                        );
+                                                                        let deny_msg = lang.bg_permission_denied(tool_name);
                                                                         channel_id_for_worker.say(&ctx_for_worker, &deny_msg).await.ok();
-                                                                        build_control_response_deny(request_id, "Background: permission not cached")
+                                                                        build_control_response_deny(request_id, lang.bg_permission_deny_reason())
                                                                     };
                                                                     if let Err(e) = stdin.write_all(resp.as_bytes()).await {
                                                                         tracing::error!("stdin write error (bg turn): {}", e);
@@ -344,12 +343,9 @@ impl SessionManager {
                                         let resp = if permission_cache.is_always_allowed(tool_name) {
                                             build_control_response_allow(request_id, input)
                                         } else {
-                                            let deny_msg = format!(
-                                                "-# ⚠️ [Background] Permission denied: {} (not in cache)",
-                                                tool_name
-                                            );
+                                            let deny_msg = lang.bg_permission_denied(tool_name);
                                             channel_id_for_worker.say(&ctx_for_worker, &deny_msg).await.ok();
-                                            build_control_response_deny(request_id, "Background: permission not cached")
+                                            build_control_response_deny(request_id, lang.bg_permission_deny_reason())
                                         };
                                         if let Err(e) = stdin.write_all(resp.as_bytes()).await {
                                             tracing::error!("stdin write error (between turns): {}", e);
@@ -507,7 +503,7 @@ impl SessionManager {
                                                 StreamEvent::TaskStarted { task_id, task_type, description, .. } => {
                                                     tracker.track_started(task_id, task_type, description);
                                                     has_bg_tasks_clone.store(tracker.has_active_tasks(), Ordering::Relaxed);
-                                                    let start_msg = format!("-# 🔔 Background task started: {}", description);
+                                                    let start_msg = lang.bg_task_started(description);
                                                     channel_id_for_worker.say(&ctx_for_worker, &start_msg).await.ok();
                                                     continue 'turn;
                                                 }
@@ -543,12 +539,12 @@ impl SessionManager {
                                                         for block in content {
                                                             match block {
                                                                 ContentBlock::Text(text) if !text.trim().is_empty() => {
-                                                                    let bg_text = format!("-# 🔔 [Background]\n{}", text);
+                                                                    let bg_text = lang.bg_notification(text);
                                                                     channel_id_for_worker.say(&ctx_for_worker, &bg_text).await.ok();
                                                                 }
                                                                 ContentBlock::ToolUse { name, input, .. } => {
                                                                     let formatted = formatter::format_tool_use(name, input);
-                                                                    let bg_text = format!("-# 🔔 [Background]\n{}", formatted);
+                                                                    let bg_text = lang.bg_notification(&formatted);
                                                                     channel_id_for_worker.say(&ctx_for_worker, &bg_text).await.ok();
                                                                 }
                                                                 _ => {}
@@ -559,8 +555,8 @@ impl SessionManager {
                                                     StreamEvent::User { tool_results, .. } => {
                                                         for result in tool_results {
                                                             if result.is_error {
-                                                                if let Some(formatted) = formatter::format_tool_result_with_name(result, None) {
-                                                                    let bg_text = format!("-# 🔔 [Background]\n{}", formatted);
+                                                                if let Some(formatted) = formatter::format_tool_result_with_name(result, None, lang) {
+                                                                    let bg_text = lang.bg_notification(&formatted);
                                                                     channel_id_for_worker.say(&ctx_for_worker, &bg_text).await.ok();
                                                                 }
                                                             }
@@ -571,9 +567,9 @@ impl SessionManager {
                                                         let resp = if permission_cache.is_always_allowed(tool_name) {
                                                             build_control_response_allow(request_id, input)
                                                         } else {
-                                                            let deny_msg = format!("-# ⚠️ [Background] Permission denied: {} (not in cache)", tool_name);
+                                                            let deny_msg = lang.bg_permission_denied(tool_name);
                                                             channel_id_for_worker.say(&ctx_for_worker, &deny_msg).await.ok();
-                                                            build_control_response_deny(request_id, "Background: permission not cached")
+                                                            build_control_response_deny(request_id, lang.bg_permission_deny_reason())
                                                         };
                                                         if let Err(e) = stdin.write_all(resp.as_bytes()).await {
                                                             tracing::error!("stdin write error (bg turn in user turn): {}", e);

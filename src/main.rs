@@ -3,6 +3,7 @@ mod config;
 mod db;
 mod error;
 mod handler;
+mod i18n;
 mod ratelimit;
 mod subprocess;
 
@@ -110,6 +111,7 @@ async fn main() -> Result<(), PidoryError> {
                     let file_path = file_path.clone();
                     let interval_secs = config.ratelimit.update_interval_secs;
                     let thresholds = config.ratelimit.alert_thresholds.clone();
+                    let lang = config.language;
                     let notification_channel = config.discord.notification_channel_id
                         .map(poise::serenity_prelude::ChannelId::new);
                     tokio::spawn(async move {
@@ -130,7 +132,7 @@ async fn main() -> Result<(), PidoryError> {
                                         poise::serenity_prelude::ActivityData::watching(&text)
                                     ));
                                     if let Some(channel_id) = notification_channel {
-                                        monitor.check_and_alert(&info, &fresh_ctx, channel_id).await;
+                                        monitor.check_and_alert(&info, &fresh_ctx, channel_id, lang).await;
                                     }
                                 }
                                 None => {
@@ -148,6 +150,7 @@ async fn main() -> Result<(), PidoryError> {
                     let permission_rxs = Arc::clone(&permission_rxs);
                     let session_skills = Arc::clone(&session_skills);
                     let db_clone = db.clone();
+                    let lang = config.language;
                     let mut ctx_rx = ctx_tx.subscribe();
                     tokio::spawn(async move {
                         let mut interval = tokio::time::interval(std::time::Duration::from_secs(300));
@@ -166,7 +169,7 @@ async fn main() -> Result<(), PidoryError> {
                                     ctx_rx.mark_changed();
                                     let ctx = ctx_rx.borrow_and_update().clone();
                                     poise::serenity_prelude::ChannelId::new(channel_id)
-                                        .say(&ctx, "-# ⏰ 세션이 비활성으로 정리되었습니다. 메시지를 보내면 자동으로 재개됩니다.")
+                                        .say(&ctx, format!("-# ⏰ {}", lang.session_idle_cleaned()))
                                         .await
                                         .ok();
                                 }

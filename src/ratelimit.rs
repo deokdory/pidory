@@ -2,6 +2,8 @@ use poise::serenity_prelude::{ChannelId, Context};
 use serde::Deserialize;
 use std::collections::HashSet;
 
+use crate::i18n::Lang;
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct RateLimitInfo {
     pub five_hour_pct: u8,
@@ -73,6 +75,7 @@ impl RateLimitMonitor {
         info: &RateLimitInfo,
         ctx: &Context,
         channel_id: ChannelId,
+        lang: Lang,
     ) {
         let triggered = self.check_thresholds(info);
         for threshold in triggered {
@@ -84,14 +87,11 @@ impl RateLimitMonitor {
                 let diff = info.five_hour_reset - now;
                 let h = diff / 3600;
                 let m = (diff % 3600) / 60;
-                format!(" — resets in {}h{}m", h, m)
+                lang.resets_in(h, m)
             } else {
                 String::new()
             };
-            let msg = format!(
-                "⚠️ Rate limit alert: 5h usage at {}% (threshold: {}%){remaining}",
-                info.five_hour_pct, threshold
-            );
+            let msg = lang.rate_limit_alert(info.five_hour_pct, threshold, &remaining);
             if let Err(e) = channel_id.say(ctx, &msg).await {
                 tracing::warn!("failed to send rate limit alert: {e}");
             }
