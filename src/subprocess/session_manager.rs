@@ -211,7 +211,9 @@ impl SessionManager {
                                         };
                                         channel_id_for_worker.say(&ctx_for_worker, &notify_msg).await.ok();
 
-                                        repository::update_session_status(&db_for_worker, &thread_id_for_worker, "running").await.ok();
+                                        if let Err(e) = repository::update_session_status(&db_for_worker, &thread_id_for_worker, "running").await {
+                                            tracing::warn!("Failed to update session status for thread {}: {}", thread_id_for_worker, e);
+                                        }
 
                                         // bg mini-loop: background turn 이벤트 처리
                                         'bg_turn: loop {
@@ -220,7 +222,9 @@ impl SessionManager {
                                                 read_result = reader.read_line(&mut line) => {
                                                     match read_result {
                                                         Ok(0) => {
-                                                            repository::update_session_status(&db_for_worker, &thread_id_for_worker, "idle").await.ok();
+                                                            if let Err(e) = repository::update_session_status(&db_for_worker, &thread_id_for_worker, "idle").await {
+                                                                tracing::warn!("Failed to update session status for thread {}: {}", thread_id_for_worker, e);
+                                                            }
                                                             break 'bg_turn;
                                                         }
                                                         Ok(_) => {
@@ -228,7 +232,9 @@ impl SessionManager {
                                                             if trimmed.is_empty() { continue 'bg_turn; }
                                                             match parse_line(trimmed) {
                                                                 Ok(StreamEvent::Result { .. }) => {
-                                                                    repository::update_session_status(&db_for_worker, &thread_id_for_worker, "idle").await.ok();
+                                                                    if let Err(e) = repository::update_session_status(&db_for_worker, &thread_id_for_worker, "idle").await {
+                                                                tracing::warn!("Failed to update session status for thread {}: {}", thread_id_for_worker, e);
+                                                            }
                                                                     break 'bg_turn;
                                                                 }
                                                                 Ok(StreamEvent::Assistant { ref content, .. }) => {
@@ -267,7 +273,9 @@ impl SessionManager {
                                                                     };
                                                                     if let Err(e) = stdin.write_all(resp.as_bytes()).await {
                                                                         tracing::error!("stdin write error (bg turn): {}", e);
-                                                                        repository::update_session_status(&db_for_worker, &thread_id_for_worker, "idle").await.ok();
+                                                                        if let Err(e) = repository::update_session_status(&db_for_worker, &thread_id_for_worker, "idle").await {
+                                                                tracing::warn!("Failed to update session status for thread {}: {}", thread_id_for_worker, e);
+                                                            }
                                                                         break 'bg_turn;
                                                                     }
                                                                     let _ = stdin.flush().await;
@@ -286,7 +294,9 @@ impl SessionManager {
                                                         }
                                                         Err(e) => {
                                                             tracing::error!("stdout read error (bg turn): {}", e);
-                                                            repository::update_session_status(&db_for_worker, &thread_id_for_worker, "idle").await.ok();
+                                                            if let Err(e) = repository::update_session_status(&db_for_worker, &thread_id_for_worker, "idle").await {
+                                                                tracing::warn!("Failed to update session status for thread {}: {}", thread_id_for_worker, e);
+                                                            }
                                                             break 'bg_turn;
                                                         }
                                                     }
@@ -306,13 +316,17 @@ impl SessionManager {
                                                             let inject_line = format!("{}\n", inject_json);
                                                             if let Err(e) = stdin.write_all(inject_line.as_bytes()).await {
                                                                 tracing::error!("mid-turn stdin write error (bg turn): {}", e);
-                                                                repository::update_session_status(&db_for_worker, &thread_id_for_worker, "idle").await.ok();
+                                                                if let Err(e) = repository::update_session_status(&db_for_worker, &thread_id_for_worker, "idle").await {
+                                                                tracing::warn!("Failed to update session status for thread {}: {}", thread_id_for_worker, e);
+                                                            }
                                                                 break 'bg_turn;
                                                             }
                                                             let _ = stdin.flush().await;
                                                         }
                                                         None => {
-                                                            repository::update_session_status(&db_for_worker, &thread_id_for_worker, "idle").await.ok();
+                                                            if let Err(e) = repository::update_session_status(&db_for_worker, &thread_id_for_worker, "idle").await {
+                                                                tracing::warn!("Failed to update session status for thread {}: {}", thread_id_for_worker, e);
+                                                            }
                                                             break 'bg_turn;
                                                         }
                                                     }
