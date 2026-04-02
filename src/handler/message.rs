@@ -122,12 +122,21 @@ async fn handle_message(
         )
         .await
     {
-        Ok(Some(rx)) => {
-            // 새 세션 — permission_rx 보관
-            data.permission_rxs.lock().await.insert(thread_id.clone(), rx);
-        }
-        Ok(None) => {
-            // 기존 세션 — permission_rx 이미 보관됨
+        Ok(result) => {
+            if let Some(rx) = result.permission_rx {
+                data.permission_rxs.lock().await.insert(thread_id.clone(), rx);
+            }
+            if let Some(evicted_tid) = result.evicted_thread_id {
+                data.permission_rxs.lock().await.remove(&evicted_tid);
+                data.session_skills.lock().await.remove(&evicted_tid);
+                repository::update_session_status(db, &evicted_tid, "idle").await.ok();
+                if let Ok(id) = evicted_tid.parse::<u64>() {
+                    ChannelId::new(id)
+                        .say(ctx, "-# ⚠️ 세션이 새 요청을 위해 정리되었습니다. 메시지를 보내면 자동으로 재개됩니다.")
+                        .await
+                        .ok();
+                }
+            }
         }
         Err(e) => {
             error!("Failed to get_or_create session for thread {}: {}", thread_id, e);

@@ -1,4 +1,5 @@
 use poise::serenity_prelude as serenity;
+use std::time::Duration;
 
 use crate::{Context, Error};
 use crate::db::repository;
@@ -61,6 +62,64 @@ fn format_relative(dt_str: &str) -> String {
     } else {
         format!("{}d ago", diff / 86400)
     }
+}
+
+fn format_idle_duration(d: Duration) -> String {
+    let secs = d.as_secs();
+    if secs < 60 {
+        format!("idle {}s", secs)
+    } else if secs < 3600 {
+        format!("idle {}m", secs / 60)
+    } else {
+        format!("idle {}h{}m", secs / 3600, (secs % 3600) / 60)
+    }
+}
+
+/// 전역 세션 현황 조회
+#[poise::command(slash_command, guild_only, owners_only)]
+pub async fn sessions(ctx: Context<'_>) -> Result<(), Error> {
+    let data = ctx.data();
+    let infos = data.sessions.get_session_info().await;
+    let max_sessions = data.config.claude.max_sessions;
+
+    if infos.is_empty() {
+        ctx.send(
+            poise::CreateReply::default()
+                .ephemeral(true)
+                .content(format!("📊 Active Sessions (0/{})\n활성 세션 없음", max_sessions)),
+        )
+        .await?;
+        return Ok(());
+    }
+
+    let idle_timeout = Duration::from_secs(data.config.claude.idle_timeout_secs);
+    let mut lines = vec![format!("📊 Active Sessions ({}/{})", infos.len(), max_sessions)];
+
+    for info in &infos {
+        let status = if info.is_turn_active {
+            "🔄 running".to_string()
+        } else {
+            format_idle_duration(info.idle_duration)
+        };
+        let bg = if info.has_bg_tasks { " — bg tasks" } else { "" };
+        let warn = if !info.is_turn_active
+            && idle_timeout.as_secs() > 0
+            && info.idle_duration > idle_timeout * 80 / 100
+        {
+            " ⚠️"
+        } else {
+            ""
+        };
+        lines.push(format!("• <#{}> — {}{}{}", info.thread_id, status, bg, warn));
+    }
+
+    ctx.send(
+        poise::CreateReply::default()
+            .ephemeral(true)
+            .content(lines.join("\n")),
+    )
+    .await?;
+    Ok(())
 }
 
 #[poise::command(slash_command, guild_only, owners_only)]
@@ -214,4 +273,29 @@ pub async fn status(
     ctx.send(reply).await?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn format_idle_seconds() {
+        assert_eq!(format_idle_duration(Duration::from_secs(30)), "idle 30s");
+    }
+
+    #[test]
+    fn format_idle_minutes() {
+        assert_eq!(format_idle_duration(Duration::from_secs(150)), "idle 2m");
+    }
+
+    #[test]
+    fn format_idle_hours() {
+        assert_eq!(format_idle_duration(Duration::from_secs(7200)), "idle 2h0m");
+    }
+
+    #[test]
+    fn format_idle_hours_minutes() {
+        assert_eq!(format_idle_duration(Duration::from_secs(5430)), "idle 1h30m");
+    }
 }

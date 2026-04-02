@@ -8,6 +8,7 @@ pub fn all_commands() -> Vec<poise::Command<Data, Error>> {
     vec![
         register::register(),
         register::unregister(),
+        session::sessions(),
         session::list(),
         session::del(),
         session::status(),

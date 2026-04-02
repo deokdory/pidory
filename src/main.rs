@@ -141,6 +141,40 @@ async fn main() -> Result<(), PidoryError> {
                     });
                 }
 
+                // Idle session TTL sweep
+                {
+                    let sessions = Arc::clone(&sessions);
+                    let idle_timeout = std::time::Duration::from_secs(config.claude.idle_timeout_secs);
+                    let permission_rxs = Arc::clone(&permission_rxs);
+                    let session_skills = Arc::clone(&session_skills);
+                    let db_clone = db.clone();
+                    let mut ctx_rx = ctx_tx.subscribe();
+                    tokio::spawn(async move {
+                        let mut interval = tokio::time::interval(std::time::Duration::from_secs(300));
+                        loop {
+                            interval.tick().await;
+                            let evicted = sessions.sweep_idle_sessions(idle_timeout).await;
+                            if evicted.is_empty() {
+                                continue;
+                            }
+                            tracing::info!("TTL sweep: evicted {} sessions", evicted.len());
+                            for tid in &evicted {
+                                permission_rxs.lock().await.remove(tid);
+                                session_skills.lock().await.remove(tid);
+                                db::repository::update_session_status(&db_clone, tid, "idle").await.ok();
+                                if let Ok(channel_id) = tid.parse::<u64>() {
+                                    ctx_rx.mark_changed();
+                                    let ctx = ctx_rx.borrow_and_update().clone();
+                                    poise::serenity_prelude::ChannelId::new(channel_id)
+                                        .say(&ctx, "-# ⏰ 세션이 비활성으로 정리되었습니다. 메시지를 보내면 자동으로 재개됩니다.")
+                                        .await
+                                        .ok();
+                                }
+                            }
+                        }
+                    });
+                }
+
                 Ok(Data {
                     config,
                     db,
