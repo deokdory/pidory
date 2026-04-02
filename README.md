@@ -16,6 +16,8 @@ Discord ↔ Claude Code CLI bridge. Send messages in a Discord thread and get Cl
 - Real-time intermediate status display
 - Code block-aware message splitting for Discord's 2000 char limit
 - Rate limit monitoring — bot presence shows current usage %, with configurable threshold alerts
+- Session lifecycle management — LRU auto-eviction when max sessions reached, idle timeout cleanup
+- Streaming messages sent without push notifications to reduce spam
 
 ## Prerequisites
 
@@ -104,6 +106,7 @@ All commands are owner-only (restricted to the `owner_id` set in `config.toml`).
 | `/stop` | Stop the current session's Claude Code process |
 | `/status [thread_id]` | Show session status (defaults to current thread) |
 | `/skill <name>` | Send a slash command (e.g. `/commit`) to the Claude Code session |
+| /sessions | Show global session overview (count, idle time, status) |
 
 ### Chatting with Claude Code
 
@@ -127,6 +130,7 @@ All commands are owner-only (restricted to the `owner_id` set in `config.toml`).
 | `claude.default_disallowed_tools` | Tools to block by default | `[]` |
 | `claude.subprocess_timeout_secs` | Max time per Claude Code subprocess | `600` |
 | `claude.max_sessions` | Max concurrent sessions | `10` |
+| `claude.idle_timeout_secs` | Idle session timeout in seconds (0 to disable) | `7200` |
 | `discord.notification_channel_id` | Channel ID for rate limit alerts (optional) | — |
 | `response.max_chunk_length` | Max characters per Discord message | `1900` |
 | `response.max_chunks` | Chunks before falling back to file attachment | `10` |
