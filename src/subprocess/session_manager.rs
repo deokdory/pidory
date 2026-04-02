@@ -794,15 +794,15 @@ impl SessionManager {
                                         }
                                         let _ = stdin.flush().await;
 
-                                        // 짧은 재대기 (timeout_secs / 5, 최소 60초)
-                                        let retry_secs = (timeout_secs / 5).max(60);
-                                        timeout_deadline = tokio::time::Instant::now() + Duration::from_secs(retry_secs);
-
-                                        // Discord 알림
+                                        // Discord 알림 (deadline 설정 전에 처리 — API 지연이 retry window를 잠식하지 않도록)
                                         channel_id_for_worker.say(
                                             &ctx_for_worker,
                                             "-# ⚠️ 장시간 무응답 — 확인 메시지를 전송했습니다"
                                         ).await.ok();
+
+                                        // 짧은 재대기 (timeout_secs / 5, 최소 60초)
+                                        let retry_secs = (timeout_secs / 5).max(60);
+                                        timeout_deadline = tokio::time::Instant::now() + Duration::from_secs(retry_secs);
 
                                         continue 'turn;
                                     } else {
