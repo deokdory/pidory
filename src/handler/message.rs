@@ -231,6 +231,7 @@ async fn handle_message(
         data.pending_permissions.clone(),
         data.config.discord.owner_id,
         data.session_skills.clone(),
+        data.config.ratelimit.file_path.as_deref(),
     )
     .await;
 
@@ -334,6 +335,7 @@ pub async fn process_turn_events(
     pending_permissions: std::sync::Arc<tokio::sync::Mutex<HashMap<String, PendingPermission>>>,
     owner_id: u64,
     session_skills: std::sync::Arc<tokio::sync::Mutex<HashMap<String, Vec<String>>>>,
+    ratelimit_file: Option<&str>,
 ) -> Option<mpsc::Receiver<PermissionRequest>> {
     // 1. typing indicator task 시작
     let cancel = CancellationToken::new();
@@ -542,7 +544,7 @@ pub async fn process_turn_events(
             .await
             .ok();
         if let Some(error_text) = error_msgs.first() {
-            channel_id.say(ctx, &format!("-# <@{}> ❌ {}", owner_id, error_text)).await.ok();
+            channel_id.say(ctx, &format!("-# ❌ {} <@{}>", error_text, owner_id)).await.ok();
         }
         emoji::set_reaction(ctx, channel_id, msg_id, ReactionStatus::Error)
             .await
@@ -551,7 +553,7 @@ pub async fn process_turn_events(
         repository::update_session_status(db, thread_id, "error")
             .await
             .ok();
-        channel_id.say(ctx, &format!("-# <@{}> ❌ 프로세스가 비정상 종료되었습니다", owner_id)).await.ok();
+        channel_id.say(ctx, &format!("-# ❌ 프로세스가 비정상 종료되었습니다 <@{}>", owner_id)).await.ok();
         emoji::set_reaction(ctx, channel_id, msg_id, ReactionStatus::Error)
             .await
             .ok();
@@ -566,11 +568,12 @@ pub async fn process_turn_events(
         }).unwrap_or(0);
 
         let duration = formatter::format_duration(duration_ms);
+        let ctx_suffix = format_ctx_suffix(ratelimit_file);
         let summary = if used_tools.is_empty() {
-            format!("-# <@{}> ✅ {}", owner_id, duration)
+            format!("-# ✅ {}{} <@{}>", duration, ctx_suffix, owner_id)
         } else {
             used_tools.dedup();
-            format!("-# <@{}> 🔧 {} — {}", owner_id, used_tools.join(", "), duration)
+            format!("-# 🔧 {} — {}{} <@{}>", used_tools.join(", "), duration, ctx_suffix, owner_id)
         };
         repository::update_session_status(db, thread_id, "idle")
             .await
@@ -604,7 +607,7 @@ pub async fn process_turn_events(
         // 완료 알림 (mention)
         if !is_interrupted {
             if has_cli_error || !got_result || !send_ok {
-                channel_id.say(ctx, &format!("-# <@{}> ❌ 에러 발생", owner_id)).await.ok();
+                channel_id.say(ctx, &format!("-# ❌ 에러 발생 <@{}>", owner_id)).await.ok();
             } else {
                 let duration_ms = events.iter().find_map(|e| {
                     if let StreamEvent::Result { duration_ms, .. } = e {
@@ -614,12 +617,21 @@ pub async fn process_turn_events(
                     }
                 }).unwrap_or(0);
                 let duration = formatter::format_duration(duration_ms);
-                channel_id.say(ctx, &format!("-# <@{}> ✅ {}", owner_id, duration)).await.ok();
+                let ctx_suffix = format_ctx_suffix(ratelimit_file);
+                channel_id.say(ctx, &format!("-# ✅ {}{} <@{}>", duration, ctx_suffix, owner_id)).await.ok();
             }
         }
     }
 
     permission_rx
+}
+
+fn format_ctx_suffix(ratelimit_file: Option<&str>) -> String {
+    ratelimit_file
+        .and_then(crate::ratelimit::read_ratelimit_file)
+        .and_then(|info| info.context_percent)
+        .map(|pct| format!(" ctx:{}%", pct))
+        .unwrap_or_default()
 }
 
 pub async fn execute_in_session(
@@ -683,6 +695,7 @@ pub async fn execute_in_session(
         data.pending_permissions.clone(),
         data.config.discord.owner_id,
         data.session_skills.clone(),
+        data.config.ratelimit.file_path.as_deref(),
     )
     .await;
 

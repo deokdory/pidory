@@ -8,6 +8,8 @@ pub struct RateLimitInfo {
     pub seven_day_pct: u8,
     pub five_hour_reset: u64,
     pub seven_day_reset: u64,
+    #[serde(default)]
+    pub context_percent: Option<u8>,
     pub updated_at: u64,
 }
 
@@ -126,6 +128,7 @@ mod tests {
             seven_day_pct,
             five_hour_reset,
             seven_day_reset: 456,
+            context_percent: None,
             updated_at: 789,
         }
     }
@@ -138,7 +141,7 @@ mod tests {
         let mut f = std::fs::File::create(&path).unwrap();
         write!(
             f,
-            r#"{{"five_hour_pct":42,"seven_day_pct":38,"five_hour_reset":123,"seven_day_reset":456,"updated_at":789}}"#
+            r#"{{"five_hour_pct":42,"seven_day_pct":38,"five_hour_reset":123,"seven_day_reset":456,"context_percent":45,"updated_at":789}}"#
         )
         .unwrap();
 
@@ -149,7 +152,48 @@ mod tests {
         assert_eq!(info.seven_day_pct, 38);
         assert_eq!(info.five_hour_reset, 123);
         assert_eq!(info.seven_day_reset, 456);
+        assert_eq!(info.context_percent, Some(45));
         assert_eq!(info.updated_at, 789);
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn test_read_file_without_context_percent() {
+        let dir = std::env::temp_dir().join("pidory_test_ratelimit_no_ctx");
+        std::fs::create_dir_all(&dir).ok();
+        let path = dir.join("ratelimit.json");
+        let mut f = std::fs::File::create(&path).unwrap();
+        write!(
+            f,
+            r#"{{"five_hour_pct":42,"seven_day_pct":38,"five_hour_reset":123,"seven_day_reset":456,"updated_at":789}}"#
+        )
+        .unwrap();
+
+        let result = read_ratelimit_file(path.to_str().unwrap());
+        assert!(result.is_some());
+        let info = result.unwrap();
+        assert_eq!(info.context_percent, None);
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn test_read_file_with_null_context_percent() {
+        let dir = std::env::temp_dir().join("pidory_test_ratelimit_null_ctx");
+        std::fs::create_dir_all(&dir).ok();
+        let path = dir.join("ratelimit.json");
+        let mut f = std::fs::File::create(&path).unwrap();
+        write!(
+            f,
+            r#"{{"five_hour_pct":42,"seven_day_pct":38,"five_hour_reset":123,"seven_day_reset":456,"context_percent":null,"updated_at":789}}"#
+        )
+        .unwrap();
+
+        let result = read_ratelimit_file(path.to_str().unwrap());
+        assert!(result.is_some());
+        let info = result.unwrap();
+        assert_eq!(info.context_percent, None);
 
         std::fs::remove_file(&path).ok();
     }
@@ -187,6 +231,7 @@ mod tests {
             seven_day_pct: 38,
             five_hour_reset: future_reset,
             seven_day_reset: 456,
+            context_percent: Some(45),
             updated_at: 789,
         };
         let s = RateLimitMonitor::format_presence(&info);
