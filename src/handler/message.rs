@@ -140,7 +140,9 @@ async fn handle_message(
             if let Some(evicted_tid) = result.evicted_thread_id {
                 data.permission_rxs.lock().await.remove(&evicted_tid);
                 data.session_skills.lock().await.remove(&evicted_tid);
-                repository::update_session_status(db, &evicted_tid, "idle").await.ok();
+                if let Err(e) = repository::update_session_status(db, &evicted_tid, "idle").await {
+                    tracing::warn!("Failed to update session status for evicted thread {}: {}", evicted_tid, e);
+                }
                 if let Ok(id) = evicted_tid.parse::<u64>() {
                     ChannelId::new(id)
                         .say(ctx, format!("-# ⚠️ {}", lang.session_evicted()))
