@@ -80,11 +80,12 @@ pub async fn skill(
     let channel_id = ctx.channel_id();
     let thread_id = channel_id.to_string();
     let data = ctx.data();
+    let lang = data.config.language;
     let serenity_ctx = ctx.serenity_context();
 
     // 세션 존재 확인
     if !data.sessions.session_exists(&thread_id).await {
-        ctx.say("❌ 이 스레드에 활성 세션이 없습니다").await?;
+        ctx.say(format!("❌ {}", lang.no_session_in_thread())).await?;
         return Ok(());
     }
 
