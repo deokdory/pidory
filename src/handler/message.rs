@@ -140,7 +140,9 @@ async fn handle_message(
             if let Some(evicted_tid) = result.evicted_thread_id {
                 data.permission_rxs.lock().await.remove(&evicted_tid);
                 data.session_skills.lock().await.remove(&evicted_tid);
-                repository::update_session_status(db, &evicted_tid, "idle").await.ok();
+                if let Err(e) = repository::update_session_status(db, &evicted_tid, "idle").await {
+                    tracing::warn!("Failed to update session status for evicted thread {}: {}", evicted_tid, e);
+                }
                 if let Ok(id) = evicted_tid.parse::<u64>() {
                     ChannelId::new(id)
                         .say(ctx, format!("-# ⚠️ {}", lang.session_evicted()))
@@ -514,31 +516,31 @@ pub async fn process_turn_events(
     // 7. 최종 처리
     if fast_complete {
         if is_interrupted {
-            repository::update_session_status(db, thread_id, "idle")
-                .await
-                .ok();
+            if let Err(e) = repository::update_session_status(db, thread_id, "idle").await {
+                tracing::warn!("Failed to update session status for thread {}: {}", thread_id, e);
+            }
             emoji::set_reaction(ctx, channel_id, msg_id, ReactionStatus::Interrupted)
                 .await
                 .ok();
         } else if has_cli_error || !got_result {
-            repository::update_session_status(db, thread_id, "error")
-                .await
-                .ok();
+            if let Err(e) = repository::update_session_status(db, thread_id, "error").await {
+                tracing::warn!("Failed to update session status for thread {}: {}", thread_id, e);
+            }
             emoji::set_reaction(ctx, channel_id, msg_id, ReactionStatus::Error)
                 .await
                 .ok();
         } else {
-            repository::update_session_status(db, thread_id, "idle")
-                .await
-                .ok();
+            if let Err(e) = repository::update_session_status(db, thread_id, "idle").await {
+                tracing::warn!("Failed to update session status for thread {}: {}", thread_id, e);
+            }
             emoji::set_reaction(ctx, channel_id, msg_id, ReactionStatus::Done)
                 .await
                 .ok();
         }
     } else if is_interrupted {
-        repository::update_session_status(db, thread_id, "idle")
-            .await
-            .ok();
+        if let Err(e) = repository::update_session_status(db, thread_id, "idle").await {
+            tracing::warn!("Failed to update session status for thread {}: {}", thread_id, e);
+        }
         emoji::set_reaction(ctx, channel_id, msg_id, ReactionStatus::Interrupted)
             .await
             .ok();
@@ -557,9 +559,9 @@ pub async fn process_turn_events(
                 }
             })
             .collect();
-        repository::update_session_status(db, thread_id, "error")
-            .await
-            .ok();
+        if let Err(e) = repository::update_session_status(db, thread_id, "error").await {
+            tracing::warn!("Failed to update session status for thread {}: {}", thread_id, e);
+        }
         if let Some(error_text) = error_msgs.first() {
             channel_id.say(ctx, &format!("-# ❌ {} <@{}>", error_text, owner_id)).await.ok();
         }
@@ -567,9 +569,9 @@ pub async fn process_turn_events(
             .await
             .ok();
     } else if !got_result {
-        repository::update_session_status(db, thread_id, "error")
-            .await
-            .ok();
+        if let Err(e) = repository::update_session_status(db, thread_id, "error").await {
+            tracing::warn!("Failed to update session status for thread {}: {}", thread_id, e);
+        }
         channel_id.say(ctx, &format!("-# ❌ {} <@{}>", lang.process_abnormal_exit(), owner_id)).await.ok();
         emoji::set_reaction(ctx, channel_id, msg_id, ReactionStatus::Error)
             .await
@@ -592,9 +594,9 @@ pub async fn process_turn_events(
             used_tools.dedup();
             format!("-# 🔧 {} — {}{} <@{}>", used_tools.join(", "), duration, ctx_suffix, owner_id)
         };
-        repository::update_session_status(db, thread_id, "idle")
-            .await
-            .ok();
+        if let Err(e) = repository::update_session_status(db, thread_id, "idle").await {
+            tracing::warn!("Failed to update session status for thread {}: {}", thread_id, e);
+        }
         channel_id.say(ctx, &summary).await.ok();
 
         emoji::set_reaction(ctx, channel_id, msg_id, ReactionStatus::Done)
@@ -602,7 +604,9 @@ pub async fn process_turn_events(
             .ok();
     }
 
-    repository::update_last_active(db, thread_id).await.ok();
+    if let Err(e) = repository::update_last_active(db, thread_id).await {
+        tracing::warn!("Failed to update last_active for thread {}: {}", thread_id, e);
+    }
 
     // 8. fast-complete path: 기존 format_response + send_response (한 메시지)
     if fast_complete {

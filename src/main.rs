@@ -164,7 +164,9 @@ async fn main() -> Result<(), PidoryError> {
                             for tid in &evicted {
                                 permission_rxs.lock().await.remove(tid);
                                 session_skills.lock().await.remove(tid);
-                                db::repository::update_session_status(&db_clone, tid, "idle").await.ok();
+                                if let Err(e) = db::repository::update_session_status(&db_clone, tid, "idle").await {
+                                    tracing::warn!("Failed to update session status for TTL sweep thread {}: {}", tid, e);
+                                }
                                 if let Ok(channel_id) = tid.parse::<u64>() {
                                     ctx_rx.mark_changed();
                                     let ctx = ctx_rx.borrow_and_update().clone();
