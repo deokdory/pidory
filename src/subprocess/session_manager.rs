@@ -1,7 +1,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::Mutex as StdMutex;
+use std::time::{Duration, Instant};
 
 use poise::serenity_prelude::{ChannelId, Context, MessageId};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -19,6 +20,11 @@ use super::background::BackgroundTaskTracker;
 use super::parser::{parse_line, StreamEvent, ContentBlock, build_control_response_allow, build_control_response_deny};
 use super::permission::{PermissionCache, PermissionDecision, PermissionRequest};
 
+pub struct SessionCreateResult {
+    pub permission_rx: Option<mpsc::Receiver<PermissionRequest>>,
+    pub evicted_thread_id: Option<String>,
+}
+
 pub struct QueuedMessage {
     pub content: String,
     pub channel_id: ChannelId,
@@ -33,6 +39,16 @@ struct SessionInner {
     worker_task: JoinHandle<()>,
     permission_tx: mpsc::Sender<PermissionRequest>,
     interrupt_tx: mpsc::Sender<()>,
+    last_activity: Arc<StdMutex<Instant>>,
+    has_active_bg_tasks: Arc<AtomicBool>,
+    is_turn_active: Arc<AtomicBool>,
+}
+
+pub struct SessionInfo {
+    pub thread_id: String,
+    pub idle_duration: Duration,
+    pub has_bg_tasks: bool,
+    pub is_turn_active: bool,
 }
 
 pub struct SessionManager {
@@ -60,18 +76,27 @@ impl SessionManager {
         ctx: Context,
         channel_id: ChannelId,
         db: sqlx::SqlitePool,
-    ) -> Result<Option<mpsc::Receiver<PermissionRequest>>, PidoryError> {
+    ) -> Result<SessionCreateResult, PidoryError> {
         let mut sessions = self.sessions.lock().await;
 
         if sessions.contains_key(thread_id) {
-            return Ok(None);
+            return Ok(SessionCreateResult { permission_rx: None, evicted_thread_id: None });
         }
 
+        let mut evicted_thread_id = None;
         if sessions.len() >= self.max_sessions {
-            return Err(PidoryError::Subprocess(format!(
-                "max sessions reached ({})",
-                self.max_sessions
-            )));
+            if let Some(evict_tid) = Self::find_evict_target(&sessions) {
+                tracing::info!(thread_id = %evict_tid, "Evicting idle session (LRU)");
+                if let Some(mut inner) = sessions.remove(&evict_tid) {
+                    inner.worker_task.abort();
+                    let _ = inner.child.kill().await;
+                }
+                evicted_thread_id = Some(evict_tid);
+            } else {
+                return Err(PidoryError::Subprocess(
+                    format!("all {} sessions are busy", self.max_sessions)
+                ));
+            }
         }
 
         let mut cmd = Command::new(&self.config.binary_path);
@@ -117,6 +142,10 @@ impl SessionManager {
         let (permission_tx, permission_rx) = mpsc::channel::<PermissionRequest>(8);
         let (interrupt_tx, mut interrupt_rx) = mpsc::channel::<()>(1);
 
+        let last_activity = Arc::new(StdMutex::new(Instant::now()));
+        let has_active_bg_tasks = Arc::new(AtomicBool::new(false));
+        let is_turn_active = Arc::new(AtomicBool::new(false));
+
         // Combined worker task: reads queue, writes stdin, reads stdout until result, streams events
         let queue_size_for_worker = Arc::clone(&queue_size);
         let timeout_secs = self.config.subprocess_timeout_secs;
@@ -126,6 +155,9 @@ impl SessionManager {
         let ctx_for_worker = ctx;
         let channel_id_for_worker = channel_id;
         let db_for_worker = db;
+        let last_activity_clone = Arc::clone(&last_activity);
+        let has_bg_tasks_clone = Arc::clone(&has_active_bg_tasks);
+        let is_turn_clone = Arc::clone(&is_turn_active);
         let worker_task = tokio::spawn(async move {
             let mut stdin = stdin;
             let mut reader = BufReader::new(stdout);
@@ -157,6 +189,7 @@ impl SessionManager {
                                 match parse_line(trimmed) {
                                     Ok(StreamEvent::TaskStarted { ref task_id, ref task_type, ref description, .. }) => {
                                         tracker.track_started(task_id, task_type, description);
+                                        has_bg_tasks_clone.store(tracker.has_active_tasks(), Ordering::Relaxed);
                                         tracing::info!("Background task started: {} ({})", task_id, task_type);
                                         let start_msg = format!("-# 🔔 Background task started: {}", description);
                                         channel_id_for_worker.say(&ctx_for_worker, &start_msg).await.ok();
@@ -168,6 +201,7 @@ impl SessionManager {
                                     }
                                     Ok(StreamEvent::TaskNotification { ref task_id, ref status, ref summary, .. }) => {
                                         tracker.track_completed(task_id);
+                                        has_bg_tasks_clone.store(tracker.has_active_tasks(), Ordering::Relaxed);
                                         let notify_msg = if status == "completed" {
                                             format!("-# 🔔 {}", summary)
                                         } else {
@@ -357,6 +391,7 @@ impl SessionManager {
                 };
 
                 queue_size_for_worker.fetch_sub(1, Ordering::Relaxed);
+                *last_activity_clone.lock().unwrap() = Instant::now();
 
                 let json_msg = serde_json::json!({
                     "type": "user",
@@ -380,6 +415,8 @@ impl SessionManager {
                 let Some(event_tx) = msg.event_tx else {
                     continue;
                 };
+
+                is_turn_clone.store(true, Ordering::Relaxed);
 
                 // primary 메시지: result까지 stdout 읽기 + mid-turn inject 동시 처리
                 let mut timeout_deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
@@ -410,6 +447,7 @@ impl SessionManager {
                             match new_msg {
                                 Some(m) => {
                                     queue_size_for_worker.fetch_sub(1, Ordering::Relaxed);
+                                    *last_activity_clone.lock().unwrap() = Instant::now();
                                     let inject_json = serde_json::json!({
                                         "type": "user",
                                         "message": {
@@ -454,6 +492,7 @@ impl SessionManager {
                                             match &event {
                                                 StreamEvent::TaskStarted { task_id, task_type, description, .. } => {
                                                     tracker.track_started(task_id, task_type, description);
+                                                    has_bg_tasks_clone.store(tracker.has_active_tasks(), Ordering::Relaxed);
                                                     let start_msg = format!("-# 🔔 Background task started: {}", description);
                                                     channel_id_for_worker.say(&ctx_for_worker, &start_msg).await.ok();
                                                     continue 'turn;
@@ -464,6 +503,7 @@ impl SessionManager {
                                                 }
                                                 StreamEvent::TaskNotification { task_id, status, summary, .. } => {
                                                     tracker.track_completed(task_id);
+                                                    has_bg_tasks_clone.store(tracker.has_active_tasks(), Ordering::Relaxed);
                                                     let notify_msg = if status == "completed" {
                                                         format!("-# 🔔 {}", summary)
                                                     } else {
@@ -715,6 +755,8 @@ impl SessionManager {
                                             let is_result = event.is_result();
                                             let _ = event_tx.send(event).await;
                                             if is_result {
+                                                is_turn_clone.store(false, Ordering::Relaxed);
+                                                *last_activity_clone.lock().unwrap() = Instant::now();
                                                 break 'turn;
                                             }
                                         }
@@ -740,6 +782,8 @@ impl SessionManager {
                         }
                     }
                 }
+                // 'turn loop 종료 후 항상 리셋 (정상/비정상 모든 break 경로 커버)
+                is_turn_clone.store(false, Ordering::Relaxed);
                 // event_tx dropped → handler의 recv() returns None
             }
 
@@ -759,10 +803,23 @@ impl SessionManager {
                 worker_task,
                 permission_tx,
                 interrupt_tx,
+                last_activity,
+                has_active_bg_tasks,
+                is_turn_active,
             },
         );
 
-        Ok(Some(permission_rx))
+        Ok(SessionCreateResult { permission_rx: Some(permission_rx), evicted_thread_id })
+    }
+
+    fn find_evict_target(sessions: &HashMap<String, SessionInner>) -> Option<String> {
+        sessions.iter()
+            .filter(|(_, s)| {
+                !s.is_turn_active.load(Ordering::Relaxed)
+                && !s.has_active_bg_tasks.load(Ordering::Relaxed)
+            })
+            .min_by_key(|(_, s)| *s.last_activity.lock().unwrap())
+            .map(|(tid, _)| tid.clone())
     }
 
     pub async fn send_message(
@@ -828,5 +885,175 @@ impl SessionManager {
         inner.interrupt_tx.try_send(())
             .map_err(|_| PidoryError::Subprocess("interrupt send failed".to_string()))?;
         Ok(())
+    }
+
+    pub async fn get_session_info(&self) -> Vec<SessionInfo> {
+        let sessions = self.sessions.lock().await;
+        let now = Instant::now();
+        sessions.iter().map(|(tid, s)| {
+            SessionInfo {
+                thread_id: tid.clone(),
+                idle_duration: now.duration_since(*s.last_activity.lock().unwrap()),
+                has_bg_tasks: s.has_active_bg_tasks.load(Ordering::Relaxed),
+                is_turn_active: s.is_turn_active.load(Ordering::Relaxed),
+            }
+        }).collect()
+    }
+
+    pub async fn sweep_idle_sessions(&self, idle_timeout: Duration) -> Vec<String> {
+        if idle_timeout.is_zero() {
+            return Vec::new();
+        }
+        let mut sessions = self.sessions.lock().await;
+        let now = Instant::now();
+        let targets: Vec<String> = sessions.iter()
+            .filter(|(_, s)| {
+                !s.is_turn_active.load(Ordering::Relaxed)
+                && !s.has_active_bg_tasks.load(Ordering::Relaxed)
+                && now.duration_since(*s.last_activity.lock().unwrap()) > idle_timeout
+            })
+            .map(|(tid, _)| tid.clone())
+            .collect();
+
+        let mut evicted = Vec::new();
+        for tid in targets {
+            tracing::info!(thread_id = %tid, "Sweeping idle session (TTL expired)");
+            if let Some(mut inner) = sessions.remove(&tid) {
+                inner.worker_task.abort();
+                let _ = inner.child.kill().await;
+            }
+            evicted.push(tid);
+        }
+        evicted
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::{Duration, Instant};
+
+    struct MockSession {
+        last_activity: Instant,
+        is_turn_active: bool,
+        has_bg_tasks: bool,
+    }
+
+    fn find_evict_target_mock(sessions: &[(&str, MockSession)]) -> Option<String> {
+        sessions
+            .iter()
+            .filter(|(_, s)| !s.is_turn_active && !s.has_bg_tasks)
+            .min_by_key(|(_, s)| s.last_activity)
+            .map(|(tid, _)| tid.to_string())
+    }
+
+    #[test]
+    fn evict_oldest_idle_session() {
+        let now = Instant::now();
+        let sessions = vec![
+            (
+                "thread_a",
+                MockSession {
+                    last_activity: now - Duration::from_secs(100),
+                    is_turn_active: false,
+                    has_bg_tasks: false,
+                },
+            ),
+            (
+                "thread_b",
+                MockSession {
+                    last_activity: now - Duration::from_secs(200),
+                    is_turn_active: false,
+                    has_bg_tasks: false,
+                },
+            ),
+        ];
+        assert_eq!(
+            find_evict_target_mock(&sessions),
+            Some("thread_b".to_string())
+        );
+    }
+
+    #[test]
+    fn skip_turn_active_session() {
+        let now = Instant::now();
+        let sessions = vec![
+            (
+                "thread_a",
+                MockSession {
+                    last_activity: now - Duration::from_secs(200),
+                    is_turn_active: true,
+                    has_bg_tasks: false,
+                },
+            ),
+            (
+                "thread_b",
+                MockSession {
+                    last_activity: now - Duration::from_secs(100),
+                    is_turn_active: false,
+                    has_bg_tasks: false,
+                },
+            ),
+        ];
+        assert_eq!(
+            find_evict_target_mock(&sessions),
+            Some("thread_b".to_string())
+        );
+    }
+
+    #[test]
+    fn skip_bg_task_session() {
+        let now = Instant::now();
+        let sessions = vec![
+            (
+                "thread_a",
+                MockSession {
+                    last_activity: now - Duration::from_secs(200),
+                    is_turn_active: false,
+                    has_bg_tasks: true,
+                },
+            ),
+            (
+                "thread_b",
+                MockSession {
+                    last_activity: now - Duration::from_secs(100),
+                    is_turn_active: false,
+                    has_bg_tasks: false,
+                },
+            ),
+        ];
+        assert_eq!(
+            find_evict_target_mock(&sessions),
+            Some("thread_b".to_string())
+        );
+    }
+
+    #[test]
+    fn all_sessions_busy() {
+        let now = Instant::now();
+        let sessions = vec![
+            (
+                "thread_a",
+                MockSession {
+                    last_activity: now,
+                    is_turn_active: true,
+                    has_bg_tasks: false,
+                },
+            ),
+            (
+                "thread_b",
+                MockSession {
+                    last_activity: now,
+                    is_turn_active: false,
+                    has_bg_tasks: true,
+                },
+            ),
+        ];
+        assert_eq!(find_evict_target_mock(&sessions), None);
+    }
+
+    #[test]
+    fn empty_sessions() {
+        let sessions: Vec<(&str, MockSession)> = vec![];
+        assert_eq!(find_evict_target_mock(&sessions), None);
     }
 }
