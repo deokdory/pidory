@@ -916,12 +916,12 @@ impl SessionManager {
             )));
         }
 
-        inner.queue_size.fetch_add(1, Ordering::Relaxed);
-
         inner
             .queue_tx
             .try_send(msg)
             .map_err(|e| PidoryError::Subprocess(format!("queue send error: {}", e)))?;
+
+        inner.queue_size.fetch_add(1, Ordering::Relaxed);
 
         Ok(())
     }
