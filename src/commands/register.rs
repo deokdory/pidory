@@ -62,6 +62,17 @@ pub async fn unregister(ctx: Context<'_>) -> Result<(), Error> {
         return Ok(());
     }
 
+    // Clean up all sessions for this channel before removing the project
+    let sessions = repository::list_sessions_by_channel(&ctx.data().db, &channel_id).await?;
+    for session in &sessions {
+        if let Err(e) = ctx.data().sessions.kill_session(&session.thread_id).await {
+            tracing::warn!(thread_id = %session.thread_id, "Failed to kill session during unregister: {}", e);
+        }
+        ctx.data().session_skills.lock().await.remove(&session.thread_id);
+        ctx.data().permission_rxs.lock().await.remove(&session.thread_id);
+    }
+    repository::delete_sessions_by_channel(&ctx.data().db, &channel_id).await?;
+
     repository::unregister_project(&ctx.data().db, &channel_id).await?;
 
     let reply = poise::CreateReply::default()
