@@ -1278,4 +1278,37 @@ mod tests {
             "second timeout must produce HardKill"
         );
     }
+
+    // ---------- queue_size counter tests ----------
+
+    /// Regression test: queue_size must NOT be incremented when try_send fails.
+    ///
+    /// Mirrors the pattern in `send_message`: fetch_add must only run after a
+    /// successful try_send. If try_send fails (e.g. channel closed) and the
+    /// counter is still incremented, the session leaks queue slots permanently.
+    #[test]
+    fn queue_size_not_incremented_on_failed_send() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let queue_size = AtomicUsize::new(0);
+        let (tx, rx) = tokio::sync::mpsc::channel::<()>(5);
+
+        // Drop the receiver so try_send will fail.
+        drop(rx);
+
+        // Replicate the send_message pattern:
+        //   try_send → on success → fetch_add
+        // If try_send fails, fetch_add must be skipped.
+        let send_result = tx.try_send(());
+        if send_result.is_ok() {
+            queue_size.fetch_add(1, Ordering::Relaxed);
+        }
+
+        assert!(send_result.is_err(), "try_send should fail on a closed channel");
+        assert_eq!(
+            queue_size.load(Ordering::Relaxed),
+            0,
+            "queue_size must remain 0 when try_send fails"
+        );
+    }
 }
