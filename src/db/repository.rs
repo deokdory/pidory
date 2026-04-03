@@ -157,6 +157,19 @@ pub async fn delete_session(
     Ok(())
 }
 
+pub async fn delete_sessions_by_channel(
+    pool: &SqlitePool,
+    channel_id: &str,
+) -> Result<(), PidoryError> {
+    sqlx::query("DELETE FROM sessions WHERE channel_id = ?")
+        .bind(channel_id)
+        .execute(pool)
+        .await
+        .map_err(PidoryError::Db)?;
+
+    Ok(())
+}
+
 pub async fn try_acquire_session(
     pool: &SqlitePool,
     thread_id: &str,
