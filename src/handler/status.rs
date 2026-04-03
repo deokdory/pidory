@@ -50,7 +50,7 @@ impl StatusMessage {
     fn rebuild_text(&mut self) {
         loop {
             let text = build_text(&self.tool_history, self.lang);
-            if text.len() <= 2000 {
+            if text.chars().count() <= 2000 {
                 self.pending_text = text;
                 self.needs_update = true;
                 break;
