@@ -413,6 +413,22 @@ impl Lang {
         }
     }
 
+    // ── Timeout messages ──
+
+    pub fn soft_timeout_nudge(&self) -> &'static str {
+        match self {
+            Lang::Ko => "장시간 무응답 — 확인 메시지를 전송했습니다",
+            Lang::En => "No response for a while — sent a check message",
+        }
+    }
+
+    pub fn hard_timeout_kill(&self) -> &'static str {
+        match self {
+            Lang::Ko => "응답 시간 초과로 턴을 종료합니다. 다시 시도해 주세요.",
+            Lang::En => "Turn timed out. Please try again.",
+        }
+    }
+
     // ── Time formatting ──
 
     pub fn format_relative_time(&self, diff_secs: u64) -> String {
@@ -532,5 +548,20 @@ mod tests {
         let err = "timeout";
         assert!(Lang::Ko.session_create_failed(&err).contains("timeout"));
         assert!(Lang::En.session_create_failed(&err).contains("timeout"));
+    }
+
+    #[test]
+    fn timeout_messages_both_langs() {
+        // soft_timeout_nudge returns non-empty strings
+        assert!(!Lang::Ko.soft_timeout_nudge().is_empty());
+        assert!(!Lang::En.soft_timeout_nudge().is_empty());
+
+        // hard_timeout_kill returns non-empty strings
+        assert!(!Lang::Ko.hard_timeout_kill().is_empty());
+        assert!(!Lang::En.hard_timeout_kill().is_empty());
+
+        // Ko and En variants are different from each other
+        assert_ne!(Lang::Ko.soft_timeout_nudge(), Lang::En.soft_timeout_nudge());
+        assert_ne!(Lang::Ko.hard_timeout_kill(), Lang::En.hard_timeout_kill());
     }
 }
