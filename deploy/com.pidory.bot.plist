@@ -15,6 +15,8 @@
 
     <key>EnvironmentVariables</key>
     <dict>
+        <key>PATH</key>
+        <string>/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin:/opt/homebrew/bin:__HOME_DIR__/.local/bin:__HOME_DIR__/.cargo/bin</string>
         <key>PIDORY_CONFIG</key>
         <string>__PROJECT_DIR__/config.toml</string>
         <key>RUST_LOG</key>
