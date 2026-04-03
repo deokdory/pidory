@@ -103,16 +103,25 @@ pub fn split_message(text: &str, max_len: usize) -> Vec<String> {
         // Force-split if a single line caused current to exceed max_len
         if current.chars().count() > max_len {
             let chars: Vec<char> = current.chars().collect();
-            for chunk_chars in chars.chunks(max_len) {
-                let s: String = chunk_chars.iter().collect();
-                if !s.trim().is_empty() {
-                    chunks.push(s);
+            let chunk_iter: Vec<String> = chars.chunks(max_len)
+                .map(|c| c.iter().collect::<String>())
+                .filter(|s| !s.trim().is_empty())
+                .collect();
+
+            for (i, s) in chunk_iter.iter().enumerate() {
+                let mut chunk = s.clone();
+                // Close the code block in all but the last chunk
+                if in_code_block && i < chunk_iter.len() - 1 {
+                    chunk.push_str("\n```");
                 }
+                chunks.push(chunk);
             }
+
+            // Preserve code block state — do NOT reset in_code_block or code_lang
             current = String::new();
-            // Reset code block state tracking since we force-split
-            in_code_block = false;
-            code_lang = String::new();
+            if in_code_block {
+                current = format!("```{}\n", code_lang);
+            }
             continue;
         }
     }
@@ -140,7 +149,7 @@ mod tests {
         let text = "line1\nline2\nline3";
         let result = split_message(text, 10);
         for chunk in &result {
-            assert!(chunk.len() <= 12);
+            assert!(chunk.chars().count() <= 12);
         }
         let joined = result.join("\n");
         assert!(joined.contains("line1"));
@@ -167,6 +176,29 @@ mod tests {
         let result = split_message(text, 1000);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0], text);
+    }
+
+    #[test]
+    fn split_force_split_inside_code_block_preserves_fences() {
+        // A code block containing a line longer than max_len should be force-split
+        // such that every resulting chunk is valid Markdown (fences come in pairs).
+        let inner = "x".repeat(2500);
+        let text = format!("```rust\n{}\n```", inner);
+        let result = split_message(&text, 1900);
+
+        // Every chunk must have an even number of ``` occurrences
+        for (i, chunk) in result.iter().enumerate() {
+            let fence_count = chunk.matches("```").count();
+            assert_eq!(
+                fence_count % 2, 0,
+                "Chunk {} has unbalanced fences ({} fences): {:?}",
+                i, fence_count, &chunk[..chunk.len().min(80)]
+            );
+        }
+
+        // The total content must contain the language hint
+        let joined = result.join("\n");
+        assert!(joined.contains("rust"), "Language hint should be present in output");
     }
 
     #[test]
@@ -310,6 +342,10 @@ pub fn format_duration(ms: u64) -> String {
     }
 }
 
+/// Bash command max display length. Discord message limit (2000 chars) minus
+/// markdown overhead (~100 chars) for a safe margin.
+const BASH_COMMAND_DISPLAY_LIMIT: usize = 1800;
+
 pub fn format_tool_use(name: &str, input: &serde_json::Value) -> String {
     match name {
         "Bash" => {
@@ -317,8 +353,8 @@ pub fn format_tool_use(name: &str, input: &serde_json::Value) -> String {
                 .get("command")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
-            let display = if command.chars().count() > 1800 {
-                let s: String = command.chars().take(1800).collect();
+            let display = if command.chars().count() > BASH_COMMAND_DISPLAY_LIMIT {
+                let s: String = command.chars().take(BASH_COMMAND_DISPLAY_LIMIT).collect();
                 format!("{}…", s)
             } else {
                 command.to_string()
@@ -371,7 +407,7 @@ pub fn format_tool_result_with_name(result: &ToolResult, tool_name: Option<&str>
 
     const TRUNCATE_LEN: usize = 500;
 
-    let is_short = !result.content.contains('\n') && result.content.len() <= 200;
+    let is_short = !result.content.contains('\n') && result.content.chars().count() <= 200;
 
     if is_short {
         let prefix = if result.is_error { "❌ " } else { "" };
@@ -383,7 +419,7 @@ pub fn format_tool_result_with_name(result: &ToolResult, tool_name: Option<&str>
     let is_edit = tool_name == Some("Edit") || tool_name == Some("Write");
     let fence = if is_edit { "```diff" } else { "```" };
 
-    let body = if result.content.len() <= TRUNCATE_LEN {
+    let body = if result.content.chars().count() <= TRUNCATE_LEN {
         format!("{}\n{}\n```", fence, result.content)
     } else {
         let truncated: String = result.content.chars().take(TRUNCATE_LEN).collect();
