@@ -733,7 +733,7 @@ async fn say_silent(ctx: &Context, channel_id: ChannelId, content: impl Into<Str
         .content(content)
         .flags(MessageFlags::SUPPRESS_NOTIFICATIONS);
     if let Err(e) = channel_id.send_message(ctx, msg).await {
-        tracing::warn!("Failed to send message to Discord: {}", e);
+        tracing::warn!(%channel_id, "Failed to send message to Discord: {}", e);
     }
 }
 
@@ -762,7 +762,10 @@ async fn send_event_to_discord(
                             used_tools.push(name.clone());
                         }
                         let formatted = formatter::format_tool_use(name, input);
-                        say_silent(ctx, channel_id, formatted).await;
+                        let chunks = formatter::split_message(&formatted, max_chunk_length);
+                        for chunk in chunks {
+                            say_silent(ctx, channel_id, chunk).await;
+                        }
                     }
                     _ => {} // Thinking 또는 빈 Text — 무시
                 }
