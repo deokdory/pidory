@@ -21,13 +21,23 @@ if [ ! -f "$PROJECT_DIR/.env" ]; then
     echo "Create it with: echo 'PIDORY_DISCORD_TOKEN=your_token' > $PROJECT_DIR/.env"
 fi
 
-# 3. Copy config if not exists
+# 3. Copy config if not exists + detect claude CLI path
 if [ ! -f "$PROJECT_DIR/config.toml" ]; then
     echo "[3/4] Creating config.toml from example..."
     cp "$PROJECT_DIR/config.toml.example" "$PROJECT_DIR/config.toml"
     echo "IMPORTANT: Edit config.toml with your Discord guild_id and owner_id"
 else
     echo "[3/4] config.toml already exists, skipping"
+fi
+
+# Detect claude CLI absolute path and inject into config.toml
+CLAUDE_BIN="$(which claude 2>/dev/null || true)"
+if [ -n "$CLAUDE_BIN" ]; then
+    echo "     Detected claude CLI: $CLAUDE_BIN"
+    sed -i.bak "s|^binary_path = .*|binary_path = \"$CLAUDE_BIN\"|" "$PROJECT_DIR/config.toml"
+    rm -f "$PROJECT_DIR/config.toml.bak"
+else
+    echo "WARNING: claude CLI not found in PATH. Set binary_path in config.toml manually."
 fi
 
 # 4. Install service
