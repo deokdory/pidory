@@ -549,4 +549,19 @@ mod tests {
         assert!(Lang::Ko.session_create_failed(&err).contains("timeout"));
         assert!(Lang::En.session_create_failed(&err).contains("timeout"));
     }
+
+    #[test]
+    fn timeout_messages_both_langs() {
+        // soft_timeout_nudge returns non-empty strings
+        assert!(!Lang::Ko.soft_timeout_nudge().is_empty());
+        assert!(!Lang::En.soft_timeout_nudge().is_empty());
+
+        // hard_timeout_kill returns non-empty strings
+        assert!(!Lang::Ko.hard_timeout_kill().is_empty());
+        assert!(!Lang::En.hard_timeout_kill().is_empty());
+
+        // Ko and En variants are different from each other
+        assert_ne!(Lang::Ko.soft_timeout_nudge(), Lang::En.soft_timeout_nudge());
+        assert_ne!(Lang::Ko.hard_timeout_kill(), Lang::En.hard_timeout_kill());
+    }
 }

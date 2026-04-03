@@ -314,4 +314,31 @@ mod tests {
         let s = get_session_by_thread(&pool, "nonexistent").await.unwrap();
         assert!(s.is_none());
     }
+
+    #[tokio::test]
+    async fn delete_sessions_by_channel_test() {
+        let pool = setup_db().await;
+
+        // Register a project and create 2 sessions
+        register_project(&pool, "ch1", "/tmp/proj", None).await.unwrap();
+        create_session(&pool, "th1", "ch1").await.unwrap();
+        create_session(&pool, "th2", "ch1").await.unwrap();
+
+        // Verify both sessions exist
+        let sessions = list_sessions_by_channel(&pool, "ch1").await.unwrap();
+        assert_eq!(sessions.len(), 2);
+
+        // Delete all sessions for the channel
+        delete_sessions_by_channel(&pool, "ch1").await.unwrap();
+
+        // Both sessions should be deleted
+        let s1 = get_session_by_thread(&pool, "th1").await.unwrap();
+        assert!(s1.is_none());
+        let s2 = get_session_by_thread(&pool, "th2").await.unwrap();
+        assert!(s2.is_none());
+
+        // The project should still exist
+        let project = get_project_by_channel(&pool, "ch1").await.unwrap();
+        assert!(project.is_some());
+    }
 }
