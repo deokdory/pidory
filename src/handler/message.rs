@@ -415,7 +415,7 @@ pub async fn process_turn_events(
     if !fast_complete {
         // 버퍼링된 이벤트 먼저 전송
         for event in &events {
-            send_event_to_discord(ctx, channel_id, event, &mut tool_use_names, &mut used_tools, lang).await;
+            send_event_to_discord(ctx, channel_id, event, &mut tool_use_names, &mut used_tools, max_chunk_length, lang).await;
         }
 
         loop {
@@ -460,7 +460,7 @@ pub async fn process_turn_events(
             match stream_event {
                 Some(Ok(stream_event)) => {
                     typing_paused.store(false, Ordering::Relaxed);
-                    send_event_to_discord(ctx, channel_id, &stream_event, &mut tool_use_names, &mut used_tools, lang).await;
+                    send_event_to_discord(ctx, channel_id, &stream_event, &mut tool_use_names, &mut used_tools, max_chunk_length, lang).await;
 
                     if stream_event.is_result() {
                         got_result = true;
@@ -732,7 +732,9 @@ async fn say_silent(ctx: &Context, channel_id: ChannelId, content: impl Into<Str
     let msg = CreateMessage::new()
         .content(content)
         .flags(MessageFlags::SUPPRESS_NOTIFICATIONS);
-    channel_id.send_message(ctx, msg).await.ok();
+    if let Err(e) = channel_id.send_message(ctx, msg).await {
+        tracing::warn!("Failed to send message to Discord: {}", e);
+    }
 }
 
 async fn send_event_to_discord(
@@ -741,6 +743,7 @@ async fn send_event_to_discord(
     event: &StreamEvent,
     tool_use_names: &mut HashMap<String, String>,
     used_tools: &mut Vec<String>,
+    max_chunk_length: usize,
     lang: Lang,
 ) {
     match event {
@@ -748,7 +751,10 @@ async fn send_event_to_discord(
             for block in content {
                 match block {
                     ContentBlock::Text(text) if !text.trim().is_empty() => {
-                        say_silent(ctx, channel_id, text.clone()).await;
+                        let chunks = formatter::split_message(text, max_chunk_length);
+                        for chunk in chunks {
+                            say_silent(ctx, channel_id, chunk).await;
+                        }
                     }
                     ContentBlock::ToolUse { id, name, input } => {
                         tool_use_names.insert(id.clone(), name.clone());
