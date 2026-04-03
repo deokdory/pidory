@@ -33,6 +33,9 @@ pub fn format_response(events: &[StreamEvent], lang: Lang) -> String {
             StreamEvent::User { tool_results, .. } => {
                 for result in tool_results {
                     let tool_name = tool_use_names.get(&result.tool_use_id).map(|s| s.as_str());
+                    if matches!(tool_name, Some("Read" | "Grep" | "Glob")) && !result.is_error {
+                        continue;
+                    }
                     if let Some(formatted) = format_tool_result_with_name(result, tool_name, lang) {
                         parts.push(formatted);
                     }
@@ -53,7 +56,7 @@ pub fn format_response(events: &[StreamEvent], lang: Lang) -> String {
 }
 
 pub fn split_message(text: &str, max_len: usize) -> Vec<String> {
-    if text.len() <= max_len {
+    if text.chars().count() <= max_len {
         return vec![text.to_string()];
     }
 
@@ -71,7 +74,7 @@ pub fn split_message(text: &str, max_len: usize) -> Vec<String> {
         let will_toggle = is_fence;
 
         // Check if adding this line would exceed the limit
-        if current.len() + line_with_newline.len() > max_len && !current.is_empty() {
+        if current.chars().count() + line_with_newline.chars().count() > max_len && !current.is_empty() {
             if in_code_block && !is_fence {
                 // Close the open code block in the current chunk
                 current.push_str("```\n");
@@ -96,6 +99,22 @@ pub fn split_message(text: &str, max_len: usize) -> Vec<String> {
         }
 
         current.push_str(&line_with_newline);
+
+        // Force-split if a single line caused current to exceed max_len
+        if current.chars().count() > max_len {
+            let chars: Vec<char> = current.chars().collect();
+            for chunk_chars in chars.chunks(max_len) {
+                let s: String = chunk_chars.iter().collect();
+                if !s.trim().is_empty() {
+                    chunks.push(s);
+                }
+            }
+            current = String::new();
+            // Reset code block state tracking since we force-split
+            in_code_block = false;
+            code_lang = String::new();
+            continue;
+        }
     }
 
     if !current.trim().is_empty() {
@@ -232,7 +251,13 @@ pub fn format_tool_use(name: &str, input: &serde_json::Value) -> String {
                 .get("command")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
-            format!("-# 🔧 **Bash**\n```\n{}\n```", command)
+            let display = if command.chars().count() > 1800 {
+                let s: String = command.chars().take(1800).collect();
+                format!("{}…", s)
+            } else {
+                command.to_string()
+            };
+            format!("-# 🔧 **Bash**\n```\n{}\n```", display)
         }
         "Edit" => {
             let file_path = input
