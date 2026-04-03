@@ -413,6 +413,22 @@ impl Lang {
         }
     }
 
+    // ── Timeout messages ──
+
+    pub fn soft_timeout_nudge(&self) -> &'static str {
+        match self {
+            Lang::Ko => "장시간 무응답 — 확인 메시지를 전송했습니다",
+            Lang::En => "No response for a while — sent a check message",
+        }
+    }
+
+    pub fn hard_timeout_kill(&self) -> &'static str {
+        match self {
+            Lang::Ko => "응답 시간 초과로 턴을 종료합니다. 다시 시도해 주세요.",
+            Lang::En => "Turn timed out. Please try again.",
+        }
+    }
+
     // ── Time formatting ──
 
     pub fn format_relative_time(&self, diff_secs: u64) -> String {

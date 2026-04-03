@@ -826,7 +826,7 @@ impl SessionManager {
                                         // Discord 알림 (deadline 설정 전에 처리 — API 지연이 retry window를 잠식하지 않도록)
                                         channel_id_for_worker.say(
                                             &ctx_for_worker,
-                                            "-# ⚠️ 장시간 무응답 — 확인 메시지를 전송했습니다"
+                                            format!("-# ⚠️ {}", lang.soft_timeout_nudge())
                                         ).await.ok();
 
                                         // 짧은 재대기 (timeout_secs / 5, 최소 60초)
@@ -848,7 +848,7 @@ impl SessionManager {
                                         );
                                         channel_id_for_worker.say(
                                             &ctx_for_worker,
-                                            "⚠️ 응답 시간 초과로 턴을 종료합니다. 다시 시도해 주세요."
+                                            format!("⚠️ {}", lang.hard_timeout_kill())
                                         ).await.ok();
                                         break 'turn;
                                     }
