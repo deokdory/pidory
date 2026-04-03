@@ -230,6 +230,72 @@ mod tests {
         let result_en = format_tool_result_with_name(&tr, None, Lang::En).unwrap();
         assert!(result_en.contains("truncated"));
     }
+
+    #[test]
+    fn split_korean_multibyte_fits_in_char_limit() {
+        // 700 Korean characters = 2100 bytes, but only 700 chars — fits within 1900 char limit
+        let text: String = "가".repeat(700);
+        let result = split_message(&text, 1900);
+        assert_eq!(result.len(), 1, "700 Korean chars should fit in a single 1900-char chunk");
+    }
+
+    #[test]
+    fn split_single_long_line_exceeding_max_len() {
+        // A single line of 2500 chars with no newlines must be force-split
+        let text = "a".repeat(2500);
+        let result = split_message(&text, 1900);
+        assert_eq!(result.len(), 2, "2500-char line should split into exactly 2 chunks at 1900 limit");
+        for chunk in &result {
+            assert!(
+                chunk.chars().count() <= 1900,
+                "Each chunk must be within the 1900-char limit, got {} chars",
+                chunk.chars().count()
+            );
+        }
+    }
+
+    #[test]
+    fn format_tool_use_bash_truncates_long_command() {
+        let long_command = "x".repeat(2000);
+        let result = format_tool_use("Bash", &serde_json::json!({"command": long_command}));
+        assert!(
+            result.chars().count() <= 1900,
+            "Formatted Bash tool_use should fit within Discord limit, got {} chars",
+            result.chars().count()
+        );
+        assert!(result.contains("…"), "Truncated command should contain the ellipsis indicator");
+    }
+
+    #[test]
+    fn format_response_skips_read_grep_glob_results() {
+        use crate::subprocess::parser::{ContentBlock, StreamEvent, ToolResult};
+
+        let events = vec![
+            StreamEvent::Assistant {
+                content: vec![ContentBlock::ToolUse {
+                    id: "tool-1".into(),
+                    name: "Read".into(),
+                    input: serde_json::json!({"file_path": "/tmp/secret.txt"}),
+                }],
+                session_id: "s1".into(),
+            },
+            StreamEvent::User {
+                tool_results: vec![ToolResult {
+                    tool_use_id: "tool-1".into(),
+                    content: "file contents here".into(),
+                    is_error: false,
+                }],
+                session_id: "s1".into(),
+            },
+        ];
+
+        let result = format_response(&events, Lang::Ko);
+        assert!(
+            !result.contains("file contents here"),
+            "Successful Read tool results should be filtered out, but got: {}",
+            result
+        );
+    }
 }
 
 pub fn format_duration(ms: u64) -> String {
