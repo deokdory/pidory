@@ -169,11 +169,6 @@ async fn handle_message(
 
     let is_new_command = new_message.content.trim().eq_ignore_ascii_case("/new");
 
-    // /new 감지 → 다음 메시지에 context inject 예약
-    if is_new_command {
-        data.needs_context.lock().await.insert(thread_id.clone());
-    }
-
     // 원자적 acquire: running이 아닌 경우에만 running으로 전환
     let acquired = repository::try_acquire_session(db, &thread_id).await?;
 
@@ -188,6 +183,10 @@ async fn handle_message(
 
         match data.sessions.send_message(&thread_id, msg).await {
             Ok(()) => {
+                // /new가 성공적으로 큐잉된 후에만 flag 세팅
+                if is_new_command {
+                    data.needs_context.lock().await.insert(thread_id.clone());
+                }
                 let _ = channel_id
                     .create_reaction(
                         ctx,
@@ -246,6 +245,11 @@ async fn handle_message(
             .await
             .map_err(|e| PidoryError::Discord(Box::new(e)))?;
         return Ok(());
+    }
+
+    // /new가 성공적으로 전송된 후에만 flag 세팅
+    if is_new_command {
+        data.needs_context.lock().await.insert(thread_id.clone());
     }
 
     // permission_rx를 꺼내서 process_turn_events에 넘김 (turn 종료 후 다시 넣음)
@@ -685,9 +689,7 @@ pub async fn execute_in_session(
 ) -> Result<(), PidoryError> {
     let db = &data.db;
 
-    if content.trim().eq_ignore_ascii_case("/new") {
-        data.needs_context.lock().await.insert(thread_id.to_string());
-    }
+    let is_new_command = content.trim().eq_ignore_ascii_case("/new");
 
     let acquired = repository::try_acquire_session(db, thread_id).await?;
 
@@ -700,6 +702,9 @@ pub async fn execute_in_session(
             event_tx: None,
         };
         data.sessions.send_message(thread_id, msg).await?;
+        if is_new_command {
+            data.needs_context.lock().await.insert(thread_id.to_string());
+        }
         return Ok(());
     }
 
@@ -723,6 +728,10 @@ pub async fn execute_in_session(
             .ok();
         repository::update_session_status(db, thread_id, "error").await?;
         return Err(e);
+    }
+
+    if is_new_command {
+        data.needs_context.lock().await.insert(thread_id.to_string());
     }
 
     let permission_rx = data.permission_rxs.lock().await.remove(thread_id);
