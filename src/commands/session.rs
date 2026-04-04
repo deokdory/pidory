@@ -185,6 +185,7 @@ pub async fn del(
     let _ = ctx.data().sessions.kill_session(&tid).await;
     ctx.data().session_skills.lock().await.remove(&tid);
     ctx.data().permission_rxs.lock().await.remove(&tid);
+    ctx.data().needs_context.lock().await.remove(&tid);
 
     repository::delete_session(&ctx.data().db, &tid).await?;
 

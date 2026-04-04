@@ -95,10 +95,15 @@ async fn handle_message(
     let msg_id = new_message.id;
 
     // 세션 DB 확인/생성
+    let is_new_session;
     let session = match repository::get_session_by_thread(db, &thread_id).await? {
-        Some(s) => s,
+        Some(s) => {
+            is_new_session = false;
+            s
+        }
         None => {
             tracing::info!("Creating new session for thread {}", thread_id);
+            is_new_session = true;
             repository::create_session(db, &thread_id, &parent_channel_id).await?
         }
     };
@@ -140,6 +145,7 @@ async fn handle_message(
             if let Some(evicted_tid) = result.evicted_thread_id {
                 data.permission_rxs.lock().await.remove(&evicted_tid);
                 data.session_skills.lock().await.remove(&evicted_tid);
+                data.needs_context.lock().await.remove(&evicted_tid);
                 if let Err(e) = repository::update_session_status(db, &evicted_tid, "idle").await {
                     tracing::warn!("Failed to update session status for evicted thread {}: {}", evicted_tid, e);
                 }
@@ -161,11 +167,18 @@ async fn handle_message(
         }
     }
 
+    let is_new_command = new_message.content.trim().eq_ignore_ascii_case("/new");
+
+    // /new 감지 → 다음 메시지에 context inject 예약
+    if is_new_command {
+        data.needs_context.lock().await.insert(thread_id.clone());
+    }
+
     // 원자적 acquire: running이 아닌 경우에만 running으로 전환
     let acquired = repository::try_acquire_session(db, &thread_id).await?;
 
     if !acquired {
-        // mid-turn inject: event_tx 없이 전송
+        // mid-turn inject: event_tx 없이 전송 (context inject 안 함, needs_context 소비 안 함)
         let msg = QueuedMessage {
             content: new_message.content.clone(),
             channel_id,
@@ -202,14 +215,21 @@ async fn handle_message(
         return Ok(());
     }
 
-    // 직접 실행 경로
+    // 직접 실행 경로: context inject 판정 (primary 경로만)
+    let had_needs_context = if !is_new_command {
+        data.needs_context.lock().await.remove(&thread_id)
+    } else {
+        false
+    };
+    let content = build_context_content(&new_message.content, is_new_session, had_needs_context, &guild_channel.name, lang);
+
     emoji::set_reaction(ctx, channel_id, msg_id, ReactionStatus::Running)
         .await
         .ok();
 
     let (event_tx, event_rx) = mpsc::channel::<StreamEvent>(64);
     let msg = QueuedMessage {
-        content: new_message.content.clone(),
+        content: content.clone(),
         channel_id,
         message_id: msg_id,
         event_tx: Some(event_tx),
@@ -665,6 +685,10 @@ pub async fn execute_in_session(
 ) -> Result<(), PidoryError> {
     let db = &data.db;
 
+    if content.trim().eq_ignore_ascii_case("/new") {
+        data.needs_context.lock().await.insert(thread_id.to_string());
+    }
+
     let acquired = repository::try_acquire_session(db, thread_id).await?;
 
     if !acquired {
@@ -830,5 +854,61 @@ async fn handle_permission_request(
                 .response_tx
                 .send(PermissionDecision::Deny);
         }
+    }
+}
+
+/// 순수 함수: context inject 판정 및 content 생성
+fn build_context_content(
+    content: &str,
+    is_new_session: bool,
+    had_needs_context: bool,
+    thread_name: &str,
+    lang: Lang,
+) -> String {
+    let is_new_command = content.trim().eq_ignore_ascii_case("/new");
+    if !is_new_command && (is_new_session || had_needs_context) {
+        let context = lang.session_context(thread_name);
+        format!("{}\n\n{}", context, content)
+    } else {
+        content.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn inject_on_new_session() {
+        let result = build_context_content("안녕", true, false, "테스트 스레드", Lang::Ko);
+        assert!(result.contains("<system-reminder>"));
+        assert!(result.contains("테스트 스레드"));
+        assert!(result.ends_with("안녕"));
+    }
+
+    #[test]
+    fn inject_after_new_command() {
+        let result = build_context_content("작업 시작", false, true, "스레드", Lang::Ko);
+        assert!(result.contains("<system-reminder>"));
+    }
+
+    #[test]
+    fn no_inject_on_new_command() {
+        let result = build_context_content("/new", true, false, "스레드", Lang::Ko);
+        assert!(!result.contains("<system-reminder>"));
+        assert_eq!(result, "/new");
+    }
+
+    #[test]
+    fn no_inject_normal_message() {
+        let result = build_context_content("일반 메시지", false, false, "스레드", Lang::Ko);
+        assert!(!result.contains("<system-reminder>"));
+        assert_eq!(result, "일반 메시지");
+    }
+
+    #[test]
+    fn new_command_case_insensitive() {
+        let result = build_context_content("/New", true, false, "스레드", Lang::Ko);
+        assert!(!result.contains("<system-reminder>"));
     }
 }
