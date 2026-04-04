@@ -314,6 +314,8 @@ impl SessionManager {
                                                                             }
                                                                             let _ = stdin.flush().await;
                                                                         } else {
+                                                                            // permission 대기 중 idle eviction 방지
+                                                                            *last_activity_clone.lock().unwrap() = Instant::now();
                                                                             // perm sub-loop: oneshot 대기 + stdout/queue/interrupt 동시 처리
                                                                             'bgt_perm: loop {
                                                                                 line.clear();
@@ -546,6 +548,8 @@ impl SessionManager {
                                                 let _ = stdin.flush().await;
                                                 continue;
                                             }
+                                            // permission 대기 중 idle eviction 방지
+                                            *last_activity_clone.lock().unwrap() = Instant::now();
                                             // perm sub-loop: oneshot 대기 + stdout/queue/interrupt 동시 처리
                                             'bt_perm: loop {
                                                 line.clear();
@@ -871,6 +875,8 @@ impl SessionManager {
                                                             let _ = stdin.flush().await;
                                                             continue 'turn;
                                                         }
+                                                        // permission 대기 중 idle eviction 방지
+                                                        *last_activity_clone.lock().unwrap() = Instant::now();
                                                         // perm sub-loop: oneshot 대기 + stdout/queue/interrupt 동시 처리
                                                         'bgut_perm: loop {
                                                             line.clear();
