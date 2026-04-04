@@ -184,8 +184,8 @@ pub async fn del(
     // Kill session if running (ignore failure — process may have already exited)
     let _ = ctx.data().sessions.kill_session(&tid).await;
     ctx.data().session_skills.lock().await.remove(&tid);
-    ctx.data().permission_rxs.lock().await.remove(&tid);
     ctx.data().needs_context.lock().await.remove(&tid);
+    ctx.data().pending_permissions.lock().await.retain(|_, p| p.thread_id != tid);
 
     repository::delete_session(&ctx.data().db, &tid).await?;
 

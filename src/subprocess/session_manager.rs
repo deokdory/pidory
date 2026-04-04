@@ -22,7 +22,6 @@ use super::parser::{parse_line, StreamEvent, ContentBlock, build_control_respons
 use super::permission::{PermissionCache, PermissionDecision, PermissionRequest};
 
 pub struct SessionCreateResult {
-    pub permission_rx: Option<mpsc::Receiver<PermissionRequest>>,
     pub evicted_thread_id: Option<String>,
 }
 
@@ -38,6 +37,7 @@ struct SessionInner {
     queue_tx: mpsc::Sender<QueuedMessage>,
     queue_size: Arc<AtomicUsize>,
     worker_task: JoinHandle<()>,
+    permission_handler: JoinHandle<()>,
     permission_tx: mpsc::Sender<PermissionRequest>,
     interrupt_tx: mpsc::Sender<()>,
     last_activity: Arc<StdMutex<Instant>>,
@@ -78,11 +78,13 @@ impl SessionManager {
         channel_id: ChannelId,
         db: sqlx::SqlitePool,
         lang: Lang,
+        pending_permissions: std::sync::Arc<tokio::sync::Mutex<std::collections::HashMap<String, crate::PendingPermission>>>,
+        owner_id: u64,
     ) -> Result<SessionCreateResult, PidoryError> {
         let mut sessions = self.sessions.lock().await;
 
         if sessions.contains_key(thread_id) {
-            return Ok(SessionCreateResult { permission_rx: None, evicted_thread_id: None });
+            return Ok(SessionCreateResult { evicted_thread_id: None });
         }
 
         let mut evicted_thread_id = None;
@@ -91,6 +93,7 @@ impl SessionManager {
                 tracing::info!(thread_id = %evict_tid, "Evicting idle session (LRU)");
                 if let Some(mut inner) = sessions.remove(&evict_tid) {
                     inner.worker_task.abort();
+                    inner.permission_handler.abort();
                     let _ = inner.child.kill().await;
                 }
                 evicted_thread_id = Some(evict_tid);
@@ -142,6 +145,15 @@ impl SessionManager {
         let (queue_tx, queue_rx) = mpsc::channel::<QueuedMessage>(5);
         let queue_size = Arc::new(AtomicUsize::new(0));
         let (permission_tx, permission_rx) = mpsc::channel::<PermissionRequest>(8);
+        let permission_handler = tokio::spawn(crate::subprocess::permission::run_permission_handler(
+            permission_rx,
+            ctx.clone(),
+            channel_id,
+            pending_permissions,
+            owner_id,
+            lang,
+            thread_id.to_string(),
+        ));
         let (interrupt_tx, mut interrupt_rx) = mpsc::channel::<()>(1);
 
         let last_activity = Arc::new(StdMutex::new(Instant::now()));
@@ -263,22 +275,169 @@ impl SessionManager {
                                                                         }
                                                                     }
                                                                 }
-                                                                Ok(StreamEvent::ControlRequest { ref request_id, ref tool_name, ref input, .. }) => {
-                                                                    let resp = if permission_cache.is_always_allowed(tool_name) {
-                                                                        build_control_response_allow(request_id, input)
+                                                                Ok(StreamEvent::ControlRequest { ref request_id, ref tool_name, ref tool_use_id, ref input, ref decision_reason, .. }) => {
+                                                                    if permission_cache.is_always_allowed(tool_name) {
+                                                                        let resp = build_control_response_allow(request_id, input);
+                                                                        if let Err(e) = stdin.write_all(resp.as_bytes()).await {
+                                                                            tracing::error!("stdin write error (bg turn): {}", e);
+                                                                            if let Err(e) = repository::update_session_status(&db_for_worker, &thread_id_for_worker, "idle").await {
+                                                                                tracing::warn!("Failed to update session status for thread {}: {}", thread_id_for_worker, e);
+                                                                            }
+                                                                            break 'bg_turn;
+                                                                        }
+                                                                        let _ = stdin.flush().await;
                                                                     } else {
-                                                                        let deny_msg = lang.bg_permission_denied(tool_name);
-                                                                        channel_id_for_worker.say(&ctx_for_worker, &deny_msg).await.ok();
-                                                                        build_control_response_deny(request_id, lang.bg_permission_deny_reason())
-                                                                    };
-                                                                    if let Err(e) = stdin.write_all(resp.as_bytes()).await {
-                                                                        tracing::error!("stdin write error (bg turn): {}", e);
-                                                                        if let Err(e) = repository::update_session_status(&db_for_worker, &thread_id_for_worker, "idle").await {
-                                                                tracing::warn!("Failed to update session status for thread {}: {}", thread_id_for_worker, e);
-                                                            }
-                                                                        break 'bg_turn;
+                                                                        // Discord 버튼으로 permission 요청
+                                                                        let saved_request_id = request_id.clone();
+                                                                        let saved_tool_name = tool_name.clone();
+                                                                        let saved_tool_use_id = tool_use_id.clone();
+                                                                        let saved_input = input.clone();
+                                                                        let saved_decision_reason = decision_reason.clone();
+                                                                        let (resp_tx, mut resp_rx) = tokio::sync::oneshot::channel();
+                                                                        let perm_req = PermissionRequest {
+                                                                            request_id: saved_request_id.clone(),
+                                                                            tool_name: saved_tool_name.clone(),
+                                                                            tool_use_id: saved_tool_use_id,
+                                                                            input: saved_input.clone(),
+                                                                            decision_reason: saved_decision_reason,
+                                                                            response_tx: resp_tx,
+                                                                        };
+                                                                        if permission_tx.send(perm_req).await.is_err() {
+                                                                            tracing::error!("permission_tx closed (bg turn), denying");
+                                                                            let resp = build_control_response_deny(&saved_request_id, "permission handler unavailable");
+                                                                            if let Err(e) = stdin.write_all(resp.as_bytes()).await {
+                                                                                tracing::error!("stdin write error: {}", e);
+                                                                                if let Err(e) = repository::update_session_status(&db_for_worker, &thread_id_for_worker, "idle").await {
+                                                                                    tracing::warn!("Failed to update session status: {}", e);
+                                                                                }
+                                                                                break 'bg_turn;
+                                                                            }
+                                                                            let _ = stdin.flush().await;
+                                                                        } else {
+                                                                            // perm sub-loop: oneshot 대기 + stdout/queue/interrupt 동시 처리
+                                                                            'bgt_perm: loop {
+                                                                                line.clear();
+                                                                                tokio::select! {
+                                                                                    decision = &mut resp_rx => {
+                                                                                        match decision {
+                                                                                            Ok(d) => {
+                                                                                                if let Err(e) = handle_permission_decision(d, &saved_request_id, &saved_tool_name, &saved_input, &mut stdin, &mut permission_cache).await {
+                                                                                                    tracing::error!("stdin write error (perm decision bg turn): {}", e);
+                                                                                                    if let Err(e) = repository::update_session_status(&db_for_worker, &thread_id_for_worker, "idle").await {
+                                                                                                        tracing::warn!("Failed to update session status: {}", e);
+                                                                                                    }
+                                                                                                    break 'bg_turn;
+                                                                                                }
+                                                                                            }
+                                                                                            Err(_) => {
+                                                                                                let resp = build_control_response_deny(&saved_request_id, "session terminated");
+                                                                                                if let Err(e) = stdin.write_all(resp.as_bytes()).await {
+                                                                                                    tracing::error!("stdin write error: {}", e);
+                                                                                                }
+                                                                                                let _ = stdin.flush().await;
+                                                                                            }
+                                                                                        }
+                                                                                        break 'bgt_perm;
+                                                                                    }
+                                                                                    read_result = reader.read_line(&mut line) => {
+                                                                                        match read_result {
+                                                                                            Ok(0) => {
+                                                                                                if let Err(e) = repository::update_session_status(&db_for_worker, &thread_id_for_worker, "idle").await {
+                                                                                                    tracing::warn!("Failed to update session status: {}", e);
+                                                                                                }
+                                                                                                break 'bg_turn;
+                                                                                            }
+                                                                                            Ok(_) => {
+                                                                                                let trimmed = line.trim_end();
+                                                                                                if !trimmed.is_empty() {
+                                                                                                    if let Ok(event) = parse_line(trimmed) {
+                                                                                                        match event {
+                                                                                                            StreamEvent::TaskStarted { ref task_id, ref task_type, ref description, .. } => {
+                                                                                                                tracker.track_started(task_id, task_type, description);
+                                                                                                                has_bg_tasks_clone.store(tracker.has_active_tasks(), Ordering::Relaxed);
+                                                                                                            }
+                                                                                                            StreamEvent::TaskProgress { ref task_id, ref description, .. } => {
+                                                                                                                tracker.track_progress(task_id, description);
+                                                                                                            }
+                                                                                                            StreamEvent::Result { .. } => {
+                                                                                                                if let Err(e) = repository::update_session_status(&db_for_worker, &thread_id_for_worker, "idle").await {
+                                                                                                                    tracing::warn!("Failed to update session status: {}", e);
+                                                                                                                }
+                                                                                                                break 'bg_turn;
+                                                                                                            }
+                                                                                                            _ => {
+                                                                                                                tracing::debug!("Event during bg-turn perm wait: {:?}", event);
+                                                                                                            }
+                                                                                                        }
+                                                                                                    }
+                                                                                                }
+                                                                                            }
+                                                                                            Err(e) => {
+                                                                                                tracing::error!("stdout read error during perm wait (bg turn): {}", e);
+                                                                                                if let Err(e) = repository::update_session_status(&db_for_worker, &thread_id_for_worker, "idle").await {
+                                                                                                    tracing::warn!("Failed to update session status: {}", e);
+                                                                                                }
+                                                                                                break 'bg_turn;
+                                                                                            }
+                                                                                        }
+                                                                                    }
+                                                                                    new_msg = queue_rx.recv() => {
+                                                                                        match new_msg {
+                                                                                            Some(m) => {
+                                                                                                queue_size_for_worker.fetch_sub(1, Ordering::Relaxed);
+                                                                                                let inject_json = serde_json::json!({
+                                                                                                    "type": "user",
+                                                                                                    "message": {
+                                                                                                        "role": "user",
+                                                                                                        "content": [{"type": "text", "text": m.content}]
+                                                                                                    }
+                                                                                                });
+                                                                                                let inject_line = format!("{}
+", inject_json);
+                                                                                                if let Err(e) = stdin.write_all(inject_line.as_bytes()).await {
+                                                                                                    tracing::error!("mid-turn stdin write error (perm wait bg turn): {}", e);
+                                                                                                    if let Err(e) = repository::update_session_status(&db_for_worker, &thread_id_for_worker, "idle").await {
+                                                                                                        tracing::warn!("Failed to update session status: {}", e);
+                                                                                                    }
+                                                                                                    break 'bg_turn;
+                                                                                                }
+                                                                                                let _ = stdin.flush().await;
+                                                                                            }
+                                                                                            None => {
+                                                                                                if let Err(e) = repository::update_session_status(&db_for_worker, &thread_id_for_worker, "idle").await {
+                                                                                                    tracing::warn!("Failed to update session status: {}", e);
+                                                                                                }
+                                                                                                break 'bg_turn;
+                                                                                            }
+                                                                                        }
+                                                                                    }
+                                                                                    _ = interrupt_rx.recv() => {
+                                                                                        let interrupt_msg = serde_json::json!({
+                                                                                            "type": "control_request",
+                                                                                            "request_id": format!("interrupt_{}", std::time::SystemTime::now()
+                                                                                                .duration_since(std::time::UNIX_EPOCH)
+                                                                                                .unwrap_or_default()
+                                                                                                .as_millis()),
+                                                                                            "request": {"subtype": "interrupt"}
+                                                                                        });
+                                                                                        let interrupt_line = format!("{}
+", interrupt_msg);
+                                                                                        if let Err(e) = stdin.write_all(interrupt_line.as_bytes()).await {
+                                                                                            tracing::error!("interrupt write error (bg turn perm wait): {}", e);
+                                                                                        } else {
+                                                                                            let _ = stdin.flush().await;
+                                                                                        }
+                                                                                        let resp = build_control_response_deny(&saved_request_id, "interrupted");
+                                                                                        if let Err(e) = stdin.write_all(resp.as_bytes()).await {
+                                                                                            tracing::error!("stdin write error (interrupt perm wait bg turn): {}", e);
+                                                                                        }
+                                                                                        let _ = stdin.flush().await;
+                                                                                        break 'bgt_perm;
+                                                                                    }
+                                                                                }
+                                                                            }
+                                                                        }
                                                                     }
-                                                                    let _ = stdin.flush().await;
                                                                 }
                                                                 Ok(StreamEvent::TaskStarted { ref task_id, ref task_type, ref description, .. }) => {
                                                                     tracker.track_started(task_id, task_type, description);
@@ -353,19 +512,124 @@ impl SessionManager {
 
                                         continue;
                                     }
-                                    Ok(StreamEvent::ControlRequest { ref request_id, ref tool_name, ref input, .. }) => {
-                                        let resp = if permission_cache.is_always_allowed(tool_name) {
-                                            build_control_response_allow(request_id, input)
+                                    Ok(StreamEvent::ControlRequest { ref request_id, ref tool_name, ref tool_use_id, ref input, ref decision_reason, .. }) => {
+                                        if permission_cache.is_always_allowed(tool_name) {
+                                            let resp = build_control_response_allow(request_id, input);
+                                            if let Err(e) = stdin.write_all(resp.as_bytes()).await {
+                                                tracing::error!("stdin write error (between turns): {}", e);
+                                                break;
+                                            }
+                                            let _ = stdin.flush().await;
                                         } else {
-                                            let deny_msg = lang.bg_permission_denied(tool_name);
-                                            channel_id_for_worker.say(&ctx_for_worker, &deny_msg).await.ok();
-                                            build_control_response_deny(request_id, lang.bg_permission_deny_reason())
-                                        };
-                                        if let Err(e) = stdin.write_all(resp.as_bytes()).await {
-                                            tracing::error!("stdin write error (between turns): {}", e);
-                                            break;
+                                            // Discord 버튼으로 permission 요청
+                                            let saved_request_id = request_id.clone();
+                                            let saved_tool_name = tool_name.clone();
+                                            let saved_tool_use_id = tool_use_id.clone();
+                                            let saved_input = input.clone();
+                                            let saved_decision_reason = decision_reason.clone();
+                                            let (resp_tx, mut resp_rx) = tokio::sync::oneshot::channel();
+                                            let perm_req = PermissionRequest {
+                                                request_id: saved_request_id.clone(),
+                                                tool_name: saved_tool_name.clone(),
+                                                tool_use_id: saved_tool_use_id,
+                                                input: saved_input.clone(),
+                                                decision_reason: saved_decision_reason,
+                                                response_tx: resp_tx,
+                                            };
+                                            if permission_tx.send(perm_req).await.is_err() {
+                                                tracing::error!("permission_tx closed (between turns), denying");
+                                                let resp = build_control_response_deny(&saved_request_id, "permission handler unavailable");
+                                                if let Err(e) = stdin.write_all(resp.as_bytes()).await {
+                                                    tracing::error!("stdin write error: {}", e);
+                                                    break;
+                                                }
+                                                let _ = stdin.flush().await;
+                                                continue;
+                                            }
+                                            // perm sub-loop: oneshot 대기 + stdout/queue/interrupt 동시 처리
+                                            'bt_perm: loop {
+                                                line.clear();
+                                                tokio::select! {
+                                                    decision = &mut resp_rx => {
+                                                        match decision {
+                                                            Ok(d) => {
+                                                                if let Err(e) = handle_permission_decision(d, &saved_request_id, &saved_tool_name, &saved_input, &mut stdin, &mut permission_cache).await {
+                                                                    tracing::error!("stdin write error (perm decision between turns): {}", e);
+                                                                    break 'bt_perm;
+                                                                }
+                                                            }
+                                                            Err(_) => {
+                                                                // oneshot dropped (session kill) → deny
+                                                                let resp = build_control_response_deny(&saved_request_id, "session terminated");
+                                                                if let Err(e) = stdin.write_all(resp.as_bytes()).await {
+                                                                    tracing::error!("stdin write error: {}", e);
+                                                                }
+                                                                let _ = stdin.flush().await;
+                                                            }
+                                                        }
+                                                        break 'bt_perm;
+                                                    }
+                                                    read_result = reader.read_line(&mut line) => {
+                                                        match read_result {
+                                                            Ok(0) => break,
+                                                            Ok(_) => {
+                                                                let trimmed = line.trim_end();
+                                                                if !trimmed.is_empty() {
+                                                                    if let Ok(event) = parse_line(trimmed) {
+                                                                        match event {
+                                                                            StreamEvent::TaskStarted { ref task_id, ref task_type, ref description, .. } => {
+                                                                                tracker.track_started(task_id, task_type, description);
+                                                                                has_bg_tasks_clone.store(tracker.has_active_tasks(), Ordering::Relaxed);
+                                                                            }
+                                                                            StreamEvent::TaskProgress { ref task_id, ref description, .. } => {
+                                                                                tracker.track_progress(task_id, description);
+                                                                            }
+                                                                            _ => {
+                                                                                tracing::debug!("Event during between-turns perm wait: {:?}", event);
+                                                                            }
+                                                                        }
+                                                                    }
+                                                                }
+                                                            }
+                                                            Err(e) => {
+                                                                tracing::error!("stdout read error during perm wait (between turns): {}", e);
+                                                                break 'bt_perm;
+                                                            }
+                                                        }
+                                                    }
+                                                    new_msg = queue_rx.recv() => {
+                                                        match new_msg {
+                                                            Some(m) => {
+                                                                queue_size_for_worker.fetch_sub(1, Ordering::Relaxed);
+                                                                let inject_json = serde_json::json!({
+                                                                    "type": "user",
+                                                                    "message": {
+                                                                        "role": "user",
+                                                                        "content": [{"type": "text", "text": m.content}]
+                                                                    }
+                                                                });
+                                                                let inject_line = format!("{}
+", inject_json);
+                                                                if let Err(e) = stdin.write_all(inject_line.as_bytes()).await {
+                                                                    tracing::error!("mid-turn stdin write error (perm wait between turns): {}", e);
+                                                                    break 'bt_perm;
+                                                                }
+                                                                let _ = stdin.flush().await;
+                                                            }
+                                                            None => break,
+                                                        }
+                                                    }
+                                                    _ = interrupt_rx.recv() => {
+                                                        let resp = build_control_response_deny(&saved_request_id, "interrupted");
+                                                        if let Err(e) = stdin.write_all(resp.as_bytes()).await {
+                                                            tracing::error!("stdin write error (interrupt perm wait between turns): {}", e);
+                                                        }
+                                                        let _ = stdin.flush().await;
+                                                        break 'bt_perm;
+                                                    }
+                                                }
+                                            }
                                         }
-                                        let _ = stdin.flush().await;
                                         continue;
                                     }
                                     Ok(event) => {
@@ -577,19 +841,136 @@ impl SessionManager {
                                                         }
                                                         continue 'turn;
                                                     }
-                                                    StreamEvent::ControlRequest { request_id, tool_name, input, .. } => {
-                                                        let resp = if permission_cache.is_always_allowed(tool_name) {
-                                                            build_control_response_allow(request_id, input)
-                                                        } else {
-                                                            let deny_msg = lang.bg_permission_denied(tool_name);
-                                                            channel_id_for_worker.say(&ctx_for_worker, &deny_msg).await.ok();
-                                                            build_control_response_deny(request_id, lang.bg_permission_deny_reason())
-                                                        };
-                                                        if let Err(e) = stdin.write_all(resp.as_bytes()).await {
-                                                            tracing::error!("stdin write error (bg turn in user turn): {}", e);
-                                                            break 'turn;
+                                                    StreamEvent::ControlRequest { request_id, tool_name, tool_use_id, input, decision_reason, .. } => {
+                                                        if permission_cache.is_always_allowed(&tool_name) {
+                                                            let resp = build_control_response_allow(&request_id, &input);
+                                                            if let Err(e) = stdin.write_all(resp.as_bytes()).await {
+                                                                tracing::error!("stdin write error (bg turn in user turn): {}", e);
+                                                                break 'turn;
+                                                            }
+                                                            let _ = stdin.flush().await;
+                                                            continue 'turn;
                                                         }
-                                                        let _ = stdin.flush().await;
+                                                        // Discord 버튼으로 permission 요청
+                                                        let (resp_tx, mut resp_rx) = tokio::sync::oneshot::channel();
+                                                        let perm_req = PermissionRequest {
+                                                            request_id: request_id.clone(),
+                                                            tool_name: tool_name.clone(),
+                                                            tool_use_id: tool_use_id.to_string(),
+                                                            input: input.clone(),
+                                                            decision_reason: decision_reason.clone(),
+                                                            response_tx: resp_tx,
+                                                        };
+                                                        if permission_tx.send(perm_req).await.is_err() {
+                                                            tracing::error!("permission_tx closed (bg turn in user turn), denying");
+                                                            let resp = build_control_response_deny(&request_id, "permission handler unavailable");
+                                                            if let Err(e) = stdin.write_all(resp.as_bytes()).await {
+                                                                tracing::error!("stdin write error: {}", e);
+                                                                break 'turn;
+                                                            }
+                                                            let _ = stdin.flush().await;
+                                                            continue 'turn;
+                                                        }
+                                                        // perm sub-loop: oneshot 대기 + stdout/queue/interrupt 동시 처리
+                                                        'bgut_perm: loop {
+                                                            line.clear();
+                                                            tokio::select! {
+                                                                decision = &mut resp_rx => {
+                                                                    match decision {
+                                                                        Ok(d) => {
+                                                                            if let Err(e) = handle_permission_decision(d, &request_id, &tool_name, &input, &mut stdin, &mut permission_cache).await {
+                                                                                tracing::error!("stdin write error (perm decision bg turn in user turn): {}", e);
+                                                                                break 'turn;
+                                                                            }
+                                                                        }
+                                                                        Err(_) => {
+                                                                            let resp = build_control_response_deny(&request_id, "session terminated");
+                                                                            if let Err(e) = stdin.write_all(resp.as_bytes()).await {
+                                                                                tracing::error!("stdin write error: {}", e);
+                                                                            }
+                                                                            let _ = stdin.flush().await;
+                                                                        }
+                                                                    }
+                                                                    break 'bgut_perm;
+                                                                }
+                                                                _ = interrupt_rx.recv() => {
+                                                                    let interrupt_msg = serde_json::json!({
+                                                                        "type": "control_request",
+                                                                        "request_id": format!("interrupt_{}", std::time::SystemTime::now()
+                                                                            .duration_since(std::time::UNIX_EPOCH)
+                                                                            .unwrap_or_default()
+                                                                            .as_millis()),
+                                                                        "request": {"subtype": "interrupt"}
+                                                                    });
+                                                                    let interrupt_line = format!("{}
+", interrupt_msg);
+                                                                    if let Err(e) = stdin.write_all(interrupt_line.as_bytes()).await {
+                                                                        tracing::error!("interrupt write error (bg turn in user turn perm wait): {}", e);
+                                                                    } else {
+                                                                        let _ = stdin.flush().await;
+                                                                    }
+                                                                    let resp = build_control_response_deny(&request_id, "interrupted");
+                                                                    if let Err(e) = stdin.write_all(resp.as_bytes()).await {
+                                                                        tracing::error!("stdin write error (interrupt perm wait bg turn in user turn): {}", e);
+                                                                    }
+                                                                    let _ = stdin.flush().await;
+                                                                    break 'bgut_perm;
+                                                                }
+                                                                new_msg = queue_rx.recv() => {
+                                                                    match new_msg {
+                                                                        Some(m) => {
+                                                                            queue_size_for_worker.fetch_sub(1, Ordering::Relaxed);
+                                                                            *last_activity_clone.lock().unwrap() = Instant::now();
+                                                                            let inject_json = serde_json::json!({
+                                                                                "type": "user",
+                                                                                "message": {
+                                                                                    "role": "user",
+                                                                                    "content": [{"type": "text", "text": m.content}]
+                                                                                }
+                                                                            });
+                                                                            let inject_line = format!("{}
+", inject_json);
+                                                                            if let Err(e) = stdin.write_all(inject_line.as_bytes()).await {
+                                                                                tracing::error!("mid-turn stdin write error (perm wait bg turn in user turn): {}", e);
+                                                                                break 'turn;
+                                                                            }
+                                                                            let _ = stdin.flush().await;
+                                                                        }
+                                                                        None => {
+                                                                            break 'turn;
+                                                                        }
+                                                                    }
+                                                                }
+                                                                read_result = reader.read_line(&mut line) => {
+                                                                    match read_result {
+                                                                        Ok(0) => {
+                                                                            queue_rx.close();
+                                                                            break 'turn;
+                                                                        }
+                                                                        Ok(_) => {
+                                                                            let t = line.trim_end();
+                                                                            if !t.is_empty() {
+                                                                                match parse_line(t) {
+                                                                                    Ok(ev) => {
+                                                                                        let _ = event_tx.send(ev).await;
+                                                                                    }
+                                                                                    Err(e) => {
+                                                                                        tracing::warn!("Parse error (perm wait bg turn in user turn): {}", e);
+                                                                                    }
+                                                                                }
+                                                                            }
+                                                                        }
+                                                                        Err(e) => {
+                                                                            tracing::error!("stdout read error (perm wait bg turn in user turn): {}", e);
+                                                                            queue_rx.close();
+                                                                            break 'turn;
+                                                                        }
+                                                                    }
+                                                                }
+                                                            }
+                                                        }
+                                                        timeout_deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
+                                                        tracing::debug!(thread_id = %thread_id_for_worker, "Timeout deadline reset after bg-turn perm");
                                                         continue 'turn;
                                                     }
                                                     _ => { continue 'turn; } // Init, RateLimit 등 skip
@@ -647,8 +1028,7 @@ impl SessionManager {
                                                 // permission 대기 루프 (timeout 없음)
                                                 tokio::pin!(resp_rx);
                                                 let mut perm_deny_reason: Option<String> = None;
-                                                let mut perm_allow = false;
-                                                let mut perm_always_allow_tool: Option<String> = None;
+                                                let mut perm_decision: Option<PermissionDecision> = None;
 
                                                 'perm: loop {
                                                     line.clear();
@@ -674,15 +1054,8 @@ impl SessionManager {
                                                         }
                                                         decision = &mut resp_rx => {
                                                             match decision {
-                                                                Ok(PermissionDecision::Allow) => {
-                                                                    perm_allow = true;
-                                                                }
-                                                                Ok(PermissionDecision::AlwaysAllow) => {
-                                                                    perm_allow = true;
-                                                                    perm_always_allow_tool = Some(saved_tool_name.clone());
-                                                                }
-                                                                Ok(PermissionDecision::Deny) => {
-                                                                    perm_deny_reason = Some("User rejected this action".to_string());
+                                                                Ok(d) => {
+                                                                    perm_decision = Some(d);
                                                                 }
                                                                 Err(_) => {
                                                                     perm_deny_reason = Some("Permission handler unavailable".to_string());
@@ -752,15 +1125,17 @@ impl SessionManager {
                                                     }
                                                 }
 
-                                                if perm_allow {
-                                                    let resp = build_control_response_allow(&saved_request_id, &saved_input);
-                                                    if let Err(e) = stdin.write_all(resp.as_bytes()).await {
-                                                        tracing::error!("stdin write error (allow): {}", e);
+                                                if let Some(decision) = perm_decision {
+                                                    if let Err(e) = handle_permission_decision(
+                                                        decision,
+                                                        &saved_request_id,
+                                                        &saved_tool_name,
+                                                        &saved_input,
+                                                        &mut stdin,
+                                                        &mut permission_cache,
+                                                    ).await {
+                                                        tracing::error!("stdin write error (perm decision): {}", e);
                                                         break 'turn;
-                                                    }
-                                                    let _ = stdin.flush().await;
-                                                    if let Some(t) = perm_always_allow_tool {
-                                                        permission_cache.add_always_allow(&t);
                                                     }
                                                 } else if let Some(reason) = perm_deny_reason {
                                                     let resp = build_control_response_deny(&saved_request_id, &reason);
@@ -877,6 +1252,7 @@ impl SessionManager {
                 queue_tx,
                 queue_size,
                 worker_task,
+                permission_handler,
                 permission_tx,
                 interrupt_tx,
                 last_activity,
@@ -885,7 +1261,7 @@ impl SessionManager {
             },
         );
 
-        Ok(SessionCreateResult { permission_rx: Some(permission_rx), evicted_thread_id })
+        Ok(SessionCreateResult { evicted_thread_id })
     }
 
     fn find_evict_target(sessions: &HashMap<String, SessionInner>) -> Option<String> {
@@ -933,6 +1309,7 @@ impl SessionManager {
         })?;
 
         inner.worker_task.abort();
+        inner.permission_handler.abort();
 
         inner
             .child
@@ -996,12 +1373,50 @@ impl SessionManager {
             tracing::info!(thread_id = %tid, "Sweeping idle session (TTL expired)");
             if let Some(mut inner) = sessions.remove(&tid) {
                 inner.worker_task.abort();
+                inner.permission_handler.abort();
                 let _ = inner.child.kill().await;
             }
             evicted.push(tid);
         }
         evicted
     }
+}
+
+/// Permission decision을 처리하여 control_response를 stdin에 작성하고 cache를 업데이트한다.
+/// Returns: true if allowed, false if denied.
+fn resolve_permission_decision(
+    decision: &PermissionDecision,
+    request_id: &str,
+    tool_name: &str,
+    input: &serde_json::Value,
+    permission_cache: &mut PermissionCache,
+) -> (String, bool) {
+    match decision {
+        PermissionDecision::Allow => {
+            (build_control_response_allow(request_id, input), true)
+        }
+        PermissionDecision::AlwaysAllow => {
+            permission_cache.add_always_allow(tool_name);
+            (build_control_response_allow(request_id, input), true)
+        }
+        PermissionDecision::Deny => {
+            (build_control_response_deny(request_id, "User denied"), false)
+        }
+    }
+}
+
+async fn handle_permission_decision(
+    decision: PermissionDecision,
+    request_id: &str,
+    tool_name: &str,
+    input: &serde_json::Value,
+    stdin: &mut ChildStdin,
+    permission_cache: &mut PermissionCache,
+) -> Result<bool, std::io::Error> {
+    let (resp, allowed) = resolve_permission_decision(&decision, request_id, tool_name, input, permission_cache);
+    stdin.write_all(resp.as_bytes()).await?;
+    stdin.flush().await?;
+    Ok(allowed)
 }
 
 #[cfg(test)]
@@ -1311,4 +1726,72 @@ mod tests {
             "queue_size must remain 0 when try_send fails"
         );
     }
+    // ---------- resolve_permission_decision tests ----------
+
+    #[test]
+    fn resolve_allow() {
+        use super::resolve_permission_decision;
+        use super::super::permission::{PermissionCache, PermissionDecision};
+
+        let mut cache = PermissionCache::new();
+        let input = serde_json::json!({"command": "ls"});
+        let (resp, allowed) = resolve_permission_decision(
+            &PermissionDecision::Allow,
+            "req1",
+            "Bash",
+            &input,
+            &mut cache,
+        );
+        assert!(allowed, "Allow decision must return allowed=true");
+        assert!(resp.contains("req1"), "response must contain request_id");
+        assert!(
+            !cache.is_always_allowed("Bash"),
+            "Allow must NOT add to always-allow cache"
+        );
+    }
+
+    #[test]
+    fn resolve_always_allow() {
+        use super::resolve_permission_decision;
+        use super::super::permission::{PermissionCache, PermissionDecision};
+
+        let mut cache = PermissionCache::new();
+        let input = serde_json::json!({"command": "ls"});
+        let (resp, allowed) = resolve_permission_decision(
+            &PermissionDecision::AlwaysAllow,
+            "req2",
+            "Bash",
+            &input,
+            &mut cache,
+        );
+        assert!(allowed, "AlwaysAllow decision must return allowed=true");
+        assert!(resp.contains("req2"), "response must contain request_id");
+        assert!(
+            cache.is_always_allowed("Bash"),
+            "AlwaysAllow must add tool to always-allow cache"
+        );
+    }
+
+    #[test]
+    fn resolve_deny() {
+        use super::resolve_permission_decision;
+        use super::super::permission::{PermissionCache, PermissionDecision};
+
+        let mut cache = PermissionCache::new();
+        let input = serde_json::json!({});
+        let (resp, allowed) = resolve_permission_decision(
+            &PermissionDecision::Deny,
+            "req3",
+            "Edit",
+            &input,
+            &mut cache,
+        );
+        assert!(!allowed, "Deny decision must return allowed=false");
+        assert!(resp.contains("req3"), "response must contain request_id");
+        assert!(
+            !cache.is_always_allowed("Edit"),
+            "Deny must NOT add to always-allow cache"
+        );
+    }
+
 }

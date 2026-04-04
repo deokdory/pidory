@@ -69,7 +69,6 @@ pub async fn unregister(ctx: Context<'_>) -> Result<(), Error> {
             tracing::warn!(thread_id = %session.thread_id, "Failed to kill session during unregister: {}", e);
         }
         ctx.data().session_skills.lock().await.remove(&session.thread_id);
-        ctx.data().permission_rxs.lock().await.remove(&session.thread_id);
         ctx.data().needs_context.lock().await.remove(&session.thread_id);
     }
     repository::delete_sessions_by_channel(&ctx.data().db, &channel_id).await?;
