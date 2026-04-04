@@ -1,0 +1,1082 @@
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::Mutex as StdMutex;
+use std::time::{Duration, Instant};
+
+use poise::serenity_prelude::{ChannelId, Context};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::process::{ChildStdin, ChildStdout};
+use tokio::sync::{mpsc, Mutex};
+
+use crate::db::repository;
+use crate::handler::formatter;
+use crate::i18n::Lang;
+use super::background::BackgroundTaskTracker;
+use super::parser::{parse_line, StreamEvent, ContentBlock, build_control_response_allow, build_control_response_deny};
+use super::permission::{PermissionCache, PermissionDecision, PermissionRequest};
+use super::session_manager::{QueuedMessage, SessionInner};
+
+// ─── T6: Common JSON builder helpers ───────────────────────────────────────
+
+fn build_user_message_json(content: &str) -> String {
+    let json = serde_json::json!({
+        "type": "user",
+        "message": {
+            "role": "user",
+            "content": [{"type": "text", "text": content}]
+        }
+    });
+    format!("{}\n", json)
+}
+
+fn build_interrupt_json() -> String {
+    let msg = serde_json::json!({
+        "type": "control_request",
+        "request_id": format!("interrupt_{}", std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()),
+        "request": {"subtype": "interrupt"}
+    });
+    format!("{}\n", msg)
+}
+
+// ─── T2: Between-turns event action ────────────────────────────────────────
+
+enum BetweenTurnsAction {
+    /// Continue the main loop (no queued message ready)
+    Continue,
+    /// Break the main loop (EOF or fatal error)
+    Break,
+    /// A primary message was dequeued and is ready to process
+    ProcessMessage(QueuedMessage),
+}
+
+// ─── T5: Permission wait result ─────────────────────────────────────────────
+
+pub(super) enum PermissionWaitResult {
+    Allow,
+    AlwaysAllow(String), // tool_name
+    Deny(String),        // reason
+    Error,               // stdin error → caller does break
+}
+
+// ─── SessionWorker struct ───────────────────────────────────────────────────
+
+pub(super) struct SessionWorker {
+    // IO
+    stdin: ChildStdin,
+    reader: BufReader<ChildStdout>,
+    line: String,
+    // Channels
+    queue_rx: mpsc::Receiver<QueuedMessage>,
+    interrupt_rx: mpsc::Receiver<()>,
+    permission_tx: mpsc::Sender<PermissionRequest>,
+    // State
+    permission_cache: PermissionCache,
+    tracker: BackgroundTaskTracker,
+    // Shared refs
+    queue_size: Arc<AtomicUsize>,
+    sessions: Arc<Mutex<HashMap<String, SessionInner>>>,
+    last_activity: Arc<StdMutex<Instant>>,
+    has_bg_tasks: Arc<AtomicBool>,
+    is_turn_active: Arc<AtomicBool>,
+    // Config/Context
+    thread_id: String,
+    channel_id: ChannelId,
+    ctx: Context,
+    db: sqlx::SqlitePool,
+    timeout_secs: u64,
+    lang: Lang,
+}
+
+impl SessionWorker {
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn new(
+        stdin: ChildStdin,
+        reader: BufReader<ChildStdout>,
+        queue_rx: mpsc::Receiver<QueuedMessage>,
+        interrupt_rx: mpsc::Receiver<()>,
+        permission_tx: mpsc::Sender<PermissionRequest>,
+        queue_size: Arc<AtomicUsize>,
+        sessions: Arc<Mutex<HashMap<String, SessionInner>>>,
+        last_activity: Arc<StdMutex<Instant>>,
+        has_bg_tasks: Arc<AtomicBool>,
+        is_turn_active: Arc<AtomicBool>,
+        thread_id: String,
+        channel_id: ChannelId,
+        ctx: Context,
+        db: sqlx::SqlitePool,
+        timeout_secs: u64,
+        lang: Lang,
+    ) -> Self {
+        Self {
+            stdin,
+            reader,
+            line: String::new(),
+            queue_rx,
+            interrupt_rx,
+            permission_tx,
+            permission_cache: PermissionCache::new(),
+            tracker: BackgroundTaskTracker::new(),
+            queue_size,
+            sessions,
+            last_activity,
+            has_bg_tasks,
+            is_turn_active,
+            thread_id,
+            channel_id,
+            ctx,
+            db,
+            timeout_secs,
+            lang,
+        }
+    }
+
+    pub(super) async fn run(mut self) {
+        let Self {
+            ref mut stdin,
+            ref mut reader,
+            ref mut line,
+            ref mut queue_rx,
+            ref mut interrupt_rx,
+            ref permission_tx,
+            ref mut permission_cache,
+            ref mut tracker,
+            ref queue_size,
+            ref sessions,
+            ref last_activity,
+            ref has_bg_tasks,
+            ref is_turn_active,
+            ref thread_id,
+            ref channel_id,
+            ref ctx,
+            ref db,
+            timeout_secs,
+            lang,
+        } = self;
+
+        loop {
+            let action = handle_between_turns_event(
+                stdin,
+                reader,
+                line,
+                queue_rx,
+                interrupt_rx,
+                permission_cache,
+                tracker,
+                queue_size,
+                has_bg_tasks,
+                thread_id,
+                channel_id,
+                ctx,
+                db,
+                lang,
+            ).await;
+
+            match action {
+                BetweenTurnsAction::Continue => continue,
+                BetweenTurnsAction::Break => break,
+                BetweenTurnsAction::ProcessMessage(msg) => {
+                    queue_size.fetch_sub(1, Ordering::Relaxed);
+                    *last_activity.lock().unwrap() = Instant::now();
+
+                    let json_line = build_user_message_json(&msg.content);
+                    if let Err(e) = stdin.write_all(json_line.as_bytes()).await {
+                        tracing::error!("stdin write error for thread {}: {}", thread_id, e);
+                        break;
+                    }
+                    if let Err(e) = stdin.flush().await {
+                        tracing::error!("stdin flush error for thread {}: {}", thread_id, e);
+                        break;
+                    }
+
+                    // event_tx가 없으면 mid-turn inject: stdin에 쓰기만 하고 다음으로
+                    let Some(event_tx) = msg.event_tx else {
+                        continue;
+                    };
+
+                    is_turn_active.store(true, Ordering::Relaxed);
+                    tracing::info!(thread_id = %thread_id, timeout_secs, "Primary turn started");
+
+                    let turn_broke = run_active_turn(
+                        stdin,
+                        reader,
+                        line,
+                        queue_rx,
+                        interrupt_rx,
+                        permission_tx,
+                        permission_cache,
+                        tracker,
+                        queue_size,
+                        has_bg_tasks,
+                        is_turn_active,
+                        last_activity,
+                        thread_id,
+                        channel_id,
+                        ctx,
+                        timeout_secs,
+                        lang,
+                        event_tx,
+                    ).await;
+
+                    // 'turn loop 종료 후 항상 리셋 (정상/비정상 모든 break 경로 커버)
+                    is_turn_active.store(false, Ordering::Relaxed);
+
+                    if turn_broke {
+                        break;
+                    }
+                }
+            }
+        }
+
+        tracing::info!(
+            "Worker task exiting for thread {}, removing from sessions",
+            thread_id
+        );
+        sessions.lock().await.remove(thread_id);
+    }
+}
+
+// ─── T2: Between-turns event handler ───────────────────────────────────────
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_between_turns_event(
+    stdin: &mut ChildStdin,
+    reader: &mut BufReader<ChildStdout>,
+    line: &mut String,
+    queue_rx: &mut mpsc::Receiver<QueuedMessage>,
+    interrupt_rx: &mut mpsc::Receiver<()>,
+    permission_cache: &mut PermissionCache,
+    tracker: &mut BackgroundTaskTracker,
+    queue_size: &Arc<AtomicUsize>,
+    has_bg_tasks: &Arc<AtomicBool>,
+    thread_id: &str,
+    channel_id: &ChannelId,
+    ctx: &Context,
+    db: &sqlx::SqlitePool,
+    lang: Lang,
+) -> BetweenTurnsAction {
+    line.clear();
+    tokio::select! {
+        biased;
+        // stdout 우선: background task 이벤트 감지
+        read_result = reader.read_line(line) => {
+            match read_result {
+                Ok(0) => {
+                    tracing::info!(
+                        "Process stdout EOF (between turns) for thread {}",
+                        thread_id
+                    );
+                    BetweenTurnsAction::Break
+                }
+                Ok(_) => {
+                    let trimmed = line.trim_end();
+                    if trimmed.is_empty() {
+                        return BetweenTurnsAction::Continue;
+                    }
+                    match parse_line(trimmed) {
+                        Ok(StreamEvent::TaskStarted { ref task_id, ref task_type, ref description, .. }) => {
+                            tracker.track_started(task_id, task_type, description);
+                            has_bg_tasks.store(tracker.has_active_tasks(), Ordering::Relaxed);
+                            tracing::info!("Background task started: {} ({})", task_id, task_type);
+                            let start_msg = lang.bg_task_started(description);
+                            channel_id.say(ctx, &start_msg).await.ok();
+                            BetweenTurnsAction::Continue
+                        }
+                        Ok(StreamEvent::TaskProgress { ref task_id, ref description, .. }) => {
+                            tracker.track_progress(task_id, description);
+                            BetweenTurnsAction::Continue
+                        }
+                        Ok(StreamEvent::TaskNotification { ref task_id, ref status, ref summary, .. }) => {
+                            tracker.track_completed(task_id);
+                            has_bg_tasks.store(tracker.has_active_tasks(), Ordering::Relaxed);
+                            let notify_msg = if status == "completed" {
+                                format!("-# 🔔 {}", summary)
+                            } else {
+                                format!("-# ❌ {}", summary)
+                            };
+                            channel_id.say(ctx, &notify_msg).await.ok();
+
+                            if let Err(e) = repository::update_session_status(db, thread_id, "running").await {
+                                tracing::warn!("Failed to update session status for thread {}: {}", thread_id, e);
+                            }
+
+                            handle_bg_turn(
+                                stdin,
+                                reader,
+                                line,
+                                queue_rx,
+                                interrupt_rx,
+                                permission_cache,
+                                tracker,
+                                queue_size,
+                                thread_id,
+                                channel_id,
+                                ctx,
+                                db,
+                                lang,
+                            ).await;
+
+                            BetweenTurnsAction::Continue
+                        }
+                        Ok(StreamEvent::ControlRequest { ref request_id, ref tool_name, ref input, .. }) => {
+                            let resp = if permission_cache.is_always_allowed(tool_name) {
+                                build_control_response_allow(request_id, input)
+                            } else {
+                                let deny_msg = lang.bg_permission_denied(tool_name);
+                                channel_id.say(ctx, &deny_msg).await.ok();
+                                build_control_response_deny(request_id, lang.bg_permission_deny_reason())
+                            };
+                            if let Err(e) = stdin.write_all(resp.as_bytes()).await {
+                                tracing::error!("stdin write error (between turns): {}", e);
+                                return BetweenTurnsAction::Break;
+                            }
+                            let _ = stdin.flush().await;
+                            BetweenTurnsAction::Continue
+                        }
+                        Ok(event) => {
+                            tracing::debug!("Between-turns event drained: {:?}", event);
+                            BetweenTurnsAction::Continue
+                        }
+                        Err(e) => {
+                            tracing::warn!("Parse error (between turns): {}", e);
+                            BetweenTurnsAction::Continue
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::error!(
+                        "stdout read error (between turns) for thread {}: {}",
+                        thread_id,
+                        e
+                    );
+                    BetweenTurnsAction::Break
+                }
+            }
+        }
+        _ = interrupt_rx.recv() => {
+            tracing::debug!("Stale interrupt consumed between turns");
+            BetweenTurnsAction::Continue
+        }
+        msg = queue_rx.recv() => {
+            match msg {
+                Some(m) => BetweenTurnsAction::ProcessMessage(m),
+                None => BetweenTurnsAction::Break,
+            }
+        }
+    }
+}
+
+// ─── T3: Background turn handler ───────────────────────────────────────────
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_bg_turn(
+    stdin: &mut ChildStdin,
+    reader: &mut BufReader<ChildStdout>,
+    line: &mut String,
+    queue_rx: &mut mpsc::Receiver<QueuedMessage>,
+    interrupt_rx: &mut mpsc::Receiver<()>,
+    permission_cache: &mut PermissionCache,
+    tracker: &mut BackgroundTaskTracker,
+    queue_size: &Arc<AtomicUsize>,
+    thread_id: &str,
+    channel_id: &ChannelId,
+    ctx: &Context,
+    db: &sqlx::SqlitePool,
+    lang: Lang,
+) {
+    'bg_turn: loop {
+        line.clear();
+        tokio::select! {
+            read_result = reader.read_line(line) => {
+                match read_result {
+                    Ok(0) => {
+                        if let Err(e) = repository::update_session_status(db, thread_id, "idle").await {
+                            tracing::warn!("Failed to update session status for thread {}: {}", thread_id, e);
+                        }
+                        break 'bg_turn;
+                    }
+                    Ok(_) => {
+                        let trimmed = line.trim_end();
+                        if trimmed.is_empty() { continue 'bg_turn; }
+                        match parse_line(trimmed) {
+                            Ok(StreamEvent::Result { .. }) => {
+                                if let Err(e) = repository::update_session_status(db, thread_id, "idle").await {
+                                    tracing::warn!("Failed to update session status for thread {}: {}", thread_id, e);
+                                }
+                                break 'bg_turn;
+                            }
+                            Ok(StreamEvent::Assistant { ref content, .. }) => {
+                                for block in content {
+                                    match block {
+                                        ContentBlock::Text(text) if !text.trim().is_empty() => {
+                                            let bg_text = lang.bg_notification(text);
+                                            channel_id.say(ctx, &bg_text).await.ok();
+                                        }
+                                        ContentBlock::ToolUse { name, input, .. } => {
+                                            let formatted = formatter::format_tool_use(name, input);
+                                            let bg_text = lang.bg_notification(&formatted);
+                                            channel_id.say(ctx, &bg_text).await.ok();
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                            }
+                            Ok(StreamEvent::User { ref tool_results, .. }) => {
+                                for result in tool_results {
+                                    if result.is_error {
+                                        if let Some(formatted) = formatter::format_tool_result_with_name(result, None, lang) {
+                                            let bg_text = lang.bg_notification(&formatted);
+                                            channel_id.say(ctx, &bg_text).await.ok();
+                                        }
+                                    }
+                                }
+                            }
+                            Ok(StreamEvent::ControlRequest { ref request_id, ref tool_name, ref input, .. }) => {
+                                let resp = if permission_cache.is_always_allowed(tool_name) {
+                                    build_control_response_allow(request_id, input)
+                                } else {
+                                    let deny_msg = lang.bg_permission_denied(tool_name);
+                                    channel_id.say(ctx, &deny_msg).await.ok();
+                                    build_control_response_deny(request_id, lang.bg_permission_deny_reason())
+                                };
+                                if let Err(e) = stdin.write_all(resp.as_bytes()).await {
+                                    tracing::error!("stdin write error (bg turn): {}", e);
+                                    if let Err(e) = repository::update_session_status(db, thread_id, "idle").await {
+                                        tracing::warn!("Failed to update session status for thread {}: {}", thread_id, e);
+                                    }
+                                    break 'bg_turn;
+                                }
+                                let _ = stdin.flush().await;
+                            }
+                            Ok(StreamEvent::TaskStarted { ref task_id, ref task_type, ref description, .. }) => {
+                                tracker.track_started(task_id, task_type, description);
+                            }
+                            Ok(StreamEvent::TaskProgress { ref task_id, ref description, .. }) => {
+                                tracker.track_progress(task_id, description);
+                            }
+                            Ok(_) => {}
+                            Err(e) => {
+                                tracing::warn!("Parse error (bg turn): {}", e);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!("stdout read error (bg turn): {}", e);
+                        if let Err(e) = repository::update_session_status(db, thread_id, "idle").await {
+                            tracing::warn!("Failed to update session status for thread {}: {}", thread_id, e);
+                        }
+                        break 'bg_turn;
+                    }
+                }
+            }
+            // bg turn 중 queue 메시지 → mid-turn inject
+            new_msg = queue_rx.recv() => {
+                match new_msg {
+                    Some(m) => {
+                        queue_size.fetch_sub(1, Ordering::Relaxed);
+                        let inject_line = build_user_message_json(&m.content);
+                        if let Err(e) = stdin.write_all(inject_line.as_bytes()).await {
+                            tracing::error!("mid-turn stdin write error (bg turn): {}", e);
+                            if let Err(e) = repository::update_session_status(db, thread_id, "idle").await {
+                                tracing::warn!("Failed to update session status for thread {}: {}", thread_id, e);
+                            }
+                            break 'bg_turn;
+                        }
+                        let _ = stdin.flush().await;
+                    }
+                    None => {
+                        if let Err(e) = repository::update_session_status(db, thread_id, "idle").await {
+                            tracing::warn!("Failed to update session status for thread {}: {}", thread_id, e);
+                        }
+                        break 'bg_turn;
+                    }
+                }
+            }
+            // bg turn 중 interrupt
+            _ = interrupt_rx.recv() => {
+                let interrupt_line = build_interrupt_json();
+                if let Err(e) = stdin.write_all(interrupt_line.as_bytes()).await {
+                    tracing::error!("interrupt write error (bg turn): {}", e);
+                } else {
+                    let _ = stdin.flush().await;
+                }
+            }
+        }
+    }
+}
+
+// ─── T5: Permission wait ────────────────────────────────────────────────────
+
+#[allow(clippy::too_many_arguments)]
+async fn wait_for_permission(
+    stdin: &mut ChildStdin,
+    reader: &mut BufReader<ChildStdout>,
+    line: &mut String,
+    queue_rx: &mut mpsc::Receiver<QueuedMessage>,
+    interrupt_rx: &mut mpsc::Receiver<()>,
+    queue_size: &Arc<AtomicUsize>,
+    thread_id: &str,
+    saved_tool_name: &str,
+    event_tx: &mpsc::Sender<StreamEvent>,
+    resp_rx: &mut tokio::sync::oneshot::Receiver<PermissionDecision>,
+) -> PermissionWaitResult {
+    'perm: loop {
+        line.clear();
+        tokio::select! {
+            // interrupt 요청 (permission 대기 중)
+            _ = interrupt_rx.recv() => {
+                let interrupt_line = build_interrupt_json();
+                if let Err(e) = stdin.write_all(interrupt_line.as_bytes()).await {
+                    tracing::error!("interrupt write error (perm wait): {}", e);
+                } else {
+                    let _ = stdin.flush().await;
+                }
+                break 'perm PermissionWaitResult::Deny("Interrupted by user".to_string());
+            }
+            decision = &mut *resp_rx => {
+                match decision {
+                    Ok(PermissionDecision::Allow) => {
+                        break 'perm PermissionWaitResult::Allow;
+                    }
+                    Ok(PermissionDecision::AlwaysAllow) => {
+                        break 'perm PermissionWaitResult::AlwaysAllow(saved_tool_name.to_string());
+                    }
+                    Ok(PermissionDecision::Deny) => {
+                        break 'perm PermissionWaitResult::Deny("User rejected this action".to_string());
+                    }
+                    Err(_) => {
+                        break 'perm PermissionWaitResult::Deny("Permission handler unavailable".to_string());
+                    }
+                }
+            }
+            // mid-turn inject during permission wait
+            new_msg = queue_rx.recv() => {
+                match new_msg {
+                    Some(m) => {
+                        queue_size.fetch_sub(1, Ordering::Relaxed);
+                        let inject_line = build_user_message_json(&m.content);
+                        if let Err(e) = stdin.write_all(inject_line.as_bytes()).await {
+                            tracing::error!("mid-turn stdin write error (perm wait): {}", e);
+                            break 'perm PermissionWaitResult::Error;
+                        }
+                        let _ = stdin.flush().await;
+                    }
+                    None => {
+                        break 'perm PermissionWaitResult::Deny("Permission handler unavailable".to_string());
+                    }
+                }
+            }
+            // stdout events during permission wait (no timeout)
+            read = reader.read_line(line) => {
+                match read {
+                    Ok(0) => {
+                        tracing::info!(
+                            "Process stdout EOF during perm wait for thread {}",
+                            thread_id
+                        );
+                        queue_rx.close();
+                        break 'perm PermissionWaitResult::Deny("Process exited".to_string());
+                    }
+                    Ok(_) => {
+                        let t = line.trim_end();
+                        if !t.is_empty() {
+                            match parse_line(t) {
+                                Ok(ev) => {
+                                    let _ = event_tx.send(ev).await;
+                                }
+                                Err(e) => {
+                                    tracing::warn!("Parse error (perm wait): {}", e);
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!("stdout read error (perm wait): {}", e);
+                        queue_rx.close();
+                        break 'perm PermissionWaitResult::Deny("stdout read error".to_string());
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ─── T4: Active turn handler ────────────────────────────────────────────────
+// Returns true if the outer main loop should also break (fatal error / EOF).
+
+#[allow(clippy::too_many_arguments)]
+async fn run_active_turn(
+    stdin: &mut ChildStdin,
+    reader: &mut BufReader<ChildStdout>,
+    line: &mut String,
+    queue_rx: &mut mpsc::Receiver<QueuedMessage>,
+    interrupt_rx: &mut mpsc::Receiver<()>,
+    permission_tx: &mpsc::Sender<PermissionRequest>,
+    permission_cache: &mut PermissionCache,
+    tracker: &mut BackgroundTaskTracker,
+    queue_size: &Arc<AtomicUsize>,
+    has_bg_tasks: &Arc<AtomicBool>,
+    is_turn_active: &Arc<AtomicBool>,
+    last_activity: &Arc<StdMutex<Instant>>,
+    thread_id: &str,
+    channel_id: &ChannelId,
+    ctx: &Context,
+    timeout_secs: u64,
+    lang: Lang,
+    event_tx: mpsc::Sender<StreamEvent>,
+) -> bool {
+    let mut timeout_deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
+    let mut bg_turn_active = false;
+    let mut soft_timeout_fired = false;
+
+    let outer_break: bool = 'turn: loop {
+        line.clear();
+        tokio::select! {
+            // interrupt 요청
+            _ = interrupt_rx.recv() => {
+                let interrupt_line = build_interrupt_json();
+                if let Err(e) = stdin.write_all(interrupt_line.as_bytes()).await {
+                    tracing::error!("interrupt write error: {}", e);
+                    break 'turn false;
+                }
+                let _ = stdin.flush().await;
+                // result 이벤트는 기존 stdout 읽기에서 처리됨
+            }
+            // 큐에서 새 메시지 (mid-turn inject)
+            new_msg = queue_rx.recv() => {
+                match new_msg {
+                    Some(m) => {
+                        queue_size.fetch_sub(1, Ordering::Relaxed);
+                        *last_activity.lock().unwrap() = Instant::now();
+                        let inject_line = build_user_message_json(&m.content);
+                        if let Err(e) = stdin.write_all(inject_line.as_bytes()).await {
+                            tracing::error!("mid-turn stdin write error: {}", e);
+                            break 'turn false;
+                        }
+                        let _ = stdin.flush().await;
+                        // m.event_tx는 None이므로 drop됨
+                        // 이벤트는 계속 원래 event_tx로 감
+                    }
+                    None => {
+                        // queue closed (kill_session)
+                        break 'turn false;
+                    }
+                }
+            }
+            // stdout에서 이벤트 읽기
+            read_result = tokio::time::timeout_at(timeout_deadline, reader.read_line(line)) => {
+                match read_result {
+                    Ok(Ok(0)) => {
+                        tracing::info!(
+                            "Process stdout EOF for thread {}",
+                            thread_id
+                        );
+                        queue_rx.close();
+                        break 'turn true;
+                    }
+                    Ok(Ok(_)) => {
+                        timeout_deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
+                        tracing::debug!(thread_id = %thread_id, "Timeout deadline reset");
+                        let trimmed = line.trim_end();
+                        if trimmed.is_empty() {
+                            continue 'turn;
+                        }
+                        match parse_line(trimmed) {
+                            Ok(event) => {
+                                let event_name = match &event {
+                                    StreamEvent::Assistant { .. } => "assistant",
+                                    StreamEvent::User { .. } => "user",
+                                    StreamEvent::Result { .. } => "result",
+                                    StreamEvent::ControlRequest { .. } => "control_request",
+                                    StreamEvent::RateLimit { .. } => "rate_limit",
+                                    StreamEvent::Init { .. } => "init",
+                                    _ => "other",
+                                };
+                                tracing::debug!(thread_id = %thread_id, event = event_name, "stdout event");
+                                // Background task 이벤트: user turn 중에도 올 수 있음
+                                match &event {
+                                    StreamEvent::TaskStarted { task_id, task_type, description, .. } => {
+                                        tracker.track_started(task_id, task_type, description);
+                                        has_bg_tasks.store(tracker.has_active_tasks(), Ordering::Relaxed);
+                                        let start_msg = lang.bg_task_started(description);
+                                        channel_id.say(ctx, &start_msg).await.ok();
+                                        continue 'turn;
+                                    }
+                                    StreamEvent::TaskProgress { task_id, description, .. } => {
+                                        tracker.track_progress(task_id, description);
+                                        continue 'turn;
+                                    }
+                                    StreamEvent::TaskNotification { task_id, status, summary, .. } => {
+                                        tracker.track_completed(task_id);
+                                        has_bg_tasks.store(tracker.has_active_tasks(), Ordering::Relaxed);
+                                        let notify_msg = if status == "completed" {
+                                            format!("-# 🔔 {}", summary)
+                                        } else {
+                                            format!("-# ❌ {}", summary)
+                                        };
+                                        channel_id.say(ctx, &notify_msg).await.ok();
+                                        bg_turn_active = true;
+                                        continue 'turn;
+                                    }
+                                    _ => {}
+                                }
+
+                                // bg turn 이벤트 처리: bg_turn_active일 때 기존 코드로 안 넘김
+                                if bg_turn_active {
+                                    match &event {
+                                        StreamEvent::Result { .. } => {
+                                            bg_turn_active = false;
+                                            timeout_deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
+                                            tracing::debug!(thread_id = %thread_id, "Timeout deadline reset");
+                                            continue 'turn; // bg turn 끝 — user turn은 계속
+                                        }
+                                        StreamEvent::Assistant { content, .. } => {
+                                            for block in content {
+                                                match block {
+                                                    ContentBlock::Text(text) if !text.trim().is_empty() => {
+                                                        let bg_text = lang.bg_notification(text);
+                                                        channel_id.say(ctx, &bg_text).await.ok();
+                                                    }
+                                                    ContentBlock::ToolUse { name, input, .. } => {
+                                                        let formatted = formatter::format_tool_use(name, input);
+                                                        let bg_text = lang.bg_notification(&formatted);
+                                                        channel_id.say(ctx, &bg_text).await.ok();
+                                                    }
+                                                    _ => {}
+                                                }
+                                            }
+                                            continue 'turn;
+                                        }
+                                        StreamEvent::User { tool_results, .. } => {
+                                            for result in tool_results {
+                                                if result.is_error {
+                                                    if let Some(formatted) = formatter::format_tool_result_with_name(result, None, lang) {
+                                                        let bg_text = lang.bg_notification(&formatted);
+                                                        channel_id.say(ctx, &bg_text).await.ok();
+                                                    }
+                                                }
+                                            }
+                                            continue 'turn;
+                                        }
+                                        StreamEvent::ControlRequest { request_id, tool_name, input, .. } => {
+                                            let resp = if permission_cache.is_always_allowed(tool_name) {
+                                                build_control_response_allow(request_id, input)
+                                            } else {
+                                                let deny_msg = lang.bg_permission_denied(tool_name);
+                                                channel_id.say(ctx, &deny_msg).await.ok();
+                                                build_control_response_deny(request_id, lang.bg_permission_deny_reason())
+                                            };
+                                            if let Err(e) = stdin.write_all(resp.as_bytes()).await {
+                                                tracing::error!("stdin write error (bg turn in user turn): {}", e);
+                                                break 'turn false;
+                                            }
+                                            let _ = stdin.flush().await;
+                                            continue 'turn;
+                                        }
+                                        _ => { continue 'turn; } // Init, RateLimit 등 skip
+                                    }
+                                }
+
+                                // 기존 user turn 이벤트 처리 (bg_turn_active == false)
+                                if let StreamEvent::ControlRequest {
+                                    ref request_id,
+                                    ref tool_name,
+                                    ref tool_use_id,
+                                    ref input,
+                                    ref decision_reason,
+                                } = event {
+                                    // Clone all fields before any move
+                                    let saved_request_id = request_id.clone();
+                                    let saved_tool_name = tool_name.clone();
+                                    let saved_tool_use_id = tool_use_id.clone();
+                                    let saved_input = input.clone();
+                                    let saved_decision_reason = decision_reason.clone();
+
+                                    if permission_cache.is_always_allowed(&saved_tool_name) {
+                                        // auto-allow from cache
+                                        let resp = build_control_response_allow(&saved_request_id, &saved_input);
+                                        if let Err(e) = stdin.write_all(resp.as_bytes()).await {
+                                            tracing::error!("stdin write error (auto-allow): {}", e);
+                                            break 'turn false;
+                                        }
+                                        let _ = stdin.flush().await;
+                                        continue 'turn;
+                                    }
+
+                                    // event_tx로 ControlRequest 전달 (handler에서 버튼 표시)
+                                    let _ = event_tx.send(event).await;
+
+                                    // permission 요청 생성
+                                    let (resp_tx, mut resp_rx) = tokio::sync::oneshot::channel();
+                                    let perm_req = PermissionRequest {
+                                        request_id: saved_request_id.clone(),
+                                        tool_name: saved_tool_name.clone(),
+                                        tool_use_id: saved_tool_use_id,
+                                        input: saved_input.clone(),
+                                        decision_reason: saved_decision_reason,
+                                        response_tx: resp_tx,
+                                    };
+
+                                    if permission_tx.send(perm_req).await.is_err() {
+                                        tracing::error!("permission_tx closed, denying");
+                                        let resp = build_control_response_deny(&saved_request_id, "Permission handler unavailable");
+                                        let _ = stdin.write_all(resp.as_bytes()).await;
+                                        let _ = stdin.flush().await;
+                                        break 'turn false;
+                                    }
+
+                                    let perm_result = wait_for_permission(
+                                        stdin,
+                                        reader,
+                                        line,
+                                        queue_rx,
+                                        interrupt_rx,
+                                        queue_size,
+                                        thread_id,
+                                        &saved_tool_name,
+                                        &event_tx,
+                                        &mut resp_rx,
+                                    ).await;
+
+                                    match perm_result {
+                                        PermissionWaitResult::Allow => {
+                                            let resp = build_control_response_allow(&saved_request_id, &saved_input);
+                                            if let Err(e) = stdin.write_all(resp.as_bytes()).await {
+                                                tracing::error!("stdin write error (allow): {}", e);
+                                                break 'turn false;
+                                            }
+                                            let _ = stdin.flush().await;
+                                        }
+                                        PermissionWaitResult::AlwaysAllow(tool_name) => {
+                                            let resp = build_control_response_allow(&saved_request_id, &saved_input);
+                                            if let Err(e) = stdin.write_all(resp.as_bytes()).await {
+                                                tracing::error!("stdin write error (allow): {}", e);
+                                                break 'turn false;
+                                            }
+                                            let _ = stdin.flush().await;
+                                            permission_cache.add_always_allow(&tool_name);
+                                        }
+                                        PermissionWaitResult::Deny(reason) => {
+                                            let resp = build_control_response_deny(&saved_request_id, &reason);
+                                            if let Err(e) = stdin.write_all(resp.as_bytes()).await {
+                                                tracing::error!("stdin write error (deny): {}", e);
+                                                break 'turn false;
+                                            }
+                                            let _ = stdin.flush().await;
+                                        }
+                                        PermissionWaitResult::Error => {
+                                            break 'turn false;
+                                        }
+                                    }
+
+                                    // timeout 리셋
+                                    timeout_deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
+                                    tracing::debug!(thread_id = %thread_id, "Timeout deadline reset");
+                                    continue 'turn;
+                                }
+
+                                // 일반 이벤트 처리
+                                let is_result = event.is_result();
+                                let _ = event_tx.send(event).await;
+                                if is_result {
+                                    is_turn_active.store(false, Ordering::Relaxed);
+                                    *last_activity.lock().unwrap() = Instant::now();
+                                    break 'turn false;
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!("Parse error: {}", e);
+                            }
+                        }
+                    }
+                    Ok(Err(e)) => {
+                        tracing::error!(
+                            "stdout read error for thread {}: {}",
+                            thread_id,
+                            e
+                        );
+                        queue_rx.close();
+                        break 'turn true;
+                    }
+                    Err(_) => {
+                        if !soft_timeout_fired {
+                            // Soft timeout: nudge 주입
+                            soft_timeout_fired = true;
+                            tracing::warn!(
+                                thread_id = %thread_id,
+                                timeout_secs,
+                                "Soft timeout fired — sending nudge"
+                            );
+                            let nudge_line = build_user_message_json("[SYSTEM] No stdout activity for an extended period. A tool may be unresponsive. Check the status of any running tools and recover if needed.");
+                            if let Err(e) = stdin.write_all(nudge_line.as_bytes()).await {
+                                tracing::error!("nudge write error: {}", e);
+                                break 'turn false;
+                            }
+                            let _ = stdin.flush().await;
+
+                            // Discord 알림 (deadline 설정 전에 처리 — API 지연이 retry window를 잠식하지 않도록)
+                            channel_id.say(
+                                ctx,
+                                format!("-# ⚠️ {}", lang.soft_timeout_nudge())
+                            ).await.ok();
+
+                            // 짧은 재대기 (timeout_secs / 5, 최소 60초)
+                            let retry_secs = (timeout_secs / 5).max(60);
+                            timeout_deadline = tokio::time::Instant::now() + Duration::from_secs(retry_secs);
+                            tracing::info!(
+                                thread_id = %thread_id,
+                                retry_secs,
+                                "Nudge sent, retry deadline set"
+                            );
+
+                            continue 'turn;
+                        } else {
+                            // Hard timeout
+                            tracing::error!(
+                                thread_id = %thread_id,
+                                timeout_secs,
+                                "Hard turn timeout — killing turn"
+                            );
+                            channel_id.say(
+                                ctx,
+                                format!("⚠️ {}", lang.hard_timeout_kill())
+                            ).await.ok();
+                            break 'turn false;
+                        }
+                    }
+                }
+            }
+        }
+    };
+
+    tracing::info!(thread_id = %thread_id, soft_timeout_fired, "Turn ended");
+    outer_break
+}
+
+// ─── Unit tests ─────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::{build_user_message_json, build_interrupt_json, BetweenTurnsAction, PermissionWaitResult};
+
+    // ── build_user_message_json ──────────────────────────────────────────────
+
+    #[test]
+    fn user_message_json_basic_structure() {
+        let out = build_user_message_json("hello");
+        let v: serde_json::Value = serde_json::from_str(out.trim()).expect("valid JSON");
+        assert_eq!(v["type"], "user");
+        assert_eq!(v["message"]["role"], "user");
+        let content = v["message"]["content"].as_array().expect("content is array");
+        assert_eq!(content.len(), 1);
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(content[0]["text"], "hello");
+    }
+
+    #[test]
+    fn user_message_json_special_chars_escaped() {
+        let out = build_user_message_json("hello \"world\"");
+        // Must round-trip through JSON without error and preserve the value
+        let v: serde_json::Value = serde_json::from_str(out.trim()).expect("valid JSON");
+        assert_eq!(v["message"]["content"][0]["text"], "hello \"world\"");
+    }
+
+    #[test]
+    fn user_message_json_korean_and_emoji() {
+        let out = build_user_message_json("안녕 🎉");
+        let v: serde_json::Value = serde_json::from_str(out.trim()).expect("valid JSON");
+        assert_eq!(v["message"]["content"][0]["text"], "안녕 🎉");
+    }
+
+    #[test]
+    fn user_message_json_empty_string() {
+        let out = build_user_message_json("");
+        let v: serde_json::Value = serde_json::from_str(out.trim()).expect("valid JSON");
+        assert_eq!(v["message"]["content"][0]["text"], "");
+    }
+
+    #[test]
+    fn user_message_json_ends_with_newline() {
+        let out = build_user_message_json("hello");
+        assert!(out.ends_with('\n'), "output must end with newline");
+    }
+
+    // ── build_interrupt_json ─────────────────────────────────────────────────
+
+    #[test]
+    fn interrupt_json_type_is_control_request() {
+        let out = build_interrupt_json();
+        let v: serde_json::Value = serde_json::from_str(out.trim()).expect("valid JSON");
+        assert_eq!(v["type"], "control_request");
+    }
+
+    #[test]
+    fn interrupt_json_subtype_is_interrupt() {
+        let out = build_interrupt_json();
+        let v: serde_json::Value = serde_json::from_str(out.trim()).expect("valid JSON");
+        assert_eq!(v["request"]["subtype"], "interrupt");
+    }
+
+    #[test]
+    fn interrupt_json_request_id_prefix() {
+        let out = build_interrupt_json();
+        let v: serde_json::Value = serde_json::from_str(out.trim()).expect("valid JSON");
+        let rid = v["request_id"].as_str().expect("request_id is string");
+        assert!(rid.starts_with("interrupt_"), "request_id must start with 'interrupt_', got: {rid}");
+    }
+
+    #[test]
+    fn interrupt_json_ends_with_newline() {
+        let out = build_interrupt_json();
+        assert!(out.ends_with('\n'), "output must end with newline");
+    }
+
+    // ── PermissionWaitResult enum ────────────────────────────────────────────
+
+    #[test]
+    fn permission_wait_result_allow_variant() {
+        let r = PermissionWaitResult::Allow;
+        assert!(matches!(r, PermissionWaitResult::Allow));
+    }
+
+    #[test]
+    fn permission_wait_result_always_allow_carries_tool_name() {
+        let r = PermissionWaitResult::AlwaysAllow("bash".to_string());
+        match r {
+            PermissionWaitResult::AlwaysAllow(name) => assert_eq!(name, "bash"),
+            _ => panic!("expected AlwaysAllow"),
+        }
+    }
+
+    #[test]
+    fn permission_wait_result_deny_carries_reason() {
+        let r = PermissionWaitResult::Deny("not allowed".to_string());
+        match r {
+            PermissionWaitResult::Deny(reason) => assert_eq!(reason, "not allowed"),
+            _ => panic!("expected Deny"),
+        }
+    }
+
+    #[test]
+    fn permission_wait_result_error_variant() {
+        let r = PermissionWaitResult::Error;
+        assert!(matches!(r, PermissionWaitResult::Error));
+    }
+
+    // ── BetweenTurnsAction enum ──────────────────────────────────────────────
+
+    #[test]
+    fn between_turns_action_continue_variant() {
+        let a = BetweenTurnsAction::Continue;
+        assert!(matches!(a, BetweenTurnsAction::Continue));
+    }
+
+    #[test]
+    fn between_turns_action_break_variant() {
+        let a = BetweenTurnsAction::Break;
+        assert!(matches!(a, BetweenTurnsAction::Break));
+    }
+}
