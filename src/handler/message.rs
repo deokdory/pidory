@@ -14,9 +14,9 @@ use crate::handler::{emoji, formatter, permission_ui};
 use crate::handler::emoji::ReactionStatus;
 use crate::i18n::Lang;
 use crate::subprocess::parser::{ContentBlock, StreamEvent};
-use crate::subprocess::permission::{PermissionDecision, PermissionRequest};
+use crate::subprocess::permission::PermissionDecision;
 use crate::subprocess::session_manager::QueuedMessage;
-use crate::{Data, PendingPermission};
+use crate::Data;
 
 pub async fn handle_event(
     ctx: &Context,
@@ -129,23 +129,22 @@ async fn handle_message(
             channel_id,
             data.db.clone(),
             lang,
+            data.pending_permissions.clone(),
+            data.config.discord.owner_id,
         )
         .await
     {
         Ok(result) => {
             tracing::info!(
                 thread_id = %thread_id,
-                new_session = result.permission_rx.is_some(),
+                new_session = is_new_session,
                 evicted = result.evicted_thread_id.as_deref(),
                 "Session get_or_create completed"
             );
-            if let Some(rx) = result.permission_rx {
-                data.permission_rxs.lock().await.insert(thread_id.clone(), rx);
-            }
             if let Some(evicted_tid) = result.evicted_thread_id {
-                data.permission_rxs.lock().await.remove(&evicted_tid);
                 data.session_skills.lock().await.remove(&evicted_tid);
                 data.needs_context.lock().await.remove(&evicted_tid);
+                data.pending_permissions.lock().await.retain(|_, p| p.thread_id != evicted_tid);
                 if let Err(e) = repository::update_session_status(db, &evicted_tid, "idle").await {
                     tracing::warn!("Failed to update session status for evicted thread {}: {}", evicted_tid, e);
                 }
@@ -252,10 +251,7 @@ async fn handle_message(
         data.needs_context.lock().await.insert(thread_id.clone());
     }
 
-    // permission_rx를 꺼내서 process_turn_events에 넘김 (turn 종료 후 다시 넣음)
-    let permission_rx = data.permission_rxs.lock().await.remove(&thread_id);
-
-    let permission_rx = process_turn_events(
+    process_turn_events(
         ctx,
         event_rx,
         channel_id,
@@ -264,19 +260,12 @@ async fn handle_message(
         db,
         data.config.response.max_chunk_length,
         data.config.response.max_chunks,
-        permission_rx,
-        data.pending_permissions.clone(),
         data.config.discord.owner_id,
         data.session_skills.clone(),
         data.config.ratelimit.file_path.as_deref(),
         lang,
     )
     .await;
-
-    // permission_rx를 다시 보관 (다음 turn에서 사용)
-    if let Some(rx) = permission_rx {
-        data.permission_rxs.lock().await.insert(thread_id.clone(), rx);
-    }
 
     Ok(())
 }
@@ -362,7 +351,6 @@ async fn handle_interaction(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
 pub async fn process_turn_events(
     ctx: &Context,
     mut event_rx: mpsc::Receiver<StreamEvent>,
@@ -372,13 +360,11 @@ pub async fn process_turn_events(
     db: &sqlx::SqlitePool,
     max_chunk_length: usize,
     max_chunks: usize,
-    mut permission_rx: Option<mpsc::Receiver<PermissionRequest>>,
-    pending_permissions: std::sync::Arc<tokio::sync::Mutex<HashMap<String, PendingPermission>>>,
     owner_id: u64,
     session_skills: std::sync::Arc<tokio::sync::Mutex<HashMap<String, Vec<String>>>>,
     ratelimit_file: Option<&str>,
     lang: Lang,
-) -> Option<mpsc::Receiver<PermissionRequest>> {
+) {
     // 1. typing indicator task 시작
     let cancel = CancellationToken::new();
     let cancel_clone = cancel.clone();
@@ -443,42 +429,9 @@ pub async fn process_turn_events(
         }
 
         loop {
-            // permission_rx가 있으면 select, 없으면 event_rx만
-            let stream_event = if permission_rx.is_some() {
-                tokio::select! {
-                    ev = event_rx.recv() => {
-                        match ev {
-                            Some(e) => Some(Ok(e)),
-                            None => Some(Err(())),
-                        }
-                    }
-                    perm = async {
-                        if let Some(rx) = permission_rx.as_mut() {
-                            rx.recv().await
-                        } else {
-                            std::future::pending().await
-                        }
-                    } => {
-                        if let Some(perm_req) = perm {
-                            typing_paused.store(true, Ordering::Relaxed);
-                            handle_permission_request(
-                                ctx,
-                                channel_id,
-                                perm_req,
-                                &pending_permissions,
-                                owner_id,
-                                lang,
-                            )
-                            .await;
-                        }
-                        continue;
-                    }
-                }
-            } else {
-                match event_rx.recv().await {
-                    Some(e) => Some(Ok(e)),
-                    None => Some(Err(())),
-                }
+            let stream_event = match event_rx.recv().await {
+                Some(e) => Some(Ok(e)),
+                None => Some(Err(())),
             };
 
             match stream_event {
@@ -668,7 +621,6 @@ pub async fn process_turn_events(
         }
     }
 
-    permission_rx
 }
 
 fn format_ctx_suffix(ratelimit_file: Option<&str>) -> String {
@@ -734,9 +686,7 @@ pub async fn execute_in_session(
         data.needs_context.lock().await.insert(thread_id.to_string());
     }
 
-    let permission_rx = data.permission_rxs.lock().await.remove(thread_id);
-
-    let permission_rx = process_turn_events(
+    process_turn_events(
         ctx,
         event_rx,
         channel_id,
@@ -745,18 +695,12 @@ pub async fn execute_in_session(
         db,
         data.config.response.max_chunk_length,
         data.config.response.max_chunks,
-        permission_rx,
-        data.pending_permissions.clone(),
         data.config.discord.owner_id,
         data.session_skills.clone(),
         data.config.ratelimit.file_path.as_deref(),
         data.config.language,
     )
     .await;
-
-    if let Some(rx) = permission_rx {
-        data.permission_rxs.lock().await.insert(thread_id.to_string(), rx);
-    }
 
     Ok(())
 }
@@ -824,45 +768,6 @@ async fn send_event_to_discord(
             }
         }
         _ => {} // Init, ControlRequest, UserReplay, Result, Unknown — 무시
-    }
-}
-
-async fn handle_permission_request(
-    ctx: &Context,
-    channel_id: ChannelId,
-    perm_req: PermissionRequest,
-    pending_permissions: &std::sync::Arc<tokio::sync::Mutex<HashMap<String, PendingPermission>>>,
-    owner_id: u64,
-    lang: Lang,
-) {
-    let msg = permission_ui::create_permission_message(
-        &perm_req.tool_name,
-        &perm_req.input,
-        &perm_req.request_id,
-        perm_req.decision_reason.as_deref(),
-        owner_id,
-        lang,
-    );
-
-    match channel_id.send_message(ctx, msg).await {
-        Ok(sent) => {
-            let pending = PendingPermission {
-                response_tx: perm_req.response_tx,
-                tool_name: perm_req.tool_name,
-                message_id: sent.id,
-            };
-            pending_permissions
-                .lock()
-                .await
-                .insert(perm_req.request_id, pending);
-        }
-        Err(e) => {
-            warn!("Failed to send permission message: {}", e);
-            // 전송 실패 시 deny
-            let _ = perm_req
-                .response_tx
-                .send(PermissionDecision::Deny);
-        }
     }
 }
 
