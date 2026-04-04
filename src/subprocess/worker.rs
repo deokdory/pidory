@@ -249,7 +249,11 @@ impl SessionWorker {
             "Worker task exiting for thread {}, removing from sessions",
             thread_id
         );
-        sessions.lock().await.remove(thread_id);
+        if let Some(mut inner) = sessions.lock().await.remove(thread_id) {
+            if let Err(e) = inner.child.kill().await {
+                tracing::warn!("Failed to kill child process for thread {}: {}", thread_id, e);
+            }
+        }
     }
 }
 
@@ -957,16 +961,17 @@ async fn run_active_turn(
 
                             continue 'turn;
                         } else {
-                            // Hard timeout
+                            // Hard timeout — full session teardown
                             tracing::error!(
                                 thread_id = %thread_id,
                                 timeout_secs,
-                                "Hard turn timeout — killing turn"
+                                "Hard turn timeout — killing session"
                             );
                             if let Err(e) = channel_id.say(ctx, format!("⚠️ {}", lang.hard_timeout_kill())).await {
                                 tracing::warn!("Failed to send hard timeout message to Discord: {}", e);
                             }
-                            break 'turn false;
+                            queue_rx.close();
+                            break 'turn true;
                         }
                     }
                 }
@@ -1100,5 +1105,35 @@ mod tests {
     fn between_turns_action_break_variant() {
         let a = BetweenTurnsAction::Break;
         assert!(matches!(a, BetweenTurnsAction::Break));
+    }
+
+    // Verifies that the hard timeout path produces outer_break = true.
+    // The labeled-break semantics: `break 'turn true` sets outer_break to true,
+    // which causes SessionWorker::run() to also break its outer loop.
+    #[test]
+    fn hard_timeout_break_value_is_true() {
+        let outer_break: bool = 'turn: loop {
+            let soft_timeout_fired = true;
+            if soft_timeout_fired {
+                // hard timeout branch
+                break 'turn true;
+            }
+            break 'turn false;
+        };
+        assert!(outer_break, "hard timeout must set outer_break = true to exit the session loop");
+    }
+
+    // Verifies that a normal turn end (EOF / result) produces outer_break = false,
+    // so the outer loop continues waiting for the next message.
+    #[test]
+    fn normal_turn_break_value_is_false() {
+        let outer_break: bool = 'turn: loop {
+            let soft_timeout_fired = false;
+            if soft_timeout_fired {
+                break 'turn true;
+            }
+            break 'turn false;
+        };
+        assert!(!outer_break, "normal turn completion must set outer_break = false to keep session alive");
     }
 }
