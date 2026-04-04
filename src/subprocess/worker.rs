@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Mutex as StdMutex;
 use std::time::{Duration, Instant};
 
-use poise::serenity_prelude::{ChannelId, Context};
+use poise::serenity_prelude::{ChannelId, Context, CreateMessage, MessageFlags};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{ChildStdin, ChildStdout};
 use tokio::sync::{mpsc, Mutex};
@@ -16,6 +16,20 @@ use super::background::BackgroundTaskTracker;
 use super::parser::{parse_line, StreamEvent, ContentBlock, build_control_response_allow, build_control_response_deny};
 use super::permission::{PermissionCache, PermissionDecision, PermissionRequest};
 use super::session_manager::{QueuedMessage, SessionInner};
+
+// ─── Helpers ────────────────────────────────────────────────────────────────
+
+async fn say_silent_chunked(ctx: &Context, channel_id: &ChannelId, text: &str) {
+    let chunks = formatter::split_message(text, 2000);
+    for chunk in chunks {
+        let msg = CreateMessage::new()
+            .content(chunk)
+            .flags(MessageFlags::SUPPRESS_NOTIFICATIONS);
+        if let Err(e) = channel_id.send_message(ctx, msg).await {
+            tracing::warn!(%channel_id, "Failed to send bg message to Discord: {}", e);
+        }
+    }
+}
 
 // ─── T6: Common JSON builder helpers ───────────────────────────────────────
 
@@ -282,7 +296,9 @@ async fn handle_between_turns_event(
                             has_bg_tasks.store(tracker.has_active_tasks(), Ordering::Relaxed);
                             tracing::info!("Background task started: {} ({})", task_id, task_type);
                             let start_msg = lang.bg_task_started(description);
-                            channel_id.say(ctx, &start_msg).await.ok();
+                            if let Err(e) = channel_id.say(ctx, &start_msg).await {
+                                tracing::warn!("Failed to send bg task started to Discord: {}", e);
+                            }
                             BetweenTurnsAction::Continue
                         }
                         Ok(StreamEvent::TaskProgress { ref task_id, ref description, .. }) => {
@@ -297,11 +313,7 @@ async fn handle_between_turns_event(
                             } else {
                                 format!("-# ❌ {}", summary)
                             };
-                            for chunk in formatter::split_message(&notify_msg, 2000) {
-                                if let Err(e) = channel_id.say(ctx, &chunk).await {
-                                    tracing::warn!("Failed to send bg notification to Discord: {}", e);
-                                }
-                            }
+                            say_silent_chunked(ctx, channel_id, &notify_msg).await;
 
                             if let Err(e) = repository::update_session_status(db, thread_id, "running").await {
                                 tracing::warn!("Failed to update session status for thread {}: {}", thread_id, e);
@@ -330,7 +342,9 @@ async fn handle_between_turns_event(
                                 build_control_response_allow(request_id, input)
                             } else {
                                 let deny_msg = lang.bg_permission_denied(tool_name);
-                                channel_id.say(ctx, &deny_msg).await.ok();
+                                if let Err(e) = channel_id.say(ctx, &deny_msg).await {
+                                    tracing::warn!("Failed to send bg permission denied to Discord: {}", e);
+                                }
                                 build_control_response_deny(request_id, lang.bg_permission_deny_reason())
                             };
                             if let Err(e) = stdin.write_all(resp.as_bytes()).await {
@@ -417,20 +431,12 @@ async fn handle_bg_turn(
                                     match block {
                                         ContentBlock::Text(text) if !text.trim().is_empty() => {
                                             let bg_text = lang.bg_notification(text);
-                                            for chunk in formatter::split_message(&bg_text, 2000) {
-                                                if let Err(e) = channel_id.say(ctx, &chunk).await {
-                                                    tracing::warn!("Failed to send bg notification to Discord: {}", e);
-                                                }
-                                            }
+                                            say_silent_chunked(ctx, channel_id, &bg_text).await;
                                         }
                                         ContentBlock::ToolUse { name, input, .. } => {
                                             let formatted = formatter::format_tool_use(name, input);
                                             let bg_text = lang.bg_notification(&formatted);
-                                            for chunk in formatter::split_message(&bg_text, 2000) {
-                                                if let Err(e) = channel_id.say(ctx, &chunk).await {
-                                                    tracing::warn!("Failed to send bg notification to Discord: {}", e);
-                                                }
-                                            }
+                                            say_silent_chunked(ctx, channel_id, &bg_text).await;
                                         }
                                         _ => {}
                                     }
@@ -441,11 +447,7 @@ async fn handle_bg_turn(
                                     if result.is_error {
                                         if let Some(formatted) = formatter::format_tool_result_with_name(result, None, lang) {
                                             let bg_text = lang.bg_notification(&formatted);
-                                            for chunk in formatter::split_message(&bg_text, 2000) {
-                                                if let Err(e) = channel_id.say(ctx, &chunk).await {
-                                                    tracing::warn!("Failed to send bg notification to Discord: {}", e);
-                                                }
-                                            }
+                                            say_silent_chunked(ctx, channel_id, &bg_text).await;
                                         }
                                     }
                                 }
@@ -456,7 +458,7 @@ async fn handle_bg_turn(
                                 } else {
                                     let deny_msg = lang.bg_permission_denied(tool_name);
                                     if let Err(e) = channel_id.say(ctx, &deny_msg).await {
-                                        tracing::warn!("Failed to send bg notification to Discord: {}", e);
+                                        tracing::warn!("Failed to send bg permission denied to Discord: {}", e);
                                     }
                                     build_control_response_deny(request_id, lang.bg_permission_deny_reason())
                                 };
@@ -720,7 +722,9 @@ async fn run_active_turn(
                                         tracker.track_started(task_id, task_type, description);
                                         has_bg_tasks.store(tracker.has_active_tasks(), Ordering::Relaxed);
                                         let start_msg = lang.bg_task_started(description);
-                                        channel_id.say(ctx, &start_msg).await.ok();
+                                        if let Err(e) = channel_id.say(ctx, &start_msg).await {
+                                            tracing::warn!("Failed to send bg task started to Discord: {}", e);
+                                        }
                                         continue 'turn;
                                     }
                                     StreamEvent::TaskProgress { task_id, description, .. } => {
@@ -735,11 +739,7 @@ async fn run_active_turn(
                                         } else {
                                             format!("-# ❌ {}", summary)
                                         };
-                                        for chunk in formatter::split_message(&notify_msg, 2000) {
-                                            if let Err(e) = channel_id.say(ctx, &chunk).await {
-                                                tracing::warn!("Failed to send bg notification to Discord: {}", e);
-                                            }
-                                        }
+                                        say_silent_chunked(ctx, channel_id, &notify_msg).await;
                                         bg_turn_active = true;
                                         continue 'turn;
                                     }
@@ -760,20 +760,12 @@ async fn run_active_turn(
                                                 match block {
                                                     ContentBlock::Text(text) if !text.trim().is_empty() => {
                                                         let bg_text = lang.bg_notification(text);
-                                                        for chunk in formatter::split_message(&bg_text, 2000) {
-                                                            if let Err(e) = channel_id.say(ctx, &chunk).await {
-                                                                tracing::warn!("Failed to send bg notification to Discord: {}", e);
-                                                            }
-                                                        }
+                                                        say_silent_chunked(ctx, channel_id, &bg_text).await;
                                                     }
                                                     ContentBlock::ToolUse { name, input, .. } => {
                                                         let formatted = formatter::format_tool_use(name, input);
                                                         let bg_text = lang.bg_notification(&formatted);
-                                                        for chunk in formatter::split_message(&bg_text, 2000) {
-                                                            if let Err(e) = channel_id.say(ctx, &chunk).await {
-                                                                tracing::warn!("Failed to send bg notification to Discord: {}", e);
-                                                            }
-                                                        }
+                                                        say_silent_chunked(ctx, channel_id, &bg_text).await;
                                                     }
                                                     _ => {}
                                                 }
@@ -785,11 +777,7 @@ async fn run_active_turn(
                                                 if result.is_error {
                                                     if let Some(formatted) = formatter::format_tool_result_with_name(result, None, lang) {
                                                         let bg_text = lang.bg_notification(&formatted);
-                                                        for chunk in formatter::split_message(&bg_text, 2000) {
-                                                            if let Err(e) = channel_id.say(ctx, &chunk).await {
-                                                                tracing::warn!("Failed to send bg notification to Discord: {}", e);
-                                                            }
-                                                        }
+                                                        say_silent_chunked(ctx, channel_id, &bg_text).await;
                                                     }
                                                 }
                                             }
@@ -801,7 +789,7 @@ async fn run_active_turn(
                                             } else {
                                                 let deny_msg = lang.bg_permission_denied(tool_name);
                                                 if let Err(e) = channel_id.say(ctx, &deny_msg).await {
-                                                    tracing::warn!("Failed to send bg notification to Discord: {}", e);
+                                                    tracing::warn!("Failed to send bg permission denied to Discord: {}", e);
                                                 }
                                                 build_control_response_deny(request_id, lang.bg_permission_deny_reason())
                                             };
@@ -954,10 +942,9 @@ async fn run_active_turn(
                             let _ = stdin.flush().await;
 
                             // Discord 알림 (deadline 설정 전에 처리 — API 지연이 retry window를 잠식하지 않도록)
-                            channel_id.say(
-                                ctx,
-                                format!("-# ⚠️ {}", lang.soft_timeout_nudge())
-                            ).await.ok();
+                            if let Err(e) = channel_id.say(ctx, format!("-# ⚠️ {}", lang.soft_timeout_nudge())).await {
+                                tracing::warn!("Failed to send soft timeout nudge to Discord: {}", e);
+                            }
 
                             // 짧은 재대기 (timeout_secs / 5, 최소 60초)
                             let retry_secs = (timeout_secs / 5).max(60);
@@ -976,10 +963,9 @@ async fn run_active_turn(
                                 timeout_secs,
                                 "Hard turn timeout — killing turn"
                             );
-                            channel_id.say(
-                                ctx,
-                                format!("⚠️ {}", lang.hard_timeout_kill())
-                            ).await.ok();
+                            if let Err(e) = channel_id.say(ctx, format!("⚠️ {}", lang.hard_timeout_kill())).await {
+                                tracing::warn!("Failed to send hard timeout message to Discord: {}", e);
+                            }
                             break 'turn false;
                         }
                     }
