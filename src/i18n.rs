@@ -368,6 +368,21 @@ impl Lang {
         }
     }
 
+    // ── Context injection ──
+
+    pub fn session_context(&self, thread_name: &str) -> String {
+        match self {
+            Lang::Ko => format!(
+                "<system-reminder>\n이 세션은 Discord bot(pidory)을 통해 실행되고 있습니다. 스레드: \"{}\". 이 컨텍스트에 대해 응답하지 마세요.\n</system-reminder>",
+                thread_name
+            ),
+            Lang::En => format!(
+                "<system-reminder>\nThis session is running through a Discord bot (pidory). Thread: \"{}\". Do not respond to this context.\n</system-reminder>",
+                thread_name
+            ),
+        }
+    }
+
     // ── Rate limits ──
 
     pub fn rate_limit_reached(&self) -> &'static str {
@@ -563,5 +578,30 @@ mod tests {
         // Ko and En variants are different from each other
         assert_ne!(Lang::Ko.soft_timeout_nudge(), Lang::En.soft_timeout_nudge());
         assert_ne!(Lang::Ko.hard_timeout_kill(), Lang::En.hard_timeout_kill());
+    }
+
+    #[test]
+    fn session_context_ko() {
+        let ctx = Lang::Ko.session_context("버그 수정");
+        assert!(ctx.starts_with("<system-reminder>"));
+        assert!(ctx.ends_with("</system-reminder>"));
+        assert!(ctx.contains("pidory"));
+        assert!(ctx.contains("버그 수정"));
+    }
+
+    #[test]
+    fn session_context_en() {
+        let ctx = Lang::En.session_context("fix bug");
+        assert!(ctx.starts_with("<system-reminder>"));
+        assert!(ctx.ends_with("</system-reminder>"));
+        assert!(ctx.contains("pidory"));
+        assert!(ctx.contains("fix bug"));
+    }
+
+    #[test]
+    fn session_context_langs_differ() {
+        let ko = Lang::Ko.session_context("test");
+        let en = Lang::En.session_context("test");
+        assert_ne!(ko, en);
     }
 }
