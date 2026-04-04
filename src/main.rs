@@ -13,13 +13,13 @@ use std::sync::Arc;
 
 use poise::serenity_prelude as serenity;
 use sqlx::SqlitePool;
-use tokio::sync::{Mutex, mpsc, oneshot, watch};
+use tokio::sync::{Mutex, oneshot, watch};
 use tracing::info;
 use tracing_subscriber::{EnvFilter, fmt};
 
 use config::Config;
 use error::PidoryError;
-use subprocess::permission::{PermissionDecision, PermissionRequest};
+use subprocess::permission::PermissionDecision;
 use subprocess::session_manager::SessionManager;
 
 type Error = PidoryError;
@@ -29,13 +29,13 @@ pub struct PendingPermission {
     pub response_tx: oneshot::Sender<PermissionDecision>,
     pub tool_name: String,
     pub message_id: serenity::MessageId,
+    pub thread_id: String,
 }
 
 pub struct Data {
     pub config: Arc<Config>,
     pub db: SqlitePool,
     pub sessions: Arc<SessionManager>,
-    pub permission_rxs: Arc<Mutex<HashMap<String, mpsc::Receiver<PermissionRequest>>>>,
     pub pending_permissions: Arc<Mutex<HashMap<String, PendingPermission>>>,
     pub session_skills: Arc<Mutex<HashMap<String, Vec<String>>>>,
     pub needs_context: Arc<Mutex<HashSet<String>>>,
@@ -97,8 +97,7 @@ async fn main() -> Result<(), PidoryError> {
                     config.claude.max_sessions,
                 ));
 
-                let permission_rxs = Arc::new(Mutex::new(HashMap::new()));
-                let pending_permissions = Arc::new(Mutex::new(HashMap::new()));
+                let pending_permissions: Arc<Mutex<HashMap<String, PendingPermission>>> = Arc::new(Mutex::new(HashMap::new()));
                 let session_skills = Arc::new(Mutex::new(HashMap::new()));
                 let skill_descriptions = load_skill_descriptions();
 
@@ -150,7 +149,7 @@ async fn main() -> Result<(), PidoryError> {
                 {
                     let sessions = Arc::clone(&sessions);
                     let idle_timeout = std::time::Duration::from_secs(config.claude.idle_timeout_secs);
-                    let permission_rxs = Arc::clone(&permission_rxs);
+                    let pending_permissions = Arc::clone(&pending_permissions);
                     let session_skills = Arc::clone(&session_skills);
                     let needs_context = Arc::clone(&needs_context);
                     let db_clone = db.clone();
@@ -166,7 +165,7 @@ async fn main() -> Result<(), PidoryError> {
                             }
                             tracing::info!("TTL sweep: evicted {} sessions", evicted.len());
                             for tid in &evicted {
-                                permission_rxs.lock().await.remove(tid);
+                                pending_permissions.lock().await.retain(|_, p| p.thread_id != *tid);
                                 session_skills.lock().await.remove(tid);
                                 needs_context.lock().await.remove(tid);
                                 if let Err(e) = db::repository::update_session_status(&db_clone, tid, "idle").await {
@@ -190,7 +189,6 @@ async fn main() -> Result<(), PidoryError> {
                     config,
                     db,
                     sessions,
-                    permission_rxs,
                     pending_permissions,
                     session_skills,
                     needs_context,
