@@ -38,6 +38,7 @@ pub struct Data {
     pub permission_rxs: Arc<Mutex<HashMap<String, mpsc::Receiver<PermissionRequest>>>>,
     pub pending_permissions: Arc<Mutex<HashMap<String, PendingPermission>>>,
     pub session_skills: Arc<Mutex<HashMap<String, Vec<String>>>>,
+    pub needs_context: Arc<Mutex<HashSet<String>>>,
     pub skill_descriptions: HashMap<String, String>,
     /// Event handler가 fresh Context를 background task에 전달하는 채널.
     /// Shard reconnect 후에도 최신 ShardMessenger를 사용할 수 있게 해준다.
@@ -143,12 +144,15 @@ async fn main() -> Result<(), PidoryError> {
                     });
                 }
 
+                let needs_context = Arc::new(Mutex::new(HashSet::new()));
+
                 // Idle session TTL sweep
                 {
                     let sessions = Arc::clone(&sessions);
                     let idle_timeout = std::time::Duration::from_secs(config.claude.idle_timeout_secs);
                     let permission_rxs = Arc::clone(&permission_rxs);
                     let session_skills = Arc::clone(&session_skills);
+                    let needs_context = Arc::clone(&needs_context);
                     let db_clone = db.clone();
                     let lang = config.language;
                     let mut ctx_rx = ctx_tx.subscribe();
@@ -164,6 +168,7 @@ async fn main() -> Result<(), PidoryError> {
                             for tid in &evicted {
                                 permission_rxs.lock().await.remove(tid);
                                 session_skills.lock().await.remove(tid);
+                                needs_context.lock().await.remove(tid);
                                 if let Err(e) = db::repository::update_session_status(&db_clone, tid, "idle").await {
                                     tracing::warn!("Failed to update session status for TTL sweep thread {}: {}", tid, e);
                                 }
@@ -180,6 +185,7 @@ async fn main() -> Result<(), PidoryError> {
                     });
                 }
 
+
                 Ok(Data {
                     config,
                     db,
@@ -187,6 +193,7 @@ async fn main() -> Result<(), PidoryError> {
                     permission_rxs,
                     pending_permissions,
                     session_skills,
+                    needs_context,
                     skill_descriptions,
                     ctx_watch: ctx_tx,
                 })
