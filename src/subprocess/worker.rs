@@ -178,6 +178,7 @@ impl SessionWorker {
                 line,
                 queue_rx,
                 interrupt_rx,
+                permission_tx,
                 permission_cache,
                 tracker,
                 queue_size,
@@ -249,8 +250,8 @@ impl SessionWorker {
             "Worker task exiting for thread {}, removing from sessions",
             thread_id
         );
-        let removed = sessions.lock().await.remove(thread_id);
-        if let Some(mut inner) = removed {
+        if let Some(mut inner) = sessions.lock().await.remove(thread_id) {
+            inner.permission_handler.abort();
             match inner.child.try_wait() {
                 Ok(Some(_status)) => {
                     // Already exited, no kill needed
@@ -275,6 +276,7 @@ async fn handle_between_turns_event(
     line: &mut String,
     queue_rx: &mut mpsc::Receiver<QueuedMessage>,
     interrupt_rx: &mut mpsc::Receiver<()>,
+    permission_tx: &mpsc::Sender<PermissionRequest>,
     permission_cache: &mut PermissionCache,
     tracker: &mut BackgroundTaskTracker,
     queue_size: &Arc<AtomicUsize>,
@@ -338,6 +340,7 @@ async fn handle_between_turns_event(
                                 line,
                                 queue_rx,
                                 interrupt_rx,
+                                permission_tx,
                                 permission_cache,
                                 tracker,
                                 queue_size,
@@ -350,21 +353,54 @@ async fn handle_between_turns_event(
 
                             BetweenTurnsAction::Continue
                         }
-                        Ok(StreamEvent::ControlRequest { ref request_id, ref tool_name, ref input, .. }) => {
-                            let resp = if permission_cache.is_always_allowed(tool_name) {
-                                build_control_response_allow(request_id, input)
-                            } else {
-                                let deny_msg = lang.bg_permission_denied(tool_name);
-                                if let Err(e) = channel_id.say(ctx, &deny_msg).await {
-                                    tracing::warn!("Failed to send bg permission denied to Discord: {}", e);
+                        Ok(StreamEvent::ControlRequest { ref request_id, ref tool_name, ref tool_use_id, ref input, ref decision_reason, .. }) => {
+                            if permission_cache.is_always_allowed(tool_name) {
+                                let resp = build_control_response_allow(request_id, input);
+                                if let Err(e) = stdin.write_all(resp.as_bytes()).await {
+                                    tracing::error!("stdin write error (between turns auto-allow): {}", e);
+                                    return BetweenTurnsAction::Break;
                                 }
-                                build_control_response_deny(request_id, lang.bg_permission_deny_reason())
-                            };
-                            if let Err(e) = stdin.write_all(resp.as_bytes()).await {
-                                tracing::error!("stdin write error (between turns): {}", e);
-                                return BetweenTurnsAction::Break;
+                                let _ = stdin.flush().await;
+                                return BetweenTurnsAction::Continue;
                             }
-                            let _ = stdin.flush().await;
+
+                            let saved_request_id = request_id.clone();
+                            let saved_tool_name = tool_name.clone();
+                            let saved_tool_use_id = tool_use_id.clone();
+                            let saved_input = input.clone();
+                            let saved_reason = decision_reason.clone();
+
+                            let (resp_tx, mut resp_rx) = tokio::sync::oneshot::channel();
+                            let perm_req = PermissionRequest {
+                                request_id: saved_request_id.clone(),
+                                tool_name: saved_tool_name.clone(),
+                                tool_use_id: saved_tool_use_id,
+                                input: saved_input.clone(),
+                                decision_reason: saved_reason,
+                                response_tx: resp_tx,
+                            };
+                            if permission_tx.send(perm_req).await.is_err() {
+                                tracing::error!("permission_tx closed, denying (between turns)");
+                                let resp = build_control_response_deny(&saved_request_id, "Permission handler unavailable");
+                                if let Err(e) = stdin.write_all(resp.as_bytes()).await {
+                                    tracing::error!("stdin write error (between turns deny): {}", e);
+                                    return BetweenTurnsAction::Break;
+                                }
+                                let _ = stdin.flush().await;
+                                return BetweenTurnsAction::Continue;
+                            }
+                            let perm_result = wait_for_permission(
+                                stdin, reader, line, queue_rx, interrupt_rx,
+                                queue_size, thread_id, &saved_tool_name, None, &mut resp_rx,
+                            ).await;
+                            match write_permission_response(perm_result, &saved_request_id, &saved_input, stdin, permission_cache).await {
+                                Ok(true) => return BetweenTurnsAction::Break,
+                                Err(e) => {
+                                    tracing::error!("stdin write error (between turns permission): {}", e);
+                                    return BetweenTurnsAction::Break;
+                                }
+                                _ => {}
+                            }
                             BetweenTurnsAction::Continue
                         }
                         Ok(event) => {
@@ -409,6 +445,7 @@ async fn handle_bg_turn(
     line: &mut String,
     queue_rx: &mut mpsc::Receiver<QueuedMessage>,
     interrupt_rx: &mut mpsc::Receiver<()>,
+    permission_tx: &mpsc::Sender<PermissionRequest>,
     permission_cache: &mut PermissionCache,
     tracker: &mut BackgroundTaskTracker,
     queue_size: &Arc<AtomicUsize>,
@@ -465,24 +502,60 @@ async fn handle_bg_turn(
                                     }
                                 }
                             }
-                            Ok(StreamEvent::ControlRequest { ref request_id, ref tool_name, ref input, .. }) => {
-                                let resp = if permission_cache.is_always_allowed(tool_name) {
-                                    build_control_response_allow(request_id, input)
+                            Ok(StreamEvent::ControlRequest { ref request_id, ref tool_name, ref tool_use_id, ref input, ref decision_reason, .. }) => {
+                                if permission_cache.is_always_allowed(tool_name) {
+                                    let resp = build_control_response_allow(request_id, input);
+                                    if let Err(e) = stdin.write_all(resp.as_bytes()).await {
+                                        tracing::error!("stdin write error (bg turn auto-allow): {}", e);
+                                        if let Err(e) = repository::update_session_status(db, thread_id, "idle").await {
+                                            tracing::warn!("Failed to update session status for thread {}: {}", thread_id, e);
+                                        }
+                                        break 'bg_turn;
+                                    }
+                                    let _ = stdin.flush().await;
                                 } else {
-                                    let deny_msg = lang.bg_permission_denied(tool_name);
-                                    if let Err(e) = channel_id.say(ctx, &deny_msg).await {
-                                        tracing::warn!("Failed to send bg permission denied to Discord: {}", e);
+                                    let saved_request_id = request_id.clone();
+                                    let saved_tool_name = tool_name.clone();
+                                    let saved_tool_use_id = tool_use_id.clone();
+                                    let saved_input = input.clone();
+                                    let saved_reason = decision_reason.clone();
+
+                                    let (resp_tx, mut resp_rx) = tokio::sync::oneshot::channel();
+                                    let perm_req = PermissionRequest {
+                                        request_id: saved_request_id.clone(),
+                                        tool_name: saved_tool_name.clone(),
+                                        tool_use_id: saved_tool_use_id,
+                                        input: saved_input.clone(),
+                                        decision_reason: saved_reason,
+                                        response_tx: resp_tx,
+                                    };
+                                    if permission_tx.send(perm_req).await.is_err() {
+                                        tracing::error!("permission_tx closed, denying (bg turn)");
+                                        let resp = build_control_response_deny(&saved_request_id, "Permission handler unavailable");
+                                        if let Err(e) = stdin.write_all(resp.as_bytes()).await {
+                                            tracing::error!("stdin write error (bg turn deny): {}", e);
+                                            if let Err(e) = repository::update_session_status(db, thread_id, "idle").await {
+                                                tracing::warn!("Failed to update session status for thread {}: {}", thread_id, e);
+                                            }
+                                            break 'bg_turn;
+                                        }
+                                        let _ = stdin.flush().await;
+                                    } else {
+                                        let perm_result = wait_for_permission(
+                                            stdin, reader, line, queue_rx, interrupt_rx,
+                                            queue_size, thread_id, &saved_tool_name, None, &mut resp_rx,
+                                        ).await;
+                                        match write_permission_response(perm_result, &saved_request_id, &saved_input, stdin, permission_cache).await {
+                                            Ok(true) | Err(_) => {
+                                                if let Err(e) = repository::update_session_status(db, thread_id, "idle").await {
+                                                    tracing::warn!("Failed to update session status for thread {}: {}", thread_id, e);
+                                                }
+                                                break 'bg_turn;
+                                            }
+                                            _ => {}
+                                        }
                                     }
-                                    build_control_response_deny(request_id, lang.bg_permission_deny_reason())
-                                };
-                                if let Err(e) = stdin.write_all(resp.as_bytes()).await {
-                                    tracing::error!("stdin write error (bg turn): {}", e);
-                                    if let Err(e) = repository::update_session_status(db, thread_id, "idle").await {
-                                        tracing::warn!("Failed to update session status for thread {}: {}", thread_id, e);
-                                    }
-                                    break 'bg_turn;
                                 }
-                                let _ = stdin.flush().await;
                             }
                             Ok(StreamEvent::TaskStarted { ref task_id, ref task_type, ref description, .. }) => {
                                 tracker.track_started(task_id, task_type, description);
@@ -553,7 +626,7 @@ async fn wait_for_permission(
     queue_size: &Arc<AtomicUsize>,
     thread_id: &str,
     saved_tool_name: &str,
-    event_tx: &mpsc::Sender<StreamEvent>,
+    event_tx: Option<&mpsc::Sender<StreamEvent>>,
     resp_rx: &mut tokio::sync::oneshot::Receiver<PermissionDecision>,
 ) -> PermissionWaitResult {
     'perm: loop {
@@ -618,7 +691,11 @@ async fn wait_for_permission(
                         if !t.is_empty() {
                             match parse_line(t) {
                                 Ok(ev) => {
-                                    let _ = event_tx.send(ev).await;
+                                    if let Some(tx) = event_tx {
+                                        let _ = tx.send(ev).await;
+                                    } else {
+                                        tracing::debug!("Draining event during perm wait (no event_tx): {:?}", ev);
+                                    }
                                 }
                                 Err(e) => {
                                     tracing::warn!("Parse error (perm wait): {}", e);
@@ -633,6 +710,42 @@ async fn wait_for_permission(
                     }
                 }
             }
+        }
+    }
+}
+
+// ─── T4a: Permission response writer ───────────────────────────────────────
+
+/// Returns Ok(true) if Error variant (caller should break), Ok(false) on success.
+async fn write_permission_response(
+    result: PermissionWaitResult,
+    request_id: &str,
+    input: &serde_json::Value,
+    stdin: &mut ChildStdin,
+    permission_cache: &mut PermissionCache,
+) -> Result<bool, std::io::Error> {
+    match result {
+        PermissionWaitResult::Allow => {
+            let resp = build_control_response_allow(request_id, input);
+            stdin.write_all(resp.as_bytes()).await?;
+            stdin.flush().await?;
+            Ok(false)
+        }
+        PermissionWaitResult::AlwaysAllow(tool_name) => {
+            let resp = build_control_response_allow(request_id, input);
+            stdin.write_all(resp.as_bytes()).await?;
+            stdin.flush().await?;
+            permission_cache.add_always_allow(&tool_name);
+            Ok(false)
+        }
+        PermissionWaitResult::Deny(reason) => {
+            let resp = build_control_response_deny(request_id, &reason);
+            stdin.write_all(resp.as_bytes()).await?;
+            stdin.flush().await?;
+            Ok(false)
+        }
+        PermissionWaitResult::Error => {
+            Ok(true) // caller should break
         }
     }
 }
@@ -796,21 +909,53 @@ async fn run_active_turn(
                                             }
                                             continue 'turn;
                                         }
-                                        StreamEvent::ControlRequest { request_id, tool_name, input, .. } => {
-                                            let resp = if permission_cache.is_always_allowed(tool_name) {
-                                                build_control_response_allow(request_id, input)
-                                            } else {
-                                                let deny_msg = lang.bg_permission_denied(tool_name);
-                                                if let Err(e) = channel_id.say(ctx, &deny_msg).await {
-                                                    tracing::warn!("Failed to send bg permission denied to Discord: {}", e);
+                                        StreamEvent::ControlRequest { request_id, tool_name, tool_use_id, input, decision_reason, .. } => {
+                                            if permission_cache.is_always_allowed(tool_name) {
+                                                let resp = build_control_response_allow(request_id, input);
+                                                if let Err(e) = stdin.write_all(resp.as_bytes()).await {
+                                                    tracing::error!("stdin write error (bg turn in user turn auto-allow): {}", e);
+                                                    break 'turn false;
                                                 }
-                                                build_control_response_deny(request_id, lang.bg_permission_deny_reason())
+                                                let _ = stdin.flush().await;
+                                                continue 'turn;
+                                            }
+
+                                            let saved_request_id = request_id.clone();
+                                            let saved_tool_name = tool_name.clone();
+                                            let saved_tool_use_id = tool_use_id.clone();
+                                            let saved_input = input.clone();
+                                            let saved_reason = decision_reason.clone();
+
+                                            let (resp_tx, mut resp_rx) = tokio::sync::oneshot::channel();
+                                            let perm_req = PermissionRequest {
+                                                request_id: saved_request_id.clone(),
+                                                tool_name: saved_tool_name.clone(),
+                                                tool_use_id: saved_tool_use_id,
+                                                input: saved_input.clone(),
+                                                decision_reason: saved_reason,
+                                                response_tx: resp_tx,
                                             };
-                                            if let Err(e) = stdin.write_all(resp.as_bytes()).await {
-                                                tracing::error!("stdin write error (bg turn in user turn): {}", e);
+                                            if permission_tx.send(perm_req).await.is_err() {
+                                                tracing::error!("permission_tx closed, denying (bg turn in user turn)");
+                                                let resp = build_control_response_deny(&saved_request_id, "Permission handler unavailable");
+                                                if let Err(e) = stdin.write_all(resp.as_bytes()).await {
+                                                    tracing::error!("stdin write error (bg turn in user turn deny): {}", e);
+                                                }
+                                                let _ = stdin.flush().await;
                                                 break 'turn false;
                                             }
-                                            let _ = stdin.flush().await;
+                                            let perm_result = wait_for_permission(
+                                                stdin, reader, line, queue_rx, interrupt_rx,
+                                                queue_size, thread_id, &saved_tool_name, Some(&event_tx), &mut resp_rx,
+                                            ).await;
+                                            match write_permission_response(perm_result, &saved_request_id, &saved_input, stdin, permission_cache).await {
+                                                Ok(true) => break 'turn false,
+                                                Err(e) => {
+                                                    tracing::error!("stdin write error (bg turn in user turn permission): {}", e);
+                                                    break 'turn false;
+                                                }
+                                                _ => {}
+                                            }
                                             continue 'turn;
                                         }
                                         _ => { continue 'turn; } // Init, RateLimit 등 skip
@@ -860,7 +1005,9 @@ async fn run_active_turn(
                                     if permission_tx.send(perm_req).await.is_err() {
                                         tracing::error!("permission_tx closed, denying");
                                         let resp = build_control_response_deny(&saved_request_id, "Permission handler unavailable");
-                                        let _ = stdin.write_all(resp.as_bytes()).await;
+                                        if let Err(e) = stdin.write_all(resp.as_bytes()).await {
+                                            tracing::error!("stdin write error (foreground deny): {}", e);
+                                        }
                                         let _ = stdin.flush().await;
                                         break 'turn false;
                                     }
@@ -874,39 +1021,17 @@ async fn run_active_turn(
                                         queue_size,
                                         thread_id,
                                         &saved_tool_name,
-                                        &event_tx,
+                                        Some(&event_tx),
                                         &mut resp_rx,
                                     ).await;
 
-                                    match perm_result {
-                                        PermissionWaitResult::Allow => {
-                                            let resp = build_control_response_allow(&saved_request_id, &saved_input);
-                                            if let Err(e) = stdin.write_all(resp.as_bytes()).await {
-                                                tracing::error!("stdin write error (allow): {}", e);
-                                                break 'turn false;
-                                            }
-                                            let _ = stdin.flush().await;
-                                        }
-                                        PermissionWaitResult::AlwaysAllow(tool_name) => {
-                                            let resp = build_control_response_allow(&saved_request_id, &saved_input);
-                                            if let Err(e) = stdin.write_all(resp.as_bytes()).await {
-                                                tracing::error!("stdin write error (allow): {}", e);
-                                                break 'turn false;
-                                            }
-                                            let _ = stdin.flush().await;
-                                            permission_cache.add_always_allow(&tool_name);
-                                        }
-                                        PermissionWaitResult::Deny(reason) => {
-                                            let resp = build_control_response_deny(&saved_request_id, &reason);
-                                            if let Err(e) = stdin.write_all(resp.as_bytes()).await {
-                                                tracing::error!("stdin write error (deny): {}", e);
-                                                break 'turn false;
-                                            }
-                                            let _ = stdin.flush().await;
-                                        }
-                                        PermissionWaitResult::Error => {
+                                    match write_permission_response(perm_result, &saved_request_id, &saved_input, stdin, permission_cache).await {
+                                        Ok(true) => break 'turn false, // Error variant
+                                        Err(e) => {
+                                            tracing::error!("stdin write error (permission response): {}", e);
                                             break 'turn false;
                                         }
+                                        _ => {} // success
                                     }
 
                                     // timeout 리셋
@@ -996,7 +1121,12 @@ async fn run_active_turn(
 
 #[cfg(test)]
 mod tests {
-    use super::{build_user_message_json, build_interrupt_json, BetweenTurnsAction, PermissionWaitResult};
+    use super::{
+        build_user_message_json, build_interrupt_json, write_permission_response,
+        BetweenTurnsAction, PermissionWaitResult,
+    };
+    use crate::subprocess::permission::PermissionCache;
+    use crate::subprocess::parser::{build_control_response_allow, build_control_response_deny};
 
     // ── build_user_message_json ──────────────────────────────────────────────
 
@@ -1144,5 +1274,183 @@ mod tests {
             break 'turn false;
         };
         assert!(!outer_break, "normal turn completion must set outer_break = false to keep session alive");
+    }
+
+    // ── write_permission_response ────────────────────────────────────────────
+
+    /// Spawn a `cat` subprocess to get a real ChildStdin for write tests.
+    async fn spawn_cat_stdin() -> tokio::process::ChildStdin {
+        let mut child = tokio::process::Command::new("cat")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("failed to spawn cat");
+        child.stdin.take().expect("no stdin")
+    }
+
+    #[tokio::test]
+    async fn write_permission_response_allow_returns_ok_false() {
+        let mut stdin = spawn_cat_stdin().await;
+        let mut cache = PermissionCache::new();
+        let input = serde_json::json!({"command": "ls"});
+        let result = write_permission_response(
+            PermissionWaitResult::Allow,
+            "req-001",
+            &input,
+            &mut stdin,
+            &mut cache,
+        )
+        .await;
+        assert_eq!(result.unwrap(), false, "Allow variant must return Ok(false)");
+    }
+
+    #[tokio::test]
+    async fn write_permission_response_allow_writes_allow_json() {
+        // Verify the JSON written to stdin has behavior=allow.
+        let expected = build_control_response_allow("req-002", &serde_json::json!({}));
+        let v: serde_json::Value = serde_json::from_str(expected.trim()).unwrap();
+        assert_eq!(v["response"]["response"]["behavior"], "allow");
+        assert_eq!(v["response"]["request_id"], "req-002");
+    }
+
+    #[tokio::test]
+    async fn write_permission_response_always_allow_updates_cache() {
+        let mut stdin = spawn_cat_stdin().await;
+        let mut cache = PermissionCache::new();
+        assert!(!cache.is_always_allowed("Bash"));
+        let input = serde_json::json!({"command": "echo hi"});
+        let result = write_permission_response(
+            PermissionWaitResult::AlwaysAllow("Bash".to_string()),
+            "req-003",
+            &input,
+            &mut stdin,
+            &mut cache,
+        )
+        .await;
+        assert_eq!(result.unwrap(), false, "AlwaysAllow must return Ok(false)");
+        assert!(cache.is_always_allowed("Bash"), "cache must record the always-allowed tool");
+    }
+
+    #[tokio::test]
+    async fn write_permission_response_always_allow_does_not_affect_other_tools() {
+        let mut stdin = spawn_cat_stdin().await;
+        let mut cache = PermissionCache::new();
+        let input = serde_json::json!({});
+        write_permission_response(
+            PermissionWaitResult::AlwaysAllow("Write".to_string()),
+            "req-004",
+            &input,
+            &mut stdin,
+            &mut cache,
+        )
+        .await
+        .unwrap();
+        assert!(cache.is_always_allowed("Write"));
+        assert!(!cache.is_always_allowed("Bash"), "unrelated tools must not be in cache");
+    }
+
+    #[tokio::test]
+    async fn write_permission_response_deny_returns_ok_false() {
+        let mut stdin = spawn_cat_stdin().await;
+        let mut cache = PermissionCache::new();
+        let input = serde_json::json!({});
+        let result = write_permission_response(
+            PermissionWaitResult::Deny("user rejected".to_string()),
+            "req-005",
+            &input,
+            &mut stdin,
+            &mut cache,
+        )
+        .await;
+        assert_eq!(result.unwrap(), false, "Deny variant must return Ok(false)");
+    }
+
+    #[tokio::test]
+    async fn write_permission_response_deny_does_not_update_cache() {
+        let mut stdin = spawn_cat_stdin().await;
+        let mut cache = PermissionCache::new();
+        let input = serde_json::json!({});
+        write_permission_response(
+            PermissionWaitResult::Deny("no".to_string()),
+            "req-006",
+            &input,
+            &mut stdin,
+            &mut cache,
+        )
+        .await
+        .unwrap();
+        assert!(!cache.is_always_allowed("Bash"), "Deny must not update the permission cache");
+    }
+
+    #[tokio::test]
+    async fn write_permission_response_error_returns_ok_true() {
+        // Error variant signals caller to break — no stdin needed.
+        let mut stdin = spawn_cat_stdin().await;
+        let mut cache = PermissionCache::new();
+        let input = serde_json::json!({});
+        let result = write_permission_response(
+            PermissionWaitResult::Error,
+            "req-007",
+            &input,
+            &mut stdin,
+            &mut cache,
+        )
+        .await;
+        assert_eq!(result.unwrap(), true, "Error variant must return Ok(true) to signal break");
+    }
+
+    #[tokio::test]
+    async fn write_permission_response_error_does_not_update_cache() {
+        let mut stdin = spawn_cat_stdin().await;
+        let mut cache = PermissionCache::new();
+        let input = serde_json::json!({});
+        write_permission_response(
+            PermissionWaitResult::Error,
+            "req-008",
+            &input,
+            &mut stdin,
+            &mut cache,
+        )
+        .await
+        .unwrap();
+        assert!(!cache.is_always_allowed("Bash"), "Error must not touch the permission cache");
+    }
+
+    // ── build_control_response_allow / build_control_response_deny ───────────
+
+    #[test]
+    fn control_response_allow_json_structure() {
+        let input = serde_json::json!({"command": "ls"});
+        let out = build_control_response_allow("rid-1", &input);
+        let v: serde_json::Value = serde_json::from_str(out.trim()).expect("valid JSON");
+        assert_eq!(v["type"], "control_response");
+        assert_eq!(v["response"]["subtype"], "success");
+        assert_eq!(v["response"]["request_id"], "rid-1");
+        assert_eq!(v["response"]["response"]["behavior"], "allow");
+        assert_eq!(v["response"]["response"]["updatedInput"]["command"], "ls");
+    }
+
+    #[test]
+    fn control_response_allow_ends_with_newline() {
+        let out = build_control_response_allow("rid-2", &serde_json::json!({}));
+        assert!(out.ends_with('\n'));
+    }
+
+    #[test]
+    fn control_response_deny_json_structure() {
+        let out = build_control_response_deny("rid-3", "user rejected");
+        let v: serde_json::Value = serde_json::from_str(out.trim()).expect("valid JSON");
+        assert_eq!(v["type"], "control_response");
+        assert_eq!(v["response"]["subtype"], "success");
+        assert_eq!(v["response"]["request_id"], "rid-3");
+        assert_eq!(v["response"]["response"]["behavior"], "deny");
+        assert_eq!(v["response"]["response"]["message"], "user rejected");
+    }
+
+    #[test]
+    fn control_response_deny_ends_with_newline() {
+        let out = build_control_response_deny("rid-4", "reason");
+        assert!(out.ends_with('\n'));
     }
 }

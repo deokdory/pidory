@@ -1,12 +1,19 @@
 #![allow(dead_code)]
 
+use std::collections::HashMap;
+use std::sync::Arc;
+
 use poise::serenity_prelude::{
     ButtonStyle, ChannelId, Context, CreateActionRow, CreateButton, CreateMessage, EditMessage,
     MessageId,
 };
+use tokio::sync::{Mutex, mpsc};
+use tracing::warn;
 
 use crate::error::PidoryError;
 use crate::i18n::Lang;
+use crate::subprocess::permission::{PermissionDecision, PermissionRequest};
+use crate::PendingPermission;
 
 pub fn create_permission_message(
     tool_name: &str,
@@ -133,6 +140,47 @@ pub fn parse_permission_custom_id(custom_id: &str) -> Option<(String, String)> {
     Some((request_id.to_string(), action.to_string()))
 }
 
+pub async fn run_permission_handler(
+    mut permission_rx: mpsc::Receiver<PermissionRequest>,
+    ctx: Context,
+    channel_id: ChannelId,
+    pending_permissions: Arc<Mutex<HashMap<String, PendingPermission>>>,
+    owner_id: u64,
+    thread_id: String,
+    lang: Lang,
+) {
+    while let Some(perm_req) = permission_rx.recv().await {
+        let msg = create_permission_message(
+            &perm_req.tool_name,
+            &perm_req.input,
+            &perm_req.request_id,
+            perm_req.decision_reason.as_deref(),
+            owner_id,
+            lang,
+        );
+
+        match channel_id.send_message(&ctx, msg).await {
+            Ok(sent) => {
+                let pending = PendingPermission {
+                    response_tx: perm_req.response_tx,
+                    tool_name: perm_req.tool_name,
+                    message_id: sent.id,
+                    thread_id: thread_id.clone(),
+                };
+                pending_permissions
+                    .lock()
+                    .await
+                    .insert(perm_req.request_id, pending);
+            }
+            Err(e) => {
+                warn!("Failed to send permission message: {}", e);
+                // 전송 실패 시 deny
+                let _ = perm_req.response_tx.send(PermissionDecision::Deny);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -217,5 +265,115 @@ mod tests {
         let input = serde_json::json!({"field": long_str});
         let result = format_tool_input_summary("UnknownTool", &input);
         assert_eq!(result, format!("`{}`", "a".repeat(100)));
+    }
+
+    // ── format_tool_input_summary: remaining tool variants ───────────────────
+
+    #[test]
+    fn format_write_summary() {
+        let input = serde_json::json!({"file_path": "/src/main.rs"});
+        let result = format_tool_input_summary("Write", &input);
+        assert_eq!(result, "`/src/main.rs`");
+    }
+
+    #[test]
+    fn format_read_summary() {
+        let input = serde_json::json!({"file_path": "/etc/hosts"});
+        let result = format_tool_input_summary("Read", &input);
+        assert_eq!(result, "`/etc/hosts`");
+    }
+
+    #[test]
+    fn format_grep_summary() {
+        let input = serde_json::json!({"pattern": "fn main"});
+        let result = format_tool_input_summary("Grep", &input);
+        assert_eq!(result, "`fn main`");
+    }
+
+    #[test]
+    fn format_glob_summary() {
+        let input = serde_json::json!({"pattern": "**/*.rs"});
+        let result = format_tool_input_summary("Glob", &input);
+        assert_eq!(result, "`**/*.rs`");
+    }
+
+    #[test]
+    fn format_bash_empty_command() {
+        let input = serde_json::json!({"command": ""});
+        let result = format_tool_input_summary("Bash", &input);
+        // Empty command still produces code-fence block
+        assert!(result.contains("```"));
+    }
+
+    #[test]
+    fn format_bash_missing_command_key() {
+        // If "command" key is absent, falls back to empty string
+        let input = serde_json::json!({});
+        let result = format_tool_input_summary("Bash", &input);
+        assert!(result.contains("```"));
+    }
+
+    // ── parse_permission_custom_id: edge cases ────────────────────────────────
+
+    #[test]
+    fn parse_colon_in_request_id() {
+        // rsplit_once(':') means the last ':' is the separator — so colons inside
+        // the request_id are preserved in the first part.
+        let (rid, action) = parse_permission_custom_id("perm:a:b:allow").unwrap();
+        assert_eq!(rid, "a:b");
+        assert_eq!(action, "allow");
+    }
+
+    #[test]
+    fn parse_empty_string() {
+        assert!(parse_permission_custom_id("").is_none());
+    }
+
+    #[test]
+    fn parse_perm_prefix_only() {
+        assert!(parse_permission_custom_id("perm:").is_none());
+    }
+
+    #[test]
+    fn parse_action_preserved_case() {
+        let (_, action) = parse_permission_custom_id("perm:id:Allow").unwrap();
+        // Action is returned as-is, case sensitive
+        assert_eq!(action, "Allow");
+    }
+
+    // ── run_permission_handler: lifecycle — tx drop causes exit ──────────────
+
+    #[tokio::test]
+    async fn permission_handler_exits_when_sender_dropped() {
+        use std::collections::HashMap;
+        use std::sync::Arc;
+        use tokio::sync::{Mutex, mpsc};
+        use crate::subprocess::permission::PermissionRequest;
+
+        // We can't construct a real serenity Context, so we test the underlying
+        // contract: `while let Some(perm_req) = permission_rx.recv().await` exits
+        // when all senders are dropped. We verify this by driving the same loop
+        // shape with a bare mpsc channel.
+        let (tx, mut rx) = mpsc::channel::<PermissionRequest>(8);
+        let pending: Arc<Mutex<HashMap<String, crate::PendingPermission>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+
+        // Spawn a task that mimics the handler's loop termination behaviour.
+        let handle = tokio::spawn(async move {
+            while let Some(_req) = rx.recv().await {
+                // would handle permission here
+            }
+            // exits when all senders dropped
+        });
+
+        drop(tx);
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), handle)
+            .await
+            .expect("handler-like task should exit within 1s")
+            .expect("task must not panic");
+
+        // Pending map remains empty since no messages were processed.
+        assert!(pending.lock().await.is_empty());
     }
 }

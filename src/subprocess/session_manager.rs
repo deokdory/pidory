@@ -15,11 +15,11 @@ use std::process::Stdio;
 use crate::config::ClaudeConfig;
 use crate::error::PidoryError;
 use crate::i18n::Lang;
+use crate::PendingPermission;
 use super::parser::StreamEvent;
 use super::permission::PermissionRequest;
 
 pub struct SessionCreateResult {
-    pub permission_rx: Option<mpsc::Receiver<PermissionRequest>>,
     pub evicted_thread_id: Option<String>,
 }
 
@@ -35,7 +35,8 @@ pub(super) struct SessionInner {
     queue_tx: mpsc::Sender<QueuedMessage>,
     queue_size: Arc<AtomicUsize>,
     worker_task: JoinHandle<()>,
-    permission_tx: mpsc::Sender<PermissionRequest>,
+    pub(super) permission_handler: JoinHandle<()>,
+    _permission_tx: mpsc::Sender<PermissionRequest>,
     interrupt_tx: mpsc::Sender<()>,
     last_activity: Arc<StdMutex<Instant>>,
     has_active_bg_tasks: Arc<AtomicBool>,
@@ -75,11 +76,13 @@ impl SessionManager {
         channel_id: ChannelId,
         db: sqlx::SqlitePool,
         lang: Lang,
+        pending_permissions: Arc<tokio::sync::Mutex<HashMap<String, PendingPermission>>>,
+        owner_id: u64,
     ) -> Result<SessionCreateResult, PidoryError> {
         let mut sessions = self.sessions.lock().await;
 
         if sessions.contains_key(thread_id) {
-            return Ok(SessionCreateResult { permission_rx: None, evicted_thread_id: None });
+            return Ok(SessionCreateResult { evicted_thread_id: None });
         }
 
         let mut evicted_thread_id = None;
@@ -87,6 +90,7 @@ impl SessionManager {
             if let Some(evict_tid) = Self::find_evict_target(&sessions) {
                 tracing::info!(thread_id = %evict_tid, "Evicting idle session (LRU)");
                 if let Some(mut inner) = sessions.remove(&evict_tid) {
+                    inner.permission_handler.abort();
                     inner.worker_task.abort();
                     let _ = inner.child.kill().await;
                 }
@@ -139,11 +143,21 @@ impl SessionManager {
         let (queue_tx, queue_rx) = mpsc::channel::<QueuedMessage>(5);
         let queue_size = Arc::new(AtomicUsize::new(0));
         let (permission_tx, permission_rx) = mpsc::channel::<PermissionRequest>(8);
-        let (interrupt_tx, mut interrupt_rx) = mpsc::channel::<()>(1);
+        let (interrupt_tx, interrupt_rx) = mpsc::channel::<()>(1);
 
         let last_activity = Arc::new(StdMutex::new(Instant::now()));
         let has_active_bg_tasks = Arc::new(AtomicBool::new(false));
         let is_turn_active = Arc::new(AtomicBool::new(false));
+
+        let permission_handler = tokio::spawn(crate::handler::permission_ui::run_permission_handler(
+            permission_rx,
+            ctx.clone(),
+            channel_id,
+            pending_permissions.clone(),
+            owner_id,
+            thread_id.to_string(),
+            lang,
+        ));
 
         // Combined worker task: reads queue, writes stdin, reads stdout until result, streams events
         let timeout_secs = self.config.subprocess_timeout_secs;
@@ -175,7 +189,8 @@ impl SessionManager {
                 queue_tx,
                 queue_size,
                 worker_task,
-                permission_tx,
+                permission_handler,
+                _permission_tx: permission_tx,
                 interrupt_tx,
                 last_activity,
                 has_active_bg_tasks,
@@ -183,7 +198,7 @@ impl SessionManager {
             },
         );
 
-        Ok(SessionCreateResult { permission_rx: Some(permission_rx), evicted_thread_id })
+        Ok(SessionCreateResult { evicted_thread_id })
     }
 
     fn find_evict_target(sessions: &HashMap<String, SessionInner>) -> Option<String> {
@@ -230,6 +245,7 @@ impl SessionManager {
             PidoryError::NotFound(format!("no active session for thread_id: {}", thread_id))
         })?;
 
+        inner.permission_handler.abort();
         inner.worker_task.abort();
 
         inner
@@ -293,6 +309,7 @@ impl SessionManager {
         for tid in targets {
             tracing::info!(thread_id = %tid, "Sweeping idle session (TTL expired)");
             if let Some(mut inner) = sessions.remove(&tid) {
+                inner.permission_handler.abort();
                 inner.worker_task.abort();
                 let _ = inner.child.kill().await;
             }
