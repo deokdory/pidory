@@ -31,7 +31,7 @@ pub struct QueuedMessage {
 }
 
 pub(super) struct SessionInner {
-    child: Child,
+    pub(super) child: Child,
     queue_tx: mpsc::Sender<QueuedMessage>,
     queue_size: Arc<AtomicUsize>,
     worker_task: JoinHandle<()>,
