@@ -103,7 +103,8 @@ pub fn split_message(text: &str, max_len: usize) -> Vec<String> {
         // Force-split if a single line caused current to exceed max_len
         if current.chars().count() > max_len {
             let chars: Vec<char> = current.chars().collect();
-            let chunk_iter: Vec<String> = chars.chunks(max_len)
+            let effective_len = if in_code_block { max_len.saturating_sub(10) } else { max_len };
+            let chunk_iter: Vec<String> = chars.chunks(effective_len)
                 .map(|c| c.iter().collect::<String>())
                 .filter(|s| !s.trim().is_empty())
                 .collect();
