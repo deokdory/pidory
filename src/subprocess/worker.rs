@@ -250,8 +250,8 @@ impl SessionWorker {
             "Worker task exiting for thread {}, removing from sessions",
             thread_id
         );
-        let removed = sessions.lock().await.remove(thread_id);
-        if let Some(mut inner) = removed {
+        if let Some(mut inner) = sessions.lock().await.remove(thread_id) {
+            inner.permission_handler.abort();
             match inner.child.try_wait() {
                 Ok(Some(_status)) => {
                     // Already exited, no kill needed
@@ -938,7 +938,9 @@ async fn run_active_turn(
                                             if permission_tx.send(perm_req).await.is_err() {
                                                 tracing::error!("permission_tx closed, denying (bg turn in user turn)");
                                                 let resp = build_control_response_deny(&saved_request_id, "Permission handler unavailable");
-                                                let _ = stdin.write_all(resp.as_bytes()).await;
+                                                if let Err(e) = stdin.write_all(resp.as_bytes()).await {
+                                                    tracing::error!("stdin write error (bg turn in user turn deny): {}", e);
+                                                }
                                                 let _ = stdin.flush().await;
                                                 break 'turn false;
                                             }
@@ -1003,7 +1005,9 @@ async fn run_active_turn(
                                     if permission_tx.send(perm_req).await.is_err() {
                                         tracing::error!("permission_tx closed, denying");
                                         let resp = build_control_response_deny(&saved_request_id, "Permission handler unavailable");
-                                        let _ = stdin.write_all(resp.as_bytes()).await;
+                                        if let Err(e) = stdin.write_all(resp.as_bytes()).await {
+                                            tracing::error!("stdin write error (foreground deny): {}", e);
+                                        }
                                         let _ = stdin.flush().await;
                                         break 'turn false;
                                     }
