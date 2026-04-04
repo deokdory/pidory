@@ -249,9 +249,18 @@ impl SessionWorker {
             "Worker task exiting for thread {}, removing from sessions",
             thread_id
         );
-        if let Some(mut inner) = sessions.lock().await.remove(thread_id) {
-            if let Err(e) = inner.child.kill().await {
-                tracing::warn!("Failed to kill child process for thread {}: {}", thread_id, e);
+        let removed = sessions.lock().await.remove(thread_id);
+        if let Some(mut inner) = removed {
+            match inner.child.try_wait() {
+                Ok(Some(_status)) => {
+                    // Already exited, no kill needed
+                }
+                _ => {
+                    // Still running or error checking — kill it
+                    if let Err(e) = inner.child.kill().await {
+                        tracing::warn!("Failed to kill child process for thread {}: {}", thread_id, e);
+                    }
+                }
             }
         }
     }
