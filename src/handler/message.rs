@@ -761,12 +761,22 @@ pub async fn execute_in_session(
     Ok(())
 }
 
+const DISCORD_MSG_LIMIT: usize = 2000;
+
 async fn say_silent(ctx: &Context, channel_id: ChannelId, content: impl Into<String>) {
-    let msg = CreateMessage::new()
-        .content(content)
-        .flags(MessageFlags::SUPPRESS_NOTIFICATIONS);
-    if let Err(e) = channel_id.send_message(ctx, msg).await {
-        tracing::warn!(%channel_id, "Failed to send message to Discord: {}", e);
+    let text = content.into();
+    let chunks = if text.chars().count() > DISCORD_MSG_LIMIT {
+        formatter::split_message(&text, DISCORD_MSG_LIMIT)
+    } else {
+        vec![text]
+    };
+    for chunk in chunks {
+        let msg = CreateMessage::new()
+            .content(chunk)
+            .flags(MessageFlags::SUPPRESS_NOTIFICATIONS);
+        if let Err(e) = channel_id.send_message(ctx, msg).await {
+            tracing::warn!(%channel_id, "Failed to send message to Discord: {}", e);
+        }
     }
 }
 
