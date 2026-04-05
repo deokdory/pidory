@@ -329,6 +329,26 @@ mod tests {
             result
         );
     }
+
+    #[test]
+    fn format_cost_zero_returns_empty() {
+        assert_eq!(format_cost(0.0), "");
+    }
+
+    #[test]
+    fn format_cost_positive_formats_with_leading_space() {
+        assert_eq!(format_cost(0.05), " $0.05");
+    }
+
+    #[test]
+    fn format_cost_rounds_to_two_decimal_places() {
+        assert_eq!(format_cost(1.234), " $1.23");
+    }
+
+    #[test]
+    fn format_cost_negative_returns_empty() {
+        assert_eq!(format_cost(-0.01), "");
+    }
 }
 
 pub fn format_duration(ms: u64) -> String {
@@ -340,6 +360,14 @@ pub fn format_duration(ms: u64) -> String {
         let minutes = ms / 60_000;
         let seconds = (ms % 60_000) / 1000;
         format!("{}m{}s", minutes, seconds)
+    }
+}
+
+pub fn format_cost(usd: f64) -> String {
+    if usd <= 0.0 {
+        String::new()
+    } else {
+        format!(" ${:.2}", usd)
     }
 }
 
