@@ -19,6 +19,19 @@ Discord ↔ Claude Code CLI bridge. Send messages in a Discord thread and get Cl
 - Session lifecycle management — LRU auto-eviction when max sessions reached, idle timeout cleanup
 - Streaming messages sent without push notifications to reduce spam
 
+## Security Model
+
+pidory delegates to Discord's built-in permission system, and sessions are **shared per thread**.
+
+- Anyone who can access the channel where a thread is registered can use the bot (the channel's VIEW_CHANNEL / SEND_MESSAGES permissions act as the gate).
+- Users in the same thread **share the same Claude Code session**. This means:
+  - A tool permission granted as `Always Allow` by one user applies **to the entire session** — subsequent messages from other users in the same thread will be auto-approved for that tool.
+  - `/skill` can be invoked by any member and can run arbitrary Claude Code skills in the session.
+- Administrative commands (`/register`, `/unregister`, `/del`, `/status`, `/list`, `/sessions`) require `MANAGE_GUILD` or `MANAGE_CHANNELS` permissions respectively.
+- `/stop` can only be called by the user who started the current turn (or the `owner_id`).
+
+**⚠️ Important**: This model assumes that users invited to the guild **trust each other**. Only invite **trusted users** to the server running pidory. Otherwise a malicious user could use the bot to execute arbitrary code, manipulate files, or escalate permissions on behalf of other users.
+
 ## Prerequisites
 
 - Rust 1.85+ (2024 edition)
