@@ -58,7 +58,7 @@ fn format_relative(dt_str: &str, lang: Lang) -> String {
 }
 
 /// 전역 세션 현황 조회
-#[poise::command(slash_command, guild_only, owners_only)]
+#[poise::command(slash_command, guild_only)]
 pub async fn sessions(ctx: Context<'_>) -> Result<(), Error> {
     let data = ctx.data();
     let lang = data.config.language;
@@ -105,7 +105,7 @@ pub async fn sessions(ctx: Context<'_>) -> Result<(), Error> {
     Ok(())
 }
 
-#[poise::command(slash_command, guild_only, owners_only)]
+#[poise::command(slash_command, guild_only)]
 pub async fn list(
     ctx: Context<'_>,
     #[description = "Channel (defaults to current channel)"] channel: Option<serenity::ChannelId>,
@@ -147,7 +147,7 @@ pub async fn list(
     Ok(())
 }
 
-#[poise::command(slash_command, guild_only, owners_only)]
+#[poise::command(slash_command, guild_only)]
 pub async fn del(
     ctx: Context<'_>,
     #[description = "Thread ID (defaults to current thread)"] thread_id: Option<String>,
@@ -186,6 +186,7 @@ pub async fn del(
     ctx.data().session_skills.lock().await.remove(&tid);
     ctx.data().pending_permissions.lock().await.retain(|_, p| p.thread_id != tid);
     ctx.data().needs_context.lock().await.remove(&tid);
+    ctx.data().turn_initiators.lock().await.remove(&tid);
 
     repository::delete_session(&ctx.data().db, &tid).await?;
 
@@ -198,7 +199,7 @@ pub async fn del(
 }
 
 /// 진행 중인 Claude Code 작업 중단
-#[poise::command(slash_command, guild_only, owners_only)]
+#[poise::command(slash_command, guild_only)]
 pub async fn stop(ctx: Context<'_>) -> Result<(), Error> {
     let channel_id = ctx.channel_id();
     let thread_id = channel_id.to_string();
@@ -222,7 +223,7 @@ pub async fn stop(ctx: Context<'_>) -> Result<(), Error> {
     Ok(())
 }
 
-#[poise::command(slash_command, guild_only, owners_only)]
+#[poise::command(slash_command, guild_only)]
 pub async fn status(
     ctx: Context<'_>,
     #[description = "Thread ID (defaults to current thread)"] thread_id: Option<String>,

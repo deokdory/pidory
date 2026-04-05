@@ -51,11 +51,6 @@ async fn handle_message(
         return Ok(());
     }
 
-    // owner ID 검증
-    if new_message.author.id != UserId::new(data.config.discord.owner_id) {
-        return Ok(());
-    }
-
     let lang = data.config.language;
 
     // 스레드인지 확인
@@ -131,6 +126,7 @@ async fn handle_message(
             lang,
             data.pending_permissions.clone(),
             data.config.discord.owner_id,
+            data.turn_initiators.clone(),
         )
         .await
     {
@@ -144,6 +140,7 @@ async fn handle_message(
                 data.pending_permissions.lock().await.retain(|_, p| p.thread_id != evicted_tid);
                 data.session_skills.lock().await.remove(&evicted_tid);
                 data.needs_context.lock().await.remove(&evicted_tid);
+                data.turn_initiators.lock().await.remove(&evicted_tid);
                 if let Err(e) = repository::update_session_status(db, &evicted_tid, "idle").await {
                     tracing::warn!("Failed to update session status for evicted thread {}: {}", evicted_tid, e);
                 }
@@ -220,6 +217,12 @@ async fn handle_message(
     };
     let content = build_context_content(&new_message.content, is_new_session, had_needs_context, &guild_channel.name, lang);
 
+    // turn 시작: 이 turn 의 triggering user 를 기록 (permission 위임용)
+    data.turn_initiators
+        .lock()
+        .await
+        .insert(thread_id.clone(), new_message.author.id);
+
     emoji::set_reaction(ctx, channel_id, msg_id, ReactionStatus::Running)
         .await
         .ok();
@@ -287,8 +290,20 @@ async fn handle_interaction(
 
     let lang = data.config.language;
 
-    // owner 검증
-    if component.user.id != UserId::new(data.config.discord.owner_id) {
+    // pending HashMap 에서 triggered_by 조회 (consume 하지 않음)
+    let triggered_by = {
+        let pending = data.pending_permissions.lock().await;
+        pending.get(&request_id).map(|p| p.triggered_by)
+    };
+
+    let Some(triggered_by) = triggered_by else {
+        // 이미 처리되었거나 존재하지 않는 request_id
+        return Ok(());
+    };
+
+    let is_owner = component.user.id == UserId::new(data.config.discord.owner_id);
+    if component.user.id != triggered_by && !is_owner {
+        // 비트리거 사용자 — ephemeral 거부, pending 유지, 버튼 활성 유지
         component
             .create_response(
                 ctx,
