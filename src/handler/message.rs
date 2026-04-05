@@ -555,21 +555,22 @@ pub async fn process_turn_events(
             .ok();
     } else {
         // 정상 완료: 요약 전송
-        let duration_ms = events.iter().find_map(|e| {
-            if let StreamEvent::Result { duration_ms, .. } = e {
-                Some(*duration_ms)
+        let (duration_ms, total_cost_usd) = events.iter().find_map(|e| {
+            if let StreamEvent::Result { duration_ms, total_cost_usd, .. } = e {
+                Some((*duration_ms, *total_cost_usd))
             } else {
                 None
             }
-        }).unwrap_or(0);
+        }).unwrap_or((0, 0.0));
 
         let duration = formatter::format_duration(duration_ms);
+        let cost = formatter::format_cost(total_cost_usd);
         let ctx_suffix = format_ctx_suffix(ratelimit_file);
         let summary = if used_tools.is_empty() {
-            format!("-# ✅ {}{} <@{}>", duration, ctx_suffix, owner_id)
+            format!("-# ✅ {}{}{} <@{}>", duration, cost, ctx_suffix, owner_id)
         } else {
             used_tools.dedup();
-            format!("-# 🔧 {} — {}{} <@{}>", used_tools.join(", "), duration, ctx_suffix, owner_id)
+            format!("-# 🔧 {} — {}{}{} <@{}>", used_tools.join(", "), duration, cost, ctx_suffix, owner_id)
         };
         if let Err(e) = repository::update_session_status(db, thread_id, "idle").await {
             tracing::warn!("Failed to update session status for thread {}: {}", thread_id, e);
@@ -607,16 +608,17 @@ pub async fn process_turn_events(
             if has_cli_error || !got_result || !send_ok {
                 channel_id.say(ctx, &format!("-# ❌ {} <@{}>", lang.error_occurred(), owner_id)).await.ok();
             } else {
-                let duration_ms = events.iter().find_map(|e| {
-                    if let StreamEvent::Result { duration_ms, .. } = e {
-                        Some(*duration_ms)
+                let (duration_ms, total_cost_usd) = events.iter().find_map(|e| {
+                    if let StreamEvent::Result { duration_ms, total_cost_usd, .. } = e {
+                        Some((*duration_ms, *total_cost_usd))
                     } else {
                         None
                     }
-                }).unwrap_or(0);
+                }).unwrap_or((0, 0.0));
                 let duration = formatter::format_duration(duration_ms);
+                let cost = formatter::format_cost(total_cost_usd);
                 let ctx_suffix = format_ctx_suffix(ratelimit_file);
-                channel_id.say(ctx, &format!("-# ✅ {}{} <@{}>", duration, ctx_suffix, owner_id)).await.ok();
+                channel_id.say(ctx, &format!("-# ✅ {}{}{} <@{}>", duration, cost, ctx_suffix, owner_id)).await.ok();
             }
         }
     }
