@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Mutex as StdMutex;
 use std::time::{Duration, Instant};
 
-use poise::serenity_prelude::{ChannelId, Context, MessageId};
+use poise::serenity_prelude::{ChannelId, Context, MessageId, UserId};
 use tokio::io::BufReader;
 use tokio::process::{Child, Command};
 use tokio::sync::{mpsc, Mutex};
@@ -78,6 +78,7 @@ impl SessionManager {
         lang: Lang,
         pending_permissions: Arc<tokio::sync::Mutex<HashMap<String, PendingPermission>>>,
         owner_id: u64,
+        turn_initiators: Arc<tokio::sync::Mutex<HashMap<String, UserId>>>,
     ) -> Result<SessionCreateResult, PidoryError> {
         let mut sessions = self.sessions.lock().await;
 
@@ -157,6 +158,7 @@ impl SessionManager {
             owner_id,
             thread_id.to_string(),
             lang,
+            turn_initiators.clone(),
         ));
 
         // Combined worker task: reads queue, writes stdin, reads stdout until result, streams events

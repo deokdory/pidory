@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use poise::serenity_prelude::{
     ButtonStyle, ChannelId, Context, CreateActionRow, CreateButton, CreateMessage, EditMessage,
-    MessageId,
+    MessageId, UserId,
 };
 use tokio::sync::{Mutex, mpsc};
 use tracing::warn;
@@ -20,7 +20,7 @@ pub fn create_permission_message(
     input: &serde_json::Value,
     request_id: &str,
     decision_reason: Option<&str>,
-    owner_id: u64,
+    triggered_by: UserId,
     lang: Lang,
 ) -> CreateMessage {
     let summary = format_tool_input_summary(tool_name, input);
@@ -29,7 +29,7 @@ pub fn create_permission_message(
         .unwrap_or_default();
     let content = format!(
         "<@{}> 🔒 **{}** {}\n{}{}",
-        owner_id, tool_name, lang.permission_request_label(), summary, reason
+        triggered_by, tool_name, lang.permission_request_label(), summary, reason
     );
 
     let allow_btn = CreateButton::new(format!("perm:{}:allow", request_id))
@@ -140,6 +140,7 @@ pub fn parse_permission_custom_id(custom_id: &str) -> Option<(String, String)> {
     Some((request_id.to_string(), action.to_string()))
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn run_permission_handler(
     mut permission_rx: mpsc::Receiver<PermissionRequest>,
     ctx: Context,
@@ -148,14 +149,21 @@ pub async fn run_permission_handler(
     owner_id: u64,
     thread_id: String,
     lang: Lang,
+    turn_initiators: Arc<Mutex<HashMap<String, UserId>>>,
 ) {
     while let Some(perm_req) = permission_rx.recv().await {
+        let triggered_by = {
+            let map = turn_initiators.lock().await;
+            map.get(&thread_id).copied()
+                .unwrap_or_else(|| UserId::new(owner_id))
+        };
+
         let msg = create_permission_message(
             &perm_req.tool_name,
             &perm_req.input,
             &perm_req.request_id,
             perm_req.decision_reason.as_deref(),
-            owner_id,
+            triggered_by,
             lang,
         );
 
@@ -166,6 +174,7 @@ pub async fn run_permission_handler(
                     tool_name: perm_req.tool_name,
                     message_id: sent.id,
                     thread_id: thread_id.clone(),
+                    triggered_by,
                 };
                 pending_permissions
                     .lock()
