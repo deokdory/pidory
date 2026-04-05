@@ -207,7 +207,7 @@ impl SessionManager {
                 !s.is_turn_active.load(Ordering::Relaxed)
                 && !s.has_active_bg_tasks.load(Ordering::Relaxed)
             })
-            .min_by_key(|(_, s)| *s.last_activity.lock().unwrap())
+            .min_by_key(|(_, s)| *s.last_activity.lock().unwrap_or_else(|p| p.into_inner()))
             .map(|(tid, _)| tid.clone())
     }
 
@@ -283,7 +283,7 @@ impl SessionManager {
         sessions.iter().map(|(tid, s)| {
             SessionInfo {
                 thread_id: tid.clone(),
-                idle_duration: now.duration_since(*s.last_activity.lock().unwrap()),
+                idle_duration: now.duration_since(*s.last_activity.lock().unwrap_or_else(|p| p.into_inner())),
                 has_bg_tasks: s.has_active_bg_tasks.load(Ordering::Relaxed),
                 is_turn_active: s.is_turn_active.load(Ordering::Relaxed),
             }
@@ -300,7 +300,7 @@ impl SessionManager {
             .filter(|(_, s)| {
                 !s.is_turn_active.load(Ordering::Relaxed)
                 && !s.has_active_bg_tasks.load(Ordering::Relaxed)
-                && now.duration_since(*s.last_activity.lock().unwrap()) > idle_timeout
+                && now.duration_since(*s.last_activity.lock().unwrap_or_else(|p| p.into_inner())) > idle_timeout
             })
             .map(|(tid, _)| tid.clone())
             .collect();
