@@ -112,6 +112,8 @@ pub struct ReleaseConfig {
     pub check_interval_secs: u64,
     #[serde(default = "default_release_last_tag_file")]
     pub last_tag_file: String,
+    #[serde(default)]
+    pub token_env: Option<String>,
 }
 
 impl Default for ReleaseConfig {
@@ -121,6 +123,7 @@ impl Default for ReleaseConfig {
             repo: default_release_repo(),
             check_interval_secs: default_release_check_interval_secs(),
             last_tag_file: default_release_last_tag_file(),
+            token_env: None,
         }
     }
 }
