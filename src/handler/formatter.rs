@@ -349,6 +349,26 @@ mod tests {
     fn format_cost_negative_returns_empty() {
         assert_eq!(format_cost(-0.01), "");
     }
+
+    #[test]
+    fn format_tokens_zero() {
+        assert_eq!(format_tokens(0, 0), "");
+    }
+
+    #[test]
+    fn format_tokens_small() {
+        assert_eq!(format_tokens(100, 50), " 150 tok");
+    }
+
+    #[test]
+    fn format_tokens_thousands() {
+        assert_eq!(format_tokens(25000, 1200), " 26.2k tok");
+    }
+
+    #[test]
+    fn format_tokens_millions() {
+        assert_eq!(format_tokens(900000, 200000), " 1.1M tok");
+    }
 }
 
 pub fn format_duration(ms: u64) -> String {
@@ -369,6 +389,21 @@ pub fn format_cost(usd: f64) -> String {
     } else {
         format!(" ${:.2}", usd)
     }
+}
+
+pub fn format_tokens(input: u64, output: u64) -> String {
+    let total = input + output;
+    if total == 0 {
+        return String::new();
+    }
+    let formatted = if total >= 1_000_000 {
+        format!("{:.1}M", total as f64 / 1_000_000.0)
+    } else if total >= 1_000 {
+        format!("{:.1}k", total as f64 / 1_000.0)
+    } else {
+        format!("{}", total)
+    };
+    format!(" {} tok", formatted)
 }
 
 /// Bash command max display length. Discord message limit (2000 chars) minus
