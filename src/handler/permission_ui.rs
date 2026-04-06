@@ -11,6 +11,7 @@ use tokio::sync::{Mutex, mpsc};
 use tracing::warn;
 
 use crate::error::PidoryError;
+use crate::handler::question_ui;
 use crate::i18n::Lang;
 use crate::subprocess::permission::{PermissionDecision, PermissionRequest};
 use crate::PendingPermission;
@@ -153,6 +154,33 @@ pub async fn run_permission_handler(
     while let Some(perm_req) = permission_rx.recv().await {
         let triggered_by = perm_req.triggered_by;
 
+        if perm_req.tool_name == "AskUserQuestion" {
+            let msg = question_ui::create_question_message(
+                &perm_req.input,
+                &perm_req.request_id,
+                triggered_by,
+                lang,
+            );
+            match channel_id.send_message(&ctx, msg).await {
+                Ok(sent) => {
+                    let pending = PendingPermission {
+                        response_tx: perm_req.response_tx,
+                        tool_name: perm_req.tool_name,
+                        message_id: sent.id,
+                        thread_id: thread_id.clone(),
+                        triggered_by,
+                        input: Some(perm_req.input),
+                    };
+                    pending_permissions.lock().await.insert(perm_req.request_id, pending);
+                }
+                Err(e) => {
+                    warn!("Failed to send question message: {}", e);
+                    let _ = perm_req.response_tx.send(PermissionDecision::Deny);
+                }
+            }
+            continue;
+        }
+
         let msg = create_permission_message(
             &perm_req.tool_name,
             &perm_req.input,
@@ -170,6 +198,7 @@ pub async fn run_permission_handler(
                     message_id: sent.id,
                     thread_id: thread_id.clone(),
                     triggered_by,
+                    input: None,
                 };
                 pending_permissions
                     .lock()
