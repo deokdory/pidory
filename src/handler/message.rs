@@ -325,34 +325,36 @@ async fn verify_component_auth(
 }
 
 /// Handles a question answer — either direct (single question) or group (multi-question).
-/// Returns the label of the answered option for UI feedback.
+///
+/// For single questions, the caller has already removed the PendingPermission and passes
+/// its `response_tx` directly. For multi-question groups, the answer is stored in the
+/// PendingQuestionGroup; when all answers are collected, the group's `response_tx` fires.
 async fn handle_question_answer(
     data: &Data,
     request_id: &str,
     answer: String,
     question_index: usize,
+    response_tx: tokio::sync::oneshot::Sender<PermissionDecision>,
 ) {
-    if let Some((group_id, _q_idx)) = question_ui::parse_sub_request_id(request_id) {
-        // Multi-question group member
+    if let Some((group_id, q_idx)) = question_ui::parse_sub_request_id(request_id) {
+        // Multi-question group member — store answer in group
+        // The caller's response_tx is a dummy; drop it and use the group's instead.
+        drop(response_tx);
         let mut groups = data.pending_question_groups.lock().await;
         if let Some(group) = groups.get_mut(&group_id) {
-            let key = format!("q_{}", _q_idx);
+            let key = format!("q_{}", q_idx);
             group.answers.insert(key, answer);
             if group.answers.len() >= group.total {
-                // All answers collected — send combined answer
                 let group = groups.remove(&group_id).unwrap();
                 let _ = group.response_tx.send(PermissionDecision::Answer(group.answers));
             }
+        } else {
+            tracing::warn!("PendingQuestionGroup not found for group_id={}", group_id);
         }
     } else {
-        // Single question — send directly via PendingPermission
-        let pending = data.pending_permissions.lock().await.remove(request_id);
-        if let Some(p) = pending {
-            let answers = HashMap::from([
-                (format!("q_{}", question_index), answer),
-            ]);
-            let _ = p.response_tx.send(PermissionDecision::Answer(answers));
-        }
+        // Single question — send directly via the caller's response_tx
+        let answers = HashMap::from([(format!("q_{}", question_index), answer)]);
+        let _ = response_tx.send(PermissionDecision::Answer(answers));
     }
 }
 
@@ -455,12 +457,13 @@ async fn handle_interaction(
             let question_index = question_ui::parse_sub_request_id(&request_id)
                 .map(|(_, idx)| idx)
                 .unwrap_or(0);
+            let input = p.input.unwrap_or_default();
             let label = question_ui::resolve_option_label(
-                &p.input.unwrap_or_default(),
+                &input,
                 question_index,
                 option_index,
             );
-            handle_question_answer(data, &request_id, label.clone(), question_index).await;
+            handle_question_answer(data, &request_id, label.clone(), question_index, p.response_tx).await;
             question_ui::disable_question_components(
                 ctx,
                 component.channel_id,
@@ -526,12 +529,13 @@ async fn handle_interaction(
             let question_index = question_ui::parse_sub_request_id(&request_id)
                 .map(|(_, idx)| idx)
                 .unwrap_or(0);
+            let input = p.input.unwrap_or_default();
             let label = question_ui::resolve_option_label(
-                &p.input.unwrap_or_default(),
+                &input,
                 question_index,
                 selected_index,
             );
-            handle_question_answer(data, &request_id, label.clone(), question_index).await;
+            handle_question_answer(data, &request_id, label.clone(), question_index, p.response_tx).await;
             question_ui::disable_question_components(
                 ctx,
                 component.channel_id,
@@ -618,7 +622,7 @@ async fn handle_modal_interaction(
         let question_index = question_ui::parse_sub_request_id(&request_id)
             .map(|(_, idx)| idx)
             .unwrap_or(0);
-        handle_question_answer(data, &request_id, answer.clone(), question_index).await;
+        handle_question_answer(data, &request_id, answer.clone(), question_index, p.response_tx).await;
         question_ui::disable_question_components(
             ctx,
             modal.channel_id,
