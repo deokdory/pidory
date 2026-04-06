@@ -412,6 +412,29 @@ impl Lang {
         }
     }
 
+    // ── Release notifications ──
+
+    pub fn release_notify_title(&self, tag: &str) -> String {
+        match self {
+            Lang::Ko => format!("🚀 pidory {} Released", tag),
+            Lang::En => format!("🚀 pidory {} Released", tag),
+        }
+    }
+
+    pub fn release_body_truncated(&self, url: &str) -> String {
+        match self {
+            Lang::Ko => format!("… [전체 릴리즈 노트]({})", url),
+            Lang::En => format!("… [Full release notes]({})", url),
+        }
+    }
+
+    pub fn release_no_body(&self) -> &'static str {
+        match self {
+            Lang::Ko => "릴리즈 노트가 없습니다.",
+            Lang::En => "No release notes available.",
+        }
+    }
+
     // ── Formatting ──
 
     pub fn response_continues(&self) -> &'static str {
