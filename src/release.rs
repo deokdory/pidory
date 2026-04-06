@@ -88,7 +88,7 @@ impl ReleaseChecker {
         }
 
         let suffix_len = truncation_suffix.chars().count();
-        let cut_at = max_len.saturating_sub(suffix_len);
+        let cut_at = max_len.saturating_sub(suffix_len + 1); // +1 for the '\n' between body and suffix
 
         // Find char boundary at cut_at
         let byte_pos = body
@@ -185,11 +185,15 @@ mod tests {
 
     #[test]
     fn truncate_body_long() {
-        // 초과 시 truncation
+        // 초과 시 truncation — Discord embed description 4096자 제한 준수
         let body = "a".repeat(5000);
         let suffix = "… [more](url)";
         let result = ReleaseChecker::truncate_body(&body, 4096, suffix);
-        assert!(result.chars().count() <= 4096 + suffix.chars().count() + 1); // +1 for newline
+        assert!(
+            result.chars().count() <= 4096,
+            "truncated body must fit within Discord embed limit, got {} chars",
+            result.chars().count()
+        );
         assert!(result.ends_with(suffix));
     }
 
