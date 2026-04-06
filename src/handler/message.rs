@@ -162,7 +162,10 @@ async fn handle_message(
         }
     }
 
-    let is_new_command = new_message.content.trim().eq_ignore_ascii_case("/new");
+    let is_new_command = {
+        let trimmed = new_message.content.trim();
+        trimmed.eq_ignore_ascii_case("/new") || trimmed.eq_ignore_ascii_case("/clear")
+    };
 
     // 원자적 acquire: running이 아닌 경우에만 running으로 전환
     let acquired = repository::try_acquire_session(db, &thread_id).await?;
@@ -714,7 +717,10 @@ pub async fn execute_in_session(
 ) -> Result<(), PidoryError> {
     let db = &data.db;
 
-    let is_new_command = content.trim().eq_ignore_ascii_case("/new");
+    let is_new_command = {
+        let trimmed = content.trim();
+        trimmed.eq_ignore_ascii_case("/new") || trimmed.eq_ignore_ascii_case("/clear")
+    };
 
     let acquired = repository::try_acquire_session(db, thread_id).await?;
 
@@ -877,7 +883,10 @@ fn build_context_content(
     thread_name: &str,
     lang: Lang,
 ) -> String {
-    let is_new_command = content.trim().eq_ignore_ascii_case("/new");
+    let is_new_command = {
+        let trimmed = content.trim();
+        trimmed.eq_ignore_ascii_case("/new") || trimmed.eq_ignore_ascii_case("/clear")
+    };
     if !is_new_command && (is_new_session || had_needs_context) {
         let context = lang.session_context(thread_name);
         format!("{}\n\n{}", context, content)
@@ -921,6 +930,19 @@ mod tests {
     #[test]
     fn new_command_case_insensitive() {
         let result = build_context_content("/New", true, false, "스레드", Lang::Ko);
+        assert!(!result.contains("<system-reminder>"));
+    }
+
+    #[test]
+    fn no_inject_on_clear_command() {
+        let result = build_context_content("/clear", true, false, "스레드", Lang::Ko);
+        assert!(!result.contains("<system-reminder>"));
+        assert_eq!(result, "/clear");
+    }
+
+    #[test]
+    fn clear_command_case_insensitive() {
+        let result = build_context_content("/Clear", true, false, "스레드", Lang::Ko);
         assert!(!result.contains("<system-reminder>"));
     }
 
