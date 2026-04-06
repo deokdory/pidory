@@ -996,7 +996,6 @@ pub fn build_control_response_deny(request_id: &str, message: &str) -> String {
     format!("{}\n", response)
 }
 
-#[allow(dead_code)]
 pub fn build_control_response_ask_answer(request_id: &str, input: &Value, answer: &str) -> String {
     let mut updated_input = input.clone();
     if let Value::Object(ref mut map) = updated_input {
