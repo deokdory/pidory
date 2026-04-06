@@ -162,10 +162,7 @@ async fn handle_message(
         }
     }
 
-    let is_new_command = {
-        let trimmed = new_message.content.trim();
-        trimmed.eq_ignore_ascii_case("/new") || trimmed.eq_ignore_ascii_case("/clear")
-    };
+    let is_new_command = is_context_reset_command(&new_message.content);
 
     // 원자적 acquire: running이 아닌 경우에만 running으로 전환
     let acquired = repository::try_acquire_session(db, &thread_id).await?;
@@ -717,10 +714,7 @@ pub async fn execute_in_session(
 ) -> Result<(), PidoryError> {
     let db = &data.db;
 
-    let is_new_command = {
-        let trimmed = content.trim();
-        trimmed.eq_ignore_ascii_case("/new") || trimmed.eq_ignore_ascii_case("/clear")
-    };
+    let is_new_command = is_context_reset_command(content);
 
     let acquired = repository::try_acquire_session(db, thread_id).await?;
 
@@ -875,6 +869,12 @@ async fn send_event_to_discord(
     }
 }
 
+/// `/new` 또는 `/clear` — 대화 컨텍스트를 리셋하는 명령인지 판정
+fn is_context_reset_command(content: &str) -> bool {
+    let trimmed = content.trim();
+    trimmed.eq_ignore_ascii_case("/new") || trimmed.eq_ignore_ascii_case("/clear")
+}
+
 /// 순수 함수: context inject 판정 및 content 생성
 fn build_context_content(
     content: &str,
@@ -883,10 +883,7 @@ fn build_context_content(
     thread_name: &str,
     lang: Lang,
 ) -> String {
-    let is_new_command = {
-        let trimmed = content.trim();
-        trimmed.eq_ignore_ascii_case("/new") || trimmed.eq_ignore_ascii_case("/clear")
-    };
+    let is_new_command = is_context_reset_command(content);
     if !is_new_command && (is_new_session || had_needs_context) {
         let context = lang.session_context(thread_name);
         format!("{}\n\n{}", context, content)
@@ -953,5 +950,30 @@ mod tests {
         assert_eq!(format_ctx_suffix(0, 0), "");
         assert_eq!(format_ctx_suffix(100, 0), "");
         assert_eq!(format_ctx_suffix(1000000, 1000000), " ctx:100%");
+    }
+
+    #[test]
+    fn context_reset_command_new() {
+        assert!(is_context_reset_command("/new"));
+        assert!(is_context_reset_command("/New"));
+        assert!(is_context_reset_command("/NEW"));
+        assert!(is_context_reset_command("  /new  "));
+    }
+
+    #[test]
+    fn context_reset_command_clear() {
+        assert!(is_context_reset_command("/clear"));
+        assert!(is_context_reset_command("/Clear"));
+        assert!(is_context_reset_command("/CLEAR"));
+        assert!(is_context_reset_command("  /clear  "));
+    }
+
+    #[test]
+    fn context_reset_command_rejects_others() {
+        assert!(!is_context_reset_command("hello"));
+        assert!(!is_context_reset_command("/help"));
+        assert!(!is_context_reset_command("/newbie"));
+        assert!(!is_context_reset_command("/clearance"));
+        assert!(!is_context_reset_command(""));
     }
 }
