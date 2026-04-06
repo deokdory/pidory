@@ -126,7 +126,6 @@ async fn handle_message(
             lang,
             data.pending_permissions.clone(),
             data.config.discord.owner_id,
-            data.turn_initiators.clone(),
         )
         .await
     {
@@ -141,6 +140,7 @@ async fn handle_message(
                 data.session_skills.lock().await.remove(&evicted_tid);
                 data.needs_context.lock().await.remove(&evicted_tid);
                 data.turn_initiators.lock().await.remove(&evicted_tid);
+                data.turn_participants.lock().await.remove(&evicted_tid);
                 if let Err(e) = repository::update_session_status(db, &evicted_tid, "idle").await {
                     tracing::warn!("Failed to update session status for evicted thread {}: {}", evicted_tid, e);
                 }
@@ -174,6 +174,7 @@ async fn handle_message(
             channel_id,
             message_id: msg_id,
             event_tx: None,
+            triggered_by: new_message.author.id,
         };
 
         match data.sessions.send_message(&thread_id, msg).await {
@@ -182,6 +183,13 @@ async fn handle_message(
                 if is_new_command {
                     data.needs_context.lock().await.insert(thread_id.clone());
                 }
+                // mid-turn inject 사용자를 participants에 추가
+                data.turn_participants
+                    .lock()
+                    .await
+                    .entry(thread_id.clone())
+                    .or_default()
+                    .insert(new_message.author.id);
                 let _ = channel_id
                     .create_reaction(
                         ctx,
@@ -223,6 +231,12 @@ async fn handle_message(
         .await
         .insert(thread_id.clone(), new_message.author.id);
 
+    // turn_participants 초기화: 새 turn 시작 시 author 만 포함
+    data.turn_participants
+        .lock()
+        .await
+        .insert(thread_id.clone(), std::collections::HashSet::from([new_message.author.id]));
+
     emoji::set_reaction(ctx, channel_id, msg_id, ReactionStatus::Running)
         .await
         .ok();
@@ -233,6 +247,7 @@ async fn handle_message(
         channel_id,
         message_id: msg_id,
         event_tx: Some(event_tx),
+        triggered_by: new_message.author.id,
     };
 
     if let Err(e) = data.sessions.send_message(&thread_id, msg).await {
@@ -266,6 +281,7 @@ async fn handle_message(
         data.config.ratelimit.file_path.as_deref(),
         lang,
         data.config.discord.owner_id,
+        data.turn_participants.clone(),
     )
     .await;
 
@@ -379,7 +395,17 @@ pub async fn process_turn_events(
     ratelimit_file: Option<&str>,
     lang: Lang,
     owner_id: u64,
+    turn_participants: std::sync::Arc<tokio::sync::Mutex<HashMap<String, std::collections::HashSet<UserId>>>>,
 ) {
+    // turn_participants 에서 멘션 문자열 빌드 (fallback: owner_id)
+    let mentions = {
+        let parts = turn_participants.lock().await;
+        parts.get(thread_id)
+            .filter(|set| !set.is_empty())
+            .map(|set| set.iter().map(|uid| format!("<@{}>", uid)).collect::<Vec<_>>().join(" "))
+            .unwrap_or_else(|| format!("<@{}>", owner_id))
+    };
+
     // 1. typing indicator task 시작
     let cancel = CancellationToken::new();
     let cancel_clone = cancel.clone();
@@ -555,7 +581,7 @@ pub async fn process_turn_events(
             tracing::warn!("Failed to update session status for thread {}: {}", thread_id, e);
         }
         if let Some(error_text) = error_msgs.first()
-            && let Err(e) = channel_id.say(ctx, &format!("-# ❌ {} <@{}>", error_text, owner_id)).await
+            && let Err(e) = channel_id.say(ctx, &format!("-# ❌ {} {}", error_text, mentions)).await
         {
             tracing::warn!(%channel_id, "Failed to send turn error notification: {}", e);
         }
@@ -566,7 +592,7 @@ pub async fn process_turn_events(
         if let Err(e) = repository::update_session_status(db, thread_id, "error").await {
             tracing::warn!("Failed to update session status for thread {}: {}", thread_id, e);
         }
-        if let Err(e) = channel_id.say(ctx, &format!("-# ❌ {} <@{}>", lang.process_abnormal_exit(), owner_id)).await {
+        if let Err(e) = channel_id.say(ctx, &format!("-# ❌ {} {}", lang.process_abnormal_exit(), mentions)).await {
             tracing::warn!(%channel_id, "Failed to send process exit notification: {}", e);
         }
         emoji::set_reaction(ctx, channel_id, msg_id, ReactionStatus::Error)
@@ -586,10 +612,10 @@ pub async fn process_turn_events(
         let cost = formatter::format_cost(total_cost_usd);
         let ctx_suffix = format_ctx_suffix(ratelimit_file);
         let summary = if used_tools.is_empty() {
-            format!("-# ✅ {}{}{} <@{}>", duration, cost, ctx_suffix, owner_id)
+            format!("-# ✅ {}{}{} {}", duration, cost, ctx_suffix, mentions)
         } else {
             used_tools.dedup();
-            format!("-# 🔧 {} — {}{}{} <@{}>", used_tools.join(", "), duration, cost, ctx_suffix, owner_id)
+            format!("-# 🔧 {} — {}{}{} {}", used_tools.join(", "), duration, cost, ctx_suffix, mentions)
         };
         if let Err(e) = repository::update_session_status(db, thread_id, "idle").await {
             tracing::warn!("Failed to update session status for thread {}: {}", thread_id, e);
@@ -627,7 +653,7 @@ pub async fn process_turn_events(
         // 완료 알림 (mention)
         if !is_interrupted {
             if has_cli_error || !got_result || !send_ok {
-                if let Err(e) = channel_id.say(ctx, &format!("-# ❌ {} <@{}>", lang.error_occurred(), owner_id)).await {
+                if let Err(e) = channel_id.say(ctx, &format!("-# ❌ {} {}", lang.error_occurred(), mentions)).await {
                     tracing::warn!(%channel_id, "Failed to send turn error notification: {}", e);
                 }
             } else {
@@ -641,7 +667,7 @@ pub async fn process_turn_events(
                 let duration = formatter::format_duration(duration_ms);
                 let cost = formatter::format_cost(total_cost_usd);
                 let ctx_suffix = format_ctx_suffix(ratelimit_file);
-                if let Err(e) = channel_id.say(ctx, &format!("-# ✅ {}{}{} <@{}>", duration, cost, ctx_suffix, owner_id)).await {
+                if let Err(e) = channel_id.say(ctx, &format!("-# ✅ {}{}{} {}", duration, cost, ctx_suffix, mentions)).await {
                     tracing::warn!(%channel_id, "Failed to send turn completion notification: {}", e);
                 }
             }
@@ -665,6 +691,7 @@ pub async fn execute_in_session(
     channel_id: ChannelId,
     msg_id: MessageId,
     content: &str,
+    triggered_by: UserId,
 ) -> Result<(), PidoryError> {
     let db = &data.db;
 
@@ -679,11 +706,19 @@ pub async fn execute_in_session(
             channel_id,
             message_id: msg_id,
             event_tx: None,
+            triggered_by,
         };
         data.sessions.send_message(thread_id, msg).await?;
         if is_new_command {
             data.needs_context.lock().await.insert(thread_id.to_string());
         }
+        // mid-turn inject 사용자를 participants에 추가
+        data.turn_participants
+            .lock()
+            .await
+            .entry(thread_id.to_string())
+            .or_default()
+            .insert(triggered_by);
         return Ok(());
     }
 
@@ -698,7 +733,14 @@ pub async fn execute_in_session(
         channel_id,
         message_id: msg_id,
         event_tx: Some(event_tx),
+        triggered_by,
     };
+
+    // turn_participants 초기화 (skill 직접 실행 경로)
+    data.turn_participants
+        .lock()
+        .await
+        .insert(thread_id.to_string(), std::collections::HashSet::from([triggered_by]));
 
     if let Err(e) = data.sessions.send_message(thread_id, msg).await {
         error!("Failed to send message to session {}: {}", thread_id, e);
@@ -726,6 +768,7 @@ pub async fn execute_in_session(
         data.config.ratelimit.file_path.as_deref(),
         data.config.language,
         data.config.discord.owner_id,
+        data.turn_participants.clone(),
     )
     .await;
 
