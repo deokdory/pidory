@@ -397,15 +397,6 @@ pub async fn process_turn_events(
     owner_id: u64,
     turn_participants: std::sync::Arc<tokio::sync::Mutex<HashMap<String, std::collections::HashSet<UserId>>>>,
 ) {
-    // turn_participants 에서 멘션 문자열 빌드 (fallback: owner_id)
-    let mentions = {
-        let parts = turn_participants.lock().await;
-        parts.get(thread_id)
-            .filter(|set| !set.is_empty())
-            .map(|set| set.iter().map(|uid| format!("<@{}>", uid)).collect::<Vec<_>>().join(" "))
-            .unwrap_or_else(|| format!("<@{}>", owner_id))
-    };
-
     // 1. typing indicator task 시작
     let cancel = CancellationToken::new();
     let cancel_clone = cancel.clone();
@@ -580,6 +571,13 @@ pub async fn process_turn_events(
         if let Err(e) = repository::update_session_status(db, thread_id, "error").await {
             tracing::warn!("Failed to update session status for thread {}: {}", thread_id, e);
         }
+        let mentions = {
+            let parts = turn_participants.lock().await;
+            parts.get(thread_id)
+                .filter(|set| !set.is_empty())
+                .map(|set| set.iter().map(|uid| format!("<@{}>", uid)).collect::<Vec<_>>().join(" "))
+                .unwrap_or_else(|| format!("<@{}>", owner_id))
+        };
         if let Some(error_text) = error_msgs.first()
             && let Err(e) = channel_id.say(ctx, &format!("-# ❌ {} {}", error_text, mentions)).await
         {
@@ -592,6 +590,13 @@ pub async fn process_turn_events(
         if let Err(e) = repository::update_session_status(db, thread_id, "error").await {
             tracing::warn!("Failed to update session status for thread {}: {}", thread_id, e);
         }
+        let mentions = {
+            let parts = turn_participants.lock().await;
+            parts.get(thread_id)
+                .filter(|set| !set.is_empty())
+                .map(|set| set.iter().map(|uid| format!("<@{}>", uid)).collect::<Vec<_>>().join(" "))
+                .unwrap_or_else(|| format!("<@{}>", owner_id))
+        };
         if let Err(e) = channel_id.say(ctx, &format!("-# ❌ {} {}", lang.process_abnormal_exit(), mentions)).await {
             tracing::warn!(%channel_id, "Failed to send process exit notification: {}", e);
         }
@@ -611,6 +616,13 @@ pub async fn process_turn_events(
         let duration = formatter::format_duration(duration_ms);
         let cost = formatter::format_cost(total_cost_usd);
         let ctx_suffix = format_ctx_suffix(ratelimit_file);
+        let mentions = {
+            let parts = turn_participants.lock().await;
+            parts.get(thread_id)
+                .filter(|set| !set.is_empty())
+                .map(|set| set.iter().map(|uid| format!("<@{}>", uid)).collect::<Vec<_>>().join(" "))
+                .unwrap_or_else(|| format!("<@{}>", owner_id))
+        };
         let summary = if used_tools.is_empty() {
             format!("-# ✅ {}{}{} {}", duration, cost, ctx_suffix, mentions)
         } else {
@@ -652,6 +664,13 @@ pub async fn process_turn_events(
 
         // 완료 알림 (mention)
         if !is_interrupted {
+            let mentions = {
+                let parts = turn_participants.lock().await;
+                parts.get(thread_id)
+                    .filter(|set| !set.is_empty())
+                    .map(|set| set.iter().map(|uid| format!("<@{}>", uid)).collect::<Vec<_>>().join(" "))
+                    .unwrap_or_else(|| format!("<@{}>", owner_id))
+            };
             if has_cli_error || !got_result || !send_ok {
                 if let Err(e) = channel_id.say(ctx, &format!("-# ❌ {} {}", lang.error_occurred(), mentions)).await {
                     tracing::warn!(%channel_id, "Failed to send turn error notification: {}", e);
