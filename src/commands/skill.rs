@@ -62,7 +62,7 @@ fn parse_frontmatter_description(content: &str) -> Option<String> {
 }
 
 /// Claude Code skill 실행
-#[poise::command(slash_command, guild_only, owners_only)]
+#[poise::command(slash_command, guild_only)]
 pub async fn skill(
     ctx: Context<'_>,
     #[autocomplete = "autocomplete_skill"]
