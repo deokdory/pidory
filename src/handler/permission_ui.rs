@@ -186,8 +186,22 @@ pub async fn run_permission_handler(
                     }
                 }
             } else {
-                // Multi-question — send each question as a separate message,
-                // create PendingPermission per sub-question, and a PendingQuestionGroup
+                // Multi-question — register group first (before sending messages)
+                // to avoid race where a fast user answers before the group exists.
+                let group = PendingQuestionGroup {
+                    response_tx: perm_req.response_tx,
+                    input: perm_req.input.clone(),
+                    answers: HashMap::new(),
+                    total: count,
+                    thread_id: thread_id.clone(),
+                    triggered_by,
+                };
+                pending_question_groups
+                    .lock()
+                    .await
+                    .insert(perm_req.request_id.clone(), group);
+
+                // Send each question as a separate message
                 let mut all_ok = true;
                 for idx in 0..count {
                     let sub_id =
@@ -201,8 +215,6 @@ pub async fn run_permission_handler(
                     );
                     match channel_id.send_message(&ctx, msg).await {
                         Ok(sent) => {
-                            // Sub-question PendingPermission — no response_tx (group owns it)
-                            // We use a dummy oneshot that's never awaited
                             let (dummy_tx, _) =
                                 tokio::sync::oneshot::channel::<PermissionDecision>();
                             let pending = PendingPermission {
@@ -223,28 +235,17 @@ pub async fn run_permission_handler(
                     }
                 }
 
-                if all_ok {
-                    let group = PendingQuestionGroup {
-                        response_tx: perm_req.response_tx,
-                        input: perm_req.input,
-                        answers: HashMap::new(),
-                        total: count,
-                        thread_id: thread_id.clone(),
-                        triggered_by,
-                    };
-                    pending_question_groups
-                        .lock()
-                        .await
-                        .insert(perm_req.request_id, group);
-                } else {
-                    // Clean up any sub-questions that were sent
+                if !all_ok {
+                    // Clean up: remove group (to recover response_tx) and any sub-questions
+                    if let Some(group) = pending_question_groups.lock().await.remove(&perm_req.request_id) {
+                        let _ = group.response_tx.send(PermissionDecision::Deny);
+                    }
                     let mut perms = pending_permissions.lock().await;
                     for idx in 0..count {
                         let sub_id =
                             question_ui::make_sub_request_id(&perm_req.request_id, idx);
                         perms.remove(&sub_id);
                     }
-                    let _ = perm_req.response_tx.send(PermissionDecision::Deny);
                 }
             }
             continue;
