@@ -5,7 +5,12 @@ use poise::serenity_prelude as serenity;
 use crate::{Context, Error};
 use crate::db::repository;
 
-#[poise::command(slash_command, guild_only, owners_only)]
+#[poise::command(
+    slash_command,
+    guild_only,
+    default_member_permissions = "MANAGE_GUILD",
+    required_permissions = "MANAGE_GUILD"
+)]
 pub async fn register(
     ctx: Context<'_>,
     #[description = "Project directory path"] path: String,
@@ -46,7 +51,12 @@ pub async fn register(
     Ok(())
 }
 
-#[poise::command(slash_command, guild_only, owners_only)]
+#[poise::command(
+    slash_command,
+    guild_only,
+    default_member_permissions = "MANAGE_GUILD",
+    required_permissions = "MANAGE_GUILD"
+)]
 pub async fn unregister(ctx: Context<'_>) -> Result<(), Error> {
     let channel_id = ctx.channel_id().to_string();
     let lang = ctx.data().config.language;
@@ -71,6 +81,7 @@ pub async fn unregister(ctx: Context<'_>) -> Result<(), Error> {
         ctx.data().session_skills.lock().await.remove(&session.thread_id);
         ctx.data().pending_permissions.lock().await.retain(|_, p| p.thread_id != session.thread_id);
         ctx.data().needs_context.lock().await.remove(&session.thread_id);
+        ctx.data().turn_initiators.lock().await.remove(&session.thread_id);
     }
     repository::delete_sessions_by_channel(&ctx.data().db, &channel_id).await?;
 

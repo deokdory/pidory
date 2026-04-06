@@ -58,7 +58,12 @@ fn format_relative(dt_str: &str, lang: Lang) -> String {
 }
 
 /// 전역 세션 현황 조회
-#[poise::command(slash_command, guild_only, owners_only)]
+#[poise::command(
+    slash_command,
+    guild_only,
+    default_member_permissions = "MANAGE_CHANNELS",
+    required_permissions = "MANAGE_CHANNELS"
+)]
 pub async fn sessions(ctx: Context<'_>) -> Result<(), Error> {
     let data = ctx.data();
     let lang = data.config.language;
@@ -105,7 +110,12 @@ pub async fn sessions(ctx: Context<'_>) -> Result<(), Error> {
     Ok(())
 }
 
-#[poise::command(slash_command, guild_only, owners_only)]
+#[poise::command(
+    slash_command,
+    guild_only,
+    default_member_permissions = "MANAGE_CHANNELS",
+    required_permissions = "MANAGE_CHANNELS"
+)]
 pub async fn list(
     ctx: Context<'_>,
     #[description = "Channel (defaults to current channel)"] channel: Option<serenity::ChannelId>,
@@ -147,7 +157,12 @@ pub async fn list(
     Ok(())
 }
 
-#[poise::command(slash_command, guild_only, owners_only)]
+#[poise::command(
+    slash_command,
+    guild_only,
+    default_member_permissions = "MANAGE_CHANNELS",
+    required_permissions = "MANAGE_CHANNELS"
+)]
 pub async fn del(
     ctx: Context<'_>,
     #[description = "Thread ID (defaults to current thread)"] thread_id: Option<String>,
@@ -186,6 +201,7 @@ pub async fn del(
     ctx.data().session_skills.lock().await.remove(&tid);
     ctx.data().pending_permissions.lock().await.retain(|_, p| p.thread_id != tid);
     ctx.data().needs_context.lock().await.remove(&tid);
+    ctx.data().turn_initiators.lock().await.remove(&tid);
 
     repository::delete_session(&ctx.data().db, &tid).await?;
 
@@ -198,7 +214,7 @@ pub async fn del(
 }
 
 /// 진행 중인 Claude Code 작업 중단
-#[poise::command(slash_command, guild_only, owners_only)]
+#[poise::command(slash_command, guild_only)]
 pub async fn stop(ctx: Context<'_>) -> Result<(), Error> {
     let channel_id = ctx.channel_id();
     let thread_id = channel_id.to_string();
@@ -207,6 +223,25 @@ pub async fn stop(ctx: Context<'_>) -> Result<(), Error> {
 
     if !data.sessions.session_exists(&thread_id).await {
         ctx.say(format!("❌ {}", lang.no_session_in_thread())).await?;
+        return Ok(());
+    }
+
+    // triggered_by 체크: 세션을 시작한 사람만 중단 가능 (owner 는 fallback)
+    let triggered_by = data.turn_initiators.lock().await.get(&thread_id).copied();
+    let is_owner = ctx.author().id == serenity::UserId::new(data.config.discord.owner_id);
+
+    let allowed = match triggered_by {
+        Some(tb) => ctx.author().id == tb || is_owner,
+        None => is_owner,
+    };
+
+    if !allowed {
+        ctx.send(
+            poise::CreateReply::default()
+                .content(format!("❌ {}", lang.no_permission()))
+                .ephemeral(true),
+        )
+        .await?;
         return Ok(());
     }
 
@@ -222,7 +257,12 @@ pub async fn stop(ctx: Context<'_>) -> Result<(), Error> {
     Ok(())
 }
 
-#[poise::command(slash_command, guild_only, owners_only)]
+#[poise::command(
+    slash_command,
+    guild_only,
+    default_member_permissions = "MANAGE_CHANNELS",
+    required_permissions = "MANAGE_CHANNELS"
+)]
 pub async fn status(
     ctx: Context<'_>,
     #[description = "Thread ID (defaults to current thread)"] thread_id: Option<String>,
