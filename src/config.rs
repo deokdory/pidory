@@ -15,6 +15,8 @@ pub struct Config {
     pub database: DatabaseConfig,
     #[serde(default)]
     pub ratelimit: RateLimitConfig,
+    #[serde(default)]
+    pub release: ReleaseConfig,
 }
 
 #[derive(Debug, Deserialize)]
@@ -98,6 +100,45 @@ fn default_update_interval_secs() -> u64 {
 
 fn default_alert_thresholds() -> Vec<u8> {
     vec![50, 80]
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ReleaseConfig {
+    #[serde(default = "default_release_enabled")]
+    pub enabled: bool,
+    #[serde(default = "default_release_repo")]
+    pub repo: String,
+    #[serde(default = "default_release_check_interval_secs")]
+    pub check_interval_secs: u64,
+    #[serde(default = "default_release_last_tag_file")]
+    pub last_tag_file: String,
+}
+
+impl Default for ReleaseConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_release_enabled(),
+            repo: default_release_repo(),
+            check_interval_secs: default_release_check_interval_secs(),
+            last_tag_file: default_release_last_tag_file(),
+        }
+    }
+}
+
+fn default_release_enabled() -> bool {
+    true
+}
+
+fn default_release_repo() -> String {
+    "deokdory/pidory".to_string()
+}
+
+fn default_release_check_interval_secs() -> u64 {
+    21600
+}
+
+fn default_release_last_tag_file() -> String {
+    "/tmp/pidory-last-release.txt".to_string()
 }
 
 fn default_subprocess_timeout_secs() -> u64 {

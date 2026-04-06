@@ -5,6 +5,7 @@ mod error;
 mod handler;
 mod i18n;
 mod ratelimit;
+mod release;
 mod subprocess;
 
 use std::collections::{HashMap, HashSet};
@@ -146,6 +147,32 @@ async fn main() -> Result<(), PidoryError> {
                             }
                         }
                     });
+                }
+
+                // Release checker
+                if config.release.enabled {
+                    if let Some(channel_id) = config.discord.notification_channel_id
+                        .map(poise::serenity_prelude::ChannelId::new)
+                    {
+                        let repo = config.release.repo.clone();
+                        let last_tag_file = config.release.last_tag_file.clone();
+                        let interval_secs = config.release.check_interval_secs;
+                        let lang = config.language;
+                        let mut ctx_rx = ctx_tx.subscribe();
+                        tokio::spawn(async move {
+                            let checker = crate::release::ReleaseChecker::new(repo, last_tag_file);
+                            let mut interval = tokio::time::interval(
+                                std::time::Duration::from_secs(interval_secs),
+                            );
+                            tracing::info!("Release checker started (interval: {interval_secs}s)");
+                            loop {
+                                interval.tick().await;
+                                ctx_rx.mark_changed();
+                                let fresh_ctx = ctx_rx.borrow_and_update().clone();
+                                checker.check_and_notify(&fresh_ctx, channel_id, lang).await;
+                            }
+                        });
+                    }
                 }
 
                 let needs_context = Arc::new(Mutex::new(HashSet::new()));
