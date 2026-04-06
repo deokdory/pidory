@@ -584,13 +584,11 @@ async fn handle_modal_interaction(
         })
         .unwrap_or_default();
 
-    // Acknowledge modal
+    // Acknowledge modal (type 6: DEFERRED_UPDATE_MESSAGE)
     modal
         .create_response(
             ctx,
-            poise::serenity_prelude::CreateInteractionResponse::UpdateMessage(
-                poise::serenity_prelude::CreateInteractionResponseMessage::new(),
-            ),
+            poise::serenity_prelude::CreateInteractionResponse::Acknowledge,
         )
         .await
         .ok();
