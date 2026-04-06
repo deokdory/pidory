@@ -35,11 +35,24 @@ pub struct PendingPermission {
     pub input: Option<serde_json::Value>,
 }
 
+/// Tracks a multi-question AskUserQuestion group.
+/// Each sub-question gets its own PendingPermission keyed by `{request_id}__q{idx}`.
+/// When all answers are collected, the combined answer is sent via `response_tx`.
+pub struct PendingQuestionGroup {
+    pub response_tx: oneshot::Sender<PermissionDecision>,
+    pub input: serde_json::Value,
+    pub answers: HashMap<String, String>,
+    pub total: usize,
+    pub thread_id: String,
+    pub triggered_by: serenity::UserId,
+}
+
 pub struct Data {
     pub config: Arc<Config>,
     pub db: SqlitePool,
     pub sessions: Arc<SessionManager>,
     pub pending_permissions: Arc<Mutex<HashMap<String, PendingPermission>>>,
+    pub pending_question_groups: Arc<Mutex<HashMap<String, PendingQuestionGroup>>>,
     pub session_skills: Arc<Mutex<HashMap<String, Vec<String>>>>,
     pub needs_context: Arc<Mutex<HashSet<String>>>,
     pub turn_initiators: Arc<Mutex<HashMap<String, serenity::UserId>>>,
@@ -103,6 +116,7 @@ async fn main() -> Result<(), PidoryError> {
                 ));
 
                 let pending_permissions: Arc<Mutex<HashMap<String, PendingPermission>>> = Arc::new(Mutex::new(HashMap::new()));
+                let pending_question_groups: Arc<Mutex<HashMap<String, PendingQuestionGroup>>> = Arc::new(Mutex::new(HashMap::new()));
                 let session_skills = Arc::new(Mutex::new(HashMap::new()));
                 let turn_initiators: Arc<Mutex<HashMap<String, serenity::UserId>>> = Arc::new(Mutex::new(HashMap::new()));
                 let turn_participants: Arc<Mutex<HashMap<String, HashSet<serenity::UserId>>>> = Arc::new(Mutex::new(HashMap::new()));
@@ -183,6 +197,7 @@ async fn main() -> Result<(), PidoryError> {
                     let sessions = Arc::clone(&sessions);
                     let idle_timeout = std::time::Duration::from_secs(config.claude.idle_timeout_secs);
                     let pending_permissions = Arc::clone(&pending_permissions);
+                    let pending_question_groups = Arc::clone(&pending_question_groups);
                     let session_skills = Arc::clone(&session_skills);
                     let needs_context = Arc::clone(&needs_context);
                     let turn_initiators = Arc::clone(&turn_initiators);
@@ -201,6 +216,7 @@ async fn main() -> Result<(), PidoryError> {
                             tracing::info!("TTL sweep: evicted {} sessions", evicted.len());
                             for tid in &evicted {
                                 pending_permissions.lock().await.retain(|_, p| p.thread_id != *tid);
+                                pending_question_groups.lock().await.retain(|_, g| g.thread_id != *tid);
                                 session_skills.lock().await.remove(tid);
                                 needs_context.lock().await.remove(tid);
                                 turn_initiators.lock().await.remove(tid);
@@ -227,6 +243,7 @@ async fn main() -> Result<(), PidoryError> {
                     db,
                     sessions,
                     pending_permissions,
+                    pending_question_groups,
                     session_skills,
                     needs_context,
                     turn_initiators,

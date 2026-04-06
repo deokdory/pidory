@@ -125,6 +125,7 @@ async fn handle_message(
             data.db.clone(),
             lang,
             data.pending_permissions.clone(),
+            data.pending_question_groups.clone(),
             data.config.discord.owner_id,
         )
         .await
@@ -137,6 +138,7 @@ async fn handle_message(
             );
             if let Some(evicted_tid) = result.evicted_thread_id {
                 data.pending_permissions.lock().await.retain(|_, p| p.thread_id != evicted_tid);
+                data.pending_question_groups.lock().await.retain(|_, g| g.thread_id != evicted_tid);
                 data.session_skills.lock().await.remove(&evicted_tid);
                 data.needs_context.lock().await.remove(&evicted_tid);
                 data.turn_initiators.lock().await.remove(&evicted_tid);
@@ -322,6 +324,38 @@ async fn verify_component_auth(
     Some(triggered_by)
 }
 
+/// Handles a question answer — either direct (single question) or group (multi-question).
+/// Returns the label of the answered option for UI feedback.
+async fn handle_question_answer(
+    data: &Data,
+    request_id: &str,
+    answer: String,
+    question_index: usize,
+) {
+    if let Some((group_id, _q_idx)) = question_ui::parse_sub_request_id(request_id) {
+        // Multi-question group member
+        let mut groups = data.pending_question_groups.lock().await;
+        if let Some(group) = groups.get_mut(&group_id) {
+            let key = format!("q_{}", _q_idx);
+            group.answers.insert(key, answer);
+            if group.answers.len() >= group.total {
+                // All answers collected — send combined answer
+                let group = groups.remove(&group_id).unwrap();
+                let _ = group.response_tx.send(PermissionDecision::Answer(group.answers));
+            }
+        }
+    } else {
+        // Single question — send directly via PendingPermission
+        let pending = data.pending_permissions.lock().await.remove(request_id);
+        if let Some(p) = pending {
+            let answers = HashMap::from([
+                (format!("q_{}", question_index), answer),
+            ]);
+            let _ = p.response_tx.send(PermissionDecision::Answer(answers));
+        }
+    }
+}
+
 async fn handle_interaction(
     ctx: &Context,
     interaction: &poise::serenity_prelude::Interaction,
@@ -418,9 +452,15 @@ async fn handle_interaction(
         let pending = data.pending_permissions.lock().await.remove(&request_id);
         if let Some(p) = pending {
             let message_id = p.message_id;
-            let label =
-                question_ui::resolve_option_label(&p.input.unwrap_or_default(), option_index);
-            let _ = p.response_tx.send(PermissionDecision::Answer(label.clone()));
+            let question_index = question_ui::parse_sub_request_id(&request_id)
+                .map(|(_, idx)| idx)
+                .unwrap_or(0);
+            let label = question_ui::resolve_option_label(
+                &p.input.unwrap_or_default(),
+                question_index,
+                option_index,
+            );
+            handle_question_answer(data, &request_id, label.clone(), question_index).await;
             question_ui::disable_question_components(
                 ctx,
                 component.channel_id,
@@ -483,11 +523,15 @@ async fn handle_interaction(
         let pending = data.pending_permissions.lock().await.remove(&request_id);
         if let Some(p) = pending {
             let message_id = p.message_id;
+            let question_index = question_ui::parse_sub_request_id(&request_id)
+                .map(|(_, idx)| idx)
+                .unwrap_or(0);
             let label = question_ui::resolve_option_label(
                 &p.input.unwrap_or_default(),
+                question_index,
                 selected_index,
             );
-            let _ = p.response_tx.send(PermissionDecision::Answer(label.clone()));
+            handle_question_answer(data, &request_id, label.clone(), question_index).await;
             question_ui::disable_question_components(
                 ctx,
                 component.channel_id,
@@ -571,7 +615,10 @@ async fn handle_modal_interaction(
     let pending = data.pending_permissions.lock().await.remove(&request_id);
     if let Some(p) = pending {
         let message_id = p.message_id;
-        let _ = p.response_tx.send(PermissionDecision::Answer(answer.clone()));
+        let question_index = question_ui::parse_sub_request_id(&request_id)
+            .map(|(_, idx)| idx)
+            .unwrap_or(0);
+        handle_question_answer(data, &request_id, answer.clone(), question_index).await;
         question_ui::disable_question_components(
             ctx,
             modal.channel_id,

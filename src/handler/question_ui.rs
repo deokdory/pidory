@@ -8,28 +8,66 @@ use serde_json::Value;
 use crate::error::PidoryError;
 use crate::i18n::Lang;
 
-/// Creates a Discord message displaying a question with interactive components.
-/// - 2-5 options → Buttons (+ free text button)
-/// - 6-25 options → Select Menu (+ free text button)
-/// - No options → Free text button only
+// ─── Sub-request-id helpers ─────────────────────────────────────────────────
+
+const SUB_ID_SEPARATOR: &str = "__q";
+
+/// Builds a sub-request-id: `{request_id}__q{question_index}`.
+pub fn make_sub_request_id(request_id: &str, question_index: usize) -> String {
+    format!("{}{}{}", request_id, SUB_ID_SEPARATOR, question_index)
+}
+
+/// Parses `{group_id}__q{index}` → `(group_id, index)`.
+pub fn parse_sub_request_id(sub_id: &str) -> Option<(String, usize)> {
+    let (group_id, idx_str) = sub_id.rsplit_once(SUB_ID_SEPARATOR)?;
+    let idx: usize = idx_str.parse().ok()?;
+    Some((group_id.to_string(), idx))
+}
+
+/// Returns the number of questions in the input.
+pub fn question_count(input: &Value) -> usize {
+    input
+        .get("questions")
+        .and_then(|q| q.as_array())
+        .map(|arr| arr.len())
+        .unwrap_or(0)
+}
+
+// ─── Question message creation ──────────────────────────────────────────────
+
+/// Creates a Discord message for a single question (first question in the input).
+/// For multi-question inputs, use `create_question_message_for_index` instead.
 pub fn create_question_message(
     input: &Value,
     request_id: &str,
     triggered_by: UserId,
     lang: Lang,
 ) -> CreateMessage {
-    let question_count = input
-        .get("questions")
-        .and_then(|q| q.as_array())
-        .map(|arr| arr.len())
-        .unwrap_or(0);
-    if question_count > 1 {
-        tracing::warn!("AskUserQuestion has {} questions, only first will be shown", question_count);
-    }
+    create_question_message_for_index(input, 0, request_id, triggered_by, lang)
+}
 
-    let question = extract_first_question(input);
-    let q_text = question.get("question").and_then(|v| v.as_str()).unwrap_or("");
-    let header = question.get("header").and_then(|v| v.as_str()).unwrap_or("");
+/// Creates a Discord message for a specific question by index.
+/// The `request_id` used in custom_ids is the sub-request-id (already includes `__q{idx}`).
+///
+/// - 2-5 options → Buttons (+ free text button)
+/// - 6-25 options → Select Menu (+ free text button)
+/// - No options → Free text button only
+pub fn create_question_message_for_index(
+    input: &Value,
+    question_index: usize,
+    sub_request_id: &str,
+    triggered_by: UserId,
+    lang: Lang,
+) -> CreateMessage {
+    let question = extract_question_at(input, question_index);
+    let q_text = question
+        .get("question")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let header = question
+        .get("header")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
     let options: Vec<(String, String)> = extract_options(&question);
 
     let header_text = if header.is_empty() {
@@ -41,10 +79,15 @@ pub fn create_question_message(
     let content = format!("<@{}> ❓{}\n{}", triggered_by, header_text, q_text);
 
     let mut components = Vec::new();
+    let rid = truncate_request_id(sub_request_id);
 
     if options.len() >= 6 {
         let capped_options = if options.len() > 25 {
-            tracing::warn!("AskUserQuestion has {} options, capping to 25 for Discord select menu", options.len());
+            tracing::warn!(
+                "AskUserQuestion q{} has {} options, capping to 25 for Discord select menu",
+                question_index,
+                options.len()
+            );
             &options[..25]
         } else {
             &options
@@ -61,7 +104,7 @@ pub fn create_question_message(
             })
             .collect();
         let select = CreateSelectMenu::new(
-            format!("ask_sel:{}", truncate_request_id(request_id)),
+            format!("ask_sel:{}", rid),
             CreateSelectMenuKind::String {
                 options: menu_options,
             },
@@ -73,7 +116,7 @@ pub fn create_question_message(
             .iter()
             .enumerate()
             .map(|(i, (label, _desc))| {
-                CreateButton::new(format!("ask:{}:{}", truncate_request_id(request_id), i))
+                CreateButton::new(format!("ask:{}:{}", rid, i))
                     .label(label)
                     .style(ButtonStyle::Primary)
             })
@@ -81,7 +124,7 @@ pub fn create_question_message(
         components.push(CreateActionRow::Buttons(buttons));
     }
 
-    let text_btn = CreateButton::new(format!("ask_text:{}", truncate_request_id(request_id)))
+    let text_btn = CreateButton::new(format!("ask_text:{}", rid))
         .label(lang.question_write_answer())
         .style(ButtonStyle::Secondary)
         .emoji('✏');
@@ -90,11 +133,11 @@ pub fn create_question_message(
     CreateMessage::new().content(content).components(components)
 }
 
-fn extract_first_question(input: &Value) -> Value {
+fn extract_question_at(input: &Value, index: usize) -> Value {
     input
         .get("questions")
         .and_then(|q| q.as_array())
-        .and_then(|arr| arr.first())
+        .and_then(|arr| arr.get(index))
         .cloned()
         .unwrap_or(Value::Object(serde_json::Map::new()))
 }
@@ -123,6 +166,8 @@ fn extract_options(question: &Value) -> Vec<(String, String)> {
         .unwrap_or_default()
 }
 
+// ─── Modal ──────────────────────────────────────────────────────────────────
+
 /// Creates a modal for free-text answer input.
 pub fn create_question_modal(request_id: &str, lang: Lang) -> CreateModal {
     let input_field = CreateInputText::new(
@@ -141,7 +186,10 @@ pub fn create_question_modal(request_id: &str, lang: Lang) -> CreateModal {
     .components(vec![CreateActionRow::InputText(input_field)])
 }
 
-/// Truncates request_id to 80 chars, leaving room for prefixes and suffixes within Discord's 100-char custom_id limit.
+// ─── Helpers ────────────────────────────────────────────────────────────────
+
+/// Truncates request_id to 80 chars, leaving room for prefixes and suffixes
+/// within Discord's 100-char custom_id limit.
 fn truncate_request_id(request_id: &str) -> &str {
     if request_id.len() > 80 {
         &request_id[..80]
@@ -173,9 +221,9 @@ pub fn parse_question_modal_id(custom_id: &str) -> Option<String> {
     custom_id.strip_prefix("ask_modal:").map(|s| s.to_string())
 }
 
-/// Resolves an option label from the original input and option index.
-pub fn resolve_option_label(input: &Value, option_index: usize) -> String {
-    let question = extract_first_question(input);
+/// Resolves an option label from the original input, question index, and option index.
+pub fn resolve_option_label(input: &Value, question_index: usize, option_index: usize) -> String {
+    let question = extract_question_at(input, question_index);
     let options = extract_options(&question);
     options
         .get(option_index)
@@ -204,11 +252,75 @@ pub async fn disable_question_components(
 mod tests {
     use super::*;
 
+    // ── sub-request-id helpers ──────────────────────────────────────────────
+
+    #[test]
+    fn make_sub_request_id_format() {
+        assert_eq!(make_sub_request_id("req-abc", 0), "req-abc__q0");
+        assert_eq!(make_sub_request_id("req-abc", 3), "req-abc__q3");
+    }
+
+    #[test]
+    fn parse_sub_request_id_valid() {
+        let (group, idx) = parse_sub_request_id("req-abc__q1").unwrap();
+        assert_eq!(group, "req-abc");
+        assert_eq!(idx, 1);
+    }
+
+    #[test]
+    fn parse_sub_request_id_roundtrip() {
+        let sub = make_sub_request_id("uuid-123-456", 2);
+        let (group, idx) = parse_sub_request_id(&sub).unwrap();
+        assert_eq!(group, "uuid-123-456");
+        assert_eq!(idx, 2);
+    }
+
+    #[test]
+    fn parse_sub_request_id_invalid() {
+        assert!(parse_sub_request_id("no-separator").is_none());
+        assert!(parse_sub_request_id("req__qnotnum").is_none());
+    }
+
+    #[test]
+    fn parse_sub_request_id_with_colons_in_group() {
+        let (group, idx) = parse_sub_request_id("a:b:c__q0").unwrap();
+        assert_eq!(group, "a:b:c");
+        assert_eq!(idx, 0);
+    }
+
+    // ── question_count ──────────────────────────────────────────────────────
+
+    #[test]
+    fn question_count_empty() {
+        assert_eq!(question_count(&serde_json::json!({})), 0);
+    }
+
+    #[test]
+    fn question_count_single() {
+        let input = serde_json::json!({"questions": [{"question": "q?"}]});
+        assert_eq!(question_count(&input), 1);
+    }
+
+    #[test]
+    fn question_count_multiple() {
+        let input = serde_json::json!({"questions": [{"question": "a?"}, {"question": "b?"}]});
+        assert_eq!(question_count(&input), 2);
+    }
+
+    // ── parsing ─────────────────────────────────────────────────────────────
+
     #[test]
     fn parse_question_button_valid() {
         let (rid, idx) = parse_question_button_id("ask:abc-123:2").unwrap();
         assert_eq!(rid, "abc-123");
         assert_eq!(idx, 2);
+    }
+
+    #[test]
+    fn parse_question_button_with_sub_id() {
+        let (rid, idx) = parse_question_button_id("ask:req-1__q0:3").unwrap();
+        assert_eq!(rid, "req-1__q0");
+        assert_eq!(idx, 3);
     }
 
     #[test]
@@ -228,6 +340,12 @@ mod tests {
     }
 
     #[test]
+    fn parse_question_text_button_with_sub_id() {
+        let rid = parse_question_text_button_id("ask_text:req-123__q1").unwrap();
+        assert_eq!(rid, "req-123__q1");
+    }
+
+    #[test]
     fn parse_question_text_button_invalid() {
         assert!(parse_question_text_button_id("ask:abc:0").is_none());
     }
@@ -244,6 +362,8 @@ mod tests {
         assert_eq!(rid, "req-789");
     }
 
+    // ── resolve_option_label ────────────────────────────────────────────────
+
     #[test]
     fn resolve_option_label_valid() {
         let input = serde_json::json!({
@@ -252,22 +372,43 @@ mod tests {
                 {"label": "B", "description": "bb"}
             ]}]
         });
-        assert_eq!(resolve_option_label(&input, 0), "A");
-        assert_eq!(resolve_option_label(&input, 1), "B");
+        assert_eq!(resolve_option_label(&input, 0, 0), "A");
+        assert_eq!(resolve_option_label(&input, 0, 1), "B");
+    }
+
+    #[test]
+    fn resolve_option_label_second_question() {
+        let input = serde_json::json!({
+            "questions": [
+                {"question": "q0", "options": [{"label": "X"}]},
+                {"question": "q1", "options": [{"label": "Y"}, {"label": "Z"}]}
+            ]
+        });
+        assert_eq!(resolve_option_label(&input, 1, 0), "Y");
+        assert_eq!(resolve_option_label(&input, 1, 1), "Z");
     }
 
     #[test]
     fn resolve_option_label_out_of_bounds() {
         let input =
             serde_json::json!({"questions": [{"question": "q", "options": [{"label": "X"}]}]});
-        assert_eq!(resolve_option_label(&input, 5), "5");
+        assert_eq!(resolve_option_label(&input, 0, 5), "5");
+    }
+
+    // ── extract helpers ─────────────────────────────────────────────────────
+
+    #[test]
+    fn extract_question_at_empty() {
+        let input = serde_json::json!({});
+        let q = extract_question_at(&input, 0);
+        assert!(q.is_object());
     }
 
     #[test]
-    fn extract_first_question_empty() {
-        let input = serde_json::json!({});
-        let q = extract_first_question(&input);
-        assert!(q.is_object());
+    fn extract_question_at_second() {
+        let input = serde_json::json!({"questions": [{"question": "a"}, {"question": "b"}]});
+        let q = extract_question_at(&input, 1);
+        assert_eq!(q["question"], "b");
     }
 
     #[test]
@@ -288,19 +429,27 @@ mod tests {
         assert_eq!(opts[1].1, "");
     }
 
+    // ── message creation ────────────────────────────────────────────────────
+
     #[test]
-    fn create_question_message_multi_question_uses_first() {
+    fn create_question_message_for_each_index() {
         let input = serde_json::json!({
             "questions": [
-                {"question": "First?", "options": [{"label": "A"}]},
-                {"question": "Second?", "options": [{"label": "B"}]}
+                {"question": "First?", "header": "Q1", "options": [{"label": "A", "description": "a"}]},
+                {"question": "Second?", "header": "Q2", "options": [{"label": "B", "description": "b"}]}
             ]
         });
-        let msg = create_question_message(&input, "req-1", UserId::new(1), Lang::En);
-        let json = serde_json::to_value(&msg).unwrap();
-        let content = json["content"].as_str().unwrap_or("");
-        assert!(content.contains("First?"));
-        assert!(!content.contains("Second?"));
+        let msg0 = create_question_message_for_index(&input, 0, "req__q0", UserId::new(1), Lang::En);
+        let json0 = serde_json::to_value(&msg0).unwrap();
+        let content0 = json0["content"].as_str().unwrap_or("");
+        assert!(content0.contains("First?"));
+        assert!(!content0.contains("Second?"));
+
+        let msg1 = create_question_message_for_index(&input, 1, "req__q1", UserId::new(1), Lang::En);
+        let json1 = serde_json::to_value(&msg1).unwrap();
+        let content1 = json1["content"].as_str().unwrap_or("");
+        assert!(content1.contains("Second?"));
+        assert!(!content1.contains("First?"));
     }
 
     #[test]

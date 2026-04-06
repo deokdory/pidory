@@ -71,10 +71,10 @@ enum BetweenTurnsAction {
 
 pub(super) enum PermissionWaitResult {
     Allow,
-    AlwaysAllow(String), // tool_name
-    Deny(String),        // reason
-    Error,               // stdin error → caller does break
-    Answer(String),      // answer for AskUserQuestion
+    AlwaysAllow(String),                          // tool_name
+    Deny(String),                                 // reason
+    Error,                                        // stdin error → caller does break
+    Answer(std::collections::HashMap<String, String>), // answers for AskUserQuestion
 }
 
 // ─── SessionWorker struct ───────────────────────────────────────────────────
@@ -767,8 +767,8 @@ async fn write_permission_response(
         PermissionWaitResult::Error => {
             Ok(true) // caller should break
         }
-        PermissionWaitResult::Answer(answer) => {
-            let resp = build_control_response_ask_answer(request_id, input, &answer);
+        PermissionWaitResult::Answer(answers) => {
+            let resp = build_control_response_ask_answer(request_id, input, &answers);
             stdin.write_all(resp.as_bytes()).await?;
             stdin.flush().await?;
             Ok(false)
@@ -1489,8 +1489,9 @@ mod tests {
         let mut stdin = spawn_cat_stdin().await;
         let mut cache = PermissionCache::new();
         let input = serde_json::json!({"questions": [{"question": "pick?"}]});
+        let answers = std::collections::HashMap::from([("q_0".to_string(), "Blue".to_string())]);
         let result = write_permission_response(
-            PermissionWaitResult::Answer("Blue".to_string()),
+            PermissionWaitResult::Answer(answers),
             "req-ask",
             &input,
             &mut stdin,
@@ -1504,8 +1505,9 @@ mod tests {
         let mut stdin = spawn_cat_stdin().await;
         let mut cache = PermissionCache::new();
         let input = serde_json::json!({});
+        let answers = std::collections::HashMap::from([("q_0".to_string(), "test".to_string())]);
         write_permission_response(
-            PermissionWaitResult::Answer("test".to_string()),
+            PermissionWaitResult::Answer(answers),
             "req-ask2",
             &input,
             &mut stdin,
