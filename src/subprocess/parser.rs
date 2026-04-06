@@ -45,6 +45,8 @@ pub enum StreamEvent {
         duration_ms: u64,
         total_cost_usd: f64,
         num_turns: u32,
+        input_tokens: u64,
+        output_tokens: u64,
     },
     UserReplay {
         content: String,
@@ -868,6 +870,19 @@ pub fn parse_line(line: &str) -> Result<StreamEvent, serde_json::Error> {
                 .get("num_turns")
                 .and_then(|n| n.as_u64())
                 .unwrap_or(0) as u32;
+            let usage = v.get("usage");
+            let input_tokens = usage
+                .and_then(|u| {
+                    let input = u.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+                    let cache_creation = u.get("cache_creation_input_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+                    let cache_read = u.get("cache_read_input_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+                    Some(input + cache_creation + cache_read)
+                })
+                .unwrap_or(0);
+            let output_tokens = usage
+                .and_then(|u| u.get("output_tokens"))
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
             Ok(StreamEvent::Result {
                 subtype,
                 session_id,
@@ -877,6 +892,8 @@ pub fn parse_line(line: &str) -> Result<StreamEvent, serde_json::Error> {
                 duration_ms,
                 total_cost_usd,
                 num_turns,
+                input_tokens,
+                output_tokens,
             })
         }
         "control_request" => {
