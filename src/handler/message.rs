@@ -287,6 +287,41 @@ async fn handle_message(
     Ok(())
 }
 
+/// Verifies the interacting user is the triggering user or the bot owner.
+/// Returns `Some(triggered_by)` if authorized, `None` if rejected (ephemeral sent).
+async fn verify_component_auth(
+    component: &poise::serenity_prelude::ComponentInteraction,
+    ctx: &Context,
+    data: &Data,
+    request_id: &str,
+    lang: Lang,
+) -> Option<UserId> {
+    let triggered_by = {
+        let pending = data.pending_permissions.lock().await;
+        pending.get(request_id).map(|p| p.triggered_by)
+    };
+
+    let triggered_by = triggered_by?;
+
+    let is_owner = component.user.id == UserId::new(data.config.discord.owner_id);
+    if component.user.id != triggered_by && !is_owner {
+        component
+            .create_response(
+                ctx,
+                poise::serenity_prelude::CreateInteractionResponse::Message(
+                    poise::serenity_prelude::CreateInteractionResponseMessage::new()
+                        .content(format!("❌ {}", lang.no_permission()))
+                        .ephemeral(true),
+                ),
+            )
+            .await
+            .ok();
+        return None;
+    }
+
+    Some(triggered_by)
+}
+
 async fn handle_interaction(
     ctx: &Context,
     interaction: &poise::serenity_prelude::Interaction,
@@ -311,33 +346,9 @@ async fn handle_interaction(
     if let Some((request_id, action)) =
         permission_ui::parse_permission_custom_id(&component.data.custom_id)
     {
-        // pending HashMap 에서 triggered_by 조회 (consume 하지 않음)
-        let triggered_by = {
-            let pending = data.pending_permissions.lock().await;
-            pending.get(&request_id).map(|p| p.triggered_by)
-        };
-
-        let Some(triggered_by) = triggered_by else {
-            // 이미 처리되었거나 존재하지 않는 request_id
+        let Some(_triggered_by) = verify_component_auth(component, ctx, data, &request_id, lang).await else {
             return Ok(());
         };
-
-        let is_owner = component.user.id == UserId::new(data.config.discord.owner_id);
-        if component.user.id != triggered_by && !is_owner {
-            // 비트리거 사용자 — ephemeral 거부, pending 유지, 버튼 활성 유지
-            component
-                .create_response(
-                    ctx,
-                    poise::serenity_prelude::CreateInteractionResponse::Message(
-                        poise::serenity_prelude::CreateInteractionResponseMessage::new()
-                            .content(format!("❌ {}", lang.no_permission()))
-                            .ephemeral(true),
-                    ),
-                )
-                .await
-                .ok();
-            return Ok(());
-        }
 
         // interaction defer — 메시지 업데이트로 응답 (3초 제약)
         component
@@ -390,30 +401,9 @@ async fn handle_interaction(
     if let Some((request_id, option_index)) =
         question_ui::parse_question_button_id(&component.data.custom_id)
     {
-        let triggered_by = {
-            let pending = data.pending_permissions.lock().await;
-            pending.get(&request_id).map(|p| p.triggered_by)
-        };
-
-        let Some(triggered_by) = triggered_by else {
+        let Some(_triggered_by) = verify_component_auth(component, ctx, data, &request_id, lang).await else {
             return Ok(());
         };
-
-        let is_owner = component.user.id == UserId::new(data.config.discord.owner_id);
-        if component.user.id != triggered_by && !is_owner {
-            component
-                .create_response(
-                    ctx,
-                    poise::serenity_prelude::CreateInteractionResponse::Message(
-                        poise::serenity_prelude::CreateInteractionResponseMessage::new()
-                            .content(format!("❌ {}", lang.no_permission()))
-                            .ephemeral(true),
-                    ),
-                )
-                .await
-                .ok();
-            return Ok(());
-        }
 
         component
             .create_response(
@@ -449,30 +439,9 @@ async fn handle_interaction(
     if let Some(request_id) =
         question_ui::parse_question_text_button_id(&component.data.custom_id)
     {
-        let triggered_by = {
-            let pending = data.pending_permissions.lock().await;
-            pending.get(&request_id).map(|p| p.triggered_by)
-        };
-
-        let Some(triggered_by) = triggered_by else {
+        let Some(_triggered_by) = verify_component_auth(component, ctx, data, &request_id, lang).await else {
             return Ok(());
         };
-
-        let is_owner = component.user.id == UserId::new(data.config.discord.owner_id);
-        if component.user.id != triggered_by && !is_owner {
-            component
-                .create_response(
-                    ctx,
-                    poise::serenity_prelude::CreateInteractionResponse::Message(
-                        poise::serenity_prelude::CreateInteractionResponseMessage::new()
-                            .content(format!("❌ {}", lang.no_permission()))
-                            .ephemeral(true),
-                    ),
-                )
-                .await
-                .ok();
-            return Ok(());
-        }
 
         // Respond with modal (do NOT defer with UpdateMessage)
         component
@@ -490,30 +459,9 @@ async fn handle_interaction(
 
     // Try question select menu: ask_sel:{request_id}
     if let Some(request_id) = question_ui::parse_question_select_id(&component.data.custom_id) {
-        let triggered_by = {
-            let pending = data.pending_permissions.lock().await;
-            pending.get(&request_id).map(|p| p.triggered_by)
-        };
-
-        let Some(triggered_by) = triggered_by else {
+        let Some(_triggered_by) = verify_component_auth(component, ctx, data, &request_id, lang).await else {
             return Ok(());
         };
-
-        let is_owner = component.user.id == UserId::new(data.config.discord.owner_id);
-        if component.user.id != triggered_by && !is_owner {
-            component
-                .create_response(
-                    ctx,
-                    poise::serenity_prelude::CreateInteractionResponse::Message(
-                        poise::serenity_prelude::CreateInteractionResponseMessage::new()
-                            .content(format!("❌ {}", lang.no_permission()))
-                            .ephemeral(true),
-                    ),
-                )
-                .await
-                .ok();
-            return Ok(());
-        }
 
         component
             .create_response(
@@ -568,6 +516,32 @@ async fn handle_modal_interaction(
     };
 
     let lang = data.config.language;
+
+    // Authorization check
+    let triggered_by = {
+        let pending = data.pending_permissions.lock().await;
+        pending.get(&request_id).map(|p| p.triggered_by)
+    };
+
+    let Some(triggered_by) = triggered_by else {
+        return Ok(());
+    };
+
+    let is_owner = modal.user.id == UserId::new(data.config.discord.owner_id);
+    if modal.user.id != triggered_by && !is_owner {
+        modal
+            .create_response(
+                ctx,
+                poise::serenity_prelude::CreateInteractionResponse::Message(
+                    poise::serenity_prelude::CreateInteractionResponseMessage::new()
+                        .content(format!("❌ {}", lang.no_permission()))
+                        .ephemeral(true),
+                ),
+            )
+            .await
+            .ok();
+        return Ok(());
+    }
 
     // Extract answer from modal input
     let answer = modal
