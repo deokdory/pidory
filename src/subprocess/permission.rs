@@ -4,11 +4,12 @@ use std::collections::HashSet;
 
 use poise::serenity_prelude::UserId;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PermissionDecision {
     Allow,
     AlwaysAllow,
     Deny,
+    Answer(String),
 }
 
 pub struct PermissionRequest {

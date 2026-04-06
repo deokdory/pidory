@@ -13,7 +13,7 @@ use crate::db::repository;
 use crate::handler::formatter;
 use crate::i18n::Lang;
 use super::background::BackgroundTaskTracker;
-use super::parser::{parse_line, StreamEvent, ContentBlock, build_control_response_allow, build_control_response_deny};
+use super::parser::{parse_line, StreamEvent, ContentBlock, build_control_response_allow, build_control_response_deny, build_control_response_ask_answer};
 use super::permission::{PermissionCache, PermissionDecision, PermissionRequest};
 use super::session_manager::{QueuedMessage, SessionInner};
 
@@ -74,6 +74,7 @@ pub(super) enum PermissionWaitResult {
     AlwaysAllow(String), // tool_name
     Deny(String),        // reason
     Error,               // stdin error → caller does break
+    Answer(String),      // answer for AskUserQuestion
 }
 
 // ─── SessionWorker struct ───────────────────────────────────────────────────
@@ -669,6 +670,9 @@ async fn wait_for_permission(
                     Ok(PermissionDecision::Deny) => {
                         break 'perm PermissionWaitResult::Deny("User rejected this action".to_string());
                     }
+                    Ok(PermissionDecision::Answer(answer)) => {
+                        break 'perm PermissionWaitResult::Answer(answer);
+                    }
                     Err(_) => {
                         break 'perm PermissionWaitResult::Deny("Permission handler unavailable".to_string());
                     }
@@ -762,6 +766,12 @@ async fn write_permission_response(
         }
         PermissionWaitResult::Error => {
             Ok(true) // caller should break
+        }
+        PermissionWaitResult::Answer(answer) => {
+            let resp = build_control_response_ask_answer(request_id, input, &answer);
+            stdin.write_all(resp.as_bytes()).await?;
+            stdin.flush().await?;
+            Ok(false)
         }
     }
 }
@@ -1472,5 +1482,35 @@ mod tests {
     fn control_response_deny_ends_with_newline() {
         let out = build_control_response_deny("rid-4", "reason");
         assert!(out.ends_with('\n'));
+    }
+
+    #[tokio::test]
+    async fn write_permission_response_answer_returns_ok_false() {
+        let mut stdin = spawn_cat_stdin().await;
+        let mut cache = PermissionCache::new();
+        let input = serde_json::json!({"questions": [{"question": "pick?"}]});
+        let result = write_permission_response(
+            PermissionWaitResult::Answer("Blue".to_string()),
+            "req-ask",
+            &input,
+            &mut stdin,
+            &mut cache,
+        ).await;
+        assert_eq!(result.unwrap(), false);
+    }
+
+    #[tokio::test]
+    async fn write_permission_response_answer_does_not_update_cache() {
+        let mut stdin = spawn_cat_stdin().await;
+        let mut cache = PermissionCache::new();
+        let input = serde_json::json!({});
+        write_permission_response(
+            PermissionWaitResult::Answer("test".to_string()),
+            "req-ask2",
+            &input,
+            &mut stdin,
+            &mut cache,
+        ).await.unwrap();
+        assert!(!cache.is_always_allowed("AskUserQuestion"));
     }
 }

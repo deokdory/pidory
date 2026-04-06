@@ -32,6 +32,7 @@ pub struct PendingPermission {
     pub message_id: serenity::MessageId,
     pub thread_id: String,
     pub triggered_by: serenity::UserId,
+    pub input: Option<serde_json::Value>,
 }
 
 pub struct Data {

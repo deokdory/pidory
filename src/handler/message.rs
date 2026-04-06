@@ -10,7 +10,7 @@ use tracing::{error, warn};
 
 use crate::db::repository;
 use crate::error::PidoryError;
-use crate::handler::{emoji, formatter, permission_ui};
+use crate::handler::{emoji, formatter, permission_ui, question_ui};
 use crate::handler::emoji::ReactionStatus;
 use crate::i18n::Lang;
 use crate::subprocess::parser::{ContentBlock, StreamEvent};
@@ -292,49 +292,300 @@ async fn handle_interaction(
     interaction: &poise::serenity_prelude::Interaction,
     data: &Data,
 ) -> Result<(), PidoryError> {
+    match interaction {
+        poise::serenity_prelude::Interaction::Modal(modal) => {
+            return handle_modal_interaction(ctx, modal, data).await;
+        }
+        poise::serenity_prelude::Interaction::Component(_) => {}
+        _ => return Ok(()),
+    }
+
     let component = match interaction {
         poise::serenity_prelude::Interaction::Component(c) => c,
         _ => return Ok(()),
     };
 
-    let (request_id, action) =
-        match permission_ui::parse_permission_custom_id(&component.data.custom_id) {
-            Some(parsed) => parsed,
-            None => return Ok(()),
-        };
-
     let lang = data.config.language;
 
-    // pending HashMap 에서 triggered_by 조회 (consume 하지 않음)
-    let triggered_by = {
-        let pending = data.pending_permissions.lock().await;
-        pending.get(&request_id).map(|p| p.triggered_by)
-    };
+    // Try permission button first
+    if let Some((request_id, action)) =
+        permission_ui::parse_permission_custom_id(&component.data.custom_id)
+    {
+        // pending HashMap 에서 triggered_by 조회 (consume 하지 않음)
+        let triggered_by = {
+            let pending = data.pending_permissions.lock().await;
+            pending.get(&request_id).map(|p| p.triggered_by)
+        };
 
-    let Some(triggered_by) = triggered_by else {
-        // 이미 처리되었거나 존재하지 않는 request_id
-        return Ok(());
-    };
+        let Some(triggered_by) = triggered_by else {
+            // 이미 처리되었거나 존재하지 않는 request_id
+            return Ok(());
+        };
 
-    let is_owner = component.user.id == UserId::new(data.config.discord.owner_id);
-    if component.user.id != triggered_by && !is_owner {
-        // 비트리거 사용자 — ephemeral 거부, pending 유지, 버튼 활성 유지
+        let is_owner = component.user.id == UserId::new(data.config.discord.owner_id);
+        if component.user.id != triggered_by && !is_owner {
+            // 비트리거 사용자 — ephemeral 거부, pending 유지, 버튼 활성 유지
+            component
+                .create_response(
+                    ctx,
+                    poise::serenity_prelude::CreateInteractionResponse::Message(
+                        poise::serenity_prelude::CreateInteractionResponseMessage::new()
+                            .content(format!("❌ {}", lang.no_permission()))
+                            .ephemeral(true),
+                    ),
+                )
+                .await
+                .ok();
+            return Ok(());
+        }
+
+        // interaction defer — 메시지 업데이트로 응답 (3초 제약)
         component
             .create_response(
                 ctx,
-                poise::serenity_prelude::CreateInteractionResponse::Message(
-                    poise::serenity_prelude::CreateInteractionResponseMessage::new()
-                        .content(format!("❌ {}", lang.no_permission()))
-                        .ephemeral(true),
+                poise::serenity_prelude::CreateInteractionResponse::UpdateMessage(
+                    poise::serenity_prelude::CreateInteractionResponseMessage::new(),
                 ),
             )
             .await
             .ok();
+
+        let decision = match action.as_str() {
+            "allow" => PermissionDecision::Allow,
+            "always" => PermissionDecision::AlwaysAllow,
+            "deny" => PermissionDecision::Deny,
+            _ => return Ok(()),
+        };
+
+        // pending_permissions에서 꺼내서 oneshot 전송
+        let pending = data
+            .pending_permissions
+            .lock()
+            .await
+            .remove(&request_id);
+
+        if let Some(p) = pending {
+            let tool_name = p.tool_name.clone();
+            let message_id = p.message_id;
+            // decision 전송 (실패해도 무시)
+            let _ = p.response_tx.send(decision);
+
+            // 버튼 disable
+            permission_ui::disable_permission_buttons(
+                ctx,
+                component.channel_id,
+                message_id,
+                &action,
+                &tool_name,
+                lang,
+            )
+            .await
+            .ok();
+        }
+
         return Ok(());
     }
 
-    // interaction defer — 메시지 업데이트로 응답 (3초 제약)
-    component
+    // Try question option button: ask:{request_id}:{index}
+    if let Some((request_id, option_index)) =
+        question_ui::parse_question_button_id(&component.data.custom_id)
+    {
+        let triggered_by = {
+            let pending = data.pending_permissions.lock().await;
+            pending.get(&request_id).map(|p| p.triggered_by)
+        };
+
+        let Some(triggered_by) = triggered_by else {
+            return Ok(());
+        };
+
+        let is_owner = component.user.id == UserId::new(data.config.discord.owner_id);
+        if component.user.id != triggered_by && !is_owner {
+            component
+                .create_response(
+                    ctx,
+                    poise::serenity_prelude::CreateInteractionResponse::Message(
+                        poise::serenity_prelude::CreateInteractionResponseMessage::new()
+                            .content(format!("❌ {}", lang.no_permission()))
+                            .ephemeral(true),
+                    ),
+                )
+                .await
+                .ok();
+            return Ok(());
+        }
+
+        component
+            .create_response(
+                ctx,
+                poise::serenity_prelude::CreateInteractionResponse::UpdateMessage(
+                    poise::serenity_prelude::CreateInteractionResponseMessage::new(),
+                ),
+            )
+            .await
+            .ok();
+
+        let pending = data.pending_permissions.lock().await.remove(&request_id);
+        if let Some(p) = pending {
+            let message_id = p.message_id;
+            let label =
+                question_ui::resolve_option_label(&p.input.unwrap_or_default(), option_index);
+            let _ = p.response_tx.send(PermissionDecision::Answer(label.clone()));
+            question_ui::disable_question_components(
+                ctx,
+                component.channel_id,
+                message_id,
+                &label,
+                lang,
+            )
+            .await
+            .ok();
+        }
+
+        return Ok(());
+    }
+
+    // Try question free-text button: ask_text:{request_id}
+    if let Some(request_id) =
+        question_ui::parse_question_text_button_id(&component.data.custom_id)
+    {
+        let triggered_by = {
+            let pending = data.pending_permissions.lock().await;
+            pending.get(&request_id).map(|p| p.triggered_by)
+        };
+
+        let Some(triggered_by) = triggered_by else {
+            return Ok(());
+        };
+
+        let is_owner = component.user.id == UserId::new(data.config.discord.owner_id);
+        if component.user.id != triggered_by && !is_owner {
+            component
+                .create_response(
+                    ctx,
+                    poise::serenity_prelude::CreateInteractionResponse::Message(
+                        poise::serenity_prelude::CreateInteractionResponseMessage::new()
+                            .content(format!("❌ {}", lang.no_permission()))
+                            .ephemeral(true),
+                    ),
+                )
+                .await
+                .ok();
+            return Ok(());
+        }
+
+        // Respond with modal (do NOT defer with UpdateMessage)
+        component
+            .create_response(
+                ctx,
+                poise::serenity_prelude::CreateInteractionResponse::Modal(
+                    question_ui::create_question_modal(&request_id, lang),
+                ),
+            )
+            .await
+            .ok();
+
+        return Ok(());
+    }
+
+    // Try question select menu: ask_sel:{request_id}
+    if let Some(request_id) = question_ui::parse_question_select_id(&component.data.custom_id) {
+        let triggered_by = {
+            let pending = data.pending_permissions.lock().await;
+            pending.get(&request_id).map(|p| p.triggered_by)
+        };
+
+        let Some(triggered_by) = triggered_by else {
+            return Ok(());
+        };
+
+        let is_owner = component.user.id == UserId::new(data.config.discord.owner_id);
+        if component.user.id != triggered_by && !is_owner {
+            component
+                .create_response(
+                    ctx,
+                    poise::serenity_prelude::CreateInteractionResponse::Message(
+                        poise::serenity_prelude::CreateInteractionResponseMessage::new()
+                            .content(format!("❌ {}", lang.no_permission()))
+                            .ephemeral(true),
+                    ),
+                )
+                .await
+                .ok();
+            return Ok(());
+        }
+
+        component
+            .create_response(
+                ctx,
+                poise::serenity_prelude::CreateInteractionResponse::UpdateMessage(
+                    poise::serenity_prelude::CreateInteractionResponseMessage::new(),
+                ),
+            )
+            .await
+            .ok();
+
+        let selected_index: usize = match &component.data.kind {
+            poise::serenity_prelude::ComponentInteractionDataKind::StringSelect { values } => {
+                values.first().and_then(|v| v.parse().ok()).unwrap_or(0)
+            }
+            _ => 0,
+        };
+
+        let pending = data.pending_permissions.lock().await.remove(&request_id);
+        if let Some(p) = pending {
+            let message_id = p.message_id;
+            let label = question_ui::resolve_option_label(
+                &p.input.unwrap_or_default(),
+                selected_index,
+            );
+            let _ = p.response_tx.send(PermissionDecision::Answer(label.clone()));
+            question_ui::disable_question_components(
+                ctx,
+                component.channel_id,
+                message_id,
+                &label,
+                lang,
+            )
+            .await
+            .ok();
+        }
+
+        return Ok(());
+    }
+
+    Ok(())
+}
+
+async fn handle_modal_interaction(
+    ctx: &Context,
+    modal: &poise::serenity_prelude::ModalInteraction,
+    data: &Data,
+) -> Result<(), PidoryError> {
+    let request_id = match question_ui::parse_question_modal_id(&modal.data.custom_id) {
+        Some(rid) => rid,
+        None => return Ok(()),
+    };
+
+    let lang = data.config.language;
+
+    // Extract answer from modal input
+    let answer = modal
+        .data
+        .components
+        .first()
+        .and_then(|row| row.components.first())
+        .and_then(|comp| {
+            if let poise::serenity_prelude::ActionRowComponent::InputText(input) = comp {
+                input.value.clone()
+            } else {
+                None
+            }
+        })
+        .unwrap_or_default();
+
+    // Acknowledge modal
+    modal
         .create_response(
             ctx,
             poise::serenity_prelude::CreateInteractionResponse::UpdateMessage(
@@ -344,33 +595,16 @@ async fn handle_interaction(
         .await
         .ok();
 
-    let decision = match action.as_str() {
-        "allow" => PermissionDecision::Allow,
-        "always" => PermissionDecision::AlwaysAllow,
-        "deny" => PermissionDecision::Deny,
-        _ => return Ok(()),
-    };
-
-    // pending_permissions에서 꺼내서 oneshot 전송
-    let pending = data
-        .pending_permissions
-        .lock()
-        .await
-        .remove(&request_id);
-
+    // Send answer to pending
+    let pending = data.pending_permissions.lock().await.remove(&request_id);
     if let Some(p) = pending {
-        let tool_name = p.tool_name.clone();
         let message_id = p.message_id;
-        // decision 전송 (실패해도 무시)
-        let _ = p.response_tx.send(decision);
-
-        // 버튼 disable
-        permission_ui::disable_permission_buttons(
+        let _ = p.response_tx.send(PermissionDecision::Answer(answer.clone()));
+        question_ui::disable_question_components(
             ctx,
-            component.channel_id,
+            modal.channel_id,
             message_id,
-            &action,
-            &tool_name,
+            &answer,
             lang,
         )
         .await
