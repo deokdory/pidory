@@ -518,6 +518,50 @@ impl Lang {
             }
         }
     }
+
+    // ── Question (AskUserQuestion) ──
+
+    pub fn question_select_placeholder(&self) -> &'static str {
+        match self {
+            Lang::Ko => "답변을 선택하세요",
+            Lang::En => "Select an answer",
+        }
+    }
+
+    pub fn question_write_answer(&self) -> &'static str {
+        match self {
+            Lang::Ko => "직접 입력",
+            Lang::En => "Write answer",
+        }
+    }
+
+    pub fn question_modal_title(&self) -> &'static str {
+        match self {
+            Lang::Ko => "답변 입력",
+            Lang::En => "Enter answer",
+        }
+    }
+
+    pub fn question_modal_label(&self) -> &'static str {
+        match self {
+            Lang::Ko => "답변",
+            Lang::En => "Answer",
+        }
+    }
+
+    pub fn question_modal_placeholder(&self) -> &'static str {
+        match self {
+            Lang::Ko => "답변을 입력하세요...",
+            Lang::En => "Type your answer...",
+        }
+    }
+
+    pub fn question_answered(&self) -> &'static str {
+        match self {
+            Lang::Ko => "답변:",
+            Lang::En => "Answered:",
+        }
+    }
 }
 
 #[cfg(test)]
