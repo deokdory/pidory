@@ -76,7 +76,7 @@ pub fn create_question_message_for_index(
         format!(" — **{}**", header)
     };
 
-    let content = format!("<@{}> ❓{}\n{}", triggered_by, header_text, q_text);
+    let content = format!("<@{}>{}\n{}", triggered_by, header_text, q_text);
 
     let mut components = Vec::new();
     let rid = truncate_request_id(sub_request_id);
@@ -123,12 +123,6 @@ pub fn create_question_message_for_index(
             .collect();
         components.push(CreateActionRow::Buttons(buttons));
     }
-
-    let text_btn = CreateButton::new(format!("ask_text:{}", rid))
-        .label(lang.question_write_answer())
-        .style(ButtonStyle::Secondary)
-        .emoji('✏');
-    components.push(CreateActionRow::Buttons(vec![text_btn]));
 
     CreateMessage::new().content(content).components(components)
 }
