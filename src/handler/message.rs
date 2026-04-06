@@ -42,7 +42,7 @@ async fn handle_message(
     data: &Data,
 ) -> Result<(), PidoryError> {
     // 시스템 메시지 무시 (스레드 이름 변경, 핀 등)
-    if !matches!(new_message.kind, MessageType::Regular | MessageType::InlineReply) {
+    if !matches!(new_message.kind, MessageType::Regular | MessageType::InlineReply | MessageType::ThreadStarterMessage) {
         return Ok(());
     }
 
