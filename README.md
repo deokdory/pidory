@@ -30,7 +30,9 @@ pidory delegates to Discord's built-in permission system, and sessions are **sha
 - Administrative commands (`/register`, `/unregister`, `/del`, `/status`, `/list`, `/sessions`) require `MANAGE_GUILD` or `MANAGE_CHANNELS` permissions respectively.
 - `/stop` can only be called by the user who started the current turn (or the `owner_id`).
 
-**⚠️ Important**: This model assumes that users invited to the guild **trust each other**. Only invite **trusted users** to the server running pidory. Otherwise a malicious user could use the bot to execute arbitrary code, manipulate files, or escalate permissions on behalf of other users.
+**⚠️ Multi-user support is still in beta.** Use with caution.
+
+This model assumes that users invited to the guild **trust each other**. Only invite people you **genuinely trust** to the server running pidory and work together. Otherwise a malicious user could use the bot to execute arbitrary code, manipulate files, or escalate permissions on behalf of other users.
 
 ## Prerequisites
 
