@@ -195,7 +195,7 @@ impl SessionWorker {
                 BetweenTurnsAction::Break => break,
                 BetweenTurnsAction::ProcessMessage(msg) => {
                     queue_size.fetch_sub(1, Ordering::Relaxed);
-                    *last_activity.lock().unwrap() = Instant::now();
+                    *last_activity.lock().unwrap_or_else(|p| p.into_inner()) = Instant::now();
 
                     let json_line = build_user_message_json(&msg.content);
                     if let Err(e) = stdin.write_all(json_line.as_bytes()).await {
@@ -796,7 +796,7 @@ async fn run_active_turn(
                 match new_msg {
                     Some(m) => {
                         queue_size.fetch_sub(1, Ordering::Relaxed);
-                        *last_activity.lock().unwrap() = Instant::now();
+                        *last_activity.lock().unwrap_or_else(|p| p.into_inner()) = Instant::now();
                         let inject_line = build_user_message_json(&m.content);
                         if let Err(e) = stdin.write_all(inject_line.as_bytes()).await {
                             tracing::error!("mid-turn stdin write error: {}", e);
@@ -1045,7 +1045,7 @@ async fn run_active_turn(
                                 let _ = event_tx.send(event).await;
                                 if is_result {
                                     is_turn_active.store(false, Ordering::Relaxed);
-                                    *last_activity.lock().unwrap() = Instant::now();
+                                    *last_activity.lock().unwrap_or_else(|p| p.into_inner()) = Instant::now();
                                     break 'turn false;
                                 }
                             }
