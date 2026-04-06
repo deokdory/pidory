@@ -82,6 +82,7 @@ pub async fn unregister(ctx: Context<'_>) -> Result<(), Error> {
         ctx.data().pending_permissions.lock().await.retain(|_, p| p.thread_id != session.thread_id);
         ctx.data().needs_context.lock().await.remove(&session.thread_id);
         ctx.data().turn_initiators.lock().await.remove(&session.thread_id);
+        ctx.data().turn_participants.lock().await.remove(&session.thread_id);
     }
     repository::delete_sessions_by_channel(&ctx.data().db, &channel_id).await?;
 
