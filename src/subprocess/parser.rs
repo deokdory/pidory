@@ -47,6 +47,7 @@ pub enum StreamEvent {
         num_turns: u32,
         input_tokens: u64,
         output_tokens: u64,
+        context_window: u64,
     },
     UserReplay {
         content: String,
@@ -526,6 +527,29 @@ mod tests {
         let event2 = parse_line(line2).unwrap();
         assert!(!event2.is_task_notification());
     }
+
+    #[test]
+    fn parse_result_with_model_usage() {
+        let line = r#"{"type":"result","subtype":"success","session_id":"abc","is_error":false,"duration_ms":1000,"total_cost_usd":0.16,"num_turns":1,"usage":{"input_tokens":3,"cache_creation_input_tokens":26147,"cache_read_input_tokens":0,"output_tokens":4},"modelUsage":{"claude-opus-4-6[1m]":{"inputTokens":3,"outputTokens":4,"contextWindow":1000000,"maxOutputTokens":64000}}}"#;
+        let event = parse_line(line).unwrap();
+        if let StreamEvent::Result { context_window, input_tokens, .. } = event {
+            assert_eq!(context_window, 1000000);
+            assert_eq!(input_tokens, 3 + 26147 + 0); // input + cache_creation + cache_read
+        } else {
+            panic!("expected Result");
+        }
+    }
+
+    #[test]
+    fn parse_result_empty_model_usage() {
+        let line = r#"{"type":"result","subtype":"success","session_id":"abc","is_error":false,"duration_ms":0,"total_cost_usd":0,"num_turns":0,"modelUsage":{}}"#;
+        let event = parse_line(line).unwrap();
+        if let StreamEvent::Result { context_window, .. } = event {
+            assert_eq!(context_window, 0);
+        } else {
+            panic!("expected Result");
+        }
+    }
 }
 
 pub fn parse_line(line: &str) -> Result<StreamEvent, serde_json::Error> {
@@ -883,6 +907,12 @@ pub fn parse_line(line: &str) -> Result<StreamEvent, serde_json::Error> {
                 .and_then(|u| u.get("output_tokens"))
                 .and_then(|v| v.as_u64())
                 .unwrap_or(0);
+            let context_window = v.get("modelUsage")
+                .and_then(|m| m.as_object())
+                .and_then(|m| m.values().next())
+                .and_then(|model| model.get("contextWindow"))
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
             Ok(StreamEvent::Result {
                 subtype,
                 session_id,
@@ -894,6 +924,7 @@ pub fn parse_line(line: &str) -> Result<StreamEvent, serde_json::Error> {
                 num_turns,
                 input_tokens,
                 output_tokens,
+                context_window,
             })
         }
         "control_request" => {
