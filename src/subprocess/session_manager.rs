@@ -28,6 +28,7 @@ pub struct QueuedMessage {
     pub channel_id: ChannelId,
     pub message_id: MessageId,
     pub event_tx: Option<mpsc::Sender<StreamEvent>>,  // None = mid-turn inject
+    pub triggered_by: UserId,
 }
 
 pub(super) struct SessionInner {
@@ -78,7 +79,6 @@ impl SessionManager {
         lang: Lang,
         pending_permissions: Arc<tokio::sync::Mutex<HashMap<String, PendingPermission>>>,
         owner_id: u64,
-        turn_initiators: Arc<tokio::sync::Mutex<HashMap<String, UserId>>>,
     ) -> Result<SessionCreateResult, PidoryError> {
         let mut sessions = self.sessions.lock().await;
 
@@ -158,7 +158,6 @@ impl SessionManager {
             owner_id,
             thread_id.to_string(),
             lang,
-            turn_initiators.clone(),
         ));
 
         // Combined worker task: reads queue, writes stdin, reads stdout until result, streams events
@@ -181,6 +180,7 @@ impl SessionManager {
             db,
             timeout_secs,
             lang,
+            owner_id,
         ).run());
 
 

@@ -202,6 +202,7 @@ pub async fn del(
     ctx.data().pending_permissions.lock().await.retain(|_, p| p.thread_id != tid);
     ctx.data().needs_context.lock().await.remove(&tid);
     ctx.data().turn_initiators.lock().await.remove(&tid);
+    ctx.data().turn_participants.lock().await.remove(&tid);
 
     repository::delete_session(&ctx.data().db, &tid).await?;
 

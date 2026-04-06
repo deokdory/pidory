@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Mutex as StdMutex;
 use std::time::{Duration, Instant};
 
-use poise::serenity_prelude::{ChannelId, Context, CreateMessage, MessageFlags};
+use poise::serenity_prelude::{ChannelId, Context, CreateMessage, MessageFlags, UserId};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{ChildStdin, ChildStdout};
 use tokio::sync::{mpsc, Mutex};
@@ -90,6 +90,7 @@ pub(super) struct SessionWorker {
     // State
     permission_cache: PermissionCache,
     tracker: BackgroundTaskTracker,
+    current_triggered_by: UserId,
     // Shared refs
     queue_size: Arc<AtomicUsize>,
     sessions: Arc<Mutex<HashMap<String, SessionInner>>>,
@@ -124,6 +125,7 @@ impl SessionWorker {
         db: sqlx::SqlitePool,
         timeout_secs: u64,
         lang: Lang,
+        owner_id: u64,
     ) -> Self {
         Self {
             stdin,
@@ -134,6 +136,7 @@ impl SessionWorker {
             permission_tx,
             permission_cache: PermissionCache::new(),
             tracker: BackgroundTaskTracker::new(),
+            current_triggered_by: UserId::new(owner_id),
             queue_size,
             sessions,
             last_activity,
@@ -158,6 +161,7 @@ impl SessionWorker {
             ref permission_tx,
             ref mut permission_cache,
             ref mut tracker,
+            ref mut current_triggered_by,
             ref queue_size,
             ref sessions,
             ref last_activity,
@@ -169,6 +173,7 @@ impl SessionWorker {
             ref db,
             timeout_secs,
             lang,
+            ..
         } = self;
 
         loop {
@@ -181,6 +186,7 @@ impl SessionWorker {
                 permission_tx,
                 permission_cache,
                 tracker,
+                current_triggered_by,
                 queue_size,
                 has_bg_tasks,
                 thread_id,
@@ -196,6 +202,9 @@ impl SessionWorker {
                 BetweenTurnsAction::ProcessMessage(msg) => {
                     queue_size.fetch_sub(1, Ordering::Relaxed);
                     *last_activity.lock().unwrap_or_else(|p| p.into_inner()) = Instant::now();
+
+                    // 현재 turn 의 triggered_by 업데이트
+                    *current_triggered_by = msg.triggered_by;
 
                     let json_line = build_user_message_json(&msg.content);
                     if let Err(e) = stdin.write_all(json_line.as_bytes()).await {
@@ -224,6 +233,7 @@ impl SessionWorker {
                         permission_tx,
                         permission_cache,
                         tracker,
+                        current_triggered_by,
                         queue_size,
                         has_bg_tasks,
                         is_turn_active,
@@ -279,6 +289,7 @@ async fn handle_between_turns_event(
     permission_tx: &mpsc::Sender<PermissionRequest>,
     permission_cache: &mut PermissionCache,
     tracker: &mut BackgroundTaskTracker,
+    current_triggered_by: &mut UserId,
     queue_size: &Arc<AtomicUsize>,
     has_bg_tasks: &Arc<AtomicBool>,
     thread_id: &str,
@@ -343,6 +354,7 @@ async fn handle_between_turns_event(
                                 permission_tx,
                                 permission_cache,
                                 tracker,
+                                current_triggered_by,
                                 queue_size,
                                 thread_id,
                                 channel_id,
@@ -378,6 +390,7 @@ async fn handle_between_turns_event(
                                 input: saved_input.clone(),
                                 decision_reason: saved_reason,
                                 response_tx: resp_tx,
+                                triggered_by: *current_triggered_by,
                             };
                             if permission_tx.send(perm_req).await.is_err() {
                                 tracing::error!("permission_tx closed, denying (between turns)");
@@ -448,6 +461,7 @@ async fn handle_bg_turn(
     permission_tx: &mpsc::Sender<PermissionRequest>,
     permission_cache: &mut PermissionCache,
     tracker: &mut BackgroundTaskTracker,
+    current_triggered_by: &mut UserId,
     queue_size: &Arc<AtomicUsize>,
     thread_id: &str,
     channel_id: &ChannelId,
@@ -528,6 +542,7 @@ async fn handle_bg_turn(
                                         input: saved_input.clone(),
                                         decision_reason: saved_reason,
                                         response_tx: resp_tx,
+                                        triggered_by: *current_triggered_by,
                                     };
                                     if permission_tx.send(perm_req).await.is_err() {
                                         tracing::error!("permission_tx closed, denying (bg turn)");
@@ -583,6 +598,7 @@ async fn handle_bg_turn(
                 match new_msg {
                     Some(m) => {
                         queue_size.fetch_sub(1, Ordering::Relaxed);
+                        *current_triggered_by = m.triggered_by;
                         let inject_line = build_user_message_json(&m.content);
                         if let Err(e) = stdin.write_all(inject_line.as_bytes()).await {
                             tracing::error!("mid-turn stdin write error (bg turn): {}", e);
@@ -763,6 +779,7 @@ async fn run_active_turn(
     permission_tx: &mpsc::Sender<PermissionRequest>,
     permission_cache: &mut PermissionCache,
     tracker: &mut BackgroundTaskTracker,
+    current_triggered_by: &mut UserId,
     queue_size: &Arc<AtomicUsize>,
     has_bg_tasks: &Arc<AtomicBool>,
     is_turn_active: &Arc<AtomicBool>,
@@ -797,6 +814,7 @@ async fn run_active_turn(
                     Some(m) => {
                         queue_size.fetch_sub(1, Ordering::Relaxed);
                         *last_activity.lock().unwrap_or_else(|p| p.into_inner()) = Instant::now();
+                        *current_triggered_by = m.triggered_by;
                         let inject_line = build_user_message_json(&m.content);
                         if let Err(e) = stdin.write_all(inject_line.as_bytes()).await {
                             tracing::error!("mid-turn stdin write error: {}", e);
@@ -934,6 +952,7 @@ async fn run_active_turn(
                                                 input: saved_input.clone(),
                                                 decision_reason: saved_reason,
                                                 response_tx: resp_tx,
+                                                triggered_by: *current_triggered_by,
                                             };
                                             if permission_tx.send(perm_req).await.is_err() {
                                                 tracing::error!("permission_tx closed, denying (bg turn in user turn)");
@@ -1000,6 +1019,7 @@ async fn run_active_turn(
                                         input: saved_input.clone(),
                                         decision_reason: saved_decision_reason,
                                         response_tx: resp_tx,
+                                        triggered_by: *current_triggered_by,
                                     };
 
                                     if permission_tx.send(perm_req).await.is_err() {
