@@ -101,6 +101,7 @@ pub async fn skill(
         channel_id,
         msg_id,
         &content,
+        ctx.author().id,
     )
     .await?;
 
