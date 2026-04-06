@@ -78,6 +78,7 @@ impl SessionManager {
         db: sqlx::SqlitePool,
         lang: Lang,
         pending_permissions: Arc<tokio::sync::Mutex<HashMap<String, PendingPermission>>>,
+        pending_question_groups: Arc<tokio::sync::Mutex<HashMap<String, crate::PendingQuestionGroup>>>,
         owner_id: u64,
     ) -> Result<SessionCreateResult, PidoryError> {
         let mut sessions = self.sessions.lock().await;
@@ -155,6 +156,7 @@ impl SessionManager {
             ctx.clone(),
             channel_id,
             pending_permissions.clone(),
+            pending_question_groups.clone(),
             owner_id,
             thread_id.to_string(),
             lang,
