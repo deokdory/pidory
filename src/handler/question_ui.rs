@@ -18,6 +18,15 @@ pub fn create_question_message(
     triggered_by: UserId,
     lang: Lang,
 ) -> CreateMessage {
+    let question_count = input
+        .get("questions")
+        .and_then(|q| q.as_array())
+        .map(|arr| arr.len())
+        .unwrap_or(0);
+    if question_count > 1 {
+        tracing::warn!("AskUserQuestion has {} questions, only first will be shown", question_count);
+    }
+
     let question = extract_first_question(input);
     let q_text = question.get("question").and_then(|v| v.as_str()).unwrap_or("");
     let header = question.get("header").and_then(|v| v.as_str()).unwrap_or("");
@@ -34,7 +43,13 @@ pub fn create_question_message(
     let mut components = Vec::new();
 
     if options.len() >= 6 {
-        let menu_options: Vec<CreateSelectMenuOption> = options
+        let capped_options = if options.len() > 25 {
+            tracing::warn!("AskUserQuestion has {} options, capping to 25 for Discord select menu", options.len());
+            &options[..25]
+        } else {
+            &options
+        };
+        let menu_options: Vec<CreateSelectMenuOption> = capped_options
             .iter()
             .enumerate()
             .map(|(i, (label, desc))| {
@@ -46,7 +61,7 @@ pub fn create_question_message(
             })
             .collect();
         let select = CreateSelectMenu::new(
-            format!("ask_sel:{}", request_id),
+            format!("ask_sel:{}", truncate_request_id(request_id)),
             CreateSelectMenuKind::String {
                 options: menu_options,
             },
@@ -58,7 +73,7 @@ pub fn create_question_message(
             .iter()
             .enumerate()
             .map(|(i, (label, _desc))| {
-                CreateButton::new(format!("ask:{}:{}", request_id, i))
+                CreateButton::new(format!("ask:{}:{}", truncate_request_id(request_id), i))
                     .label(label)
                     .style(ButtonStyle::Primary)
             })
@@ -66,7 +81,7 @@ pub fn create_question_message(
         components.push(CreateActionRow::Buttons(buttons));
     }
 
-    let text_btn = CreateButton::new(format!("ask_text:{}", request_id))
+    let text_btn = CreateButton::new(format!("ask_text:{}", truncate_request_id(request_id)))
         .label(lang.question_write_answer())
         .style(ButtonStyle::Secondary)
         .emoji('✏');
@@ -120,10 +135,19 @@ pub fn create_question_modal(request_id: &str, lang: Lang) -> CreateModal {
     .required(true);
 
     CreateModal::new(
-        format!("ask_modal:{}", request_id),
+        format!("ask_modal:{}", truncate_request_id(request_id)),
         lang.question_modal_title(),
     )
     .components(vec![CreateActionRow::InputText(input_field)])
+}
+
+/// Truncates request_id to 80 chars, leaving room for prefixes and suffixes within Discord's 100-char custom_id limit.
+fn truncate_request_id(request_id: &str) -> &str {
+    if request_id.len() > 80 {
+        &request_id[..80]
+    } else {
+        request_id
+    }
 }
 
 /// Parses `ask:{request_id}:{option_index}` button custom_id.
@@ -262,5 +286,51 @@ mod tests {
         assert_eq!(opts[0].1, "desc");
         assert_eq!(opts[1].0, "B");
         assert_eq!(opts[1].1, "");
+    }
+
+    #[test]
+    fn create_question_message_multi_question_uses_first() {
+        let input = serde_json::json!({
+            "questions": [
+                {"question": "First?", "options": [{"label": "A"}]},
+                {"question": "Second?", "options": [{"label": "B"}]}
+            ]
+        });
+        let msg = create_question_message(&input, "req-1", UserId::new(1), Lang::En);
+        let json = serde_json::to_value(&msg).unwrap();
+        let content = json["content"].as_str().unwrap_or("");
+        assert!(content.contains("First?"));
+        assert!(!content.contains("Second?"));
+    }
+
+    #[test]
+    fn create_question_message_caps_select_at_25() {
+        let options: Vec<serde_json::Value> = (0..30)
+            .map(|i| serde_json::json!({"label": format!("Opt {}", i)}))
+            .collect();
+        let input = serde_json::json!({"questions": [{"question": "pick", "options": options}]});
+        // Should not panic — select menu capped at 25
+        let _msg = create_question_message(&input, "req-cap", UserId::new(1), Lang::En);
+    }
+
+    #[test]
+    fn truncate_request_id_short() {
+        assert_eq!(truncate_request_id("abc-123"), "abc-123");
+    }
+
+    #[test]
+    fn truncate_request_id_long() {
+        let long = "a".repeat(120);
+        assert_eq!(truncate_request_id(&long).len(), 80);
+    }
+
+    #[test]
+    fn custom_ids_within_100_chars() {
+        let long_id = "a".repeat(120);
+        let rid = truncate_request_id(&long_id);
+        assert!(format!("ask:{}:{}", rid, 99).len() <= 100);
+        assert!(format!("ask_text:{}", rid).len() <= 100);
+        assert!(format!("ask_sel:{}", rid).len() <= 100);
+        assert!(format!("ask_modal:{}", rid).len() <= 100);
     }
 }
