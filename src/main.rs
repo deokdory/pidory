@@ -157,10 +157,12 @@ async fn main() -> Result<(), PidoryError> {
                         let repo = config.release.repo.clone();
                         let last_tag_file = config.release.last_tag_file.clone();
                         let interval_secs = config.release.check_interval_secs;
+                        let token = config.release.token_env.as_ref()
+                            .and_then(|env_name| std::env::var(env_name).ok());
                         let lang = config.language;
                         let mut ctx_rx = ctx_tx.subscribe();
                         tokio::spawn(async move {
-                            let checker = crate::release::ReleaseChecker::new(repo, last_tag_file);
+                            let checker = crate::release::ReleaseChecker::new(repo, last_tag_file, token);
                             let mut interval = tokio::time::interval(
                                 std::time::Duration::from_secs(interval_secs),
                             );
