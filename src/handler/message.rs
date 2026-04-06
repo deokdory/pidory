@@ -278,7 +278,6 @@ async fn handle_message(
         data.config.response.max_chunk_length,
         data.config.response.max_chunks,
         data.session_skills.clone(),
-        data.config.ratelimit.file_path.as_deref(),
         lang,
         data.config.discord.owner_id,
         data.turn_participants.clone(),
@@ -392,7 +391,6 @@ pub async fn process_turn_events(
     max_chunk_length: usize,
     max_chunks: usize,
     session_skills: std::sync::Arc<tokio::sync::Mutex<HashMap<String, Vec<String>>>>,
-    ratelimit_file: Option<&str>,
     lang: Lang,
     owner_id: u64,
     turn_participants: std::sync::Arc<tokio::sync::Mutex<HashMap<String, std::collections::HashSet<UserId>>>>,
@@ -605,18 +603,18 @@ pub async fn process_turn_events(
             .ok();
     } else {
         // 정상 완료: 요약 전송
-        let (duration_ms, total_cost_usd, input_tokens, output_tokens) = events.iter().find_map(|e| {
-            if let StreamEvent::Result { duration_ms, total_cost_usd, input_tokens, output_tokens, .. } = e {
-                Some((*duration_ms, *total_cost_usd, *input_tokens, *output_tokens))
+        let (duration_ms, total_cost_usd, input_tokens, output_tokens, context_window) = events.iter().find_map(|e| {
+            if let StreamEvent::Result { duration_ms, total_cost_usd, input_tokens, output_tokens, context_window, .. } = e {
+                Some((*duration_ms, *total_cost_usd, *input_tokens, *output_tokens, *context_window))
             } else {
                 None
             }
-        }).unwrap_or((0, 0.0, 0, 0));
+        }).unwrap_or((0, 0.0, 0, 0, 0));
 
         let duration = formatter::format_duration(duration_ms);
         let cost = formatter::format_cost(total_cost_usd);
         let tokens = formatter::format_tokens(input_tokens, output_tokens);
-        let ctx_suffix = format_ctx_suffix(ratelimit_file);
+        let ctx_suffix = format_ctx_suffix(input_tokens, context_window);
         let mentions = {
             let parts = turn_participants.lock().await;
             parts.get(thread_id)
@@ -677,17 +675,17 @@ pub async fn process_turn_events(
                     tracing::warn!(%channel_id, "Failed to send turn error notification: {}", e);
                 }
             } else {
-                let (duration_ms, total_cost_usd, input_tokens, output_tokens) = events.iter().find_map(|e| {
-                    if let StreamEvent::Result { duration_ms, total_cost_usd, input_tokens, output_tokens, .. } = e {
-                        Some((*duration_ms, *total_cost_usd, *input_tokens, *output_tokens))
+                let (duration_ms, total_cost_usd, input_tokens, output_tokens, context_window) = events.iter().find_map(|e| {
+                    if let StreamEvent::Result { duration_ms, total_cost_usd, input_tokens, output_tokens, context_window, .. } = e {
+                        Some((*duration_ms, *total_cost_usd, *input_tokens, *output_tokens, *context_window))
                     } else {
                         None
                     }
-                }).unwrap_or((0, 0.0, 0, 0));
+                }).unwrap_or((0, 0.0, 0, 0, 0));
                 let duration = formatter::format_duration(duration_ms);
                 let cost = formatter::format_cost(total_cost_usd);
                 let tokens = formatter::format_tokens(input_tokens, output_tokens);
-                let ctx_suffix = format_ctx_suffix(ratelimit_file);
+                let ctx_suffix = format_ctx_suffix(input_tokens, context_window);
                 if let Err(e) = channel_id.say(ctx, &format!("-# ✅ {}{}{}{} {}", duration, cost, tokens, ctx_suffix, mentions)).await {
                     tracing::warn!(%channel_id, "Failed to send turn completion notification: {}", e);
                 }
@@ -697,12 +695,12 @@ pub async fn process_turn_events(
 
 }
 
-fn format_ctx_suffix(ratelimit_file: Option<&str>) -> String {
-    ratelimit_file
-        .and_then(crate::ratelimit::read_ratelimit_file)
-        .and_then(|info| info.context_percent)
-        .map(|pct| format!(" ctx:{}%", pct))
-        .unwrap_or_default()
+fn format_ctx_suffix(input_tokens: u64, context_window: u64) -> String {
+    if context_window == 0 {
+        return String::new();
+    }
+    let pct = (input_tokens as f64 / context_window as f64 * 100.0).min(100.0) as u8;
+    format!(" ctx:{}%", pct)
 }
 
 pub async fn execute_in_session(
@@ -786,7 +784,6 @@ pub async fn execute_in_session(
         data.config.response.max_chunk_length,
         data.config.response.max_chunks,
         data.session_skills.clone(),
-        data.config.ratelimit.file_path.as_deref(),
         data.config.language,
         data.config.discord.owner_id,
         data.turn_participants.clone(),
@@ -925,5 +922,14 @@ mod tests {
     fn new_command_case_insensitive() {
         let result = build_context_content("/New", true, false, "스레드", Lang::Ko);
         assert!(!result.contains("<system-reminder>"));
+    }
+
+    #[test]
+    fn test_format_ctx_suffix() {
+        assert_eq!(format_ctx_suffix(26150, 1000000), " ctx:2%");
+        assert_eq!(format_ctx_suffix(420000, 1000000), " ctx:42%");
+        assert_eq!(format_ctx_suffix(0, 0), "");
+        assert_eq!(format_ctx_suffix(100, 0), "");
+        assert_eq!(format_ctx_suffix(1000000, 1000000), " ctx:100%");
     }
 }
