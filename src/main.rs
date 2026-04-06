@@ -41,6 +41,7 @@ pub struct Data {
     pub session_skills: Arc<Mutex<HashMap<String, Vec<String>>>>,
     pub needs_context: Arc<Mutex<HashSet<String>>>,
     pub turn_initiators: Arc<Mutex<HashMap<String, serenity::UserId>>>,
+    pub turn_participants: Arc<Mutex<HashMap<String, HashSet<serenity::UserId>>>>,
     pub skill_descriptions: HashMap<String, String>,
     /// Event handler가 fresh Context를 background task에 전달하는 채널.
     /// Shard reconnect 후에도 최신 ShardMessenger를 사용할 수 있게 해준다.
@@ -102,6 +103,7 @@ async fn main() -> Result<(), PidoryError> {
                 let pending_permissions: Arc<Mutex<HashMap<String, PendingPermission>>> = Arc::new(Mutex::new(HashMap::new()));
                 let session_skills = Arc::new(Mutex::new(HashMap::new()));
                 let turn_initiators: Arc<Mutex<HashMap<String, serenity::UserId>>> = Arc::new(Mutex::new(HashMap::new()));
+                let turn_participants: Arc<Mutex<HashMap<String, HashSet<serenity::UserId>>>> = Arc::new(Mutex::new(HashMap::new()));
                 let skill_descriptions = load_skill_descriptions();
 
                 // watch channel: event handler → background task로 fresh Context 전달
@@ -156,6 +158,7 @@ async fn main() -> Result<(), PidoryError> {
                     let session_skills = Arc::clone(&session_skills);
                     let needs_context = Arc::clone(&needs_context);
                     let turn_initiators = Arc::clone(&turn_initiators);
+                    let turn_participants = Arc::clone(&turn_participants);
                     let db_clone = db.clone();
                     let lang = config.language;
                     let mut ctx_rx = ctx_tx.subscribe();
@@ -173,6 +176,7 @@ async fn main() -> Result<(), PidoryError> {
                                 session_skills.lock().await.remove(tid);
                                 needs_context.lock().await.remove(tid);
                                 turn_initiators.lock().await.remove(tid);
+                                turn_participants.lock().await.remove(tid);
                                 if let Err(e) = db::repository::update_session_status(&db_clone, tid, "idle").await {
                                     tracing::warn!("Failed to update session status for TTL sweep thread {}: {}", tid, e);
                                 }
@@ -198,6 +202,7 @@ async fn main() -> Result<(), PidoryError> {
                     session_skills,
                     needs_context,
                     turn_initiators,
+                    turn_participants,
                     skill_descriptions,
                     ctx_watch: ctx_tx,
                 })

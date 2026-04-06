@@ -146,17 +146,12 @@ pub async fn run_permission_handler(
     ctx: Context,
     channel_id: ChannelId,
     pending_permissions: Arc<Mutex<HashMap<String, PendingPermission>>>,
-    owner_id: u64,
+    _owner_id: u64,
     thread_id: String,
     lang: Lang,
-    turn_initiators: Arc<Mutex<HashMap<String, UserId>>>,
 ) {
     while let Some(perm_req) = permission_rx.recv().await {
-        let triggered_by = {
-            let map = turn_initiators.lock().await;
-            map.get(&thread_id).copied()
-                .unwrap_or_else(|| UserId::new(owner_id))
-        };
+        let triggered_by = perm_req.triggered_by;
 
         let msg = create_permission_message(
             &perm_req.tool_name,

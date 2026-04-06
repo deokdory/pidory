@@ -2,6 +2,8 @@
 
 use std::collections::HashSet;
 
+use poise::serenity_prelude::UserId;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PermissionDecision {
     Allow,
@@ -16,6 +18,7 @@ pub struct PermissionRequest {
     pub input: serde_json::Value,
     pub decision_reason: Option<String>,
     pub response_tx: tokio::sync::oneshot::Sender<PermissionDecision>,
+    pub triggered_by: UserId,
 }
 
 pub struct PermissionCache {
