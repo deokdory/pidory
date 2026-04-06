@@ -14,7 +14,7 @@ use crate::error::PidoryError;
 use crate::handler::question_ui;
 use crate::i18n::Lang;
 use crate::subprocess::permission::{PermissionDecision, PermissionRequest};
-use crate::PendingPermission;
+use crate::{PendingPermission, PendingQuestionGroup};
 
 pub fn create_permission_message(
     tool_name: &str,
@@ -147,6 +147,7 @@ pub async fn run_permission_handler(
     ctx: Context,
     channel_id: ChannelId,
     pending_permissions: Arc<Mutex<HashMap<String, PendingPermission>>>,
+    pending_question_groups: Arc<Mutex<HashMap<String, PendingQuestionGroup>>>,
     _owner_id: u64,
     thread_id: String,
     lang: Lang,
@@ -155,26 +156,94 @@ pub async fn run_permission_handler(
         let triggered_by = perm_req.triggered_by;
 
         if perm_req.tool_name == "AskUserQuestion" {
-            let msg = question_ui::create_question_message(
-                &perm_req.input,
-                &perm_req.request_id,
-                triggered_by,
-                lang,
-            );
-            match channel_id.send_message(&ctx, msg).await {
-                Ok(sent) => {
-                    let pending = PendingPermission {
+            let count = question_ui::question_count(&perm_req.input);
+            if count <= 1 {
+                // Single question — direct PendingPermission, no group needed
+                let msg = question_ui::create_question_message(
+                    &perm_req.input,
+                    &perm_req.request_id,
+                    triggered_by,
+                    lang,
+                );
+                match channel_id.send_message(&ctx, msg).await {
+                    Ok(sent) => {
+                        let pending = PendingPermission {
+                            response_tx: perm_req.response_tx,
+                            tool_name: perm_req.tool_name,
+                            message_id: sent.id,
+                            thread_id: thread_id.clone(),
+                            triggered_by,
+                            input: Some(perm_req.input),
+                        };
+                        pending_permissions
+                            .lock()
+                            .await
+                            .insert(perm_req.request_id, pending);
+                    }
+                    Err(e) => {
+                        warn!("Failed to send question message: {}", e);
+                        let _ = perm_req.response_tx.send(PermissionDecision::Deny);
+                    }
+                }
+            } else {
+                // Multi-question — send each question as a separate message,
+                // create PendingPermission per sub-question, and a PendingQuestionGroup
+                let mut all_ok = true;
+                for idx in 0..count {
+                    let sub_id =
+                        question_ui::make_sub_request_id(&perm_req.request_id, idx);
+                    let msg = question_ui::create_question_message_for_index(
+                        &perm_req.input,
+                        idx,
+                        &sub_id,
+                        triggered_by,
+                        lang,
+                    );
+                    match channel_id.send_message(&ctx, msg).await {
+                        Ok(sent) => {
+                            // Sub-question PendingPermission — no response_tx (group owns it)
+                            // We use a dummy oneshot that's never awaited
+                            let (dummy_tx, _) =
+                                tokio::sync::oneshot::channel::<PermissionDecision>();
+                            let pending = PendingPermission {
+                                response_tx: dummy_tx,
+                                tool_name: perm_req.tool_name.clone(),
+                                message_id: sent.id,
+                                thread_id: thread_id.clone(),
+                                triggered_by,
+                                input: Some(perm_req.input.clone()),
+                            };
+                            pending_permissions.lock().await.insert(sub_id, pending);
+                        }
+                        Err(e) => {
+                            warn!("Failed to send question message (q{}): {}", idx, e);
+                            all_ok = false;
+                            break;
+                        }
+                    }
+                }
+
+                if all_ok {
+                    let group = PendingQuestionGroup {
                         response_tx: perm_req.response_tx,
-                        tool_name: perm_req.tool_name,
-                        message_id: sent.id,
+                        input: perm_req.input,
+                        answers: HashMap::new(),
+                        total: count,
                         thread_id: thread_id.clone(),
                         triggered_by,
-                        input: Some(perm_req.input),
                     };
-                    pending_permissions.lock().await.insert(perm_req.request_id, pending);
-                }
-                Err(e) => {
-                    warn!("Failed to send question message: {}", e);
+                    pending_question_groups
+                        .lock()
+                        .await
+                        .insert(perm_req.request_id, group);
+                } else {
+                    // Clean up any sub-questions that were sent
+                    let mut perms = pending_permissions.lock().await;
+                    for idx in 0..count {
+                        let sub_id =
+                            question_ui::make_sub_request_id(&perm_req.request_id, idx);
+                        perms.remove(&sub_id);
+                    }
                     let _ = perm_req.response_tx.send(PermissionDecision::Deny);
                 }
             }

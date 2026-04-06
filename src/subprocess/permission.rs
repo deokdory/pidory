@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use poise::serenity_prelude::UserId;
 
@@ -9,7 +9,7 @@ pub enum PermissionDecision {
     Allow,
     AlwaysAllow,
     Deny,
-    Answer(String),
+    Answer(HashMap<String, String>),
 }
 
 pub struct PermissionRequest {

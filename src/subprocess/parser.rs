@@ -996,11 +996,18 @@ pub fn build_control_response_deny(request_id: &str, message: &str) -> String {
     format!("{}\n", response)
 }
 
-pub fn build_control_response_ask_answer(request_id: &str, input: &Value, answer: &str) -> String {
+pub fn build_control_response_ask_answer(
+    request_id: &str,
+    input: &Value,
+    answers: &std::collections::HashMap<String, String>,
+) -> String {
     let mut updated_input = input.clone();
     if let Value::Object(ref mut map) = updated_input {
-        let answers = serde_json::json!({"q_0": answer});
-        map.insert("answers".to_string(), answers);
+        let answers_value: serde_json::Map<String, Value> = answers
+            .iter()
+            .map(|(k, v)| (k.clone(), Value::String(v.clone())))
+            .collect();
+        map.insert("answers".to_string(), Value::Object(answers_value));
     }
     let json = serde_json::json!({
         "type": "control_response",
@@ -1019,19 +1026,35 @@ pub fn build_control_response_ask_answer(request_id: &str, input: &Value, answer
 #[cfg(test)]
 mod ask_answer_tests {
     use super::*;
+    use std::collections::HashMap;
 
     #[test]
     fn build_control_response_ask_answer_sets_q0() {
         let input = serde_json::json!({"questions": [{"question": "pick?"}]});
-        let out = build_control_response_ask_answer("req-1", &input, "Blue");
+        let answers = HashMap::from([("q_0".to_string(), "Blue".to_string())]);
+        let out = build_control_response_ask_answer("req-1", &input, &answers);
         let v: serde_json::Value = serde_json::from_str(out.trim()).expect("valid JSON");
         assert_eq!(v["response"]["response"]["updatedInput"]["answers"]["q_0"], "Blue");
     }
 
     #[test]
+    fn build_control_response_ask_answer_multiple_questions() {
+        let input = serde_json::json!({"questions": [{"question": "q1?"}, {"question": "q2?"}]});
+        let answers = HashMap::from([
+            ("q_0".to_string(), "A".to_string()),
+            ("q_1".to_string(), "B".to_string()),
+        ]);
+        let out = build_control_response_ask_answer("req-m", &input, &answers);
+        let v: serde_json::Value = serde_json::from_str(out.trim()).expect("valid JSON");
+        assert_eq!(v["response"]["response"]["updatedInput"]["answers"]["q_0"], "A");
+        assert_eq!(v["response"]["response"]["updatedInput"]["answers"]["q_1"], "B");
+    }
+
+    #[test]
     fn build_control_response_ask_answer_preserves_original_fields() {
         let input = serde_json::json!({"questions": [{"question": "pick?"}], "extra": 42});
-        let out = build_control_response_ask_answer("req-2", &input, "Red");
+        let answers = HashMap::from([("q_0".to_string(), "Red".to_string())]);
+        let out = build_control_response_ask_answer("req-2", &input, &answers);
         let v: serde_json::Value = serde_json::from_str(out.trim()).expect("valid JSON");
         assert_eq!(v["response"]["response"]["updatedInput"]["extra"], 42);
         assert_eq!(v["response"]["response"]["updatedInput"]["questions"][0]["question"], "pick?");
@@ -1040,7 +1063,8 @@ mod ask_answer_tests {
     #[test]
     fn build_control_response_ask_answer_ends_with_newline() {
         let input = serde_json::json!({});
-        let out = build_control_response_ask_answer("req-3", &input, "test");
+        let answers = HashMap::from([("q_0".to_string(), "test".to_string())]);
+        let out = build_control_response_ask_answer("req-3", &input, &answers);
         assert!(out.ends_with('\n'));
     }
 }
