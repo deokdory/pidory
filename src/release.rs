@@ -14,10 +14,11 @@ pub struct ReleaseChecker {
     client: reqwest::Client,
     repo: String,
     last_tag_file: String,
+    token: Option<String>,
 }
 
 impl ReleaseChecker {
-    pub fn new(repo: String, last_tag_file: String) -> Self {
+    pub fn new(repo: String, last_tag_file: String, token: Option<String>) -> Self {
         let client = reqwest::Client::builder()
             .user_agent("pidory")
             .build()
@@ -26,6 +27,7 @@ impl ReleaseChecker {
             client,
             repo,
             last_tag_file,
+            token,
         }
     }
 
@@ -34,7 +36,11 @@ impl ReleaseChecker {
             "https://api.github.com/repos/{}/releases/latest",
             self.repo
         );
-        let response = match self.client.get(&url).send().await {
+        let mut request = self.client.get(&url);
+        if let Some(token) = &self.token {
+            request = request.bearer_auth(token);
+        }
+        let response = match request.send().await {
             Ok(r) => r,
             Err(e) => {
                 tracing::warn!("failed to fetch latest release from {url}: {e}");
@@ -223,6 +229,7 @@ mod tests {
         let checker = ReleaseChecker::new(
             "test/repo".to_string(),
             "/nonexistent/path/last-release.txt".to_string(),
+            None,
         );
         assert!(checker.read_last_tag().is_none());
     }
@@ -236,6 +243,7 @@ mod tests {
         let checker = ReleaseChecker::new(
             "test/repo".to_string(),
             path.to_str().unwrap().to_string(),
+            None,
         );
 
         checker.write_last_tag("v1.0.0");
@@ -256,6 +264,7 @@ mod tests {
         let checker = ReleaseChecker::new(
             "test/repo".to_string(),
             path.to_str().unwrap().to_string(),
+            None,
         );
 
         assert_eq!(checker.read_last_tag().as_deref(), Some("v1.0.0"));
@@ -272,6 +281,7 @@ mod tests {
         let checker = ReleaseChecker::new(
             "test/repo".to_string(),
             path.to_str().unwrap().to_string(),
+            None,
         );
 
         assert!(checker.read_last_tag().is_none());
