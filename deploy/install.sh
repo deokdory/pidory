@@ -10,12 +10,12 @@ OS="$(uname -s)"
 echo "=== pidory deployment ($OS) ==="
 
 # 1. Build
-echo "[1/4] Building release binary..."
+echo "[1/5] Building release binary..."
 cd "$PROJECT_DIR"
 cargo build --release
 
 # 2. Check .env
-echo "[2/4] Checking environment..."
+echo "[2/5] Checking environment..."
 if [ ! -f "$PROJECT_DIR/.env" ]; then
     echo "WARNING: .env not found."
     echo "Create it with: echo 'PIDORY_DISCORD_TOKEN=your_token' > $PROJECT_DIR/.env"
@@ -23,11 +23,11 @@ fi
 
 # 3. Copy config if not exists + detect claude CLI path
 if [ ! -f "$PROJECT_DIR/config.toml" ]; then
-    echo "[3/4] Creating config.toml from example..."
+    echo "[3/5] Creating config.toml from example..."
     cp "$PROJECT_DIR/config.toml.example" "$PROJECT_DIR/config.toml"
     echo "IMPORTANT: Edit config.toml with your Discord guild_id and owner_id"
 else
-    echo "[3/4] config.toml already exists, skipping"
+    echo "[3/5] config.toml already exists, skipping"
 fi
 
 # Detect claude CLI absolute path and inject into config.toml
@@ -41,7 +41,7 @@ else
 fi
 
 # 4. Install service
-echo "[4/4] Installing service..."
+echo "[4/5] Installing service..."
 
 if [ "$OS" = "Darwin" ]; then
     # macOS — launchd
@@ -92,6 +92,21 @@ else
     echo "Start:   sudo systemctl start pidory"
     echo "Status:  sudo systemctl status pidory"
     echo "Logs:    journalctl -u pidory -f"
+fi
+
+# 5. Install skills
+echo "[5/5] Installing skills..."
+SKILLS_TARGET="$HOME/.claude/skills"
+if [ -d "$PROJECT_DIR/skills" ]; then
+    mkdir -p "$SKILLS_TARGET"
+    for skill_dir in "$PROJECT_DIR/skills"/*/; do
+        skill_name="$(basename "$skill_dir")"
+        mkdir -p "$SKILLS_TARGET/$skill_name"
+        cp -r "$skill_dir"* "$SKILLS_TARGET/$skill_name/"
+        echo "  Installed: $skill_name"
+    done
+else
+    echo "  No skills directory found, skipping"
 fi
 
 echo ""
