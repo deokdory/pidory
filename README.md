@@ -104,7 +104,25 @@ launchctl load ~/Library/LaunchAgents/com.pidory.bot.plist
 tail -f ~/.pidory/stderr.log
 ```
 
-`install.sh` builds the release binary, copies `config.toml.example` if no config exists, installs the service file, and enables it on boot.
+`install.sh` builds the release binary, copies `config.toml.example` if no config exists, installs the service file, enables it on boot, and deploys built-in skills to `~/.claude/skills/`.
+
+## Update
+
+To update an existing installation:
+
+```bash
+cd pidory
+./deploy/update.sh
+```
+
+This will:
+1. Pull latest changes (fast-forward only)
+2. Rebuild the release binary
+3. Sync built-in skills to `~/.claude/skills/`
+
+After update, restart the service:
+- **Linux**: `sudo systemctl restart pidory`
+- **macOS**: `launchctl kickstart -k gui/$(id -u)/com.pidory.bot`
 
 ## Usage
 

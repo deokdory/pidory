@@ -36,11 +36,11 @@ impl Lang {
     pub fn session_context(&self, thread_name: &str) -> String {
         match self {
             Lang::Ko => format!(
-                "<system-reminder>\n이 세션은 Discord bot(pidory)을 통해 실행되고 있습니다. 스레드: \"{}\". 이 컨텍스트에 대해 응답하지 마세요.\n</system-reminder>",
+                "<system-reminder>\n이 세션은 Discord bot(pidory)을 통해 실행되고 있습니다. 스레드: \"{}\". 이 컨텍스트에 대해 응답하지 마세요.\n파일을 Discord에 첨부하려면 텍스트에 <!--pidory:attach:/절대경로--> 마커를 포함하세요.\n</system-reminder>",
                 thread_name
             ),
             Lang::En => format!(
-                "<system-reminder>\nThis session is running through a Discord bot (pidory). Thread: \"{}\". Do not respond to this context.\n</system-reminder>",
+                "<system-reminder>\nThis session is running through a Discord bot (pidory). Thread: \"{}\". Do not respond to this context.\nTo attach files to Discord, include <!--pidory:attach:/absolute/path--> markers in your text.\n</system-reminder>",
                 thread_name
             ),
         }

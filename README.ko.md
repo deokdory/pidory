@@ -104,7 +104,25 @@ launchctl load ~/Library/LaunchAgents/com.pidory.bot.plist
 tail -f ~/.pidory/stderr.log
 ```
 
-`install.sh`는 릴리즈 바이너리를 빌드하고, config가 없으면 `config.toml.example`을 복사하며, 서비스 파일을 설치하고 부팅 시 자동 시작을 등록합니다.
+`install.sh`는 릴리즈 바이너리를 빌드하고, config가 없으면 `config.toml.example`을 복사하며, 서비스 파일을 설치하고 부팅 시 자동 시작을 등록합니다. 설치 스크립트는 내장 스킬을 `~/.claude/skills/`에 자동 배포합니다.
+
+## 업데이트
+
+기존 설치를 업데이트하려면:
+
+```bash
+cd pidory
+./deploy/update.sh
+```
+
+수행 내용:
+1. 최신 변경사항 pull (fast-forward only)
+2. 릴리스 바이너리 재빌드
+3. 내장 스킬을 `~/.claude/skills/`에 동기화
+
+업데이트 후 서비스를 재시작하세요:
+- **Linux**: `sudo systemctl restart pidory`
+- **macOS**: `launchctl kickstart -k gui/$(id -u)/com.pidory.bot`
 
 ## 사용법
 
