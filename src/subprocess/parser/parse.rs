@@ -370,6 +370,18 @@ pub fn parse_line(line: &str) -> Result<StreamEvent, serde_json::Error> {
             let total_input_tokens = input_tokens
                 .saturating_add(cache_creation)
                 .saturating_add(cache_read);
+            let model_usage_raw = v.get("modelUsage")
+                .map(|m| m.to_string())
+                .unwrap_or_else(|| "null".to_string());
+            tracing::info!(
+                input_tokens,
+                cache_creation,
+                cache_read,
+                total_input_tokens,
+                context_window,
+                model_usage_raw,
+                "ctx% debug: result event usage"
+            );
             Ok(StreamEvent::Result {
                 subtype,
                 session_id,
