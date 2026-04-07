@@ -69,8 +69,10 @@ impl std::error::Error for DownloadError {
 /// - Truncates to `MAX_FILENAME_BYTES` bytes while preserving extension
 /// - Returns `"unnamed"` if the result would be empty
 pub fn sanitize_filename(filename: &str) -> String {
-    // Remove path separators and null bytes
-    let s = filename.replace(['/', '\\', '\0'], "");
+    // Remove path separators and control characters (includes null bytes)
+    let s = filename
+        .replace(['/', '\\'], "")
+        .replace(|c: char| c.is_ascii_control(), "");
 
     // Remove `..` sequences
     let s = s.replace("..", "");
@@ -96,7 +98,7 @@ pub fn sanitize_filename(filename: &str) -> String {
         // ext includes the dot
         if ext.len() >= MAX_FILENAME_BYTES {
             // Extension itself is too long; just truncate the whole string
-            s[..MAX_FILENAME_BYTES].to_owned()
+            truncate_to_bytes(&s, MAX_FILENAME_BYTES)
         } else {
             let max_stem = MAX_FILENAME_BYTES - ext.len();
             // Truncate stem at a byte boundary
@@ -162,6 +164,37 @@ pub async fn download_attachments(
     let mut paths: Vec<String> = Vec::new();
     let mut errors: Vec<DownloadError> = Vec::new();
 
+    // Create download dir once before the loop
+    if let Err(e) = tokio::fs::create_dir_all(&download_dir).await {
+        return (
+            vec![],
+            attachments
+                .iter()
+                .map(|a| DownloadError::IoError {
+                    filename: a.filename.clone(),
+                    source: std::io::Error::new(e.kind(), e.to_string()),
+                })
+                .collect(),
+        );
+    }
+
+    // Canonicalize before the loop to defend against TOCTOU symlink races
+    let canonical_dir = match tokio::fs::canonicalize(&download_dir).await {
+        Ok(p) => p,
+        Err(e) => {
+            return (
+                vec![],
+                attachments
+                    .iter()
+                    .map(|a| DownloadError::IoError {
+                        filename: a.filename.clone(),
+                        source: std::io::Error::new(e.kind(), e.to_string()),
+                    })
+                    .collect(),
+            );
+        }
+    };
+
     for attachment in attachments {
         let filename = attachment.filename.clone();
         let size = attachment.size as u64;
@@ -184,15 +217,7 @@ pub async fn download_attachments(
 
         let sanitized = sanitize_filename(&filename);
         let dest_filename = format!("{}_{}", message_id, sanitized);
-        let dest_path = download_dir.join(&dest_filename);
-
-        if let Err(e) = tokio::fs::create_dir_all(&download_dir).await {
-            errors.push(DownloadError::IoError {
-                filename,
-                source: e,
-            });
-            continue;
-        }
+        let dest_path = canonical_dir.join(&dest_filename);
 
         let bytes = match client.get(&attachment.url).send().await {
             Ok(resp) => match resp.error_for_status() {
@@ -231,7 +256,21 @@ pub async fn download_attachments(
             continue;
         }
 
-        if let Err(e) = tokio::fs::write(&dest_path, &bytes).await {
+        // create_new(true) refuses to open existing files or symlinks,
+        // preventing TOCTOU overwrites via symlink substitution.
+        let write_result = {
+            use tokio::io::AsyncWriteExt as _;
+            match tokio::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&dest_path)
+                .await
+            {
+                Ok(mut f) => f.write_all(&bytes).await.map_err(|e| e),
+                Err(e) => Err(e),
+            }
+        };
+        if let Err(e) = write_result {
             errors.push(DownloadError::IoError {
                 filename,
                 source: e,
@@ -252,19 +291,7 @@ pub async fn download_attachments(
             }
         };
 
-        let pidory_downloads = match tokio::fs::canonicalize(&download_dir).await {
-            Ok(p) => p,
-            Err(e) => {
-                let _ = tokio::fs::remove_file(&dest_path).await;
-                errors.push(DownloadError::IoError {
-                    filename,
-                    source: e,
-                });
-                continue;
-            }
-        };
-
-        if !canonical.starts_with(&pidory_downloads) {
+        if !canonical.starts_with(&canonical_dir) {
             let _ = tokio::fs::remove_file(&dest_path).await;
             errors.push(DownloadError::IoError {
                 filename,
@@ -342,6 +369,12 @@ mod tests {
     fn sanitize_backslash() {
         let result = sanitize_filename("path\\to\\file.txt");
         assert!(!result.contains('\\'));
+    }
+
+    #[test]
+    fn sanitize_control_chars() {
+        let result = sanitize_filename("hello\x01\x7Fworld.txt");
+        assert_eq!(result, "helloworld.txt");
     }
 
     #[test]

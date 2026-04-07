@@ -178,23 +178,8 @@ async fn handle_message(
 
     if !acquired {
         // mid-turn inject: event_tx 없이 전송 (context inject 안 함, needs_context 소비 안 함)
-        let mid_turn_downloaded_files = if !new_message.attachments.is_empty() {
-            let (paths, errors) = attachment_download::download_attachments(
-                &new_message.attachments,
-                std::path::Path::new(&project.path),
-                channel_id.get(),
-                msg_id.get(),
-            )
-            .await;
-            for err in &errors {
-                let _ = channel_id
-                    .say(&ctx, format!("⚠️ {}", err))
-                    .await;
-            }
-            paths
-        } else {
-            Vec::new()
-        };
+        let mid_turn_downloaded_files =
+            download_message_attachments(&new_message.attachments, &project.path, channel_id, msg_id, ctx).await;
 
         let msg = QueuedMessage {
             content: new_message.content.clone(),
@@ -203,7 +188,7 @@ async fn handle_message(
             event_tx: None,
             triggered_by: new_message.author.id,
             cancelled: Arc::new(AtomicBool::new(false)),
-            downloaded_files: mid_turn_downloaded_files,
+            downloaded_files: mid_turn_downloaded_files.clone(),
         };
 
         match data.sessions.send_message(&thread_id, msg).await {
@@ -228,6 +213,9 @@ async fn handle_message(
                     .await;
             }
             Err(e) if e.to_string().contains("queue full") => {
+                for path in &mid_turn_downloaded_files {
+                    let _ = tokio::fs::remove_file(path).await;
+                }
                 channel_id
                     .say(ctx, format!("❌ {}", lang.queue_full()))
                     .await
@@ -235,6 +223,9 @@ async fn handle_message(
                 return Ok(());
             }
             Err(e) => {
+                for path in &mid_turn_downloaded_files {
+                    let _ = tokio::fs::remove_file(path).await;
+                }
                 channel_id
                     .say(ctx, format!("❌ {}", lang.error_with(&e)))
                     .await
@@ -266,23 +257,8 @@ async fn handle_message(
         .await
         .insert(thread_id.clone(), std::collections::HashSet::from([new_message.author.id]));
 
-    let primary_downloaded_files = if !new_message.attachments.is_empty() {
-        let (paths, errors) = attachment_download::download_attachments(
-            &new_message.attachments,
-            std::path::Path::new(&project.path),
-            channel_id.get(),
-            msg_id.get(),
-        )
-        .await;
-        for err in &errors {
-            let _ = channel_id
-                .say(&ctx, format!("⚠️ {}", err))
-                .await;
-        }
-        paths
-    } else {
-        Vec::new()
-    };
+    let primary_downloaded_files =
+        download_message_attachments(&new_message.attachments, &project.path, channel_id, msg_id, ctx).await;
 
     emoji::set_reaction(ctx, channel_id, msg_id, ReactionStatus::Running)
         .await
@@ -296,11 +272,14 @@ async fn handle_message(
         event_tx: Some(event_tx),
         triggered_by: new_message.author.id,
         cancelled: Arc::new(AtomicBool::new(false)),
-        downloaded_files: primary_downloaded_files,
+        downloaded_files: primary_downloaded_files.clone(),
     };
 
     if let Err(e) = data.sessions.send_message(&thread_id, msg).await {
         error!("Failed to send message to session {}: {}", thread_id, e);
+        for path in &primary_downloaded_files {
+            let _ = tokio::fs::remove_file(path).await;
+        }
         emoji::set_reaction(ctx, channel_id, msg_id, ReactionStatus::Error)
             .await
             .ok();
@@ -428,6 +407,29 @@ pub async fn execute_in_session(
     .await;
 
     Ok(())
+}
+
+async fn download_message_attachments(
+    attachments: &[poise::serenity_prelude::Attachment],
+    project_path: &str,
+    channel_id: ChannelId,
+    msg_id: MessageId,
+    ctx: &Context,
+) -> Vec<String> {
+    if attachments.is_empty() {
+        return Vec::new();
+    }
+    let (paths, errors) = attachment_download::download_attachments(
+        attachments,
+        std::path::Path::new(project_path),
+        channel_id.get(),
+        msg_id.get(),
+    )
+    .await;
+    for err in &errors {
+        let _ = channel_id.say(ctx, format!("⚠️ {}", err)).await;
+    }
+    paths
 }
 
 #[cfg(test)]
