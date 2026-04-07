@@ -359,6 +359,17 @@ pub fn parse_line(line: &str) -> Result<StreamEvent, serde_json::Error> {
                 .and_then(|model| model.get("contextWindow"))
                 .and_then(|v| v.as_u64())
                 .unwrap_or(0);
+            let cache_creation = usage
+                .and_then(|u| u.get("cache_creation_input_tokens"))
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            let cache_read = usage
+                .and_then(|u| u.get("cache_read_input_tokens"))
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            let total_input_tokens = input_tokens
+                .saturating_add(cache_creation)
+                .saturating_add(cache_read);
             Ok(StreamEvent::Result {
                 subtype,
                 session_id,
@@ -371,6 +382,7 @@ pub fn parse_line(line: &str) -> Result<StreamEvent, serde_json::Error> {
                 input_tokens,
                 output_tokens,
                 context_window,
+                total_input_tokens,
             })
         }
         "control_request" => {
@@ -754,9 +766,22 @@ mod tests {
     fn parse_result_with_model_usage() {
         let line = r#"{"type":"result","subtype":"success","session_id":"abc","is_error":false,"duration_ms":1000,"total_cost_usd":0.16,"num_turns":1,"usage":{"input_tokens":3,"cache_creation_input_tokens":26147,"cache_read_input_tokens":0,"output_tokens":4},"modelUsage":{"claude-opus-4-6[1m]":{"inputTokens":3,"outputTokens":4,"contextWindow":1000000,"maxOutputTokens":64000}}}"#;
         let event = parse_line(line).unwrap();
-        if let StreamEvent::Result { context_window, input_tokens, .. } = event {
+        if let StreamEvent::Result { context_window, input_tokens, total_input_tokens, .. } = event {
             assert_eq!(context_window, 1000000);
             assert_eq!(input_tokens, 3); // input_tokens only (cache tokens excluded)
+            assert_eq!(total_input_tokens, 26150); // 3 + 26147 + 0
+        } else {
+            panic!("expected Result");
+        }
+    }
+
+    #[test]
+    fn parse_result_without_cache_fields() {
+        let line = r#"{"type":"result","subtype":"success","session_id":"abc","is_error":false,"duration_ms":500,"total_cost_usd":0.05,"num_turns":1,"usage":{"input_tokens":500,"output_tokens":100}}"#;
+        let event = parse_line(line).unwrap();
+        if let StreamEvent::Result { input_tokens, total_input_tokens, .. } = event {
+            assert_eq!(input_tokens, 500);
+            assert_eq!(total_input_tokens, 500); // no cache fields → total == input
         } else {
             panic!("expected Result");
         }

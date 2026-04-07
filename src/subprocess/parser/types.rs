@@ -48,6 +48,7 @@ pub enum StreamEvent {
         input_tokens: u64,
         output_tokens: u64,
         context_window: u64,
+        total_input_tokens: u64,
     },
     UserReplay {
         content: String,
