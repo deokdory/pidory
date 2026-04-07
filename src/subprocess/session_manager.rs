@@ -56,7 +56,7 @@ pub struct SessionManager {
     sessions: Arc<Mutex<HashMap<String, SessionInner>>>,
     config: Arc<ClaudeConfig>,
     max_sessions: usize,
-    pending_recalls: Arc<tokio::sync::Mutex<HashMap<MessageId, Arc<AtomicBool>>>>,
+    pending_recalls: Arc<tokio::sync::Mutex<HashMap<MessageId, (String, Arc<AtomicBool>)>>>,
 }
 
 impl SessionManager {
@@ -99,6 +99,7 @@ impl SessionManager {
                     inner.worker_task.abort();
                     let _ = inner.child.kill().await;
                 }
+                self.pending_recalls.lock().await.retain(|_, (tid, _)| tid != &evict_tid);
                 evicted_thread_id = Some(evict_tid);
             } else {
                 return Err(PidoryError::Subprocess(
@@ -240,22 +241,23 @@ impl SessionManager {
         let msg_id = msg.message_id;
         let cancelled = Arc::clone(&msg.cancelled);
 
-        inner
-            .queue_tx
-            .try_send(msg)
-            .map_err(|e| PidoryError::Subprocess(format!("queue send error: {}", e)))?;
+        // pending_recalls 등록을 enqueue 이전에 수행하여 race 방지
+        self.pending_recalls.lock().await.insert(msg_id, (thread_id.to_string(), cancelled));
+
+        if let Err(e) = inner.queue_tx.try_send(msg) {
+            self.pending_recalls.lock().await.remove(&msg_id);
+            return Err(PidoryError::Subprocess(format!("queue send error: {}", e)));
+        }
 
         inner.queue_size.fetch_add(1, Ordering::Relaxed);
-
-        self.pending_recalls.lock().await.insert(msg_id, cancelled);
 
         Ok(())
     }
 
     pub async fn try_recall(&self, msg_id: MessageId) -> bool {
         let mut pending = self.pending_recalls.lock().await;
-        if let Some(cancelled) = pending.remove(&msg_id) {
-            cancelled.store(true, Ordering::Relaxed);
+        if let Some((_, cancelled)) = pending.remove(&msg_id) {
+            cancelled.store(true, Ordering::Release);
             true
         } else {
             false
@@ -270,6 +272,9 @@ impl SessionManager {
 
         inner.permission_handler.abort();
         inner.worker_task.abort();
+
+        // 해당 session의 pending_recalls 엔트리 정리
+        self.pending_recalls.lock().await.retain(|_, (tid, _)| tid != thread_id);
 
         inner
             .child
@@ -337,6 +342,9 @@ impl SessionManager {
                 let _ = inner.child.kill().await;
             }
             evicted.push(tid);
+        }
+        if !evicted.is_empty() {
+            self.pending_recalls.lock().await.retain(|_, (tid, _)| !evicted.contains(tid));
         }
         evicted
     }
