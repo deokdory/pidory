@@ -27,12 +27,14 @@ echo "[3/3] Syncing skills..."
 SKILLS_TARGET="$HOME/.claude/skills"
 if [ -d "$PROJECT_DIR/skills" ]; then
     mkdir -p "$SKILLS_TARGET"
+    shopt -s nullglob dotglob
     for skill_dir in "$PROJECT_DIR/skills"/*/; do
         skill_name="$(basename "$skill_dir")"
         mkdir -p "$SKILLS_TARGET/$skill_name"
         cp -r "$skill_dir"* "$SKILLS_TARGET/$skill_name/"
         echo "  Synced: $skill_name"
     done
+    shopt -u nullglob dotglob
 fi
 
 # 5. Restart guidance
