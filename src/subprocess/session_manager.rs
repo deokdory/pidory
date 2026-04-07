@@ -30,6 +30,7 @@ pub struct QueuedMessage {
     pub event_tx: Option<mpsc::Sender<StreamEvent>>,  // None = mid-turn inject
     pub triggered_by: UserId,
     pub cancelled: Arc<AtomicBool>,
+    pub downloaded_files: Vec<String>,  // 다운로드된 파일의 절대 경로
 }
 
 pub(super) struct SessionInner {

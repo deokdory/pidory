@@ -13,6 +13,7 @@ use tracing::{error, warn};
 
 use crate::db::repository;
 use crate::error::PidoryError;
+use crate::handler::attachment_download;
 use crate::handler::emoji;
 use crate::handler::emoji::ReactionStatus;
 use crate::subprocess::parser::StreamEvent;
@@ -177,6 +178,24 @@ async fn handle_message(
 
     if !acquired {
         // mid-turn inject: event_tx 없이 전송 (context inject 안 함, needs_context 소비 안 함)
+        let mid_turn_downloaded_files = if !new_message.attachments.is_empty() {
+            let (paths, errors) = attachment_download::download_attachments(
+                &new_message.attachments,
+                std::path::Path::new(&project.path),
+                channel_id.get(),
+                msg_id.get(),
+            )
+            .await;
+            for err in &errors {
+                let _ = channel_id
+                    .say(&ctx, format!("⚠️ {}", err))
+                    .await;
+            }
+            paths
+        } else {
+            Vec::new()
+        };
+
         let msg = QueuedMessage {
             content: new_message.content.clone(),
             channel_id,
@@ -184,6 +203,7 @@ async fn handle_message(
             event_tx: None,
             triggered_by: new_message.author.id,
             cancelled: Arc::new(AtomicBool::new(false)),
+            downloaded_files: mid_turn_downloaded_files,
         };
 
         match data.sessions.send_message(&thread_id, msg).await {
@@ -246,6 +266,24 @@ async fn handle_message(
         .await
         .insert(thread_id.clone(), std::collections::HashSet::from([new_message.author.id]));
 
+    let primary_downloaded_files = if !new_message.attachments.is_empty() {
+        let (paths, errors) = attachment_download::download_attachments(
+            &new_message.attachments,
+            std::path::Path::new(&project.path),
+            channel_id.get(),
+            msg_id.get(),
+        )
+        .await;
+        for err in &errors {
+            let _ = channel_id
+                .say(&ctx, format!("⚠️ {}", err))
+                .await;
+        }
+        paths
+    } else {
+        Vec::new()
+    };
+
     emoji::set_reaction(ctx, channel_id, msg_id, ReactionStatus::Running)
         .await
         .ok();
@@ -258,6 +296,7 @@ async fn handle_message(
         event_tx: Some(event_tx),
         triggered_by: new_message.author.id,
         cancelled: Arc::new(AtomicBool::new(false)),
+        downloaded_files: primary_downloaded_files,
     };
 
     if let Err(e) = data.sessions.send_message(&thread_id, msg).await {
@@ -321,6 +360,7 @@ pub async fn execute_in_session(
             event_tx: None,
             triggered_by,
             cancelled: Arc::new(AtomicBool::new(false)),
+            downloaded_files: Vec::new(),
         };
         data.sessions.send_message(thread_id, msg).await?;
         if is_new_command {
@@ -349,6 +389,7 @@ pub async fn execute_in_session(
         event_tx: Some(event_tx),
         triggered_by,
         cancelled: Arc::new(AtomicBool::new(false)),
+        downloaded_files: Vec::new(),
     };
 
     // turn_participants 초기화 (skill 직접 실행 경로)
