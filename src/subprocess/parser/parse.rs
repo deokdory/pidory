@@ -364,29 +364,17 @@ pub fn parse_line(line: &str) -> Result<StreamEvent, serde_json::Error> {
                 .and_then(|model| model.get("contextWindow"))
                 .and_then(|v| v.as_u64())
                 .unwrap_or(0);
-            let total_input_tokens = if let Some(model) = main_model {
-                let input = model.get("inputTokens").and_then(|v| v.as_u64()).unwrap_or(0);
-                let cache_creation = model
-                    .get("cacheCreationInputTokens")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0);
-                let cache_read = model
-                    .get("cacheReadInputTokens")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0);
-                input.saturating_add(cache_creation).saturating_add(cache_read)
-            } else {
-                // fallback: no modelUsage available, sum from top-level usage fields
-                let cache_creation = usage
-                    .and_then(|u| u.get("cache_creation_input_tokens"))
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0);
-                let cache_read = usage
-                    .and_then(|u| u.get("cache_read_input_tokens"))
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0);
-                input_tokens.saturating_add(cache_creation).saturating_add(cache_read)
-            };
+            let cache_creation_input_tokens = usage
+                .and_then(|u| u.get("cache_creation_input_tokens"))
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            let cache_read_input_tokens = usage
+                .and_then(|u| u.get("cache_read_input_tokens"))
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            let total_input_tokens = input_tokens
+                .saturating_add(cache_creation_input_tokens)
+                .saturating_add(cache_read_input_tokens);
             Ok(StreamEvent::Result {
                 subtype,
                 session_id,
@@ -786,7 +774,7 @@ mod tests {
         if let StreamEvent::Result { context_window, input_tokens, total_input_tokens, .. } = event {
             assert_eq!(context_window, 1000000);
             assert_eq!(input_tokens, 3); // top-level usage.input_tokens
-            assert_eq!(total_input_tokens, 26150); // 3 + 26147 + 0 (per-model)
+            assert_eq!(total_input_tokens, 26150); // 3 + 26147 + 0 (top-level usage)
         } else {
             panic!("expected Result");
         }
@@ -794,13 +782,13 @@ mod tests {
 
     #[test]
     fn parse_result_with_multiple_models() {
-        // 200K + 1M models: should pick 1M model for context_window and total_input_tokens
+        // 200K + 1M models: should pick 1M model for context_window, total_input_tokens from top-level usage
         let line = r#"{"type":"result","subtype":"success","session_id":"abc","is_error":false,"duration_ms":5000,"total_cost_usd":1.0,"num_turns":3,"usage":{"input_tokens":17,"cache_creation_input_tokens":263893,"cache_read_input_tokens":1667176,"output_tokens":5067},"modelUsage":{"claude-opus-4-6":{"inputTokens":9,"cacheCreationInputTokens":257281,"cacheReadInputTokens":819053,"contextWindow":200000,"outputTokens":2202},"claude-opus-4-6[1m]":{"inputTokens":8,"cacheCreationInputTokens":6612,"cacheReadInputTokens":848123,"contextWindow":1000000,"outputTokens":2865}}}"#;
         let event = parse_line(line).unwrap();
         if let StreamEvent::Result { context_window, input_tokens, total_input_tokens, .. } = event {
             assert_eq!(context_window, 1000000); // picks the 1M model
             assert_eq!(input_tokens, 17); // top-level usage.input_tokens unchanged
-            assert_eq!(total_input_tokens, 854743); // 8 + 6612 + 848123 (1M model per-model tokens)
+            assert_eq!(total_input_tokens, 1931086); // top-level usage: 17 + 263893 + 1667176
         } else {
             panic!("expected Result");
         }
