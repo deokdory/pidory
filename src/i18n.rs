@@ -562,6 +562,49 @@ impl Lang {
             Lang::En => "Answered:",
         }
     }
+
+    // ── File attachment ──
+
+    pub fn file_attached(&self, filename: &str, size_str: &str) -> String {
+        match self {
+            Lang::Ko => format!("📎 **{}** ({})", filename, size_str),
+            Lang::En => format!("📎 **{}** ({})", filename, size_str),
+        }
+    }
+
+    pub fn file_too_large(&self, filename: &str, size_mb: f64) -> String {
+        match self {
+            Lang::Ko => format!(
+                "❌ 파일 크기 초과: **{}** ({:.1} MB) — Discord 한도 25 MB",
+                filename, size_mb
+            ),
+            Lang::En => format!(
+                "❌ File too large: **{}** ({:.1} MB) — Discord limit 25 MB",
+                filename, size_mb
+            ),
+        }
+    }
+
+    pub fn file_not_found(&self, path: &str) -> String {
+        match self {
+            Lang::Ko => format!("❌ 파일을 찾을 수 없습니다: `{}`", path),
+            Lang::En => format!("❌ File not found: `{}`", path),
+        }
+    }
+
+    pub fn file_permission_denied(&self, path: &str) -> String {
+        match self {
+            Lang::Ko => format!("❌ 파일 읽기 권한 없음: `{}`", path),
+            Lang::En => format!("❌ Permission denied: `{}`", path),
+        }
+    }
+
+    pub fn file_attach_error(&self, path: &str, error: &str) -> String {
+        match self {
+            Lang::Ko => format!("❌ 파일 전송 실패: `{}` — {}", path, error),
+            Lang::En => format!("❌ File transfer failed: `{}` — {}", path, error),
+        }
+    }
 }
 
 #[cfg(test)]

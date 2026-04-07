@@ -2,11 +2,13 @@ use poise::serenity_prelude as serenity;
 use tokio::time::{sleep, Duration};
 
 use crate::error::PidoryError;
+use crate::handler::file_attach;
 use crate::i18n::Lang;
 use crate::subprocess::parser::{ContentBlock, StreamEvent, ToolResult};
 
-pub fn format_response(events: &[StreamEvent], lang: Lang) -> String {
+pub fn format_response(events: &[StreamEvent], lang: Lang) -> (String, Vec<String>) {
     let mut parts: Vec<String> = Vec::new();
+    let mut file_paths: Vec<String> = Vec::new();
     // Maps tool_use_id -> tool name for matching results to their tool calls
     let mut tool_use_names: std::collections::HashMap<String, String> = std::collections::HashMap::new();
 
@@ -17,7 +19,11 @@ pub fn format_response(events: &[StreamEvent], lang: Lang) -> String {
                     match block {
                         ContentBlock::Text(text) => {
                             if !text.is_empty() {
-                                parts.push(text.clone());
+                                let (cleaned, paths) = file_attach::extract_file_markers(text);
+                                file_paths.extend(paths);
+                                if !cleaned.is_empty() {
+                                    parts.push(cleaned);
+                                }
                             }
                         }
                         ContentBlock::Thinking(_) => {
@@ -52,7 +58,7 @@ pub fn format_response(events: &[StreamEvent], lang: Lang) -> String {
         }
     }
 
-    parts.join("\n")
+    (parts.join("\n"), file_paths)
 }
 
 pub fn split_message(text: &str, max_len: usize) -> Vec<String> {
@@ -322,7 +328,7 @@ mod tests {
             },
         ];
 
-        let result = format_response(&events, Lang::Ko);
+        let (result, _files) = format_response(&events, Lang::Ko);
         assert!(
             !result.contains("file contents here"),
             "Successful Read tool results should be filtered out, but got: {}",
