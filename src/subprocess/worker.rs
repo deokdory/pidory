@@ -33,12 +33,31 @@ async fn say_silent_chunked(ctx: &Context, channel_id: &ChannelId, text: &str) {
 
 // ─── T6: Common JSON builder helpers ───────────────────────────────────────
 
-fn build_user_message_json(content: &str) -> String {
+fn build_user_message_json(content: &str, downloaded_files: &[String]) -> String {
+    let text = if downloaded_files.is_empty() {
+        content.to_string()
+    } else {
+        let paths: String = downloaded_files
+            .iter()
+            .map(|p| {
+                let relative = if let Some(idx) = p.find(".pidory/") {
+                    &p[idx..]
+                } else {
+                    p.as_str()
+                };
+                format!("- {relative}")
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        format!(
+            "<system-reminder>\n사용자가 파일을 첨부했습니다. 프로젝트 상대 경로로 접근하세요:\n{paths}\n</system-reminder>\n\n{content}"
+        )
+    };
     let json = serde_json::json!({
         "type": "user",
         "message": {
             "role": "user",
-            "content": [{"type": "text", "text": content}]
+            "content": [{"type": "text", "text": text}]
         }
     });
     format!("{}\n", json)
@@ -219,7 +238,7 @@ impl SessionWorker {
                     // 현재 turn 의 triggered_by 업데이트
                     *current_triggered_by = msg.triggered_by;
 
-                    let json_line = build_user_message_json(&msg.content);
+                    let json_line = build_user_message_json(&msg.content, &msg.downloaded_files);
                     if let Err(e) = stdin.write_all(json_line.as_bytes()).await {
                         tracing::error!("stdin write error for thread {}: {}", thread_id, e);
                         break;
@@ -621,7 +640,7 @@ async fn handle_bg_turn(
                             continue 'bg_turn;
                         }
                         *current_triggered_by = m.triggered_by;
-                        let inject_line = build_user_message_json(&m.content);
+                        let inject_line = build_user_message_json(&m.content, &m.downloaded_files);
                         if let Err(e) = stdin.write_all(inject_line.as_bytes()).await {
                             tracing::error!("mid-turn stdin write error (bg turn): {}", e);
                             if let Err(e) = repository::update_session_status(db, thread_id, "idle").await {
@@ -710,7 +729,7 @@ async fn wait_for_permission(
                             tracing::info!(thread_id = %thread_id, msg_id = %m.message_id, "Message recalled, skipping");
                             continue 'perm;
                         }
-                        let inject_line = build_user_message_json(&m.content);
+                        let inject_line = build_user_message_json(&m.content, &m.downloaded_files);
                         if let Err(e) = stdin.write_all(inject_line.as_bytes()).await {
                             tracing::error!("mid-turn stdin write error (perm wait): {}", e);
                             break 'perm PermissionWaitResult::Error;
@@ -858,7 +877,7 @@ async fn run_active_turn(
                         }
                         *last_activity.lock().unwrap_or_else(|p| p.into_inner()) = Instant::now();
                         *current_triggered_by = m.triggered_by;
-                        let inject_line = build_user_message_json(&m.content);
+                        let inject_line = build_user_message_json(&m.content, &m.downloaded_files);
                         if let Err(e) = stdin.write_all(inject_line.as_bytes()).await {
                             tracing::error!("mid-turn stdin write error: {}", e);
                             break 'turn false;
@@ -1160,7 +1179,7 @@ async fn run_active_turn(
                                 bg_turn_active,
                                 "#36 debug: Soft timeout fired — sending nudge"
                             );
-                            let nudge_line = build_user_message_json("[SYSTEM] No stdout activity for an extended period. A tool may be unresponsive. Check the status of any running tools and recover if needed.");
+                            let nudge_line = build_user_message_json("[SYSTEM] No stdout activity for an extended period. A tool may be unresponsive. Check the status of any running tools and recover if needed.", &[]);
                             if let Err(e) = stdin.write_all(nudge_line.as_bytes()).await {
                                 tracing::error!("nudge write error: {}", e);
                                 break 'turn false;
@@ -1220,7 +1239,7 @@ mod tests {
 
     #[test]
     fn user_message_json_basic_structure() {
-        let out = build_user_message_json("hello");
+        let out = build_user_message_json("hello", &[]);
         let v: serde_json::Value = serde_json::from_str(out.trim()).expect("valid JSON");
         assert_eq!(v["type"], "user");
         assert_eq!(v["message"]["role"], "user");
@@ -1232,7 +1251,7 @@ mod tests {
 
     #[test]
     fn user_message_json_special_chars_escaped() {
-        let out = build_user_message_json("hello \"world\"");
+        let out = build_user_message_json("hello \"world\"", &[]);
         // Must round-trip through JSON without error and preserve the value
         let v: serde_json::Value = serde_json::from_str(out.trim()).expect("valid JSON");
         assert_eq!(v["message"]["content"][0]["text"], "hello \"world\"");
@@ -1240,22 +1259,65 @@ mod tests {
 
     #[test]
     fn user_message_json_korean_and_emoji() {
-        let out = build_user_message_json("안녕 🎉");
+        let out = build_user_message_json("안녕 🎉", &[]);
         let v: serde_json::Value = serde_json::from_str(out.trim()).expect("valid JSON");
         assert_eq!(v["message"]["content"][0]["text"], "안녕 🎉");
     }
 
     #[test]
     fn user_message_json_empty_string() {
-        let out = build_user_message_json("");
+        let out = build_user_message_json("", &[]);
         let v: serde_json::Value = serde_json::from_str(out.trim()).expect("valid JSON");
         assert_eq!(v["message"]["content"][0]["text"], "");
     }
 
     #[test]
     fn user_message_json_ends_with_newline() {
-        let out = build_user_message_json("hello");
+        let out = build_user_message_json("hello", &[]);
         assert!(out.ends_with('\n'), "output must end with newline");
+    }
+
+    #[test]
+    fn build_message_no_attachments() {
+        let out = build_user_message_json("hello", &[]);
+        let v: serde_json::Value = serde_json::from_str(out.trim()).expect("valid JSON");
+        assert_eq!(v["type"], "user");
+        assert_eq!(v["message"]["role"], "user");
+        assert_eq!(v["message"]["content"][0]["type"], "text");
+        assert_eq!(v["message"]["content"][0]["text"], "hello");
+    }
+
+    #[test]
+    fn build_message_with_attachments() {
+        let files = vec!["/project/.pidory/downloads/123/456_file.py".to_string()];
+        let out = build_user_message_json("hello", &files);
+        let v: serde_json::Value = serde_json::from_str(out.trim()).expect("valid JSON");
+        let text = v["message"]["content"][0]["text"].as_str().expect("text field");
+        assert!(text.contains("<system-reminder>"), "must contain system-reminder tag");
+        assert!(text.contains("hello"), "must contain original content");
+    }
+
+    #[test]
+    fn build_message_attachment_paths_relative() {
+        let files = vec!["/project/.pidory/downloads/123/456_file.py".to_string()];
+        let out = build_user_message_json("hello", &files);
+        let v: serde_json::Value = serde_json::from_str(out.trim()).expect("valid JSON");
+        let text = v["message"]["content"][0]["text"].as_str().expect("text field");
+        assert!(text.contains(".pidory/downloads/123/456_file.py"), "must contain relative path");
+        assert!(!text.contains("/project/.pidory/"), "must not contain absolute path prefix");
+    }
+
+    #[test]
+    fn build_message_multiple_attachments() {
+        let files = vec![
+            "/project/.pidory/downloads/123/a.png".to_string(),
+            "/project/.pidory/downloads/123/b.csv".to_string(),
+        ];
+        let out = build_user_message_json("hello", &files);
+        let v: serde_json::Value = serde_json::from_str(out.trim()).expect("valid JSON");
+        let text = v["message"]["content"][0]["text"].as_str().expect("text field");
+        assert!(text.contains(".pidory/downloads/123/a.png"), "must list first file");
+        assert!(text.contains(".pidory/downloads/123/b.csv"), "must list second file");
     }
 
     // ── build_interrupt_json ─────────────────────────────────────────────────
