@@ -60,4 +60,27 @@ impl Lang {
             Lang::En => "Error occurred",
         }
     }
+
+    // ── Recall ──
+
+    pub fn recall_success(&self) -> &'static str {
+        match self {
+            Lang::Ko => "회수 완료",
+            Lang::En => "Message recalled",
+        }
+    }
+
+    pub fn recall_already_sent(&self) -> &'static str {
+        match self {
+            Lang::Ko => "이미 전달된 메시지입니다",
+            Lang::En => "Message already sent",
+        }
+    }
+
+    pub fn recall_no_session(&self) -> &'static str {
+        match self {
+            Lang::Ko => "활성 세션이 없습니다",
+            Lang::En => "No active session",
+        }
+    }
 }
