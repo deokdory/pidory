@@ -323,18 +323,18 @@ pub async fn process_turn_events(
             .ok();
     } else {
         // 정상 완료: 요약 전송
-        let (duration_ms, total_cost_usd, input_tokens, output_tokens, context_window) = events.iter().find_map(|e| {
-            if let StreamEvent::Result { duration_ms, total_cost_usd, input_tokens, output_tokens, context_window, .. } = e {
-                Some((*duration_ms, *total_cost_usd, *input_tokens, *output_tokens, *context_window))
+        let (duration_ms, total_cost_usd, input_tokens, output_tokens, context_window, total_input_tokens) = events.iter().find_map(|e| {
+            if let StreamEvent::Result { duration_ms, total_cost_usd, input_tokens, output_tokens, context_window, total_input_tokens, .. } = e {
+                Some((*duration_ms, *total_cost_usd, *input_tokens, *output_tokens, *context_window, *total_input_tokens))
             } else {
                 None
             }
-        }).unwrap_or((0, 0.0, 0, 0, 0));
+        }).unwrap_or((0, 0.0, 0, 0, 0, 0));
 
         let duration = formatter::format_duration(duration_ms);
         let cost = formatter::format_cost(total_cost_usd);
         let tokens = formatter::format_tokens(input_tokens, output_tokens);
-        let ctx_suffix = format_ctx_suffix(input_tokens, context_window);
+        let ctx_suffix = format_ctx_suffix(total_input_tokens, context_window);
         let mentions = {
             let parts = turn_participants.lock().await;
             parts.get(thread_id)
@@ -400,17 +400,17 @@ pub async fn process_turn_events(
                     tracing::warn!(%channel_id, "Failed to send turn error notification: {}", e);
                 }
             } else {
-                let (duration_ms, total_cost_usd, input_tokens, output_tokens, context_window) = events.iter().find_map(|e| {
-                    if let StreamEvent::Result { duration_ms, total_cost_usd, input_tokens, output_tokens, context_window, .. } = e {
-                        Some((*duration_ms, *total_cost_usd, *input_tokens, *output_tokens, *context_window))
+                let (duration_ms, total_cost_usd, input_tokens, output_tokens, context_window, total_input_tokens) = events.iter().find_map(|e| {
+                    if let StreamEvent::Result { duration_ms, total_cost_usd, input_tokens, output_tokens, context_window, total_input_tokens, .. } = e {
+                        Some((*duration_ms, *total_cost_usd, *input_tokens, *output_tokens, *context_window, *total_input_tokens))
                     } else {
                         None
                     }
-                }).unwrap_or((0, 0.0, 0, 0, 0));
+                }).unwrap_or((0, 0.0, 0, 0, 0, 0));
                 let duration = formatter::format_duration(duration_ms);
                 let cost = formatter::format_cost(total_cost_usd);
                 let tokens = formatter::format_tokens(input_tokens, output_tokens);
-                let ctx_suffix = format_ctx_suffix(input_tokens, context_window);
+                let ctx_suffix = format_ctx_suffix(total_input_tokens, context_window);
                 if let Err(e) = channel_id.say(ctx, &format!("-# ✅ {}{}{}{} {}", duration, cost, tokens, ctx_suffix, mentions)).await {
                     tracing::warn!(%channel_id, "Failed to send turn completion notification: {}", e);
                 }
