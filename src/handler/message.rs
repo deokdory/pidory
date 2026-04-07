@@ -10,7 +10,7 @@ use tracing::{error, warn};
 
 use crate::db::repository;
 use crate::error::PidoryError;
-use crate::handler::{emoji, formatter, permission_ui, question_ui};
+use crate::handler::{emoji, file_attach, formatter, permission_ui, question_ui};
 use crate::handler::emoji::ReactionStatus;
 use crate::i18n::Lang;
 use crate::subprocess::parser::{ContentBlock, StreamEvent};
@@ -908,7 +908,7 @@ pub async fn process_turn_events(
 
     // 8. fast-complete path: 기존 format_response + send_response (한 메시지)
     if fast_complete {
-        let response = formatter::format_response(&events, lang);
+        let (response, file_paths) = formatter::format_response(&events, lang);
         let send_ok = if !response.trim().is_empty() {
             match formatter::send_response(ctx, channel_id, &response, max_chunk_length, max_chunks, lang)
                 .await
@@ -922,6 +922,11 @@ pub async fn process_turn_events(
         } else {
             true
         };
+        if !file_paths.is_empty()
+            && let Err(e) = file_attach::send_file_attachments(ctx, channel_id, &file_paths, lang).await
+        {
+            error!("Failed to send file attachments: {}", e);
+        }
 
         // 완료 알림 (mention)
         if !is_interrupted {
@@ -1088,9 +1093,17 @@ async fn send_event_to_discord(
             for block in content {
                 match block {
                     ContentBlock::Text(text) if !text.trim().is_empty() => {
-                        let chunks = formatter::split_message(text, max_chunk_length);
-                        for chunk in chunks {
-                            say_silent(ctx, channel_id, chunk).await;
+                        let (clean_text, file_paths) = file_attach::extract_file_markers(text);
+                        if !clean_text.trim().is_empty() {
+                            let chunks = formatter::split_message(&clean_text, max_chunk_length);
+                            for chunk in chunks {
+                                say_silent(ctx, channel_id, chunk).await;
+                            }
+                        }
+                        if !file_paths.is_empty()
+                            && let Err(e) = file_attach::send_file_attachments(ctx, channel_id, &file_paths, lang).await
+                        {
+                            error!("Failed to send file attachments: {}", e);
                         }
                     }
                     ContentBlock::ToolUse { id, name, input } => {
