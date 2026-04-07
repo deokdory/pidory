@@ -124,6 +124,16 @@ After update, restart the service:
 - **Linux**: `sudo systemctl restart pidory`
 - **macOS**: `launchctl kickstart -k gui/$(id -u)/com.pidory.bot`
 
+### Menubar app (macOS only)
+
+A small menu bar app shows pidory's current state at a glance and lets you pull / build / restart with one click.
+
+```bash
+./tools/menubar/install.sh
+```
+
+The icon reflects the current state — `✓` synced, `⬇` pull needed, `🔨` build needed, `↻` restart needed, `⏳` working, `⚠` last action failed. Click for status detail and actions, including **Update everything** which chains pull → build → restart automatically. Background polling is cheap (mtime-cached, 5-min interval). Uninstall with `./tools/menubar/uninstall.sh`.
+
 ## Usage
 
 ### Slash Commands

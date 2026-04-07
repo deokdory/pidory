@@ -124,6 +124,16 @@ cd pidory
 - **Linux**: `sudo systemctl restart pidory`
 - **macOS**: `launchctl kickstart -k gui/$(id -u)/com.pidory.bot`
 
+### 메뉴바 앱 (macOS 전용)
+
+pidory의 현재 상태를 메뉴바에서 한눈에 보고, 풀/빌드/재시작을 클릭 한 번으로 처리할 수 있는 작은 메뉴바 앱입니다.
+
+```bash
+./tools/menubar/install.sh
+```
+
+아이콘이 현재 상태를 표시합니다 — `✓` 동기화됨, `⬇` 풀 필요, `🔨` 빌드 필요, `↻` 재시작 필요, `⏳` 작업 중, `⚠` 마지막 액션 실패. 클릭하면 상세 상태와 액션 메뉴가 뜨고, **Update everything** 항목은 풀 → 빌드 → 재시작을 자동으로 체이닝합니다. 백그라운드 폴링 부하는 거의 없습니다 (mtime 캐시 + 5분 간격). `./tools/menubar/uninstall.sh`로 제거.
+
 ## 사용법
 
 ### Slash 커맨드
