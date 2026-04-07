@@ -39,7 +39,7 @@ pub fn format_response(events: &[StreamEvent], lang: Lang) -> (String, Vec<Strin
             StreamEvent::User { tool_results, .. } => {
                 for result in tool_results {
                     let tool_name = tool_use_names.get(&result.tool_use_id).map(|s| s.as_str());
-                    if matches!(tool_name, Some("Read" | "Grep" | "Glob" | "Write" | "Edit" | "MultiEdit" | "WebSearch" | "WebFetch" | "TodoWrite")) && !result.is_error {
+                    if is_noise_tool(tool_name) && !result.is_error {
                         continue;
                     }
                     if let Some(formatted) = format_tool_result_with_name(result, tool_name, lang) {
@@ -429,6 +429,52 @@ mod tests {
     fn format_tokens_millions() {
         assert_eq!(format_tokens(900000, 200000), " 1.1M tok");
     }
+
+    #[test]
+    fn format_tool_use_multi_edit() {
+        let input = serde_json::json!({"file_path": "/src/main.rs"});
+        let result = format_tool_use("MultiEdit", &input);
+        assert!(result.contains("**MultiEdit**"));
+        assert!(result.contains("/src/main.rs"));
+    }
+
+    #[test]
+    fn format_tool_use_web_search() {
+        let input = serde_json::json!({"query": "rust async await"});
+        let result = format_tool_use("WebSearch", &input);
+        assert!(result.contains("**WebSearch**"));
+        assert!(result.contains("rust async await"));
+    }
+
+    #[test]
+    fn format_tool_use_web_fetch() {
+        let input = serde_json::json!({"url": "https://example.com"});
+        let result = format_tool_use("WebFetch", &input);
+        assert!(result.contains("**WebFetch**"));
+        assert!(result.contains("https://example.com"));
+    }
+
+    #[test]
+    fn format_tool_use_todo_write() {
+        let input = serde_json::json!({"todos": []});
+        let result = format_tool_use("TodoWrite", &input);
+        assert!(result.contains("**TodoWrite**"));
+    }
+
+    #[test]
+    fn is_noise_tool_returns_true_for_filtered_tools() {
+        for name in &["Read", "Grep", "Glob", "Write", "Edit", "MultiEdit", "WebSearch", "WebFetch", "TodoWrite"] {
+            assert!(is_noise_tool(Some(name)), "{} should be a noise tool", name);
+        }
+    }
+
+    #[test]
+    fn is_noise_tool_returns_false_for_non_filtered_tools() {
+        for name in &["Bash", "Agent", "CustomTool"] {
+            assert!(!is_noise_tool(Some(name)), "{} should not be a noise tool", name);
+        }
+        assert!(!is_noise_tool(None));
+    }
 }
 
 pub fn format_duration(ms: u64) -> String {
@@ -464,6 +510,11 @@ pub fn format_tokens(input: u64, output: u64) -> String {
         format!("{}", total)
     };
     format!(" {} tok", formatted)
+}
+
+/// 성공 시 Discord에 result를 표시하지 않는 도구 목록
+pub fn is_noise_tool(tool_name: Option<&str>) -> bool {
+    matches!(tool_name, Some("Read" | "Grep" | "Glob" | "Write" | "Edit" | "MultiEdit" | "WebSearch" | "WebFetch" | "TodoWrite"))
 }
 
 /// Bash command max display length. Discord message limit (2000 chars) minus
@@ -520,6 +571,30 @@ pub fn format_tool_use(name: &str, input: &serde_json::Value) -> String {
                 .unwrap_or("");
             format!("-# 🔧 **Glob** {}", pattern)
         }
+        "MultiEdit" => {
+            let file_path = input
+                .get("file_path")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            format!("-# 🔧 **MultiEdit** {}", file_path)
+        }
+        "WebSearch" => {
+            let query = input
+                .get("query")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            format!("-# 🔧 **WebSearch** {}", query)
+        }
+        "WebFetch" => {
+            let url = input
+                .get("url")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            format!("-# 🔧 **WebFetch** {}", url)
+        }
+        "TodoWrite" => {
+            format!("-# 🔧 **TodoWrite**")
+        }
         _ => format!("-# 🔧 **{}**", name),
     }
 }
@@ -540,7 +615,7 @@ pub fn format_tool_result_with_name(result: &ToolResult, tool_name: Option<&str>
 
     let prefix = if result.is_error { "❌ " } else { "" };
 
-    let is_edit = tool_name == Some("Edit") || tool_name == Some("Write");
+    let is_edit = tool_name == Some("Edit") || tool_name == Some("Write") || tool_name == Some("MultiEdit");
     let fence = if is_edit { "```diff" } else { "```" };
 
     let body = if result.content.chars().count() <= TRUNCATE_LEN {
