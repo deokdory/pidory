@@ -2,6 +2,7 @@ use std::fmt;
 use std::path::Path;
 
 use poise::serenity_prelude as serenity;
+use tracing::warn;
 
 use crate::error::PidoryError;
 use crate::i18n::Lang;
@@ -28,7 +29,9 @@ pub fn extract_file_markers(text: &str) -> (String, Vec<String>) {
         let after_prefix = &remaining[start + MARKER_PREFIX.len()..];
         if let Some(end) = after_prefix.find(MARKER_SUFFIX) {
             let path = after_prefix[..end].to_owned();
-            paths.push(path);
+            if !path.is_empty() {
+                paths.push(path);
+            }
             remaining = &after_prefix[end + MARKER_SUFFIX.len()..];
         } else {
             // Malformed marker — keep as-is and stop searching
@@ -94,6 +97,39 @@ pub fn format_file_size(bytes: u64) -> String {
     }
 }
 
+// ── Security helpers ─────────────────────────────────────────────────────────
+
+/// Returns `true` if `path` refers to a sensitive location that must not be
+/// served as a Discord attachment (dotfiles under HOME, system credential
+/// files, virtual filesystems).
+fn is_sensitive_path(path: &Path) -> bool {
+    let path_str = path.to_string_lossy();
+
+    // Block ~/.anything (dotfiles/dotdirs directly under HOME)
+    if let Some(home) = std::env::var_os("HOME") {
+        let home = Path::new(&home);
+        if let Ok(relative) = path.strip_prefix(home)
+            && let Some(std::path::Component::Normal(name)) = relative.components().next()
+            && name.to_string_lossy().starts_with('.')
+        {
+            return true;
+        }
+    }
+
+    // Block well-known system sensitive paths and virtual filesystems
+    let blocked_prefixes = [
+        "/etc/shadow",
+        "/etc/passwd",
+        "/etc/ssl/private",
+        "/proc/",
+        "/sys/",
+        "/dev/",
+    ];
+    blocked_prefixes
+        .iter()
+        .any(|prefix| path_str.starts_with(prefix))
+}
+
 // ── prepare_attachment ───────────────────────────────────────────────────────
 
 /// Validates the file at `path` and returns a ready-to-send `CreateAttachment`
@@ -118,7 +154,12 @@ pub async fn prepare_attachment(
         }
     })?;
 
-    // Check file size
+    // Block sensitive paths (dotfiles, system credentials, virtual filesystems)
+    if is_sensitive_path(&canonical) {
+        return Err(FileAttachError::PermissionDenied(path.to_owned()));
+    }
+
+    // Check file metadata
     let metadata = tokio::fs::metadata(&canonical).await.map_err(|e| {
         if e.kind() == std::io::ErrorKind::PermissionDenied {
             FileAttachError::PermissionDenied(path.to_owned())
@@ -126,6 +167,11 @@ pub async fn prepare_attachment(
             FileAttachError::IoError(e)
         }
     })?;
+
+    // Block non-regular files (directories, symlinks, FIFOs, /dev/zero, etc.)
+    if !metadata.file_type().is_file() {
+        return Err(FileAttachError::NotFound(path.to_owned()));
+    }
 
     let size = metadata.len();
     if size > MAX_FILE_SIZE {
@@ -176,8 +222,11 @@ pub async fn send_file_attachments(
                 let content = lang.file_attached(&filename, &size_str);
                 let message = serenity::CreateMessage::new()
                     .content(content)
-                    .add_file(attachment);
-                channel_id.send_message(ctx, message).await?;
+                    .add_file(attachment)
+                    .allowed_mentions(serenity::CreateAllowedMentions::new());
+                if let Err(e) = channel_id.send_message(ctx, message).await {
+                    warn!("Failed to send file attachment for {}: {}", path, e);
+                }
             }
             Err(e) => {
                 let content = match &e {
@@ -192,7 +241,12 @@ pub async fn send_file_attachments(
                     FileAttachError::PermissionDenied(p) => lang.file_permission_denied(p),
                     FileAttachError::IoError(_) => lang.file_attach_error(path, &e.to_string()),
                 };
-                channel_id.say(ctx, content).await?;
+                let error_msg = serenity::CreateMessage::new()
+                    .content(content)
+                    .allowed_mentions(serenity::CreateAllowedMentions::new());
+                if let Err(e) = channel_id.send_message(ctx, error_msg).await {
+                    warn!("Failed to send error message for {}: {}", path, e);
+                }
             }
         }
     }
