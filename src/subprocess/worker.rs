@@ -98,7 +98,7 @@ pub(super) struct SessionWorker {
     last_activity: Arc<StdMutex<Instant>>,
     has_bg_tasks: Arc<AtomicBool>,
     is_turn_active: Arc<AtomicBool>,
-    pending_recalls: Arc<tokio::sync::Mutex<HashMap<MessageId, Arc<AtomicBool>>>>,
+    pending_recalls: Arc<tokio::sync::Mutex<HashMap<MessageId, (String, Arc<AtomicBool>)>>>,
     // Config/Context
     thread_id: String,
     channel_id: ChannelId,
@@ -128,7 +128,7 @@ impl SessionWorker {
         timeout_secs: u64,
         lang: Lang,
         owner_id: u64,
-        pending_recalls: Arc<tokio::sync::Mutex<HashMap<MessageId, Arc<AtomicBool>>>>,
+        pending_recalls: Arc<tokio::sync::Mutex<HashMap<MessageId, (String, Arc<AtomicBool>)>>>,
     ) -> Self {
         Self {
             stdin,
@@ -207,14 +207,12 @@ impl SessionWorker {
                 BetweenTurnsAction::Break => break,
                 BetweenTurnsAction::ProcessMessage(msg) => {
                     queue_size.fetch_sub(1, Ordering::Relaxed);
+                    pending_recalls.lock().await.remove(&msg.message_id);
 
-                    // Cancel 체크
-                    if msg.cancelled.load(Ordering::Relaxed) {
-                        pending_recalls.lock().await.remove(&msg.message_id);
+                    if msg.cancelled.load(Ordering::Acquire) {
                         tracing::info!(thread_id = %thread_id, msg_id = %msg.message_id, "Message recalled, skipping");
                         continue;
                     }
-                    pending_recalls.lock().await.remove(&msg.message_id);
 
                     *last_activity.lock().unwrap_or_else(|p| p.into_inner()) = Instant::now();
 
@@ -308,7 +306,7 @@ async fn handle_between_turns_event(
     current_triggered_by: &mut UserId,
     queue_size: &Arc<AtomicUsize>,
     has_bg_tasks: &Arc<AtomicBool>,
-    pending_recalls: &Arc<tokio::sync::Mutex<HashMap<MessageId, Arc<AtomicBool>>>>,
+    pending_recalls: &Arc<tokio::sync::Mutex<HashMap<MessageId, (String, Arc<AtomicBool>)>>>,
     thread_id: &str,
     channel_id: &ChannelId,
     ctx: &Context,
@@ -481,7 +479,7 @@ async fn handle_bg_turn(
     tracker: &mut BackgroundTaskTracker,
     current_triggered_by: &mut UserId,
     queue_size: &Arc<AtomicUsize>,
-    pending_recalls: &Arc<tokio::sync::Mutex<HashMap<MessageId, Arc<AtomicBool>>>>,
+    pending_recalls: &Arc<tokio::sync::Mutex<HashMap<MessageId, (String, Arc<AtomicBool>)>>>,
     thread_id: &str,
     channel_id: &ChannelId,
     ctx: &Context,
@@ -617,12 +615,11 @@ async fn handle_bg_turn(
                 match new_msg {
                     Some(m) => {
                         queue_size.fetch_sub(1, Ordering::Relaxed);
-                        if m.cancelled.load(Ordering::Relaxed) {
-                            pending_recalls.lock().await.remove(&m.message_id);
+                        pending_recalls.lock().await.remove(&m.message_id);
+                        if m.cancelled.load(Ordering::Acquire) {
                             tracing::info!(thread_id = %thread_id, msg_id = %m.message_id, "Message recalled, skipping");
                             continue 'bg_turn;
                         }
-                        pending_recalls.lock().await.remove(&m.message_id);
                         *current_triggered_by = m.triggered_by;
                         let inject_line = build_user_message_json(&m.content);
                         if let Err(e) = stdin.write_all(inject_line.as_bytes()).await {
@@ -665,7 +662,7 @@ async fn wait_for_permission(
     queue_rx: &mut mpsc::Receiver<QueuedMessage>,
     interrupt_rx: &mut mpsc::Receiver<()>,
     queue_size: &Arc<AtomicUsize>,
-    pending_recalls: &Arc<tokio::sync::Mutex<HashMap<MessageId, Arc<AtomicBool>>>>,
+    pending_recalls: &Arc<tokio::sync::Mutex<HashMap<MessageId, (String, Arc<AtomicBool>)>>>,
     thread_id: &str,
     saved_tool_name: &str,
     event_tx: Option<&mpsc::Sender<StreamEvent>>,
@@ -708,12 +705,11 @@ async fn wait_for_permission(
                 match new_msg {
                     Some(m) => {
                         queue_size.fetch_sub(1, Ordering::Relaxed);
-                        if m.cancelled.load(Ordering::Relaxed) {
-                            pending_recalls.lock().await.remove(&m.message_id);
+                        pending_recalls.lock().await.remove(&m.message_id);
+                        if m.cancelled.load(Ordering::Acquire) {
                             tracing::info!(thread_id = %thread_id, msg_id = %m.message_id, "Message recalled, skipping");
                             continue 'perm;
                         }
-                        pending_recalls.lock().await.remove(&m.message_id);
                         let inject_line = build_user_message_json(&m.content);
                         if let Err(e) = stdin.write_all(inject_line.as_bytes()).await {
                             tracing::error!("mid-turn stdin write error (perm wait): {}", e);
@@ -825,7 +821,7 @@ async fn run_active_turn(
     has_bg_tasks: &Arc<AtomicBool>,
     is_turn_active: &Arc<AtomicBool>,
     last_activity: &Arc<StdMutex<Instant>>,
-    pending_recalls: &Arc<tokio::sync::Mutex<HashMap<MessageId, Arc<AtomicBool>>>>,
+    pending_recalls: &Arc<tokio::sync::Mutex<HashMap<MessageId, (String, Arc<AtomicBool>)>>>,
     thread_id: &str,
     channel_id: &ChannelId,
     ctx: &Context,
@@ -855,12 +851,11 @@ async fn run_active_turn(
                 match new_msg {
                     Some(m) => {
                         queue_size.fetch_sub(1, Ordering::Relaxed);
-                        if m.cancelled.load(Ordering::Relaxed) {
-                            pending_recalls.lock().await.remove(&m.message_id);
+                        pending_recalls.lock().await.remove(&m.message_id);
+                        if m.cancelled.load(Ordering::Acquire) {
                             tracing::info!(thread_id = %thread_id, msg_id = %m.message_id, "Message recalled, skipping");
                             continue 'turn;
                         }
-                        pending_recalls.lock().await.remove(&m.message_id);
                         *last_activity.lock().unwrap_or_else(|p| p.into_inner()) = Instant::now();
                         *current_triggered_by = m.triggered_by;
                         let inject_line = build_user_message_json(&m.content);
