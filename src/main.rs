@@ -80,7 +80,7 @@ async fn main() -> Result<(), PidoryError> {
     let guild_id = serenity::GuildId::new(config.discord.guild_id);
     let owner_id = serenity::UserId::new(config.discord.owner_id);
 
-    info!("Starting pidory bot...");
+    info!("Starting pidory v{}...", env!("CARGO_PKG_VERSION"));
 
     let config_clone = config.clone();
     let framework = poise::Framework::builder()
