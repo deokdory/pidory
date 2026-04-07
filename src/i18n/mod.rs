@@ -105,6 +105,7 @@ mod tests {
         assert!(ctx.ends_with("</system-reminder>"));
         assert!(ctx.contains("pidory"));
         assert!(ctx.contains("버그 수정"));
+        assert!(ctx.contains("pidory-toss"));
     }
 
     #[test]
@@ -114,6 +115,7 @@ mod tests {
         assert!(ctx.ends_with("</system-reminder>"));
         assert!(ctx.contains("pidory"));
         assert!(ctx.contains("fix bug"));
+        assert!(ctx.contains("pidory-toss"));
     }
 
     #[test]
