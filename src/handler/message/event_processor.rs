@@ -323,13 +323,20 @@ pub async fn process_turn_events(
             .ok();
     } else {
         // 정상 완료: 요약 전송
-        let (duration_ms, total_cost_usd, input_tokens, output_tokens, context_window, total_input_tokens) = events.iter().find_map(|e| {
-            if let StreamEvent::Result { duration_ms, total_cost_usd, input_tokens, output_tokens, context_window, total_input_tokens, .. } = e {
-                Some((*duration_ms, *total_cost_usd, *input_tokens, *output_tokens, *context_window, *total_input_tokens))
+        let (duration_ms, total_cost_usd, input_tokens, output_tokens, context_window, total_input_tokens, result_session_id) = events.iter().find_map(|e| {
+            if let StreamEvent::Result { duration_ms, total_cost_usd, input_tokens, output_tokens, context_window, total_input_tokens, session_id, .. } = e {
+                Some((*duration_ms, *total_cost_usd, *input_tokens, *output_tokens, *context_window, *total_input_tokens, session_id.clone()))
             } else {
                 None
             }
-        }).unwrap_or((0, 0.0, 0, 0, 0, 0));
+        }).unwrap_or((0, 0.0, 0, 0, 0, 0, String::new()));
+        let session_short = if result_session_id.len() >= 8 {
+            format!(" sid:{}", &result_session_id[..8])
+        } else if !result_session_id.is_empty() {
+            format!(" sid:{}", result_session_id)
+        } else {
+            String::new()
+        };
 
         let duration = formatter::format_duration(duration_ms);
         let cost = formatter::format_cost(total_cost_usd);
@@ -343,10 +350,10 @@ pub async fn process_turn_events(
                 .unwrap_or_else(|| format!("<@{}>", owner_id))
         };
         let summary = if used_tools.is_empty() {
-            format!("-# ✅ {}{}{}{} {}", duration, cost, tokens, ctx_suffix, mentions)
+            format!("-# ✅ {}{}{}{}{} {}", duration, cost, tokens, ctx_suffix, session_short, mentions)
         } else {
             used_tools.dedup();
-            format!("-# 🔧 {} — {}{}{}{} {}", used_tools.join(", "), duration, cost, tokens, ctx_suffix, mentions)
+            format!("-# 🔧 {} — {}{}{}{}{} {}", used_tools.join(", "), duration, cost, tokens, ctx_suffix, session_short, mentions)
         };
         if let Err(e) = repository::update_session_status(db, thread_id, "idle").await {
             tracing::warn!("Failed to update session status for thread {}: {}", thread_id, e);
@@ -400,18 +407,25 @@ pub async fn process_turn_events(
                     tracing::warn!(%channel_id, "Failed to send turn error notification: {}", e);
                 }
             } else {
-                let (duration_ms, total_cost_usd, input_tokens, output_tokens, context_window, total_input_tokens) = events.iter().find_map(|e| {
-                    if let StreamEvent::Result { duration_ms, total_cost_usd, input_tokens, output_tokens, context_window, total_input_tokens, .. } = e {
-                        Some((*duration_ms, *total_cost_usd, *input_tokens, *output_tokens, *context_window, *total_input_tokens))
+                let (duration_ms, total_cost_usd, input_tokens, output_tokens, context_window, total_input_tokens, fc_session_id) = events.iter().find_map(|e| {
+                    if let StreamEvent::Result { duration_ms, total_cost_usd, input_tokens, output_tokens, context_window, total_input_tokens, session_id, .. } = e {
+                        Some((*duration_ms, *total_cost_usd, *input_tokens, *output_tokens, *context_window, *total_input_tokens, session_id.clone()))
                     } else {
                         None
                     }
-                }).unwrap_or((0, 0.0, 0, 0, 0, 0));
+                }).unwrap_or((0, 0.0, 0, 0, 0, 0, String::new()));
                 let duration = formatter::format_duration(duration_ms);
                 let cost = formatter::format_cost(total_cost_usd);
                 let tokens = formatter::format_tokens(input_tokens, output_tokens);
                 let ctx_suffix = format_ctx_suffix(total_input_tokens, context_window);
-                if let Err(e) = channel_id.say(ctx, &format!("-# ✅ {}{}{}{} {}", duration, cost, tokens, ctx_suffix, mentions)).await {
+                let fc_session_short = if fc_session_id.len() >= 8 {
+                    format!(" sid:{}", &fc_session_id[..8])
+                } else if !fc_session_id.is_empty() {
+                    format!(" sid:{}", fc_session_id)
+                } else {
+                    String::new()
+                };
+                if let Err(e) = channel_id.say(ctx, &format!("-# ✅ {}{}{}{}{} {}", duration, cost, tokens, ctx_suffix, fc_session_short, mentions)).await {
                     tracing::warn!(%channel_id, "Failed to send turn completion notification: {}", e);
                 }
             }

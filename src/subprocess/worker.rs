@@ -869,7 +869,11 @@ async fn run_active_turn(
                                     StreamEvent::Init { .. } => "init",
                                     _ => "other",
                                 };
-                                tracing::debug!(thread_id = %thread_id, event = event_name, "stdout event");
+                                if event_name == "result" || event_name == "other" {
+                                    tracing::info!(thread_id = %thread_id, event = event_name, bg_turn_active, "#36 debug: stdout event");
+                                } else {
+                                    tracing::debug!(thread_id = %thread_id, event = event_name, bg_turn_active, "stdout event");
+                                }
                                 // Background task 이벤트: user turn 중에도 올 수 있음
                                 match &event {
                                     StreamEvent::TaskStarted { task_id, task_type, description, .. } => {
@@ -895,6 +899,12 @@ async fn run_active_turn(
                                         };
                                         say_silent_chunked(ctx, channel_id, &notify_msg).await;
                                         bg_turn_active = true;
+                                        tracing::info!(
+                                            thread_id = %thread_id,
+                                            task_id,
+                                            status,
+                                            "#36 debug: bg_turn_active=true (TaskNotification received)"
+                                        );
                                         continue 'turn;
                                     }
                                     _ => {}
@@ -903,10 +913,14 @@ async fn run_active_turn(
                                 // bg turn 이벤트 처리: bg_turn_active일 때 기존 코드로 안 넘김
                                 if bg_turn_active {
                                     match &event {
-                                        StreamEvent::Result { .. } => {
+                                        StreamEvent::Result { session_id, .. } => {
                                             bg_turn_active = false;
                                             timeout_deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
-                                            tracing::debug!(thread_id = %thread_id, "Timeout deadline reset");
+                                            tracing::info!(
+                                                thread_id = %thread_id,
+                                                session_id,
+                                                "#36 debug: bg turn Result consumed (bg_turn_active→false)"
+                                            );
                                             continue 'turn; // bg turn 끝 — user turn은 계속
                                         }
                                         StreamEvent::Assistant { content, .. } => {
@@ -1072,6 +1086,15 @@ async fn run_active_turn(
 
                                 // 일반 이벤트 처리
                                 let is_result = event.is_result();
+                                if is_result {
+                                    let sid = event.session_id().unwrap_or("?");
+                                    tracing::info!(
+                                        thread_id = %thread_id,
+                                        session_id = sid,
+                                        bg_turn_active,
+                                        "#36 debug: user turn Result received — ending turn"
+                                    );
+                                }
                                 let _ = event_tx.send(event).await;
                                 if is_result {
                                     is_turn_active.store(false, Ordering::Relaxed);
@@ -1100,7 +1123,8 @@ async fn run_active_turn(
                             tracing::warn!(
                                 thread_id = %thread_id,
                                 timeout_secs,
-                                "Soft timeout fired — sending nudge"
+                                bg_turn_active,
+                                "#36 debug: Soft timeout fired — sending nudge"
                             );
                             let nudge_line = build_user_message_json("[SYSTEM] No stdout activity for an extended period. A tool may be unresponsive. Check the status of any running tools and recover if needed.");
                             if let Err(e) = stdin.write_all(nudge_line.as_bytes()).await {
