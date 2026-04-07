@@ -29,6 +29,7 @@ pub struct QueuedMessage {
     pub message_id: MessageId,
     pub event_tx: Option<mpsc::Sender<StreamEvent>>,  // None = mid-turn inject
     pub triggered_by: UserId,
+    pub cancelled: Arc<AtomicBool>,
 }
 
 pub(super) struct SessionInner {
@@ -55,6 +56,7 @@ pub struct SessionManager {
     sessions: Arc<Mutex<HashMap<String, SessionInner>>>,
     config: Arc<ClaudeConfig>,
     max_sessions: usize,
+    pending_recalls: Arc<tokio::sync::Mutex<HashMap<MessageId, Arc<AtomicBool>>>>,
 }
 
 impl SessionManager {
@@ -63,6 +65,7 @@ impl SessionManager {
             sessions: Arc::new(Mutex::new(HashMap::new())),
             config,
             max_sessions,
+            pending_recalls: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         }
     }
 
@@ -183,6 +186,7 @@ impl SessionManager {
             timeout_secs,
             lang,
             owner_id,
+            Arc::clone(&self.pending_recalls),
         ).run());
 
 
@@ -233,6 +237,9 @@ impl SessionManager {
             )));
         }
 
+        let msg_id = msg.message_id;
+        let cancelled = Arc::clone(&msg.cancelled);
+
         inner
             .queue_tx
             .try_send(msg)
@@ -240,7 +247,19 @@ impl SessionManager {
 
         inner.queue_size.fetch_add(1, Ordering::Relaxed);
 
+        self.pending_recalls.lock().await.insert(msg_id, cancelled);
+
         Ok(())
+    }
+
+    pub async fn try_recall(&self, msg_id: MessageId) -> bool {
+        let mut pending = self.pending_recalls.lock().await;
+        if let Some(cancelled) = pending.remove(&msg_id) {
+            cancelled.store(true, Ordering::Relaxed);
+            true
+        } else {
+            false
+        }
     }
 
     pub async fn kill_session(&self, thread_id: &str) -> Result<(), PidoryError> {
