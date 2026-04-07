@@ -4,6 +4,9 @@ mod helpers;
 
 pub use event_processor::process_turn_events;
 
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+
 use poise::serenity_prelude::{ChannelId, Context, FullEvent, GuildId, MessageId, MessageType, UserId};
 use tokio::sync::mpsc;
 use tracing::{error, warn};
@@ -180,6 +183,7 @@ async fn handle_message(
             message_id: msg_id,
             event_tx: None,
             triggered_by: new_message.author.id,
+            cancelled: Arc::new(AtomicBool::new(false)),
         };
 
         match data.sessions.send_message(&thread_id, msg).await {
@@ -253,6 +257,7 @@ async fn handle_message(
         message_id: msg_id,
         event_tx: Some(event_tx),
         triggered_by: new_message.author.id,
+        cancelled: Arc::new(AtomicBool::new(false)),
     };
 
     if let Err(e) = data.sessions.send_message(&thread_id, msg).await {
@@ -315,6 +320,7 @@ pub async fn execute_in_session(
             message_id: msg_id,
             event_tx: None,
             triggered_by,
+            cancelled: Arc::new(AtomicBool::new(false)),
         };
         data.sessions.send_message(thread_id, msg).await?;
         if is_new_command {
@@ -342,6 +348,7 @@ pub async fn execute_in_session(
         message_id: msg_id,
         event_tx: Some(event_tx),
         triggered_by,
+        cancelled: Arc::new(AtomicBool::new(false)),
     };
 
     // turn_participants 초기화 (skill 직접 실행 경로)
