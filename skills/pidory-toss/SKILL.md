@@ -31,14 +31,14 @@ pidory Discord bot 세션 전용 스킬. Claude가 마커를 텍스트에 출력
 # 예시: /tmp/report.pdf 검증
 test -f "/tmp/report.pdf" || echo "NOT_FOUND"
 realpath "/tmp/report.pdf"
-stat -c "%s" "/tmp/report.pdf"
+wc -c < "/tmp/report.pdf"
 ```
 
 아래 순서로 각 파일을 처리한다:
 
 1. **존재 확인**: `test -f <경로>` — 실패 시 → "파일을 찾을 수 없음: {경로}" 에러 메시지 출력, 해당 파일 건너뜀
 2. **절대 경로 변환**: `realpath <경로>` — 상대 경로를 절대 경로로 변환
-3. **크기 확인**: `stat -c "%s" <절대경로>` — 26214400 bytes(25MB) 초과 시 → "파일이 너무 큼 (25MB 초과): {경로}" 에러 메시지 출력, 해당 파일 건너뜀
+3. **크기 확인**: `wc -c < <절대경로>` — 26214400 bytes(25MB) 초과 시 → "파일이 너무 큼 (25MB 초과): {경로}" 에러 메시지 출력, 해당 파일 건너뜀
 
 ### 3. 마커 출력 (검증 통과한 파일만)
 

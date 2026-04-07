@@ -40,8 +40,25 @@ else
     echo "WARNING: claude CLI not found in PATH. Set binary_path in config.toml manually."
 fi
 
-# 4. Install service
-echo "[4/5] Installing service..."
+# 4. Install skills
+echo "[4/5] Installing skills..."
+SKILLS_TARGET="$HOME/.claude/skills"
+if [ -d "$PROJECT_DIR/skills" ]; then
+    mkdir -p "$SKILLS_TARGET"
+    shopt -s nullglob dotglob
+    for skill_dir in "$PROJECT_DIR/skills"/*/; do
+        skill_name="$(basename "$skill_dir")"
+        mkdir -p "$SKILLS_TARGET/$skill_name"
+        cp -r "$skill_dir"* "$SKILLS_TARGET/$skill_name/"
+        echo "  Installed: $skill_name"
+    done
+    shopt -u nullglob dotglob
+else
+    echo "  No skills directory found, skipping"
+fi
+
+# 5. Install service
+echo "[5/5] Installing service..."
 
 if [ "$OS" = "Darwin" ]; then
     # macOS — launchd
@@ -92,21 +109,6 @@ else
     echo "Start:   sudo systemctl start pidory"
     echo "Status:  sudo systemctl status pidory"
     echo "Logs:    journalctl -u pidory -f"
-fi
-
-# 5. Install skills
-echo "[5/5] Installing skills..."
-SKILLS_TARGET="$HOME/.claude/skills"
-if [ -d "$PROJECT_DIR/skills" ]; then
-    mkdir -p "$SKILLS_TARGET"
-    for skill_dir in "$PROJECT_DIR/skills"/*/; do
-        skill_name="$(basename "$skill_dir")"
-        mkdir -p "$SKILLS_TARGET/$skill_name"
-        cp -r "$skill_dir"* "$SKILLS_TARGET/$skill_name/"
-        echo "  Installed: $skill_name"
-    done
-else
-    echo "  No skills directory found, skipping"
 fi
 
 echo ""
