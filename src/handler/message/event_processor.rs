@@ -80,8 +80,8 @@ pub(super) async fn send_event_to_discord(
         StreamEvent::User { tool_results, .. } => {
             for result in tool_results {
                 let tool_name = tool_use_names.get(&result.tool_use_id).map(|s| s.as_str());
-                // Read/Grep/Glob 결과는 생략 (에러만 표시)
-                if matches!(tool_name, Some("Read" | "Grep" | "Glob")) && !result.is_error {
+                // 조회/편집/검색 도구 결과는 생략 (에러만 표시)
+                if matches!(tool_name, Some("Read" | "Grep" | "Glob" | "Write" | "Edit" | "MultiEdit" | "WebSearch" | "WebFetch" | "TodoWrite")) && !result.is_error {
                     continue;
                 }
                 if let Some(formatted) = formatter::format_tool_result_with_name(result, tool_name, lang) {

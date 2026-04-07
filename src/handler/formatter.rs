@@ -39,7 +39,7 @@ pub fn format_response(events: &[StreamEvent], lang: Lang) -> (String, Vec<Strin
             StreamEvent::User { tool_results, .. } => {
                 for result in tool_results {
                     let tool_name = tool_use_names.get(&result.tool_use_id).map(|s| s.as_str());
-                    if matches!(tool_name, Some("Read" | "Grep" | "Glob")) && !result.is_error {
+                    if matches!(tool_name, Some("Read" | "Grep" | "Glob" | "Write" | "Edit" | "MultiEdit" | "WebSearch" | "WebFetch" | "TodoWrite")) && !result.is_error {
                         continue;
                     }
                     if let Some(formatted) = format_tool_result_with_name(result, tool_name, lang) {
@@ -306,7 +306,7 @@ mod tests {
     }
 
     #[test]
-    fn format_response_skips_read_grep_glob_results() {
+    fn format_response_skips_noise_tool_results() {
         use crate::subprocess::parser::{ContentBlock, StreamEvent, ToolResult};
 
         let events = vec![
@@ -333,6 +333,60 @@ mod tests {
             !result.contains("file contents here"),
             "Successful Read tool results should be filtered out, but got: {}",
             result
+        );
+
+        // Write 성공 result도 필터링
+        let events_write = vec![
+            StreamEvent::Assistant {
+                content: vec![ContentBlock::ToolUse {
+                    id: "tool-2".into(),
+                    name: "Write".into(),
+                    input: serde_json::json!({"file_path": "/tmp/out.txt", "content": "hello"}),
+                }],
+                session_id: "s1".into(),
+            },
+            StreamEvent::User {
+                tool_results: vec![ToolResult {
+                    tool_use_id: "tool-2".into(),
+                    content: "write success output".into(),
+                    is_error: false,
+                }],
+                session_id: "s1".into(),
+            },
+        ];
+
+        let (result_write, _) = format_response(&events_write, Lang::Ko);
+        assert!(
+            !result_write.contains("write success output"),
+            "Successful Write tool results should be filtered out, but got: {}",
+            result_write
+        );
+
+        // Write 에러 result는 표시
+        let events_write_err = vec![
+            StreamEvent::Assistant {
+                content: vec![ContentBlock::ToolUse {
+                    id: "tool-3".into(),
+                    name: "Write".into(),
+                    input: serde_json::json!({"file_path": "/tmp/out.txt", "content": "hello"}),
+                }],
+                session_id: "s1".into(),
+            },
+            StreamEvent::User {
+                tool_results: vec![ToolResult {
+                    tool_use_id: "tool-3".into(),
+                    content: "permission denied error".into(),
+                    is_error: true,
+                }],
+                session_id: "s1".into(),
+            },
+        ];
+
+        let (result_write_err, _) = format_response(&events_write_err, Lang::Ko);
+        assert!(
+            result_write_err.contains("permission denied error"),
+            "Write tool error results should be shown, but got: {}",
+            result_write_err
         );
     }
 
