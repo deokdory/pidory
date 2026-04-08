@@ -3,8 +3,9 @@ use std::collections::HashMap;
 use poise::serenity_prelude::{Context, UserId};
 
 use crate::Data;
+use crate::db::repository;
 use crate::error::PidoryError;
-use crate::handler::{permission_ui, question_ui};
+use crate::handler::{permission_ui, question_ui, reset_ui};
 use crate::i18n::Lang;
 use crate::subprocess::permission::PermissionDecision;
 
@@ -264,6 +265,147 @@ pub(super) async fn handle_interaction(
             )
             .await
             .ok();
+        }
+
+        return Ok(());
+    }
+
+    // Try reset confirm/cancel button: reset:{thread_id}:{action}
+    if let Some((thread_id, reset_action)) =
+        reset_ui::parse_reset_custom_id(&component.data.custom_id)
+    {
+        let channel_id = component.channel_id;
+
+        // Authorization: only the requester (or owner) may act
+        let requested_by = {
+            let pending = data.pending_resets.lock().await;
+            pending.get(&thread_id).map(|p| p.requested_by)
+        };
+
+        if let Some(requested_by) = requested_by {
+            let is_owner = component.user.id == UserId::new(data.config.discord.owner_id);
+            if component.user.id != requested_by && !is_owner {
+                component
+                    .create_response(
+                        ctx,
+                        poise::serenity_prelude::CreateInteractionResponse::Message(
+                            poise::serenity_prelude::CreateInteractionResponseMessage::new()
+                                .content(format!("❌ {}", lang.no_permission()))
+                                .ephemeral(true),
+                        ),
+                    )
+                    .await
+                    .ok();
+                return Ok(());
+            }
+        }
+
+        // Defer the interaction so the button click is acknowledged
+        component
+            .create_response(
+                ctx,
+                poise::serenity_prelude::CreateInteractionResponse::Acknowledge,
+            )
+            .await
+            .ok();
+
+        match reset_action {
+            reset_ui::ResetAction::Confirm => {
+                // Remove from pending — if gone, it expired
+                let pending = data.pending_resets.lock().await.remove(&thread_id);
+                let Some(pending) = pending else {
+                    component
+                        .create_followup(
+                            ctx,
+                            poise::serenity_prelude::CreateInteractionResponseFollowup::new()
+                                .content(lang.session_reset_expired())
+                                .ephemeral(true),
+                        )
+                        .await
+                        .ok();
+                    reset_ui::disable_reset_buttons(
+                        ctx,
+                        channel_id,
+                        // We don't have message_id anymore; best-effort, ignore error
+                        component.message.id,
+                        reset_ui::ResetOutcome::Expired,
+                    )
+                    .await
+                    .ok();
+                    return Ok(());
+                };
+
+                // Interrupt the session (ignore failure — may already be idle)
+                let _ = data.sessions.interrupt_session(&thread_id).await;
+
+                // Kill the session
+                match data.sessions.kill_session(&thread_id).await {
+                    Ok(()) | Err(PidoryError::NotFound(_)) => {}
+                    Err(e) => {
+                        channel_id
+                            .say(ctx, format!("❌ {}", lang.error_with(&e)))
+                            .await
+                            .ok();
+                        return Ok(());
+                    }
+                }
+
+                // Clean up in-memory maps
+                data.session_skills.lock().await.remove(&thread_id);
+                data.pending_permissions
+                    .lock()
+                    .await
+                    .retain(|_, p| p.thread_id != thread_id);
+                data.pending_question_groups
+                    .lock()
+                    .await
+                    .retain(|_, g| g.thread_id != thread_id);
+                data.needs_context.lock().await.remove(&thread_id);
+                data.turn_initiators.lock().await.remove(&thread_id);
+                data.turn_participants.lock().await.remove(&thread_id);
+
+                // Remove from DB (best-effort)
+                let _ = repository::delete_session(&data.db, &thread_id).await;
+
+                // Disable the confirm/cancel buttons and post result message
+                reset_ui::disable_reset_buttons(
+                    ctx,
+                    channel_id,
+                    pending.message_id,
+                    reset_ui::ResetOutcome::Confirmed,
+                )
+                .await
+                .ok();
+
+                channel_id
+                    .say(ctx, format!("-# ♻️ {}", lang.session_reset()))
+                    .await
+                    .ok();
+            }
+            reset_ui::ResetAction::Cancel => {
+                let pending = data.pending_resets.lock().await.remove(&thread_id);
+                let Some(pending) = pending else {
+                    component
+                        .create_followup(
+                            ctx,
+                            poise::serenity_prelude::CreateInteractionResponseFollowup::new()
+                                .content(lang.session_reset_expired())
+                                .ephemeral(true),
+                        )
+                        .await
+                        .ok();
+                    return Ok(());
+                };
+
+                reset_ui::disable_reset_buttons(
+                    ctx,
+                    channel_id,
+                    pending.message_id,
+                    reset_ui::ResetOutcome::Cancelled,
+                )
+                .await
+                .ok();
+            }
         }
 
         return Ok(());
