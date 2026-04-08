@@ -16,6 +16,7 @@ use crate::error::PidoryError;
 use crate::handler::attachment_download;
 use crate::handler::emoji;
 use crate::handler::emoji::ReactionStatus;
+use crate::handler::reset_ui;
 use crate::subprocess::parser::StreamEvent;
 use crate::subprocess::session_manager::{QueuedMessage, ReplyContext};
 use crate::Data;
@@ -202,23 +203,65 @@ async fn handle_message(
     let is_new_command = helpers::is_context_reset_command(&new_message.content);
 
     if is_new_command {
-        if let Err(e) = data.sessions.kill_session(&thread_id).await {
-            if !matches!(e, PidoryError::NotFound(_)) {
-                warn!("Failed to kill session {}: {}", thread_id, e);
+        let is_running = session.status == "running";
+        if is_running {
+            // 기존 pending_reset이 있으면 만료 처리
+            let old_pending = data.pending_resets.lock().await.remove(&thread_id);
+            if let Some(p) = old_pending {
+                let _ = reset_ui::disable_reset_buttons(ctx, channel_id, p.message_id, reset_ui::ResetOutcome::Expired).await;
             }
+
+            // 확인 버튼 메시지 전송
+            let confirm_msg = reset_ui::create_reset_confirm_message(
+                lang.session_reset_confirm(),
+                &thread_id,
+            );
+            let sent = channel_id
+                .send_message(ctx, confirm_msg)
+                .await
+                .map_err(|e| PidoryError::Discord(Box::new(e)))?;
+
+            let pending = reset_ui::PendingReset {
+                message_id: sent.id,
+                thread_id: thread_id.clone(),
+                requested_by: new_message.author.id,
+            };
+            data.pending_resets.lock().await.insert(thread_id.clone(), pending);
+
+            // 30초 타임아웃 spawn
+            let pending_resets_clone = data.pending_resets.clone();
+            let ctx_clone = ctx.clone();
+            let tid = thread_id.clone();
+            let ch = channel_id;
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                let removed = pending_resets_clone.lock().await.remove(&tid);
+                if let Some(p) = removed {
+                    let _ = reset_ui::disable_reset_buttons(&ctx_clone, ch, p.message_id, reset_ui::ResetOutcome::Expired).await;
+                }
+            });
+
+            return Ok(());
+        } else {
+            // 즉시 kill 경로
+            if let Err(e) = data.sessions.kill_session(&thread_id).await {
+                if !matches!(e, PidoryError::NotFound(_)) {
+                    warn!("Failed to kill session {}: {}", thread_id, e);
+                }
+            }
+            data.session_skills.lock().await.remove(&thread_id);
+            data.pending_permissions.lock().await.retain(|_, p| p.thread_id != thread_id);
+            data.pending_question_groups.lock().await.retain(|_, g| g.thread_id != thread_id);
+            data.needs_context.lock().await.remove(&thread_id);
+            data.turn_initiators.lock().await.remove(&thread_id);
+            data.turn_participants.lock().await.remove(&thread_id);
+            let _ = repository::delete_session(db, &thread_id).await;
+            channel_id
+                .say(ctx, format!("-# ♻️ {}", lang.session_reset()))
+                .await
+                .map_err(|e| PidoryError::Discord(Box::new(e)))?;
+            return Ok(());
         }
-        data.session_skills.lock().await.remove(&thread_id);
-        data.pending_permissions.lock().await.retain(|_, p| p.thread_id != thread_id);
-        data.pending_question_groups.lock().await.retain(|_, g| g.thread_id != thread_id);
-        data.needs_context.lock().await.remove(&thread_id);
-        data.turn_initiators.lock().await.remove(&thread_id);
-        data.turn_participants.lock().await.remove(&thread_id);
-        let _ = repository::delete_session(db, &thread_id).await;
-        channel_id
-            .say(ctx, format!("-# ♻️ {}", lang.session_reset()))
-            .await
-            .map_err(|e| PidoryError::Discord(Box::new(e)))?;
-        return Ok(());
     }
 
     // 원자적 acquire: running이 아닌 경우에만 running으로 전환
@@ -377,26 +420,70 @@ pub async fn execute_in_session(
     let db = &data.db;
 
     let is_new_command = helpers::is_context_reset_command(content);
+    let lang = data.config.language;
 
     if is_new_command {
-        if let Err(e) = data.sessions.kill_session(thread_id).await {
-            if !matches!(e, PidoryError::NotFound(_)) {
-                warn!("Failed to kill session {}: {}", thread_id, e);
+        let session = repository::get_session_by_thread(db, thread_id).await?;
+        let is_running = session.as_ref().map(|s| s.status == "running").unwrap_or(false);
+
+        if is_running {
+            // 기존 pending_reset이 있으면 만료 처리
+            let old_pending = data.pending_resets.lock().await.remove(thread_id);
+            if let Some(p) = old_pending {
+                let _ = reset_ui::disable_reset_buttons(ctx, channel_id, p.message_id, reset_ui::ResetOutcome::Expired).await;
             }
+
+            // 확인 버튼 메시지 전송
+            let confirm_msg = reset_ui::create_reset_confirm_message(
+                lang.session_reset_confirm(),
+                thread_id,
+            );
+            let sent = channel_id
+                .send_message(ctx, confirm_msg)
+                .await
+                .map_err(|e| PidoryError::Discord(Box::new(e)))?;
+
+            let pending = reset_ui::PendingReset {
+                message_id: sent.id,
+                thread_id: thread_id.to_string(),
+                requested_by: triggered_by,
+            };
+            data.pending_resets.lock().await.insert(thread_id.to_string(), pending);
+
+            // 30초 타임아웃 spawn
+            let pending_resets_clone = data.pending_resets.clone();
+            let ctx_clone = ctx.clone();
+            let tid = thread_id.to_string();
+            let ch = channel_id;
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                let removed = pending_resets_clone.lock().await.remove(&tid);
+                if let Some(p) = removed {
+                    let _ = reset_ui::disable_reset_buttons(&ctx_clone, ch, p.message_id, reset_ui::ResetOutcome::Expired).await;
+                }
+            });
+
+            return Ok(());
+        } else {
+            // 즉시 kill 경로
+            if let Err(e) = data.sessions.kill_session(thread_id).await {
+                if !matches!(e, PidoryError::NotFound(_)) {
+                    warn!("Failed to kill session {}: {}", thread_id, e);
+                }
+            }
+            data.session_skills.lock().await.remove(thread_id);
+            data.pending_permissions.lock().await.retain(|_, p| p.thread_id != thread_id);
+            data.pending_question_groups.lock().await.retain(|_, g| g.thread_id != thread_id);
+            data.needs_context.lock().await.remove(thread_id);
+            data.turn_initiators.lock().await.remove(thread_id);
+            data.turn_participants.lock().await.remove(thread_id);
+            let _ = repository::delete_session(db, thread_id).await;
+            channel_id
+                .say(ctx, format!("-# ♻️ {}", lang.session_reset()))
+                .await
+                .map_err(|e| PidoryError::Discord(Box::new(e)))?;
+            return Ok(());
         }
-        data.session_skills.lock().await.remove(thread_id);
-        data.pending_permissions.lock().await.retain(|_, p| p.thread_id != thread_id);
-        data.pending_question_groups.lock().await.retain(|_, g| g.thread_id != thread_id);
-        data.needs_context.lock().await.remove(thread_id);
-        data.turn_initiators.lock().await.remove(thread_id);
-        data.turn_participants.lock().await.remove(thread_id);
-        let _ = repository::delete_session(db, thread_id).await;
-        let lang = data.config.language;
-        channel_id
-            .say(ctx, format!("-# ♻️ {}", lang.session_reset()))
-            .await
-            .map_err(|e| PidoryError::Discord(Box::new(e)))?;
-        return Ok(());
     }
 
     let acquired = repository::try_acquire_session(db, thread_id).await?;
