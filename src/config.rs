@@ -165,24 +165,24 @@ impl Default for AttachmentConfig {
 
 impl AttachmentConfig {
     pub fn max_file_size_bytes(&self) -> u64 {
-        self.max_file_size_mb * 1024 * 1024
+        self.max_file_size_mb.saturating_mul(1024 * 1024)
     }
 
     pub fn max_aggregate_size_bytes(&self) -> u64 {
-        self.max_aggregate_size_mb * 1024 * 1024
+        self.max_aggregate_size_mb.saturating_mul(1024 * 1024)
     }
 }
 
 fn default_max_file_size_mb() -> u64 {
-    500
+    25
 }
 
 fn default_max_aggregate_size_mb() -> u64 {
-    500
+    50
 }
 
 fn default_download_timeout_secs_attachment() -> u64 {
-    120
+    30
 }
 
 fn default_subprocess_timeout_secs() -> u64 {
@@ -263,9 +263,9 @@ binary_path = "claude"
         assert_eq!(config.database.path, "pidory.db");
         assert_eq!(config.discord.token_env, "PIDORY_DISCORD_TOKEN");
         assert_eq!(config.language, Lang::Ko); // default
-        assert_eq!(config.attachment.max_file_size_mb, 500);
-        assert_eq!(config.attachment.max_aggregate_size_mb, 500);
-        assert_eq!(config.attachment.download_timeout_secs, 120);
+        assert_eq!(config.attachment.max_file_size_mb, 25);
+        assert_eq!(config.attachment.max_aggregate_size_mb, 50);
+        assert_eq!(config.attachment.download_timeout_secs, 30);
     }
 
     #[test]
@@ -508,10 +508,10 @@ binary_path = "claude"
 [response]
 "#;
         let config: Config = toml::from_str(toml_str).unwrap();
-        assert_eq!(config.attachment.max_file_size_mb, 500);
-        assert_eq!(config.attachment.max_aggregate_size_mb, 500);
-        assert_eq!(config.attachment.download_timeout_secs, 120);
-        assert_eq!(config.attachment.max_file_size_bytes(), 500 * 1024 * 1024);
-        assert_eq!(config.attachment.max_aggregate_size_bytes(), 500 * 1024 * 1024);
+        assert_eq!(config.attachment.max_file_size_mb, 25);
+        assert_eq!(config.attachment.max_aggregate_size_mb, 50);
+        assert_eq!(config.attachment.download_timeout_secs, 30);
+        assert_eq!(config.attachment.max_file_size_bytes(), 25 * 1024 * 1024);
+        assert_eq!(config.attachment.max_aggregate_size_bytes(), 50 * 1024 * 1024);
     }
 }

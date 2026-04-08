@@ -2,7 +2,7 @@ use std::fmt;
 use std::path::Path;
 use std::time::Duration;
 
-use poise::futures_util::TryStreamExt as _;
+use futures_util::TryStreamExt as _;
 use poise::serenity_prelude as serenity;
 use tokio::io::AsyncWriteExt as _;
 
@@ -199,7 +199,7 @@ pub async fn download_attachments(
         }
     };
 
-    'attachment_loop: for attachment in attachments {
+    for attachment in attachments {
         let filename = attachment.filename.clone();
         let size = attachment.size as u64;
 
@@ -243,74 +243,24 @@ pub async fn download_attachments(
 
         // create_new(true) refuses to open existing files or symlinks,
         // preventing TOCTOU overwrites via symlink substitution.
-        let write_result: Result<(), std::io::Error> = {
-            match tokio::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&dest_path)
-                .await
-            {
-                Ok(mut file) => {
-                    let mut stream = resp.bytes_stream();
-                    let mut written: u64 = 0;
-                    let mut io_err: Option<std::io::Error> = None;
-                    let mut too_large = false;
-
-                    loop {
-                        match stream.try_next().await {
-                            Ok(Some(chunk)) => {
-                                let chunk: tokio_util::bytes::Bytes = chunk;
-                                written += chunk.len() as u64;
-                                if written > max_file_size {
-                                    too_large = true;
-                                    break;
-                                }
-                                if let Err(e) = file.write_all(&chunk).await {
-                                    io_err = Some(e);
-                                    break;
-                                }
-                            }
-                            Ok(None) => break,
-                            Err(e) => {
-                                // network error mid-stream: cleanup & report
-                                drop(file);
-                                let _ = tokio::fs::remove_file(&dest_path).await;
-                                errors.push(DownloadError::NetworkError {
-                                    filename,
-                                    source: e,
-                                });
-                                continue 'attachment_loop;
-                            }
-                        }
-                    }
-
-                    if too_large {
-                        drop(file);
-                        let _ = tokio::fs::remove_file(&dest_path).await;
-                        errors.push(DownloadError::TooLarge {
-                            filename,
-                            size: written,
-                            limit: max_file_size,
-                        });
-                        continue;
-                    }
-                    if let Some(e) = io_err {
-                        drop(file);
-                        let _ = tokio::fs::remove_file(&dest_path).await;
-                        Err(e)
-                    } else {
-                        file.flush().await
-                    }
-                }
-                Err(e) => Err(e),
+        match write_stream_to_file(resp.bytes_stream(), &dest_path, max_file_size).await {
+            Ok(WriteStreamOutcome::Done { .. }) => {}
+            Ok(WriteStreamOutcome::TooLarge { written }) => {
+                errors.push(DownloadError::TooLarge {
+                    filename,
+                    size: written,
+                    limit: max_file_size,
+                });
+                continue;
             }
-        };
-        if let Err(e) = write_result {
-            errors.push(DownloadError::IoError {
-                filename,
-                source: e,
-            });
-            continue;
+            Ok(WriteStreamOutcome::NetworkError { source }) => {
+                errors.push(DownloadError::NetworkError { filename, source });
+                continue;
+            }
+            Err(e) => {
+                errors.push(DownloadError::IoError { filename, source: e });
+                continue;
+            }
         }
 
         // Path traversal final defense: canonicalize and verify prefix
@@ -343,6 +293,54 @@ pub async fn download_attachments(
     }
 
     (paths, errors)
+}
+
+// ── write_stream_to_file ─────────────────────────────────────────────────────
+
+enum WriteStreamOutcome {
+    Done { written: u64 },
+    TooLarge { written: u64 },
+    NetworkError { source: reqwest::Error },
+}
+
+async fn write_stream_to_file<S>(
+    stream: S,
+    dest_path: &std::path::Path,
+    max_file_size: u64,
+) -> Result<WriteStreamOutcome, std::io::Error>
+where
+    S: futures_util::Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Unpin,
+{
+    let mut file = tokio::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(dest_path)
+        .await?;
+
+    let mut stream = stream;
+    let mut written: u64 = 0;
+
+    loop {
+        match stream.try_next().await {
+            Ok(Some(chunk)) => {
+                written += chunk.len() as u64;
+                if written > max_file_size {
+                    drop(file);
+                    let _ = tokio::fs::remove_file(dest_path).await;
+                    return Ok(WriteStreamOutcome::TooLarge { written });
+                }
+                file.write_all(&chunk).await?;
+            }
+            Ok(None) => break,
+            Err(e) => {
+                drop(file);
+                let _ = tokio::fs::remove_file(dest_path).await;
+                return Ok(WriteStreamOutcome::NetworkError { source: e });
+            }
+        }
+    }
+    file.flush().await?;
+    Ok(WriteStreamOutcome::Done { written })
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────
@@ -475,5 +473,48 @@ mod tests {
         assert!(paths.is_empty());
         assert_eq!(errors.len(), 1);
         assert!(matches!(&errors[0], DownloadError::AggregateLimit { .. }));
+    }
+
+    #[tokio::test]
+    async fn stream_write_too_large() {
+        use bytes::Bytes;
+        use futures_util::stream;
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_owned();
+        drop(tmp); // delete file so create_new(true) can create it
+
+        // 3 chunks of 100 bytes each, limit = 200 bytes
+        let chunks: Vec<Result<Bytes, reqwest::Error>> = vec![
+            Ok(Bytes::from(vec![0u8; 100])),
+            Ok(Bytes::from(vec![0u8; 100])),
+            Ok(Bytes::from(vec![0u8; 100])),
+        ];
+        let mock_stream = stream::iter(chunks);
+
+        let outcome = write_stream_to_file(mock_stream, &path, 200).await.unwrap();
+        assert!(matches!(outcome, WriteStreamOutcome::TooLarge { .. }));
+        assert!(!path.exists(), "partial file should be deleted");
+    }
+
+    #[tokio::test]
+    async fn stream_write_within_limit() {
+        use bytes::Bytes;
+        use futures_util::stream;
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_owned();
+        drop(tmp);
+
+        let chunks: Vec<Result<Bytes, reqwest::Error>> = vec![
+            Ok(Bytes::from(vec![0u8; 100])),
+            Ok(Bytes::from(vec![0u8; 100])),
+        ];
+        let mock_stream = stream::iter(chunks);
+
+        let outcome = write_stream_to_file(mock_stream, &path, 500).await.unwrap();
+        assert!(matches!(outcome, WriteStreamOutcome::Done { written: 200 }));
+        assert!(path.exists(), "file should exist");
+        let _ = tokio::fs::remove_file(&path).await;
     }
 }
