@@ -83,4 +83,11 @@ impl Lang {
             Lang::En => "No active session",
         }
     }
+
+    pub fn session_reset(&self) -> &'static str {
+        match self {
+            Lang::Ko => "세션을 리셋했습니다. 다음 메시지부터 새 세션이 시작됩니다.",
+            Lang::En => "Session reset. A new session will start with your next message.",
+        }
+    }
 }

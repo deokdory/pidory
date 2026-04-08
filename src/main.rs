@@ -110,9 +110,12 @@ async fn main() -> Result<(), PidoryError> {
                     info!("Reset {} orphaned running sessions", reset_count);
                 }
 
+                let (ratelimit_tx, _) = tokio::sync::watch::channel(crate::ratelimit::RateLimitInfo::default());
+
                 let sessions = Arc::new(SessionManager::new(
                     Arc::new(config.claude.clone()),
                     config.claude.max_sessions,
+                    ratelimit_tx.clone(),
                 ));
 
                 let pending_permissions: Arc<Mutex<HashMap<String, PendingPermission>>> = Arc::new(Mutex::new(HashMap::new()));
@@ -126,10 +129,10 @@ async fn main() -> Result<(), PidoryError> {
                 // shard reconnect 후에도 최신 ShardMessenger 사용 가능
                 let (ctx_tx, ctx_rx) = watch::channel(ctx.clone());
 
-                // Rate limit monitor (config.ratelimit.file_path가 Some일 때만)
-                if let Some(ref file_path) = config.ratelimit.file_path {
+                // Rate limit monitor (watch channel 기반)
+                {
                     let mut ctx_rx = ctx_rx;
-                    let file_path = file_path.clone();
+                    let mut ratelimit_rx = ratelimit_tx.subscribe();
                     let interval_secs = config.ratelimit.update_interval_secs;
                     let thresholds = config.ratelimit.alert_thresholds.clone();
                     let lang = config.language;
@@ -140,25 +143,26 @@ async fn main() -> Result<(), PidoryError> {
                         let mut interval = tokio::time::interval(
                             std::time::Duration::from_secs(interval_secs)
                         );
-                        tracing::info!("Rate limit monitor started (file: {file_path}, interval: {interval_secs}s)");
+                        tracing::info!("Rate limit monitor started (watch channel, interval: {interval_secs}s)");
                         loop {
                             interval.tick().await;
-                            // watch에서 최신 값이 있으면 갱신 (non-blocking)
                             ctx_rx.mark_changed();
                             let fresh_ctx = ctx_rx.borrow_and_update().clone();
-                            match crate::ratelimit::read_ratelimit_file(&file_path) {
-                                Some(info) => {
-                                    let text = crate::ratelimit::RateLimitMonitor::format_presence(&info);
-                                    fresh_ctx.set_activity(Some(
-                                        poise::serenity_prelude::ActivityData::watching(&text)
-                                    ));
-                                    if let Some(channel_id) = notification_channel {
-                                        monitor.check_and_alert(&info, &fresh_ctx, channel_id, lang).await;
-                                    }
-                                }
-                                None => {
-                                    fresh_ctx.set_activity(None);
-                                }
+                            let info = ratelimit_rx.borrow_and_update().clone();
+                            if info.updated_at == 0 {
+                                fresh_ctx.set_activity(None);
+                                continue;
+                            }
+                            let text = crate::ratelimit::RateLimitMonitor::format_presence(&info);
+                            if text.is_empty() {
+                                fresh_ctx.set_activity(None);
+                            } else {
+                                fresh_ctx.set_activity(Some(
+                                    poise::serenity_prelude::ActivityData::watching(&text)
+                                ));
+                            }
+                            if let Some(channel_id) = notification_channel {
+                                monitor.check_and_alert(&info, &fresh_ctx, channel_id, lang).await;
                             }
                         }
                     });

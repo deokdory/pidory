@@ -1,0 +1,25 @@
+diff --git a/src/handler/message.rs b/src/handler/message.rs
+index a63ebde..962e56a 100644
+--- a/src/handler/message.rs
++++ b/src/handler/message.rs
+@@ -3,7 +3,7 @@ use std::sync::Arc;
+ use std::sync::atomic::{AtomicBool, Ordering};
+ use std::time::{Duration, Instant};
+ 
+-use poise::serenity_prelude::{ChannelId, Context, CreateMessage, FullEvent, GuildId, MessageFlags, MessageId, UserId};
++use poise::serenity_prelude::{ChannelId, Context, CreateMessage, FullEvent, GuildId, MessageFlags, MessageId, MessageType, UserId};
+ use tokio::sync::mpsc;
+ use tokio_util::sync::CancellationToken;
+ use tracing::{error, warn};
+@@ -41,6 +41,11 @@ async fn handle_message(
+     new_message: &poise::serenity_prelude::Message,
+     data: &Data,
+ ) -> Result<(), PidoryError> {
++    // 시스템 메시지 무시 (스레드 이름 변경, 핀 등)
++    if !matches!(new_message.kind, MessageType::Regular | MessageType::InlineReply) {
++        return Ok(());
++    }
++
+     // bot 자신의 메시지 무시
+     if new_message.author.bot {
+         return Ok(());
