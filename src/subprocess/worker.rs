@@ -12,6 +12,7 @@ use tokio::sync::{mpsc, Mutex};
 use crate::db::repository;
 use crate::handler::formatter;
 use crate::i18n::Lang;
+use crate::ratelimit::RateLimitInfo;
 use super::background::BackgroundTaskTracker;
 use super::parser::{parse_line, StreamEvent, ContentBlock, build_control_response_allow, build_control_response_deny, build_control_response_ask_answer};
 use super::permission::{PermissionCache, PermissionDecision, PermissionRequest};
@@ -118,6 +119,7 @@ pub(super) struct SessionWorker {
     has_bg_tasks: Arc<AtomicBool>,
     is_turn_active: Arc<AtomicBool>,
     pending_recalls: Arc<tokio::sync::Mutex<HashMap<MessageId, (String, Arc<AtomicBool>)>>>,
+    ratelimit_tx: tokio::sync::watch::Sender<RateLimitInfo>,
     // Config/Context
     thread_id: String,
     channel_id: ChannelId,
@@ -136,6 +138,7 @@ impl SessionWorker {
         interrupt_rx: mpsc::Receiver<()>,
         permission_tx: mpsc::Sender<PermissionRequest>,
         queue_size: Arc<AtomicUsize>,
+        ratelimit_tx: tokio::sync::watch::Sender<RateLimitInfo>,
         sessions: Arc<Mutex<HashMap<String, SessionInner>>>,
         last_activity: Arc<StdMutex<Instant>>,
         has_bg_tasks: Arc<AtomicBool>,
@@ -165,6 +168,7 @@ impl SessionWorker {
             has_bg_tasks,
             is_turn_active,
             pending_recalls,
+            ratelimit_tx,
             thread_id,
             channel_id,
             ctx,
@@ -191,6 +195,7 @@ impl SessionWorker {
             ref has_bg_tasks,
             ref is_turn_active,
             ref pending_recalls,
+            ref ratelimit_tx,
             ref thread_id,
             ref channel_id,
             ref ctx,
@@ -214,6 +219,7 @@ impl SessionWorker {
                 queue_size,
                 has_bg_tasks,
                 pending_recalls,
+                &ratelimit_tx,
                 thread_id,
                 channel_id,
                 ctx,
@@ -271,6 +277,7 @@ impl SessionWorker {
                         is_turn_active,
                         last_activity,
                         pending_recalls,
+                        ratelimit_tx,
                         thread_id,
                         channel_id,
                         ctx,
@@ -326,6 +333,7 @@ async fn handle_between_turns_event(
     queue_size: &Arc<AtomicUsize>,
     has_bg_tasks: &Arc<AtomicBool>,
     pending_recalls: &Arc<tokio::sync::Mutex<HashMap<MessageId, (String, Arc<AtomicBool>)>>>,
+    ratelimit_tx: &tokio::sync::watch::Sender<RateLimitInfo>,
     thread_id: &str,
     channel_id: &ChannelId,
     ctx: &Context,
@@ -391,6 +399,7 @@ async fn handle_between_turns_event(
                                 current_triggered_by,
                                 queue_size,
                                 pending_recalls,
+                                &ratelimit_tx,
                                 thread_id,
                                 channel_id,
                                 ctx,
@@ -439,7 +448,7 @@ async fn handle_between_turns_event(
                             }
                             let perm_result = wait_for_permission(
                                 stdin, reader, line, queue_rx, interrupt_rx,
-                                queue_size, pending_recalls, thread_id, &saved_tool_name, None, &mut resp_rx,
+                                queue_size, pending_recalls, &ratelimit_tx, thread_id, &saved_tool_name, None, &mut resp_rx,
                             ).await;
                             match write_permission_response(perm_result, &saved_request_id, &saved_input, stdin, permission_cache).await {
                                 Ok(true) => return BetweenTurnsAction::Break,
@@ -499,6 +508,7 @@ async fn handle_bg_turn(
     current_triggered_by: &mut UserId,
     queue_size: &Arc<AtomicUsize>,
     pending_recalls: &Arc<tokio::sync::Mutex<HashMap<MessageId, (String, Arc<AtomicBool>)>>>,
+    ratelimit_tx: &tokio::sync::watch::Sender<RateLimitInfo>,
     thread_id: &str,
     channel_id: &ChannelId,
     ctx: &Context,
@@ -594,7 +604,7 @@ async fn handle_bg_turn(
                                     } else {
                                         let perm_result = wait_for_permission(
                                             stdin, reader, line, queue_rx, interrupt_rx,
-                                            queue_size, pending_recalls, thread_id, &saved_tool_name, None, &mut resp_rx,
+                                            queue_size, pending_recalls, &ratelimit_tx, thread_id, &saved_tool_name, None, &mut resp_rx,
                                         ).await;
                                         match write_permission_response(perm_result, &saved_request_id, &saved_input, stdin, permission_cache).await {
                                             Ok(true) | Err(_) => {
@@ -613,6 +623,15 @@ async fn handle_bg_turn(
                             }
                             Ok(StreamEvent::TaskProgress { ref task_id, ref description, .. }) => {
                                 tracker.track_progress(task_id, description);
+                            }
+                            Ok(StreamEvent::RateLimit { rate_limit_type, utilization, resets_at, is_using_overage, .. }) => {
+                                if let (Some(rlt), Some(util)) = (&rate_limit_type, utilization) {
+                                    let resets = resets_at.unwrap_or(0);
+                                    let overage = is_using_overage.unwrap_or(false);
+                                    ratelimit_tx.send_modify(|info| {
+                                        info.update_from_event(rlt, util, resets, overage);
+                                    });
+                                }
                             }
                             Ok(_) => {}
                             Err(e) => {
@@ -682,6 +701,7 @@ async fn wait_for_permission(
     interrupt_rx: &mut mpsc::Receiver<()>,
     queue_size: &Arc<AtomicUsize>,
     pending_recalls: &Arc<tokio::sync::Mutex<HashMap<MessageId, (String, Arc<AtomicBool>)>>>,
+    ratelimit_tx: &tokio::sync::watch::Sender<RateLimitInfo>,
     thread_id: &str,
     saved_tool_name: &str,
     event_tx: Option<&mpsc::Sender<StreamEvent>>,
@@ -757,6 +777,16 @@ async fn wait_for_permission(
                         if !t.is_empty() {
                             match parse_line(t) {
                                 Ok(ev) => {
+                                    // RateLimit 이벤트 → 공유 상태 업데이트
+                                    if let StreamEvent::RateLimit { rate_limit_type, utilization, resets_at, is_using_overage, .. } = &ev {
+                                        if let (Some(rlt), Some(util)) = (rate_limit_type, utilization) {
+                                            let resets = resets_at.unwrap_or(0);
+                                            let overage = is_using_overage.unwrap_or(false);
+                                            ratelimit_tx.send_modify(|info| {
+                                                info.update_from_event(rlt, *util, resets, overage);
+                                            });
+                                        }
+                                    }
                                     if let Some(tx) = event_tx {
                                         let _ = tx.send(ev).await;
                                     } else {
@@ -841,6 +871,7 @@ async fn run_active_turn(
     is_turn_active: &Arc<AtomicBool>,
     last_activity: &Arc<StdMutex<Instant>>,
     pending_recalls: &Arc<tokio::sync::Mutex<HashMap<MessageId, (String, Arc<AtomicBool>)>>>,
+    ratelimit_tx: &tokio::sync::watch::Sender<RateLimitInfo>,
     thread_id: &str,
     channel_id: &ChannelId,
     ctx: &Context,
@@ -1041,7 +1072,7 @@ async fn run_active_turn(
                                             }
                                             let perm_result = wait_for_permission(
                                                 stdin, reader, line, queue_rx, interrupt_rx,
-                                                queue_size, pending_recalls, thread_id, &saved_tool_name, Some(&event_tx), &mut resp_rx,
+                                                queue_size, pending_recalls, &ratelimit_tx, thread_id, &saved_tool_name, Some(&event_tx), &mut resp_rx,
                                             ).await;
                                             match write_permission_response(perm_result, &saved_request_id, &saved_input, stdin, permission_cache).await {
                                                 Ok(true) => break 'turn false,
@@ -1053,7 +1084,17 @@ async fn run_active_turn(
                                             }
                                             continue 'turn;
                                         }
-                                        _ => { continue 'turn; } // Init, RateLimit 등 skip
+                                        StreamEvent::RateLimit { rate_limit_type, utilization, resets_at, is_using_overage, .. } => {
+                                            if let (Some(rlt), Some(util)) = (rate_limit_type, utilization) {
+                                                let resets = resets_at.unwrap_or(0);
+                                                let overage = *is_using_overage.as_ref().unwrap_or(&false);
+                                                ratelimit_tx.send_modify(|info| {
+                                                    info.update_from_event(rlt, *util, resets, overage);
+                                                });
+                                            }
+                                            continue 'turn;
+                                        }
+                                        _ => { continue 'turn; } // Init 등 skip
                                     }
                                 }
 
@@ -1116,6 +1157,7 @@ async fn run_active_turn(
                                         interrupt_rx,
                                         queue_size,
                                         pending_recalls,
+                                        &ratelimit_tx,
                                         thread_id,
                                         &saved_tool_name,
                                         Some(&event_tx),
@@ -1135,6 +1177,17 @@ async fn run_active_turn(
                                     timeout_deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
                                     tracing::debug!(thread_id = %thread_id, "Timeout deadline reset");
                                     continue 'turn;
+                                }
+
+                                // RateLimit 이벤트 → 공유 상태 업데이트
+                                if let StreamEvent::RateLimit { ref rate_limit_type, utilization, resets_at, is_using_overage, .. } = event {
+                                    if let (Some(rlt), Some(util)) = (rate_limit_type, utilization) {
+                                        let resets = resets_at.unwrap_or(0);
+                                        let overage = is_using_overage.unwrap_or(false);
+                                        ratelimit_tx.send_modify(|info| {
+                                            info.update_from_event(rlt, util, resets, overage);
+                                        });
+                                    }
                                 }
 
                                 // 일반 이벤트 처리

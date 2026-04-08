@@ -35,6 +35,9 @@ pub enum StreamEvent {
         status: String,
         resets_at: Option<u64>,
         session_id: String,
+        rate_limit_type: Option<String>,
+        utilization: Option<f64>,
+        is_using_overage: Option<bool>,
     },
     Result {
         subtype: String,
