@@ -60,6 +60,52 @@ async fn resolve_reply_context(
     })
 }
 
+async fn perform_immediate_reset(
+    ctx: &Context,
+    data: &Data,
+    db: &sqlx::SqlitePool,
+    thread_id: &str,
+    channel_id: poise::serenity_prelude::ChannelId,
+    lang: crate::i18n::Lang,
+) -> Result<(), PidoryError> {
+    // 기존 confirm 버튼 pending이 있으면 만료 처리
+    let old_pending = data.pending_resets.lock().await.remove(thread_id);
+    if let Some(p) = old_pending {
+        let _ = reset_ui::disable_reset_buttons(ctx, channel_id, p.message_id, reset_ui::ResetOutcome::Expired).await;
+    }
+
+    // kill_session
+    match data.sessions.kill_session(thread_id).await {
+        Ok(()) | Err(PidoryError::NotFound(_)) => {}
+        Err(e) => {
+            channel_id
+                .say(ctx, format!("❌ {}", lang.error_with(&e)))
+                .await
+                .ok();
+            return Err(PidoryError::Subprocess(format!("kill_session failed: {}", e)));
+        }
+    }
+
+    // 메모리 맵 정리
+    data.session_skills.lock().await.remove(thread_id);
+    data.pending_permissions.lock().await.retain(|_, p| p.thread_id != thread_id);
+    data.pending_question_groups.lock().await.retain(|_, g| g.thread_id != thread_id);
+    data.needs_context.lock().await.remove(thread_id);
+    data.turn_initiators.lock().await.remove(thread_id);
+    data.turn_participants.lock().await.remove(thread_id);
+
+    // DB 삭제
+    let _ = repository::delete_session(db, thread_id).await;
+
+    // Discord 알림
+    channel_id
+        .say(ctx, format!("-# ♻️ {}", lang.session_reset()))
+        .await
+        .map_err(|e| PidoryError::Discord(Box::new(e)))?;
+
+    Ok(())
+}
+
 async fn handle_message(
     ctx: &Context,
     new_message: &poise::serenity_prelude::Message,
@@ -243,23 +289,7 @@ async fn handle_message(
 
             return Ok(());
         } else {
-            // 즉시 kill 경로
-            if let Err(e) = data.sessions.kill_session(&thread_id).await {
-                if !matches!(e, PidoryError::NotFound(_)) {
-                    warn!("Failed to kill session {}: {}", thread_id, e);
-                }
-            }
-            data.session_skills.lock().await.remove(&thread_id);
-            data.pending_permissions.lock().await.retain(|_, p| p.thread_id != thread_id);
-            data.pending_question_groups.lock().await.retain(|_, g| g.thread_id != thread_id);
-            data.needs_context.lock().await.remove(&thread_id);
-            data.turn_initiators.lock().await.remove(&thread_id);
-            data.turn_participants.lock().await.remove(&thread_id);
-            let _ = repository::delete_session(db, &thread_id).await;
-            channel_id
-                .say(ctx, format!("-# ♻️ {}", lang.session_reset()))
-                .await
-                .map_err(|e| PidoryError::Discord(Box::new(e)))?;
+            perform_immediate_reset(ctx, data, db, &thread_id, channel_id, lang).await?;
             return Ok(());
         }
     }
@@ -465,23 +495,7 @@ pub async fn execute_in_session(
 
             return Ok(());
         } else {
-            // 즉시 kill 경로
-            if let Err(e) = data.sessions.kill_session(thread_id).await {
-                if !matches!(e, PidoryError::NotFound(_)) {
-                    warn!("Failed to kill session {}: {}", thread_id, e);
-                }
-            }
-            data.session_skills.lock().await.remove(thread_id);
-            data.pending_permissions.lock().await.retain(|_, p| p.thread_id != thread_id);
-            data.pending_question_groups.lock().await.retain(|_, g| g.thread_id != thread_id);
-            data.needs_context.lock().await.remove(thread_id);
-            data.turn_initiators.lock().await.remove(thread_id);
-            data.turn_participants.lock().await.remove(thread_id);
-            let _ = repository::delete_session(db, thread_id).await;
-            channel_id
-                .say(ctx, format!("-# ♻️ {}", lang.session_reset()))
-                .await
-                .map_err(|e| PidoryError::Discord(Box::new(e)))?;
+            perform_immediate_reset(ctx, data, db, thread_id, channel_id, lang).await?;
             return Ok(());
         }
     }
