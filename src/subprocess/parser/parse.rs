@@ -298,10 +298,23 @@ pub fn parse_line(line: &str) -> Result<StreamEvent, serde_json::Error> {
             let resets_at = rate_limit_info
                 .and_then(|r| r.get("resetsAt"))
                 .and_then(|r| r.as_u64());
+            let rate_limit_type = rate_limit_info
+                .and_then(|r| r.get("rateLimitType"))
+                .and_then(|s| s.as_str())
+                .map(|s| s.to_string());
+            let utilization = rate_limit_info
+                .and_then(|r| r.get("utilization"))
+                .and_then(|u| u.as_f64());
+            let is_using_overage = rate_limit_info
+                .and_then(|r| r.get("isUsingOverage"))
+                .and_then(|b| b.as_bool());
             Ok(StreamEvent::RateLimit {
                 status,
                 resets_at,
                 session_id,
+                rate_limit_type,
+                utilization,
+                is_using_overage,
             })
         }
         "result" => {
@@ -524,9 +537,39 @@ mod tests {
     fn parse_rate_limit() {
         let line = r#"{"type":"rate_limit_event","session_id":"abc","rate_limit_info":{"status":"allowed","resetsAt":12345}}"#;
         let event = parse_line(line).unwrap();
-        if let StreamEvent::RateLimit { status, resets_at, .. } = event {
+        if let StreamEvent::RateLimit { status, resets_at, rate_limit_type, utilization, is_using_overage, .. } = event {
             assert_eq!(status, "allowed");
             assert_eq!(resets_at, Some(12345));
+            assert_eq!(rate_limit_type, None);
+            assert_eq!(utilization, None);
+            assert_eq!(is_using_overage, None);
+        } else {
+            panic!("Expected RateLimit");
+        }
+    }
+
+    #[test]
+    fn parse_rate_limit_with_utilization() {
+        let line = r#"{"type":"rate_limit_event","session_id":"abc","rate_limit_info":{"status":"allowed_warning","resetsAt":1776042000,"rateLimitType":"seven_day","utilization":0.57,"isUsingOverage":false}}"#;
+        let event = parse_line(line).unwrap();
+        if let StreamEvent::RateLimit { status, resets_at, rate_limit_type, utilization, is_using_overage, .. } = event {
+            assert_eq!(status, "allowed_warning");
+            assert_eq!(resets_at, Some(1776042000));
+            assert_eq!(rate_limit_type, Some("seven_day".to_string()));
+            assert!((utilization.unwrap() - 0.57).abs() < 0.001);
+            assert_eq!(is_using_overage, Some(false));
+        } else {
+            panic!("Expected RateLimit");
+        }
+    }
+
+    #[test]
+    fn parse_rate_limit_five_hour() {
+        let line = r#"{"type":"rate_limit_event","session_id":"abc","rate_limit_info":{"status":"allowed","resetsAt":12345,"rateLimitType":"five_hour","utilization":0.24,"isUsingOverage":false}}"#;
+        let event = parse_line(line).unwrap();
+        if let StreamEvent::RateLimit { rate_limit_type, utilization, .. } = event {
+            assert_eq!(rate_limit_type, Some("five_hour".to_string()));
+            assert!((utilization.unwrap() - 0.24).abs() < 0.001);
         } else {
             panic!("Expected RateLimit");
         }

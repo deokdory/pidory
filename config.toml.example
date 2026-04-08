@@ -21,6 +21,5 @@ max_chunk_length = 1900       # Discord 2000자 여유분
 max_chunks = 10               # 초과 시 파일 첨부
 
 # [ratelimit]
-# file_path = "/tmp/pidory-ratelimits.json"  # statusline-ratelimit-writer.sh 출력 파일 경로
 # update_interval_secs = 60                   # presence 업데이트 주기 (초)
 # alert_thresholds = [50, 80]                 # 5h rate limit 경고 임계값 (%)

@@ -15,6 +15,7 @@ use std::process::Stdio;
 use crate::config::ClaudeConfig;
 use crate::error::PidoryError;
 use crate::i18n::Lang;
+use crate::ratelimit::RateLimitInfo;
 use crate::PendingPermission;
 use super::parser::StreamEvent;
 use super::permission::PermissionRequest;
@@ -58,15 +59,21 @@ pub struct SessionManager {
     config: Arc<ClaudeConfig>,
     max_sessions: usize,
     pending_recalls: Arc<tokio::sync::Mutex<HashMap<MessageId, (String, Arc<AtomicBool>)>>>,
+    ratelimit_tx: tokio::sync::watch::Sender<RateLimitInfo>,
 }
 
 impl SessionManager {
-    pub fn new(config: Arc<ClaudeConfig>, max_sessions: usize) -> Self {
+    pub fn new(
+        config: Arc<ClaudeConfig>,
+        max_sessions: usize,
+        ratelimit_tx: tokio::sync::watch::Sender<RateLimitInfo>,
+    ) -> Self {
         Self {
             sessions: Arc::new(Mutex::new(HashMap::new())),
             config,
             max_sessions,
             pending_recalls: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            ratelimit_tx,
         }
     }
 
@@ -177,6 +184,7 @@ impl SessionManager {
             interrupt_rx,
             permission_tx.clone(),
             Arc::clone(&queue_size),
+            self.ratelimit_tx.clone(),
             sessions_clone,
             Arc::clone(&last_activity),
             Arc::clone(&has_active_bg_tasks),
