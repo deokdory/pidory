@@ -17,7 +17,7 @@ use crate::handler::attachment_download;
 use crate::handler::emoji;
 use crate::handler::emoji::ReactionStatus;
 use crate::subprocess::parser::StreamEvent;
-use crate::subprocess::session_manager::QueuedMessage;
+use crate::subprocess::session_manager::{QueuedMessage, ReplyContext};
 use crate::Data;
 
 pub async fn handle_event(
@@ -36,6 +36,47 @@ pub async fn handle_event(
         }
         _ => Ok(()),
     }
+}
+
+async fn resolve_reply_context(
+    ctx: &Context,
+    message: &poise::serenity_prelude::Message,
+) -> Option<ReplyContext> {
+    // 1. referenced_message 우선 사용 (Gateway에서 resolve된 값)
+    if let Some(ref referenced) = message.referenced_message {
+        let content = referenced.content.trim();
+        if content.is_empty() {
+            return None;
+        }
+        return Some(ReplyContext {
+            original_content: content.to_string(),
+            original_author_name: referenced.author.name.clone(),
+        });
+    }
+
+    // 2. referenced_message가 None이면 message_reference로 HTTP fetch
+    if let Some(ref msg_ref) = message.message_reference {
+        if let Some(ref_msg_id) = msg_ref.message_id {
+            match message.channel_id.message(ctx, ref_msg_id).await {
+                Ok(fetched) => {
+                    let content = fetched.content.trim();
+                    if content.is_empty() {
+                        return None;
+                    }
+                    return Some(ReplyContext {
+                        original_content: content.to_string(),
+                        original_author_name: fetched.author.name.clone(),
+                    });
+                }
+                Err(e) => {
+                    warn!("Failed to fetch referenced message {}: {}", ref_msg_id, e);
+                    return None;
+                }
+            }
+        }
+    }
+
+    None
 }
 
 async fn handle_message(
@@ -95,6 +136,13 @@ async fn handle_message(
     tracing::info!(thread_id = %thread_id, "Message received in thread");
     let channel_id = new_message.channel_id;
     let msg_id = new_message.id;
+
+    // reply context resolve (InlineReply인 경우)
+    let reply_context = if new_message.kind == MessageType::InlineReply {
+        resolve_reply_context(ctx, new_message).await
+    } else {
+        None
+    };
 
     // 세션 DB 확인/생성
     let is_new_session;
@@ -214,6 +262,7 @@ async fn handle_message(
             triggered_by: new_message.author.id,
             cancelled: Arc::new(AtomicBool::new(false)),
             downloaded_files: mid_turn_downloaded_files.clone(),
+            reply_context: reply_context.clone(),
         };
 
         match data.sessions.send_message(&thread_id, msg).await {
@@ -290,6 +339,7 @@ async fn handle_message(
         triggered_by: new_message.author.id,
         cancelled: Arc::new(AtomicBool::new(false)),
         downloaded_files: primary_downloaded_files.clone(),
+        reply_context: reply_context.clone(),
     };
 
     if let Err(e) = data.sessions.send_message(&thread_id, msg).await {
@@ -378,6 +428,7 @@ pub async fn execute_in_session(
             triggered_by,
             cancelled: Arc::new(AtomicBool::new(false)),
             downloaded_files: Vec::new(),
+            reply_context: None,
         };
         data.sessions.send_message(thread_id, msg).await?;
         // mid-turn inject 사용자를 participants에 추가
@@ -404,6 +455,7 @@ pub async fn execute_in_session(
         triggered_by,
         cancelled: Arc::new(AtomicBool::new(false)),
         downloaded_files: Vec::new(),
+        reply_context: None,
     };
 
     // turn_participants 초기화 (skill 직접 실행 경로)

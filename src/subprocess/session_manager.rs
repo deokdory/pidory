@@ -24,6 +24,12 @@ pub struct SessionCreateResult {
     pub evicted_thread_id: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+pub struct ReplyContext {
+    pub original_content: String,
+    pub original_author_name: String,
+}
+
 pub struct QueuedMessage {
     pub content: String,
     pub channel_id: ChannelId,
@@ -32,6 +38,7 @@ pub struct QueuedMessage {
     pub triggered_by: UserId,
     pub cancelled: Arc<AtomicBool>,
     pub downloaded_files: Vec<String>,  // 다운로드된 파일의 절대 경로
+    pub reply_context: Option<ReplyContext>,
 }
 
 pub(super) struct SessionInner {
