@@ -23,3 +23,8 @@ max_chunks = 10               # 초과 시 파일 첨부
 # [ratelimit]
 # update_interval_secs = 60                   # presence 업데이트 주기 (초)
 # alert_thresholds = [50, 80]                 # 5h rate limit 경고 임계값 (%)
+
+# [attachment]
+# max_file_size_mb = 500       # 파일 1개 최대 크기 (MB), Discord Nitro: 500 / Basic: 50 / Free: 10
+# max_aggregate_size_mb = 500  # 메시지당 첨부파일 총 크기 (MB)
+# download_timeout_secs = 120  # 다운로드 타임아웃 (초)
