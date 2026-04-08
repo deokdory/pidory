@@ -37,11 +37,13 @@ async fn say_silent_chunked(ctx: &Context, channel_id: &ChannelId, text: &str) {
 fn build_user_message_json(content: &str, downloaded_files: &[String], reply_context: Option<&ReplyContext>) -> String {
     let mut text = String::new();
 
-    // 1. reply context — plain user content (신뢰 경계 분리, prompt injection 방지)
+    // 1. reply context — system-reminder로 신뢰 경계 분리, </system-reminder> 인젝션 방지
     if let Some(reply) = reply_context {
+        let safe_author = reply.original_author_name.replace("</system-reminder>", "");
+        let safe_content = reply.original_content.replace("</system-reminder>", "");
         text.push_str(&format!(
-            "[Reply to @{}: {}]\n\n",
-            reply.original_author_name, reply.original_content
+            "<system-reminder>\n이 메시지는 다음 메시지에 대한 reply(답장)입니다:\n[원본 작성자: {}]\n{}\n</system-reminder>\n\n",
+            safe_author, safe_content
         ));
     }
 
