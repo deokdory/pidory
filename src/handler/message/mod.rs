@@ -300,7 +300,14 @@ async fn handle_message(
     if !acquired {
         // mid-turn inject: event_tx 없이 전송 (context inject 안 함, needs_context 소비 안 함)
         let mid_turn_downloaded_files =
-            download_message_attachments(&new_message.attachments, &project.path, channel_id, msg_id, ctx).await;
+            download_message_attachments(
+                &new_message.attachments,
+                &project.path,
+                channel_id,
+                msg_id,
+                ctx,
+                &data.config.attachment,
+            ).await;
 
         let msg = QueuedMessage {
             content: new_message.content.clone(),
@@ -379,8 +386,22 @@ async fn handle_message(
         .await
         .insert(thread_id.clone(), std::collections::HashSet::from([new_message.author.id]));
 
+    // 첨부파일 있으면 ⏬ reaction 먼저
+    if !new_message.attachments.is_empty() {
+        emoji::set_reaction(ctx, channel_id, msg_id, ReactionStatus::Downloading)
+            .await
+            .ok();
+    }
+
     let primary_downloaded_files =
-        download_message_attachments(&new_message.attachments, &project.path, channel_id, msg_id, ctx).await;
+        download_message_attachments(
+            &new_message.attachments,
+            &project.path,
+            channel_id,
+            msg_id,
+            ctx,
+            &data.config.attachment,
+        ).await;
 
     emoji::set_reaction(ctx, channel_id, msg_id, ReactionStatus::Running)
         .await
@@ -594,6 +615,7 @@ async fn download_message_attachments(
     channel_id: ChannelId,
     msg_id: MessageId,
     ctx: &Context,
+    attachment_config: &crate::config::AttachmentConfig,
 ) -> Vec<String> {
     if attachments.is_empty() {
         return Vec::new();
@@ -603,6 +625,9 @@ async fn download_message_attachments(
         std::path::Path::new(project_path),
         channel_id.get(),
         msg_id.get(),
+        attachment_config.max_file_size_bytes(),
+        attachment_config.max_aggregate_size_bytes(),
+        attachment_config.download_timeout_secs,
     )
     .await;
     for err in &errors {

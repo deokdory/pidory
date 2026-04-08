@@ -10,6 +10,7 @@ pub enum ReactionStatus {
     #[allow(dead_code)]
     Timeout,
     Interrupted,
+    Downloading,
 }
 
 impl ReactionStatus {
@@ -20,11 +21,12 @@ impl ReactionStatus {
             ReactionStatus::Error => "❌",
             ReactionStatus::Timeout => "⏰",
             ReactionStatus::Interrupted => "⛔",
+            ReactionStatus::Downloading => "⏬",
         }
     }
 }
 
-const ALL_EMOJIS: &[&str] = &["🔄", "✅", "❌", "⏰", "📨", "⛔"];
+const ALL_EMOJIS: &[&str] = &["🔄", "✅", "❌", "⏰", "📨", "⛔", "⏬"];
 
 pub async fn set_reaction(
     ctx: &Context,
