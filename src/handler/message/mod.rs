@@ -39,44 +39,24 @@ pub async fn handle_event(
 }
 
 async fn resolve_reply_context(
-    ctx: &Context,
+    _ctx: &Context,
     message: &poise::serenity_prelude::Message,
 ) -> Option<ReplyContext> {
-    // 1. referenced_message 우선 사용 (Gateway에서 resolve된 값)
-    if let Some(ref referenced) = message.referenced_message {
-        let content = referenced.content.trim();
-        if content.is_empty() {
-            return None;
-        }
-        return Some(ReplyContext {
-            original_content: content.to_string(),
-            original_author_name: referenced.author.name.clone(),
-        });
-    }
+    // Use Gateway-resolved referenced_message only (no HTTP fallback to preserve queue order)
+    let referenced = message.referenced_message.as_ref()?;
+    let content = referenced.content.trim();
 
-    // 2. referenced_message가 None이면 message_reference로 HTTP fetch
-    if let Some(ref msg_ref) = message.message_reference {
-        if let Some(ref_msg_id) = msg_ref.message_id {
-            match message.channel_id.message(ctx, ref_msg_id).await {
-                Ok(fetched) => {
-                    let content = fetched.content.trim();
-                    if content.is_empty() {
-                        return None;
-                    }
-                    return Some(ReplyContext {
-                        original_content: content.to_string(),
-                        original_author_name: fetched.author.name.clone(),
-                    });
-                }
-                Err(e) => {
-                    warn!("Failed to fetch referenced message {}: {}", ref_msg_id, e);
-                    return None;
-                }
-            }
-        }
-    }
+    // Include fallback text when content is empty (attachment-only, embed-only, etc.)
+    let original_content = if content.is_empty() {
+        "(텍스트 없음 — 이미지/파일/임베드만 있는 메시지)".to_string()
+    } else {
+        content.to_string()
+    };
 
-    None
+    Some(ReplyContext {
+        original_content,
+        original_author_name: referenced.author.name.clone(),
+    })
 }
 
 async fn handle_message(

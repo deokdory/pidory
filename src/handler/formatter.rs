@@ -681,6 +681,8 @@ pub async fn send_reply(
         let message = CreateMessage::new()
             .content(content)
             .reference_message((channel_id, msg_id))
+            // TODO(reply-activate): fail_if_not_exists(false) 추가 필요.
+            // serenity API 확인 후 reply 기능 활성화 시 처리.
             .allowed_mentions(CreateAllowedMentions::new());
         channel_id.send_message(ctx, message).await
     } else {
