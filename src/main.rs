@@ -53,6 +53,7 @@ pub struct Data {
     pub sessions: Arc<SessionManager>,
     pub pending_permissions: Arc<Mutex<HashMap<String, PendingPermission>>>,
     pub pending_question_groups: Arc<Mutex<HashMap<String, PendingQuestionGroup>>>,
+    pub pending_resets: Arc<Mutex<HashMap<String, handler::reset_ui::PendingReset>>>,
     pub session_skills: Arc<Mutex<HashMap<String, Vec<String>>>>,
     pub needs_context: Arc<Mutex<HashSet<String>>>,
     pub turn_initiators: Arc<Mutex<HashMap<String, serenity::UserId>>>,
@@ -120,6 +121,7 @@ async fn main() -> Result<(), PidoryError> {
 
                 let pending_permissions: Arc<Mutex<HashMap<String, PendingPermission>>> = Arc::new(Mutex::new(HashMap::new()));
                 let pending_question_groups: Arc<Mutex<HashMap<String, PendingQuestionGroup>>> = Arc::new(Mutex::new(HashMap::new()));
+                let pending_resets: Arc<Mutex<HashMap<String, handler::reset_ui::PendingReset>>> = Arc::new(Mutex::new(HashMap::new()));
                 let session_skills = Arc::new(Mutex::new(HashMap::new()));
                 let turn_initiators: Arc<Mutex<HashMap<String, serenity::UserId>>> = Arc::new(Mutex::new(HashMap::new()));
                 let turn_participants: Arc<Mutex<HashMap<String, HashSet<serenity::UserId>>>> = Arc::new(Mutex::new(HashMap::new()));
@@ -250,6 +252,7 @@ async fn main() -> Result<(), PidoryError> {
                     sessions,
                     pending_permissions,
                     pending_question_groups,
+                    pending_resets,
                     session_skills,
                     needs_context,
                     turn_initiators,
