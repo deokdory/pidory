@@ -39,44 +39,24 @@ pub async fn handle_event(
 }
 
 async fn resolve_reply_context(
-    ctx: &Context,
+    _ctx: &Context,
     message: &poise::serenity_prelude::Message,
 ) -> Option<ReplyContext> {
-    // 1. referenced_message 우선 사용 (Gateway에서 resolve된 값)
-    if let Some(ref referenced) = message.referenced_message {
-        let content = referenced.content.trim();
-        if content.is_empty() {
-            return None;
-        }
-        return Some(ReplyContext {
-            original_content: content.to_string(),
-            original_author_name: referenced.author.name.clone(),
-        });
-    }
+    // Use Gateway-resolved referenced_message only (no HTTP fallback to preserve queue order)
+    let referenced = message.referenced_message.as_ref()?;
+    let content = referenced.content.trim();
 
-    // 2. referenced_message가 None이면 message_reference로 HTTP fetch
-    if let Some(ref msg_ref) = message.message_reference {
-        if let Some(ref_msg_id) = msg_ref.message_id {
-            match message.channel_id.message(ctx, ref_msg_id).await {
-                Ok(fetched) => {
-                    let content = fetched.content.trim();
-                    if content.is_empty() {
-                        return None;
-                    }
-                    return Some(ReplyContext {
-                        original_content: content.to_string(),
-                        original_author_name: fetched.author.name.clone(),
-                    });
-                }
-                Err(e) => {
-                    warn!("Failed to fetch referenced message {}: {}", ref_msg_id, e);
-                    return None;
-                }
-            }
-        }
-    }
+    // Include fallback text when content is empty (attachment-only, embed-only, etc.)
+    let original_content = if content.is_empty() {
+        "(텍스트 없음 — 이미지/파일/임베드만 있는 메시지)".to_string()
+    } else {
+        content.to_string()
+    };
 
-    None
+    Some(ReplyContext {
+        original_content,
+        original_author_name: referenced.author.name.clone(),
+    })
 }
 
 async fn handle_message(
@@ -221,31 +201,6 @@ async fn handle_message(
 
     let is_new_command = helpers::is_context_reset_command(&new_message.content);
 
-    // /new 또는 /clear: 세션을 완전히 종료하고 다음 메시지에서 새 세션 자동 생성
-    if is_new_command {
-        // kill_session 실패는 세션이 이미 없거나 kill 실패. 후자는 로깅하고 계속 진행.
-        if let Err(e) = data.sessions.kill_session(&thread_id).await {
-            // NotFound 에러는 무시 (세션이 이미 없음)
-            if !e.to_string().contains("not found") {
-                tracing::warn!("Failed to kill session {}: {}", thread_id, e);
-            }
-        }
-        // 메모리 맵 정리
-        data.session_skills.lock().await.remove(&thread_id);
-        data.pending_permissions.lock().await.retain(|_, p| p.thread_id != thread_id);
-        data.pending_question_groups.lock().await.retain(|_, g| g.thread_id != thread_id);
-        data.needs_context.lock().await.remove(&thread_id);
-        data.turn_initiators.lock().await.remove(&thread_id);
-        data.turn_participants.lock().await.remove(&thread_id);
-        // DB 레코드 삭제 (kill 성공 여부와 무관, 어차피 세션은 이미 없음)
-        let _ = repository::delete_session(db, &thread_id).await;
-        channel_id
-            .say(ctx, format!("-# ♻️ {}", lang.session_reset()))
-            .await
-            .map_err(|e| PidoryError::Discord(Box::new(e)))?;
-        return Ok(());
-    }
-
     // 원자적 acquire: running이 아닌 경우에만 running으로 전환
     let acquired = repository::try_acquire_session(db, &thread_id).await?;
 
@@ -267,6 +222,10 @@ async fn handle_message(
 
         match data.sessions.send_message(&thread_id, msg).await {
             Ok(()) => {
+                // /new가 성공적으로 큐잉된 후에만 flag 세팅
+                if is_new_command {
+                    data.needs_context.lock().await.insert(thread_id.clone());
+                }
                 // mid-turn inject 사용자를 participants에 추가
                 data.turn_participants
                     .lock()
@@ -308,7 +267,11 @@ async fn handle_message(
     }
 
     // 직접 실행 경로: context inject 판정 (primary 경로만)
-    let had_needs_context = data.needs_context.lock().await.remove(&thread_id);
+    let had_needs_context = if !is_new_command {
+        data.needs_context.lock().await.remove(&thread_id)
+    } else {
+        false
+    };
     let content = helpers::build_context_content(&new_message.content, is_new_session, had_needs_context, &guild_channel.name, lang);
 
     // turn 시작: 이 turn 의 triggering user 를 기록 (permission 위임용)
@@ -358,6 +321,11 @@ async fn handle_message(
         return Ok(());
     }
 
+    // /new가 성공적으로 전송된 후에만 flag 세팅
+    if is_new_command {
+        data.needs_context.lock().await.insert(thread_id.clone());
+    }
+
     process_turn_events(
         ctx,
         event_rx,
@@ -390,32 +358,6 @@ pub async fn execute_in_session(
 
     let is_new_command = helpers::is_context_reset_command(content);
 
-    // /new 또는 /clear: 세션을 완전히 종료하고 다음 메시지에서 새 세션 자동 생성
-    if is_new_command {
-        let lang = data.config.language;
-        // kill_session 실패는 세션이 이미 없거나 kill 실패. 후자는 로깅하고 계속 진행.
-        if let Err(e) = data.sessions.kill_session(thread_id).await {
-            // NotFound 에러는 무시 (세션이 이미 없음)
-            if !e.to_string().contains("not found") {
-                tracing::warn!("Failed to kill session {}: {}", thread_id, e);
-            }
-        }
-        // 메모리 맵 정리
-        data.session_skills.lock().await.remove(thread_id);
-        data.pending_permissions.lock().await.retain(|_, p| p.thread_id != thread_id);
-        data.pending_question_groups.lock().await.retain(|_, g| g.thread_id != thread_id);
-        data.needs_context.lock().await.remove(thread_id);
-        data.turn_initiators.lock().await.remove(thread_id);
-        data.turn_participants.lock().await.remove(thread_id);
-        // DB 레코드 삭제 (kill 성공 여부와 무관, 어차피 세션은 이미 없음)
-        let _ = repository::delete_session(db, thread_id).await;
-        channel_id
-            .say(ctx, format!("-# ♻️ {}", lang.session_reset()))
-            .await
-            .map_err(|e| PidoryError::Discord(Box::new(e)))?;
-        return Ok(());
-    }
-
     let acquired = repository::try_acquire_session(db, thread_id).await?;
 
     if !acquired {
@@ -431,6 +373,9 @@ pub async fn execute_in_session(
             reply_context: None,
         };
         data.sessions.send_message(thread_id, msg).await?;
+        if is_new_command {
+            data.needs_context.lock().await.insert(thread_id.to_string());
+        }
         // mid-turn inject 사용자를 participants에 추가
         data.turn_participants
             .lock()
@@ -471,6 +416,10 @@ pub async fn execute_in_session(
             .ok();
         repository::update_session_status(db, thread_id, "error").await?;
         return Err(e);
+    }
+
+    if is_new_command {
+        data.needs_context.lock().await.insert(thread_id.to_string());
     }
 
     process_turn_events(

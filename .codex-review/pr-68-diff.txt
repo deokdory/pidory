@@ -1,0 +1,62 @@
+diff --git a/src/subprocess/session_manager.rs b/src/subprocess/session_manager.rs
+index bdb0de5..dc4c00e 100644
+--- a/src/subprocess/session_manager.rs
++++ b/src/subprocess/session_manager.rs
+@@ -207,7 +207,7 @@ impl SessionManager {
+                 !s.is_turn_active.load(Ordering::Relaxed)
+                 && !s.has_active_bg_tasks.load(Ordering::Relaxed)
+             })
+-            .min_by_key(|(_, s)| *s.last_activity.lock().unwrap())
++            .min_by_key(|(_, s)| *s.last_activity.lock().unwrap_or_else(|p| p.into_inner()))
+             .map(|(tid, _)| tid.clone())
+     }
+ 
+@@ -283,7 +283,7 @@ impl SessionManager {
+         sessions.iter().map(|(tid, s)| {
+             SessionInfo {
+                 thread_id: tid.clone(),
+-                idle_duration: now.duration_since(*s.last_activity.lock().unwrap()),
++                idle_duration: now.duration_since(*s.last_activity.lock().unwrap_or_else(|p| p.into_inner())),
+                 has_bg_tasks: s.has_active_bg_tasks.load(Ordering::Relaxed),
+                 is_turn_active: s.is_turn_active.load(Ordering::Relaxed),
+             }
+@@ -300,7 +300,7 @@ impl SessionManager {
+             .filter(|(_, s)| {
+                 !s.is_turn_active.load(Ordering::Relaxed)
+                 && !s.has_active_bg_tasks.load(Ordering::Relaxed)
+-                && now.duration_since(*s.last_activity.lock().unwrap()) > idle_timeout
++                && now.duration_since(*s.last_activity.lock().unwrap_or_else(|p| p.into_inner())) > idle_timeout
+             })
+             .map(|(tid, _)| tid.clone())
+             .collect();
+diff --git a/src/subprocess/worker.rs b/src/subprocess/worker.rs
+index 1b85255..9ede0e8 100644
+--- a/src/subprocess/worker.rs
++++ b/src/subprocess/worker.rs
+@@ -195,7 +195,7 @@ impl SessionWorker {
+                 BetweenTurnsAction::Break => break,
+                 BetweenTurnsAction::ProcessMessage(msg) => {
+                     queue_size.fetch_sub(1, Ordering::Relaxed);
+-                    *last_activity.lock().unwrap() = Instant::now();
++                    *last_activity.lock().unwrap_or_else(|p| p.into_inner()) = Instant::now();
+ 
+                     let json_line = build_user_message_json(&msg.content);
+                     if let Err(e) = stdin.write_all(json_line.as_bytes()).await {
+@@ -796,7 +796,7 @@ async fn run_active_turn(
+                 match new_msg {
+                     Some(m) => {
+                         queue_size.fetch_sub(1, Ordering::Relaxed);
+-                        *last_activity.lock().unwrap() = Instant::now();
++                        *last_activity.lock().unwrap_or_else(|p| p.into_inner()) = Instant::now();
+                         let inject_line = build_user_message_json(&m.content);
+                         if let Err(e) = stdin.write_all(inject_line.as_bytes()).await {
+                             tracing::error!("mid-turn stdin write error: {}", e);
+@@ -1045,7 +1045,7 @@ async fn run_active_turn(
+                                 let _ = event_tx.send(event).await;
+                                 if is_result {
+                                     is_turn_active.store(false, Ordering::Relaxed);
+-                                    *last_activity.lock().unwrap() = Instant::now();
++                                    *last_activity.lock().unwrap_or_else(|p| p.into_inner()) = Instant::now();
+                                     break 'turn false;
+                                 }
+                             }

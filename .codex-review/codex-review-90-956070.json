@@ -1,0 +1,1 @@
+{"findings":[],"summary":"No issues found in the refactor diff for module visibility, re-exports, import-path preservation, allow-annotation preservation, test retention, or new ownership/clone regressions.","files_reviewed":17}
