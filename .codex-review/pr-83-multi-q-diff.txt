@@ -1,0 +1,832 @@
+diff --git a/src/handler/message.rs b/src/handler/message.rs
+index 1bdc2ef..8cfc734 100644
+--- a/src/handler/message.rs
++++ b/src/handler/message.rs
+@@ -125,6 +125,7 @@ async fn handle_message(
+             data.db.clone(),
+             lang,
+             data.pending_permissions.clone(),
++            data.pending_question_groups.clone(),
+             data.config.discord.owner_id,
+         )
+         .await
+@@ -137,6 +138,7 @@ async fn handle_message(
+             );
+             if let Some(evicted_tid) = result.evicted_thread_id {
+                 data.pending_permissions.lock().await.retain(|_, p| p.thread_id != evicted_tid);
++                data.pending_question_groups.lock().await.retain(|_, g| g.thread_id != evicted_tid);
+                 data.session_skills.lock().await.remove(&evicted_tid);
+                 data.needs_context.lock().await.remove(&evicted_tid);
+                 data.turn_initiators.lock().await.remove(&evicted_tid);
+@@ -322,6 +324,38 @@ async fn verify_component_auth(
+     Some(triggered_by)
+ }
+ 
++/// Handles a question answer — either direct (single question) or group (multi-question).
++/// Returns the label of the answered option for UI feedback.
++async fn handle_question_answer(
++    data: &Data,
++    request_id: &str,
++    answer: String,
++    question_index: usize,
++) {
++    if let Some((group_id, _q_idx)) = question_ui::parse_sub_request_id(request_id) {
++        // Multi-question group member
++        let mut groups = data.pending_question_groups.lock().await;
++        if let Some(group) = groups.get_mut(&group_id) {
++            let key = format!("q_{}", _q_idx);
++            group.answers.insert(key, answer);
++            if group.answers.len() >= group.total {
++                // All answers collected — send combined answer
++                let group = groups.remove(&group_id).unwrap();
++                let _ = group.response_tx.send(PermissionDecision::Answer(group.answers));
++            }
++        }
++    } else {
++        // Single question — send directly via PendingPermission
++        let pending = data.pending_permissions.lock().await.remove(request_id);
++        if let Some(p) = pending {
++            let answers = HashMap::from([
++                (format!("q_{}", question_index), answer),
++            ]);
++            let _ = p.response_tx.send(PermissionDecision::Answer(answers));
++        }
++    }
++}
++
+ async fn handle_interaction(
+     ctx: &Context,
+     interaction: &poise::serenity_prelude::Interaction,
+@@ -418,9 +452,15 @@ async fn handle_interaction(
+         let pending = data.pending_permissions.lock().await.remove(&request_id);
+         if let Some(p) = pending {
+             let message_id = p.message_id;
+-            let label =
+-                question_ui::resolve_option_label(&p.input.unwrap_or_default(), option_index);
+-            let _ = p.response_tx.send(PermissionDecision::Answer(label.clone()));
++            let question_index = question_ui::parse_sub_request_id(&request_id)
++                .map(|(_, idx)| idx)
++                .unwrap_or(0);
++            let label = question_ui::resolve_option_label(
++                &p.input.unwrap_or_default(),
++                question_index,
++                option_index,
++            );
++            handle_question_answer(data, &request_id, label.clone(), question_index).await;
+             question_ui::disable_question_components(
+                 ctx,
+                 component.channel_id,
+@@ -483,11 +523,15 @@ async fn handle_interaction(
+         let pending = data.pending_permissions.lock().await.remove(&request_id);
+         if let Some(p) = pending {
+             let message_id = p.message_id;
++            let question_index = question_ui::parse_sub_request_id(&request_id)
++                .map(|(_, idx)| idx)
++                .unwrap_or(0);
+             let label = question_ui::resolve_option_label(
+                 &p.input.unwrap_or_default(),
++                question_index,
+                 selected_index,
+             );
+-            let _ = p.response_tx.send(PermissionDecision::Answer(label.clone()));
++            handle_question_answer(data, &request_id, label.clone(), question_index).await;
+             question_ui::disable_question_components(
+                 ctx,
+                 component.channel_id,
+@@ -571,7 +615,10 @@ async fn handle_modal_interaction(
+     let pending = data.pending_permissions.lock().await.remove(&request_id);
+     if let Some(p) = pending {
+         let message_id = p.message_id;
+-        let _ = p.response_tx.send(PermissionDecision::Answer(answer.clone()));
++        let question_index = question_ui::parse_sub_request_id(&request_id)
++            .map(|(_, idx)| idx)
++            .unwrap_or(0);
++        handle_question_answer(data, &request_id, answer.clone(), question_index).await;
+         question_ui::disable_question_components(
+             ctx,
+             modal.channel_id,
+diff --git a/src/handler/permission_ui.rs b/src/handler/permission_ui.rs
+index 0e2c40b..288de51 100644
+--- a/src/handler/permission_ui.rs
++++ b/src/handler/permission_ui.rs
+@@ -14,7 +14,7 @@ use crate::error::PidoryError;
+ use crate::handler::question_ui;
+ use crate::i18n::Lang;
+ use crate::subprocess::permission::{PermissionDecision, PermissionRequest};
+-use crate::PendingPermission;
++use crate::{PendingPermission, PendingQuestionGroup};
+ 
+ pub fn create_permission_message(
+     tool_name: &str,
+@@ -147,6 +147,7 @@ pub async fn run_permission_handler(
+     ctx: Context,
+     channel_id: ChannelId,
+     pending_permissions: Arc<Mutex<HashMap<String, PendingPermission>>>,
++    pending_question_groups: Arc<Mutex<HashMap<String, PendingQuestionGroup>>>,
+     _owner_id: u64,
+     thread_id: String,
+     lang: Lang,
+@@ -155,26 +156,94 @@ pub async fn run_permission_handler(
+         let triggered_by = perm_req.triggered_by;
+ 
+         if perm_req.tool_name == "AskUserQuestion" {
+-            let msg = question_ui::create_question_message(
+-                &perm_req.input,
+-                &perm_req.request_id,
+-                triggered_by,
+-                lang,
+-            );
+-            match channel_id.send_message(&ctx, msg).await {
+-                Ok(sent) => {
+-                    let pending = PendingPermission {
++            let count = question_ui::question_count(&perm_req.input);
++            if count <= 1 {
++                // Single question — direct PendingPermission, no group needed
++                let msg = question_ui::create_question_message(
++                    &perm_req.input,
++                    &perm_req.request_id,
++                    triggered_by,
++                    lang,
++                );
++                match channel_id.send_message(&ctx, msg).await {
++                    Ok(sent) => {
++                        let pending = PendingPermission {
++                            response_tx: perm_req.response_tx,
++                            tool_name: perm_req.tool_name,
++                            message_id: sent.id,
++                            thread_id: thread_id.clone(),
++                            triggered_by,
++                            input: Some(perm_req.input),
++                        };
++                        pending_permissions
++                            .lock()
++                            .await
++                            .insert(perm_req.request_id, pending);
++                    }
++                    Err(e) => {
++                        warn!("Failed to send question message: {}", e);
++                        let _ = perm_req.response_tx.send(PermissionDecision::Deny);
++                    }
++                }
++            } else {
++                // Multi-question — send each question as a separate message,
++                // create PendingPermission per sub-question, and a PendingQuestionGroup
++                let mut all_ok = true;
++                for idx in 0..count {
++                    let sub_id =
++                        question_ui::make_sub_request_id(&perm_req.request_id, idx);
++                    let msg = question_ui::create_question_message_for_index(
++                        &perm_req.input,
++                        idx,
++                        &sub_id,
++                        triggered_by,
++                        lang,
++                    );
++                    match channel_id.send_message(&ctx, msg).await {
++                        Ok(sent) => {
++                            // Sub-question PendingPermission — no response_tx (group owns it)
++                            // We use a dummy oneshot that's never awaited
++                            let (dummy_tx, _) =
++                                tokio::sync::oneshot::channel::<PermissionDecision>();
++                            let pending = PendingPermission {
++                                response_tx: dummy_tx,
++                                tool_name: perm_req.tool_name.clone(),
++                                message_id: sent.id,
++                                thread_id: thread_id.clone(),
++                                triggered_by,
++                                input: Some(perm_req.input.clone()),
++                            };
++                            pending_permissions.lock().await.insert(sub_id, pending);
++                        }
++                        Err(e) => {
++                            warn!("Failed to send question message (q{}): {}", idx, e);
++                            all_ok = false;
++                            break;
++                        }
++                    }
++                }
++
++                if all_ok {
++                    let group = PendingQuestionGroup {
+                         response_tx: perm_req.response_tx,
+-                        tool_name: perm_req.tool_name,
+-                        message_id: sent.id,
++                        input: perm_req.input,
++                        answers: HashMap::new(),
++                        total: count,
+                         thread_id: thread_id.clone(),
+                         triggered_by,
+-                        input: Some(perm_req.input),
+                     };
+-                    pending_permissions.lock().await.insert(perm_req.request_id, pending);
+-                }
+-                Err(e) => {
+-                    warn!("Failed to send question message: {}", e);
++                    pending_question_groups
++                        .lock()
++                        .await
++                        .insert(perm_req.request_id, group);
++                } else {
++                    // Clean up any sub-questions that were sent
++                    let mut perms = pending_permissions.lock().await;
++                    for idx in 0..count {
++                        let sub_id =
++                            question_ui::make_sub_request_id(&perm_req.request_id, idx);
++                        perms.remove(&sub_id);
++                    }
+                     let _ = perm_req.response_tx.send(PermissionDecision::Deny);
+                 }
+             }
+diff --git a/src/handler/question_ui.rs b/src/handler/question_ui.rs
+index eca61e2..4b04fbf 100644
+--- a/src/handler/question_ui.rs
++++ b/src/handler/question_ui.rs
+@@ -8,28 +8,66 @@ use serde_json::Value;
+ use crate::error::PidoryError;
+ use crate::i18n::Lang;
+ 
+-/// Creates a Discord message displaying a question with interactive components.
+-/// - 2-5 options → Buttons (+ free text button)
+-/// - 6-25 options → Select Menu (+ free text button)
+-/// - No options → Free text button only
++// ─── Sub-request-id helpers ─────────────────────────────────────────────────
++
++const SUB_ID_SEPARATOR: &str = "__q";
++
++/// Builds a sub-request-id: `{request_id}__q{question_index}`.
++pub fn make_sub_request_id(request_id: &str, question_index: usize) -> String {
++    format!("{}{}{}", request_id, SUB_ID_SEPARATOR, question_index)
++}
++
++/// Parses `{group_id}__q{index}` → `(group_id, index)`.
++pub fn parse_sub_request_id(sub_id: &str) -> Option<(String, usize)> {
++    let (group_id, idx_str) = sub_id.rsplit_once(SUB_ID_SEPARATOR)?;
++    let idx: usize = idx_str.parse().ok()?;
++    Some((group_id.to_string(), idx))
++}
++
++/// Returns the number of questions in the input.
++pub fn question_count(input: &Value) -> usize {
++    input
++        .get("questions")
++        .and_then(|q| q.as_array())
++        .map(|arr| arr.len())
++        .unwrap_or(0)
++}
++
++// ─── Question message creation ──────────────────────────────────────────────
++
++/// Creates a Discord message for a single question (first question in the input).
++/// For multi-question inputs, use `create_question_message_for_index` instead.
+ pub fn create_question_message(
+     input: &Value,
+     request_id: &str,
+     triggered_by: UserId,
+     lang: Lang,
+ ) -> CreateMessage {
+-    let question_count = input
+-        .get("questions")
+-        .and_then(|q| q.as_array())
+-        .map(|arr| arr.len())
+-        .unwrap_or(0);
+-    if question_count > 1 {
+-        tracing::warn!("AskUserQuestion has {} questions, only first will be shown", question_count);
+-    }
++    create_question_message_for_index(input, 0, request_id, triggered_by, lang)
++}
+ 
+-    let question = extract_first_question(input);
+-    let q_text = question.get("question").and_then(|v| v.as_str()).unwrap_or("");
+-    let header = question.get("header").and_then(|v| v.as_str()).unwrap_or("");
++/// Creates a Discord message for a specific question by index.
++/// The `request_id` used in custom_ids is the sub-request-id (already includes `__q{idx}`).
++///
++/// - 2-5 options → Buttons (+ free text button)
++/// - 6-25 options → Select Menu (+ free text button)
++/// - No options → Free text button only
++pub fn create_question_message_for_index(
++    input: &Value,
++    question_index: usize,
++    sub_request_id: &str,
++    triggered_by: UserId,
++    lang: Lang,
++) -> CreateMessage {
++    let question = extract_question_at(input, question_index);
++    let q_text = question
++        .get("question")
++        .and_then(|v| v.as_str())
++        .unwrap_or("");
++    let header = question
++        .get("header")
++        .and_then(|v| v.as_str())
++        .unwrap_or("");
+     let options: Vec<(String, String)> = extract_options(&question);
+ 
+     let header_text = if header.is_empty() {
+@@ -41,10 +79,15 @@ pub fn create_question_message(
+     let content = format!("<@{}> ❓{}\n{}", triggered_by, header_text, q_text);
+ 
+     let mut components = Vec::new();
++    let rid = truncate_request_id(sub_request_id);
+ 
+     if options.len() >= 6 {
+         let capped_options = if options.len() > 25 {
+-            tracing::warn!("AskUserQuestion has {} options, capping to 25 for Discord select menu", options.len());
++            tracing::warn!(
++                "AskUserQuestion q{} has {} options, capping to 25 for Discord select menu",
++                question_index,
++                options.len()
++            );
+             &options[..25]
+         } else {
+             &options
+@@ -61,7 +104,7 @@ pub fn create_question_message(
+             })
+             .collect();
+         let select = CreateSelectMenu::new(
+-            format!("ask_sel:{}", truncate_request_id(request_id)),
++            format!("ask_sel:{}", rid),
+             CreateSelectMenuKind::String {
+                 options: menu_options,
+             },
+@@ -73,7 +116,7 @@ pub fn create_question_message(
+             .iter()
+             .enumerate()
+             .map(|(i, (label, _desc))| {
+-                CreateButton::new(format!("ask:{}:{}", truncate_request_id(request_id), i))
++                CreateButton::new(format!("ask:{}:{}", rid, i))
+                     .label(label)
+                     .style(ButtonStyle::Primary)
+             })
+@@ -81,7 +124,7 @@ pub fn create_question_message(
+         components.push(CreateActionRow::Buttons(buttons));
+     }
+ 
+-    let text_btn = CreateButton::new(format!("ask_text:{}", truncate_request_id(request_id)))
++    let text_btn = CreateButton::new(format!("ask_text:{}", rid))
+         .label(lang.question_write_answer())
+         .style(ButtonStyle::Secondary)
+         .emoji('✏');
+@@ -90,11 +133,11 @@ pub fn create_question_message(
+     CreateMessage::new().content(content).components(components)
+ }
+ 
+-fn extract_first_question(input: &Value) -> Value {
++fn extract_question_at(input: &Value, index: usize) -> Value {
+     input
+         .get("questions")
+         .and_then(|q| q.as_array())
+-        .and_then(|arr| arr.first())
++        .and_then(|arr| arr.get(index))
+         .cloned()
+         .unwrap_or(Value::Object(serde_json::Map::new()))
+ }
+@@ -123,6 +166,8 @@ fn extract_options(question: &Value) -> Vec<(String, String)> {
+         .unwrap_or_default()
+ }
+ 
++// ─── Modal ──────────────────────────────────────────────────────────────────
++
+ /// Creates a modal for free-text answer input.
+ pub fn create_question_modal(request_id: &str, lang: Lang) -> CreateModal {
+     let input_field = CreateInputText::new(
+@@ -141,7 +186,10 @@ pub fn create_question_modal(request_id: &str, lang: Lang) -> CreateModal {
+     .components(vec![CreateActionRow::InputText(input_field)])
+ }
+ 
+-/// Truncates request_id to 80 chars, leaving room for prefixes and suffixes within Discord's 100-char custom_id limit.
++// ─── Helpers ────────────────────────────────────────────────────────────────
++
++/// Truncates request_id to 80 chars, leaving room for prefixes and suffixes
++/// within Discord's 100-char custom_id limit.
+ fn truncate_request_id(request_id: &str) -> &str {
+     if request_id.len() > 80 {
+         &request_id[..80]
+@@ -173,9 +221,9 @@ pub fn parse_question_modal_id(custom_id: &str) -> Option<String> {
+     custom_id.strip_prefix("ask_modal:").map(|s| s.to_string())
+ }
+ 
+-/// Resolves an option label from the original input and option index.
+-pub fn resolve_option_label(input: &Value, option_index: usize) -> String {
+-    let question = extract_first_question(input);
++/// Resolves an option label from the original input, question index, and option index.
++pub fn resolve_option_label(input: &Value, question_index: usize, option_index: usize) -> String {
++    let question = extract_question_at(input, question_index);
+     let options = extract_options(&question);
+     options
+         .get(option_index)
+@@ -204,6 +252,63 @@ pub async fn disable_question_components(
+ mod tests {
+     use super::*;
+ 
++    // ── sub-request-id helpers ──────────────────────────────────────────────
++
++    #[test]
++    fn make_sub_request_id_format() {
++        assert_eq!(make_sub_request_id("req-abc", 0), "req-abc__q0");
++        assert_eq!(make_sub_request_id("req-abc", 3), "req-abc__q3");
++    }
++
++    #[test]
++    fn parse_sub_request_id_valid() {
++        let (group, idx) = parse_sub_request_id("req-abc__q1").unwrap();
++        assert_eq!(group, "req-abc");
++        assert_eq!(idx, 1);
++    }
++
++    #[test]
++    fn parse_sub_request_id_roundtrip() {
++        let sub = make_sub_request_id("uuid-123-456", 2);
++        let (group, idx) = parse_sub_request_id(&sub).unwrap();
++        assert_eq!(group, "uuid-123-456");
++        assert_eq!(idx, 2);
++    }
++
++    #[test]
++    fn parse_sub_request_id_invalid() {
++        assert!(parse_sub_request_id("no-separator").is_none());
++        assert!(parse_sub_request_id("req__qnotnum").is_none());
++    }
++
++    #[test]
++    fn parse_sub_request_id_with_colons_in_group() {
++        let (group, idx) = parse_sub_request_id("a:b:c__q0").unwrap();
++        assert_eq!(group, "a:b:c");
++        assert_eq!(idx, 0);
++    }
++
++    // ── question_count ──────────────────────────────────────────────────────
++
++    #[test]
++    fn question_count_empty() {
++        assert_eq!(question_count(&serde_json::json!({})), 0);
++    }
++
++    #[test]
++    fn question_count_single() {
++        let input = serde_json::json!({"questions": [{"question": "q?"}]});
++        assert_eq!(question_count(&input), 1);
++    }
++
++    #[test]
++    fn question_count_multiple() {
++        let input = serde_json::json!({"questions": [{"question": "a?"}, {"question": "b?"}]});
++        assert_eq!(question_count(&input), 2);
++    }
++
++    // ── parsing ─────────────────────────────────────────────────────────────
++
+     #[test]
+     fn parse_question_button_valid() {
+         let (rid, idx) = parse_question_button_id("ask:abc-123:2").unwrap();
+@@ -211,6 +316,13 @@ mod tests {
+         assert_eq!(idx, 2);
+     }
+ 
++    #[test]
++    fn parse_question_button_with_sub_id() {
++        let (rid, idx) = parse_question_button_id("ask:req-1__q0:3").unwrap();
++        assert_eq!(rid, "req-1__q0");
++        assert_eq!(idx, 3);
++    }
++
+     #[test]
+     fn parse_question_button_invalid_prefix() {
+         assert!(parse_question_button_id("perm:abc:0").is_none());
+@@ -227,6 +339,12 @@ mod tests {
+         assert_eq!(rid, "req-123");
+     }
+ 
++    #[test]
++    fn parse_question_text_button_with_sub_id() {
++        let rid = parse_question_text_button_id("ask_text:req-123__q1").unwrap();
++        assert_eq!(rid, "req-123__q1");
++    }
++
+     #[test]
+     fn parse_question_text_button_invalid() {
+         assert!(parse_question_text_button_id("ask:abc:0").is_none());
+@@ -244,6 +362,8 @@ mod tests {
+         assert_eq!(rid, "req-789");
+     }
+ 
++    // ── resolve_option_label ────────────────────────────────────────────────
++
+     #[test]
+     fn resolve_option_label_valid() {
+         let input = serde_json::json!({
+@@ -252,24 +372,45 @@ mod tests {
+                 {"label": "B", "description": "bb"}
+             ]}]
+         });
+-        assert_eq!(resolve_option_label(&input, 0), "A");
+-        assert_eq!(resolve_option_label(&input, 1), "B");
++        assert_eq!(resolve_option_label(&input, 0, 0), "A");
++        assert_eq!(resolve_option_label(&input, 0, 1), "B");
++    }
++
++    #[test]
++    fn resolve_option_label_second_question() {
++        let input = serde_json::json!({
++            "questions": [
++                {"question": "q0", "options": [{"label": "X"}]},
++                {"question": "q1", "options": [{"label": "Y"}, {"label": "Z"}]}
++            ]
++        });
++        assert_eq!(resolve_option_label(&input, 1, 0), "Y");
++        assert_eq!(resolve_option_label(&input, 1, 1), "Z");
+     }
+ 
+     #[test]
+     fn resolve_option_label_out_of_bounds() {
+         let input =
+             serde_json::json!({"questions": [{"question": "q", "options": [{"label": "X"}]}]});
+-        assert_eq!(resolve_option_label(&input, 5), "5");
++        assert_eq!(resolve_option_label(&input, 0, 5), "5");
+     }
+ 
++    // ── extract helpers ─────────────────────────────────────────────────────
++
+     #[test]
+-    fn extract_first_question_empty() {
++    fn extract_question_at_empty() {
+         let input = serde_json::json!({});
+-        let q = extract_first_question(&input);
++        let q = extract_question_at(&input, 0);
+         assert!(q.is_object());
+     }
+ 
++    #[test]
++    fn extract_question_at_second() {
++        let input = serde_json::json!({"questions": [{"question": "a"}, {"question": "b"}]});
++        let q = extract_question_at(&input, 1);
++        assert_eq!(q["question"], "b");
++    }
++
+     #[test]
+     fn extract_options_empty() {
+         let q = serde_json::json!({"question": "hi"});
+@@ -288,19 +429,27 @@ mod tests {
+         assert_eq!(opts[1].1, "");
+     }
+ 
++    // ── message creation ────────────────────────────────────────────────────
++
+     #[test]
+-    fn create_question_message_multi_question_uses_first() {
++    fn create_question_message_for_each_index() {
+         let input = serde_json::json!({
+             "questions": [
+-                {"question": "First?", "options": [{"label": "A"}]},
+-                {"question": "Second?", "options": [{"label": "B"}]}
++                {"question": "First?", "header": "Q1", "options": [{"label": "A", "description": "a"}]},
++                {"question": "Second?", "header": "Q2", "options": [{"label": "B", "description": "b"}]}
+             ]
+         });
+-        let msg = create_question_message(&input, "req-1", UserId::new(1), Lang::En);
+-        let json = serde_json::to_value(&msg).unwrap();
+-        let content = json["content"].as_str().unwrap_or("");
+-        assert!(content.contains("First?"));
+-        assert!(!content.contains("Second?"));
++        let msg0 = create_question_message_for_index(&input, 0, "req__q0", UserId::new(1), Lang::En);
++        let json0 = serde_json::to_value(&msg0).unwrap();
++        let content0 = json0["content"].as_str().unwrap_or("");
++        assert!(content0.contains("First?"));
++        assert!(!content0.contains("Second?"));
++
++        let msg1 = create_question_message_for_index(&input, 1, "req__q1", UserId::new(1), Lang::En);
++        let json1 = serde_json::to_value(&msg1).unwrap();
++        let content1 = json1["content"].as_str().unwrap_or("");
++        assert!(content1.contains("Second?"));
++        assert!(!content1.contains("First?"));
+     }
+ 
+     #[test]
+diff --git a/src/main.rs b/src/main.rs
+index e566fb9..47fc607 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -35,11 +35,24 @@ pub struct PendingPermission {
+     pub input: Option<serde_json::Value>,
+ }
+ 
++/// Tracks a multi-question AskUserQuestion group.
++/// Each sub-question gets its own PendingPermission keyed by `{request_id}__q{idx}`.
++/// When all answers are collected, the combined answer is sent via `response_tx`.
++pub struct PendingQuestionGroup {
++    pub response_tx: oneshot::Sender<PermissionDecision>,
++    pub input: serde_json::Value,
++    pub answers: HashMap<String, String>,
++    pub total: usize,
++    pub thread_id: String,
++    pub triggered_by: serenity::UserId,
++}
++
+ pub struct Data {
+     pub config: Arc<Config>,
+     pub db: SqlitePool,
+     pub sessions: Arc<SessionManager>,
+     pub pending_permissions: Arc<Mutex<HashMap<String, PendingPermission>>>,
++    pub pending_question_groups: Arc<Mutex<HashMap<String, PendingQuestionGroup>>>,
+     pub session_skills: Arc<Mutex<HashMap<String, Vec<String>>>>,
+     pub needs_context: Arc<Mutex<HashSet<String>>>,
+     pub turn_initiators: Arc<Mutex<HashMap<String, serenity::UserId>>>,
+@@ -103,6 +116,7 @@ async fn main() -> Result<(), PidoryError> {
+                 ));
+ 
+                 let pending_permissions: Arc<Mutex<HashMap<String, PendingPermission>>> = Arc::new(Mutex::new(HashMap::new()));
++                let pending_question_groups: Arc<Mutex<HashMap<String, PendingQuestionGroup>>> = Arc::new(Mutex::new(HashMap::new()));
+                 let session_skills = Arc::new(Mutex::new(HashMap::new()));
+                 let turn_initiators: Arc<Mutex<HashMap<String, serenity::UserId>>> = Arc::new(Mutex::new(HashMap::new()));
+                 let turn_participants: Arc<Mutex<HashMap<String, HashSet<serenity::UserId>>>> = Arc::new(Mutex::new(HashMap::new()));
+@@ -183,6 +197,7 @@ async fn main() -> Result<(), PidoryError> {
+                     let sessions = Arc::clone(&sessions);
+                     let idle_timeout = std::time::Duration::from_secs(config.claude.idle_timeout_secs);
+                     let pending_permissions = Arc::clone(&pending_permissions);
++                    let pending_question_groups = Arc::clone(&pending_question_groups);
+                     let session_skills = Arc::clone(&session_skills);
+                     let needs_context = Arc::clone(&needs_context);
+                     let turn_initiators = Arc::clone(&turn_initiators);
+@@ -201,6 +216,7 @@ async fn main() -> Result<(), PidoryError> {
+                             tracing::info!("TTL sweep: evicted {} sessions", evicted.len());
+                             for tid in &evicted {
+                                 pending_permissions.lock().await.retain(|_, p| p.thread_id != *tid);
++                                pending_question_groups.lock().await.retain(|_, g| g.thread_id != *tid);
+                                 session_skills.lock().await.remove(tid);
+                                 needs_context.lock().await.remove(tid);
+                                 turn_initiators.lock().await.remove(tid);
+@@ -227,6 +243,7 @@ async fn main() -> Result<(), PidoryError> {
+                     db,
+                     sessions,
+                     pending_permissions,
++                    pending_question_groups,
+                     session_skills,
+                     needs_context,
+                     turn_initiators,
+diff --git a/src/subprocess/parser.rs b/src/subprocess/parser.rs
+index 8573a42..b2817da 100644
+--- a/src/subprocess/parser.rs
++++ b/src/subprocess/parser.rs
+@@ -996,11 +996,18 @@ pub fn build_control_response_deny(request_id: &str, message: &str) -> String {
+     format!("{}\n", response)
+ }
+ 
+-pub fn build_control_response_ask_answer(request_id: &str, input: &Value, answer: &str) -> String {
++pub fn build_control_response_ask_answer(
++    request_id: &str,
++    input: &Value,
++    answers: &std::collections::HashMap<String, String>,
++) -> String {
+     let mut updated_input = input.clone();
+     if let Value::Object(ref mut map) = updated_input {
+-        let answers = serde_json::json!({"q_0": answer});
+-        map.insert("answers".to_string(), answers);
++        let answers_value: serde_json::Map<String, Value> = answers
++            .iter()
++            .map(|(k, v)| (k.clone(), Value::String(v.clone())))
++            .collect();
++        map.insert("answers".to_string(), Value::Object(answers_value));
+     }
+     let json = serde_json::json!({
+         "type": "control_response",
+@@ -1019,19 +1026,35 @@ pub fn build_control_response_ask_answer(request_id: &str, input: &Value, answer
+ #[cfg(test)]
+ mod ask_answer_tests {
+     use super::*;
++    use std::collections::HashMap;
+ 
+     #[test]
+     fn build_control_response_ask_answer_sets_q0() {
+         let input = serde_json::json!({"questions": [{"question": "pick?"}]});
+-        let out = build_control_response_ask_answer("req-1", &input, "Blue");
++        let answers = HashMap::from([("q_0".to_string(), "Blue".to_string())]);
++        let out = build_control_response_ask_answer("req-1", &input, &answers);
+         let v: serde_json::Value = serde_json::from_str(out.trim()).expect("valid JSON");
+         assert_eq!(v["response"]["response"]["updatedInput"]["answers"]["q_0"], "Blue");
+     }
+ 
++    #[test]
++    fn build_control_response_ask_answer_multiple_questions() {
++        let input = serde_json::json!({"questions": [{"question": "q1?"}, {"question": "q2?"}]});
++        let answers = HashMap::from([
++            ("q_0".to_string(), "A".to_string()),
++            ("q_1".to_string(), "B".to_string()),
++        ]);
++        let out = build_control_response_ask_answer("req-m", &input, &answers);
++        let v: serde_json::Value = serde_json::from_str(out.trim()).expect("valid JSON");
++        assert_eq!(v["response"]["response"]["updatedInput"]["answers"]["q_0"], "A");
++        assert_eq!(v["response"]["response"]["updatedInput"]["answers"]["q_1"], "B");
++    }
++
+     #[test]
+     fn build_control_response_ask_answer_preserves_original_fields() {
+         let input = serde_json::json!({"questions": [{"question": "pick?"}], "extra": 42});
+-        let out = build_control_response_ask_answer("req-2", &input, "Red");
++        let answers = HashMap::from([("q_0".to_string(), "Red".to_string())]);
++        let out = build_control_response_ask_answer("req-2", &input, &answers);
+         let v: serde_json::Value = serde_json::from_str(out.trim()).expect("valid JSON");
+         assert_eq!(v["response"]["response"]["updatedInput"]["extra"], 42);
+         assert_eq!(v["response"]["response"]["updatedInput"]["questions"][0]["question"], "pick?");
+@@ -1040,7 +1063,8 @@ mod ask_answer_tests {
+     #[test]
+     fn build_control_response_ask_answer_ends_with_newline() {
+         let input = serde_json::json!({});
+-        let out = build_control_response_ask_answer("req-3", &input, "test");
++        let answers = HashMap::from([("q_0".to_string(), "test".to_string())]);
++        let out = build_control_response_ask_answer("req-3", &input, &answers);
+         assert!(out.ends_with('\n'));
+     }
+ }
+diff --git a/src/subprocess/permission.rs b/src/subprocess/permission.rs
+index 175d2bc..4f8c455 100644
+--- a/src/subprocess/permission.rs
++++ b/src/subprocess/permission.rs
+@@ -1,6 +1,6 @@
+ #![allow(dead_code)]
+ 
+-use std::collections::HashSet;
++use std::collections::{HashMap, HashSet};
+ 
+ use poise::serenity_prelude::UserId;
+ 
+@@ -9,7 +9,7 @@ pub enum PermissionDecision {
+     Allow,
+     AlwaysAllow,
+     Deny,
+-    Answer(String),
++    Answer(HashMap<String, String>),
+ }
+ 
+ pub struct PermissionRequest {
+diff --git a/src/subprocess/session_manager.rs b/src/subprocess/session_manager.rs
+index cf18c14..13d6b82 100644
+--- a/src/subprocess/session_manager.rs
++++ b/src/subprocess/session_manager.rs
+@@ -78,6 +78,7 @@ impl SessionManager {
+         db: sqlx::SqlitePool,
+         lang: Lang,
+         pending_permissions: Arc<tokio::sync::Mutex<HashMap<String, PendingPermission>>>,
++        pending_question_groups: Arc<tokio::sync::Mutex<HashMap<String, crate::PendingQuestionGroup>>>,
+         owner_id: u64,
+     ) -> Result<SessionCreateResult, PidoryError> {
+         let mut sessions = self.sessions.lock().await;
+@@ -155,6 +156,7 @@ impl SessionManager {
+             ctx.clone(),
+             channel_id,
+             pending_permissions.clone(),
++            pending_question_groups.clone(),
+             owner_id,
+             thread_id.to_string(),
+             lang,
+diff --git a/src/subprocess/worker.rs b/src/subprocess/worker.rs
+index a8d2e66..5e12c29 100644
+--- a/src/subprocess/worker.rs
++++ b/src/subprocess/worker.rs
+@@ -71,10 +71,10 @@ enum BetweenTurnsAction {
+ 
+ pub(super) enum PermissionWaitResult {
+     Allow,
+-    AlwaysAllow(String), // tool_name
+-    Deny(String),        // reason
+-    Error,               // stdin error → caller does break
+-    Answer(String),      // answer for AskUserQuestion
++    AlwaysAllow(String),                          // tool_name
++    Deny(String),                                 // reason
++    Error,                                        // stdin error → caller does break
++    Answer(std::collections::HashMap<String, String>), // answers for AskUserQuestion
+ }
+ 
+ // ─── SessionWorker struct ───────────────────────────────────────────────────
+@@ -767,8 +767,8 @@ async fn write_permission_response(
+         PermissionWaitResult::Error => {
+             Ok(true) // caller should break
+         }
+-        PermissionWaitResult::Answer(answer) => {
+-            let resp = build_control_response_ask_answer(request_id, input, &answer);
++        PermissionWaitResult::Answer(answers) => {
++            let resp = build_control_response_ask_answer(request_id, input, &answers);
+             stdin.write_all(resp.as_bytes()).await?;
+             stdin.flush().await?;
+             Ok(false)
+@@ -1489,8 +1489,9 @@ mod tests {
+         let mut stdin = spawn_cat_stdin().await;
+         let mut cache = PermissionCache::new();
+         let input = serde_json::json!({"questions": [{"question": "pick?"}]});
++        let answers = std::collections::HashMap::from([("q_0".to_string(), "Blue".to_string())]);
+         let result = write_permission_response(
+-            PermissionWaitResult::Answer("Blue".to_string()),
++            PermissionWaitResult::Answer(answers),
+             "req-ask",
+             &input,
+             &mut stdin,
+@@ -1504,8 +1505,9 @@ mod tests {
+         let mut stdin = spawn_cat_stdin().await;
+         let mut cache = PermissionCache::new();
+         let input = serde_json::json!({});
++        let answers = std::collections::HashMap::from([("q_0".to_string(), "test".to_string())]);
+         write_permission_response(
+-            PermissionWaitResult::Answer("test".to_string()),
++            PermissionWaitResult::Answer(answers),
+             "req-ask2",
+             &input,
+             &mut stdin,

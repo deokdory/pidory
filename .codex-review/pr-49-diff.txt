@@ -1,0 +1,276 @@
+diff --git a/src/commands/register.rs b/src/commands/register.rs
+index bd984e6..689f391 100644
+--- a/src/commands/register.rs
++++ b/src/commands/register.rs
+@@ -70,6 +70,7 @@ pub async fn unregister(ctx: Context<'_>) -> Result<(), Error> {
+         }
+         ctx.data().session_skills.lock().await.remove(&session.thread_id);
+         ctx.data().permission_rxs.lock().await.remove(&session.thread_id);
++        ctx.data().needs_context.lock().await.remove(&session.thread_id);
+     }
+     repository::delete_sessions_by_channel(&ctx.data().db, &channel_id).await?;
+ 
+diff --git a/src/commands/session.rs b/src/commands/session.rs
+index fdbd6e4..b78b288 100644
+--- a/src/commands/session.rs
++++ b/src/commands/session.rs
+@@ -185,6 +185,7 @@ pub async fn del(
+     let _ = ctx.data().sessions.kill_session(&tid).await;
+     ctx.data().session_skills.lock().await.remove(&tid);
+     ctx.data().permission_rxs.lock().await.remove(&tid);
++    ctx.data().needs_context.lock().await.remove(&tid);
+ 
+     repository::delete_session(&ctx.data().db, &tid).await?;
+ 
+diff --git a/src/handler/message.rs b/src/handler/message.rs
+index ed56dcc..016f425 100644
+--- a/src/handler/message.rs
++++ b/src/handler/message.rs
+@@ -95,10 +95,15 @@ async fn handle_message(
+     let msg_id = new_message.id;
+ 
+     // 세션 DB 확인/생성
++    let is_new_session;
+     let session = match repository::get_session_by_thread(db, &thread_id).await? {
+-        Some(s) => s,
++        Some(s) => {
++            is_new_session = false;
++            s
++        }
+         None => {
+             tracing::info!("Creating new session for thread {}", thread_id);
++            is_new_session = true;
+             repository::create_session(db, &thread_id, &parent_channel_id).await?
+         }
+     };
+@@ -140,6 +145,7 @@ async fn handle_message(
+             if let Some(evicted_tid) = result.evicted_thread_id {
+                 data.permission_rxs.lock().await.remove(&evicted_tid);
+                 data.session_skills.lock().await.remove(&evicted_tid);
++                data.needs_context.lock().await.remove(&evicted_tid);
+                 if let Err(e) = repository::update_session_status(db, &evicted_tid, "idle").await {
+                     tracing::warn!("Failed to update session status for evicted thread {}: {}", evicted_tid, e);
+                 }
+@@ -161,11 +167,18 @@ async fn handle_message(
+         }
+     }
+ 
++    let is_new_command = new_message.content.trim().eq_ignore_ascii_case("/new");
++
++    // /new 감지 → 다음 메시지에 context inject 예약
++    if is_new_command {
++        data.needs_context.lock().await.insert(thread_id.clone());
++    }
++
+     // 원자적 acquire: running이 아닌 경우에만 running으로 전환
+     let acquired = repository::try_acquire_session(db, &thread_id).await?;
+ 
+     if !acquired {
+-        // mid-turn inject: event_tx 없이 전송
++        // mid-turn inject: event_tx 없이 전송 (context inject 안 함, needs_context 소비 안 함)
+         let msg = QueuedMessage {
+             content: new_message.content.clone(),
+             channel_id,
+@@ -202,14 +215,21 @@ async fn handle_message(
+         return Ok(());
+     }
+ 
+-    // 직접 실행 경로
++    // 직접 실행 경로: context inject 판정 (primary 경로만)
++    let had_needs_context = if !is_new_command {
++        data.needs_context.lock().await.remove(&thread_id)
++    } else {
++        false
++    };
++    let content = build_context_content(&new_message.content, is_new_session, had_needs_context, &guild_channel.name, lang);
++
+     emoji::set_reaction(ctx, channel_id, msg_id, ReactionStatus::Running)
+         .await
+         .ok();
+ 
+     let (event_tx, event_rx) = mpsc::channel::<StreamEvent>(64);
+     let msg = QueuedMessage {
+-        content: new_message.content.clone(),
++        content: content.clone(),
+         channel_id,
+         message_id: msg_id,
+         event_tx: Some(event_tx),
+@@ -665,6 +685,10 @@ pub async fn execute_in_session(
+ ) -> Result<(), PidoryError> {
+     let db = &data.db;
+ 
++    if content.trim().eq_ignore_ascii_case("/new") {
++        data.needs_context.lock().await.insert(thread_id.to_string());
++    }
++
+     let acquired = repository::try_acquire_session(db, thread_id).await?;
+ 
+     if !acquired {
+@@ -832,3 +856,59 @@ async fn handle_permission_request(
+         }
+     }
+ }
++
++/// 순수 함수: context inject 판정 및 content 생성
++fn build_context_content(
++    content: &str,
++    is_new_session: bool,
++    had_needs_context: bool,
++    thread_name: &str,
++    lang: Lang,
++) -> String {
++    let is_new_command = content.trim().eq_ignore_ascii_case("/new");
++    if !is_new_command && (is_new_session || had_needs_context) {
++        let context = lang.session_context(thread_name);
++        format!("{}\n\n{}", context, content)
++    } else {
++        content.to_string()
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn inject_on_new_session() {
++        let result = build_context_content("안녕", true, false, "테스트 스레드", Lang::Ko);
++        assert!(result.contains("<system-reminder>"));
++        assert!(result.contains("테스트 스레드"));
++        assert!(result.ends_with("안녕"));
++    }
++
++    #[test]
++    fn inject_after_new_command() {
++        let result = build_context_content("작업 시작", false, true, "스레드", Lang::Ko);
++        assert!(result.contains("<system-reminder>"));
++    }
++
++    #[test]
++    fn no_inject_on_new_command() {
++        let result = build_context_content("/new", true, false, "스레드", Lang::Ko);
++        assert!(!result.contains("<system-reminder>"));
++        assert_eq!(result, "/new");
++    }
++
++    #[test]
++    fn no_inject_normal_message() {
++        let result = build_context_content("일반 메시지", false, false, "스레드", Lang::Ko);
++        assert!(!result.contains("<system-reminder>"));
++        assert_eq!(result, "일반 메시지");
++    }
++
++    #[test]
++    fn new_command_case_insensitive() {
++        let result = build_context_content("/New", true, false, "스레드", Lang::Ko);
++        assert!(!result.contains("<system-reminder>"));
++    }
++}
+diff --git a/src/i18n.rs b/src/i18n.rs
+index fe54dbe..a9c2658 100644
+--- a/src/i18n.rs
++++ b/src/i18n.rs
+@@ -368,6 +368,21 @@ impl Lang {
+         }
+     }
+ 
++    // ── Context injection ──
++
++    pub fn session_context(&self, thread_name: &str) -> String {
++        match self {
++            Lang::Ko => format!(
++                "<system-reminder>\n이 세션은 Discord bot(pidory)을 통해 실행되고 있습니다. 스레드: \"{}\". 이 컨텍스트에 대해 응답하지 마세요.\n</system-reminder>",
++                thread_name
++            ),
++            Lang::En => format!(
++                "<system-reminder>\nThis session is running through a Discord bot (pidory). Thread: \"{}\". Do not respond to this context.\n</system-reminder>",
++                thread_name
++            ),
++        }
++    }
++
+     // ── Rate limits ──
+ 
+     pub fn rate_limit_reached(&self) -> &'static str {
+@@ -564,4 +579,29 @@ mod tests {
+         assert_ne!(Lang::Ko.soft_timeout_nudge(), Lang::En.soft_timeout_nudge());
+         assert_ne!(Lang::Ko.hard_timeout_kill(), Lang::En.hard_timeout_kill());
+     }
++
++    #[test]
++    fn session_context_ko() {
++        let ctx = Lang::Ko.session_context("버그 수정");
++        assert!(ctx.starts_with("<system-reminder>"));
++        assert!(ctx.ends_with("</system-reminder>"));
++        assert!(ctx.contains("pidory"));
++        assert!(ctx.contains("버그 수정"));
++    }
++
++    #[test]
++    fn session_context_en() {
++        let ctx = Lang::En.session_context("fix bug");
++        assert!(ctx.starts_with("<system-reminder>"));
++        assert!(ctx.ends_with("</system-reminder>"));
++        assert!(ctx.contains("pidory"));
++        assert!(ctx.contains("fix bug"));
++    }
++
++    #[test]
++    fn session_context_langs_differ() {
++        let ko = Lang::Ko.session_context("test");
++        let en = Lang::En.session_context("test");
++        assert_ne!(ko, en);
++    }
+ }
+diff --git a/src/main.rs b/src/main.rs
+index a1c5487..b894bc3 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -38,6 +38,7 @@ pub struct Data {
+     pub permission_rxs: Arc<Mutex<HashMap<String, mpsc::Receiver<PermissionRequest>>>>,
+     pub pending_permissions: Arc<Mutex<HashMap<String, PendingPermission>>>,
+     pub session_skills: Arc<Mutex<HashMap<String, Vec<String>>>>,
++    pub needs_context: Arc<Mutex<HashSet<String>>>,
+     pub skill_descriptions: HashMap<String, String>,
+     /// Event handler가 fresh Context를 background task에 전달하는 채널.
+     /// Shard reconnect 후에도 최신 ShardMessenger를 사용할 수 있게 해준다.
+@@ -143,12 +144,15 @@ async fn main() -> Result<(), PidoryError> {
+                     });
+                 }
+ 
++                let needs_context = Arc::new(Mutex::new(HashSet::new()));
++
+                 // Idle session TTL sweep
+                 {
+                     let sessions = Arc::clone(&sessions);
+                     let idle_timeout = std::time::Duration::from_secs(config.claude.idle_timeout_secs);
+                     let permission_rxs = Arc::clone(&permission_rxs);
+                     let session_skills = Arc::clone(&session_skills);
++                    let needs_context = Arc::clone(&needs_context);
+                     let db_clone = db.clone();
+                     let lang = config.language;
+                     let mut ctx_rx = ctx_tx.subscribe();
+@@ -164,6 +168,7 @@ async fn main() -> Result<(), PidoryError> {
+                             for tid in &evicted {
+                                 permission_rxs.lock().await.remove(tid);
+                                 session_skills.lock().await.remove(tid);
++                                needs_context.lock().await.remove(tid);
+                                 if let Err(e) = db::repository::update_session_status(&db_clone, tid, "idle").await {
+                                     tracing::warn!("Failed to update session status for TTL sweep thread {}: {}", tid, e);
+                                 }
+@@ -180,6 +185,7 @@ async fn main() -> Result<(), PidoryError> {
+                     });
+                 }
+ 
++
+                 Ok(Data {
+                     config,
+                     db,
+@@ -187,6 +193,7 @@ async fn main() -> Result<(), PidoryError> {
+                     permission_rxs,
+                     pending_permissions,
+                     session_skills,
++                    needs_context,
+                     skill_descriptions,
+                     ctx_watch: ctx_tx,
+                 })

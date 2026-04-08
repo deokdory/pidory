@@ -1,0 +1,61 @@
+diff --git a/src/handler/message.rs b/src/handler/message.rs
+index 6b652b4..3d157e4 100644
+--- a/src/handler/message.rs
++++ b/src/handler/message.rs
+@@ -539,8 +539,10 @@ pub async fn process_turn_events(
+         if let Err(e) = repository::update_session_status(db, thread_id, "error").await {
+             tracing::warn!("Failed to update session status for thread {}: {}", thread_id, e);
+         }
+-        if let Some(error_text) = error_msgs.first() {
+-            channel_id.say(ctx, &format!("-# ❌ {} <@{}>", error_text, owner_id)).await.ok();
++        if let Some(error_text) = error_msgs.first()
++            && let Err(e) = channel_id.say(ctx, &format!("-# ❌ {} <@{}>", error_text, owner_id)).await
++        {
++            tracing::warn!(%channel_id, "Failed to send turn error notification: {}", e);
+         }
+         emoji::set_reaction(ctx, channel_id, msg_id, ReactionStatus::Error)
+             .await
+@@ -549,7 +551,9 @@ pub async fn process_turn_events(
+         if let Err(e) = repository::update_session_status(db, thread_id, "error").await {
+             tracing::warn!("Failed to update session status for thread {}: {}", thread_id, e);
+         }
+-        channel_id.say(ctx, &format!("-# ❌ {} <@{}>", lang.process_abnormal_exit(), owner_id)).await.ok();
++        if let Err(e) = channel_id.say(ctx, &format!("-# ❌ {} <@{}>", lang.process_abnormal_exit(), owner_id)).await {
++            tracing::warn!(%channel_id, "Failed to send process exit notification: {}", e);
++        }
+         emoji::set_reaction(ctx, channel_id, msg_id, ReactionStatus::Error)
+             .await
+             .ok();
+@@ -575,7 +579,9 @@ pub async fn process_turn_events(
+         if let Err(e) = repository::update_session_status(db, thread_id, "idle").await {
+             tracing::warn!("Failed to update session status for thread {}: {}", thread_id, e);
+         }
+-        channel_id.say(ctx, &summary).await.ok();
++        if let Err(e) = channel_id.say(ctx, &summary).await {
++            tracing::warn!(%channel_id, "Failed to send turn summary: {}", e);
++        }
+ 
+         emoji::set_reaction(ctx, channel_id, msg_id, ReactionStatus::Done)
+             .await
+@@ -606,7 +612,9 @@ pub async fn process_turn_events(
+         // 완료 알림 (mention)
+         if !is_interrupted {
+             if has_cli_error || !got_result || !send_ok {
+-                channel_id.say(ctx, &format!("-# ❌ {} <@{}>", lang.error_occurred(), owner_id)).await.ok();
++                if let Err(e) = channel_id.say(ctx, &format!("-# ❌ {} <@{}>", lang.error_occurred(), owner_id)).await {
++                    tracing::warn!(%channel_id, "Failed to send turn error notification: {}", e);
++                }
+             } else {
+                 let (duration_ms, total_cost_usd) = events.iter().find_map(|e| {
+                     if let StreamEvent::Result { duration_ms, total_cost_usd, .. } = e {
+@@ -618,7 +626,9 @@ pub async fn process_turn_events(
+                 let duration = formatter::format_duration(duration_ms);
+                 let cost = formatter::format_cost(total_cost_usd);
+                 let ctx_suffix = format_ctx_suffix(ratelimit_file);
+-                channel_id.say(ctx, &format!("-# ✅ {}{}{} <@{}>", duration, cost, ctx_suffix, owner_id)).await.ok();
++                if let Err(e) = channel_id.say(ctx, &format!("-# ✅ {}{}{} <@{}>", duration, cost, ctx_suffix, owner_id)).await {
++                    tracing::warn!(%channel_id, "Failed to send turn completion notification: {}", e);
++                }
+             }
+         }
+     }
