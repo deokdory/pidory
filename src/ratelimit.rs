@@ -116,7 +116,18 @@ impl RateLimitMonitor {
             self.last_five_hour_reset = five_hour_reset;
         }
 
-        let pct = info.five_hour_pct.unwrap_or(0);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        // reset이 과거면 0%로 간주 (stale reset에 대한 false alert 방지)
+        let pct = if info.five_hour_reset.map_or(true, |r| r <= now) {
+            0
+        } else {
+            info.five_hour_pct.unwrap_or(0)
+        };
+
         let mut triggered = Vec::new();
         for &threshold in &self.alert_thresholds {
             if pct >= threshold && !self.alerted_thresholds.contains(&threshold) {
@@ -140,11 +151,15 @@ impl RateLimitMonitor {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs();
-            let remaining = if info.five_hour_reset.map_or(false, |r| r > now) {
-                let diff = info.five_hour_reset.unwrap() - now;
-                let h = diff / 3600;
-                let m = (diff % 3600) / 60;
-                lang.resets_in(h, m)
+            let remaining = if let Some(reset) = info.five_hour_reset {
+                if reset > now {
+                    let diff = reset - now;
+                    let h = diff / 3600;
+                    let m = (diff % 3600) / 60;
+                    lang.resets_in(h, m)
+                } else {
+                    String::new()
+                }
             } else {
                 String::new()
             };
@@ -273,7 +288,12 @@ mod tests {
     #[test]
     fn test_alert_threshold_triggered() {
         let mut monitor = RateLimitMonitor::new(vec![50]);
-        let info = make_info(55, 0, 100);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let mut info = make_info(55, 0, 100);
+        info.five_hour_reset = Some(now + 3600); // future reset
         let triggered = monitor.check_thresholds(&info);
         assert_eq!(triggered, vec![50]);
     }
@@ -289,7 +309,12 @@ mod tests {
     #[test]
     fn test_alert_threshold_dedup() {
         let mut monitor = RateLimitMonitor::new(vec![50]);
-        let info = make_info(55, 0, 100);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let mut info = make_info(55, 0, 100);
+        info.five_hour_reset = Some(now + 3600); // future reset
 
         let first = monitor.check_thresholds(&info);
         assert_eq!(first, vec![50]);
@@ -301,14 +326,20 @@ mod tests {
     #[test]
     fn test_alert_reset_cycle() {
         let mut monitor = RateLimitMonitor::new(vec![50]);
-        let info1 = make_info(55, 0, 100);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let mut info1 = make_info(55, 0, 100);
+        info1.five_hour_reset = Some(now + 3600);
         let first = monitor.check_thresholds(&info1);
         assert_eq!(first, vec![50]);
 
         let dedup = monitor.check_thresholds(&info1);
         assert!(dedup.is_empty());
 
-        let info2 = make_info(55, 0, 200);
+        let mut info2 = make_info(55, 0, 200);
+        info2.five_hour_reset = Some(now + 7200); // different reset time
         let after_reset = monitor.check_thresholds(&info2);
         assert_eq!(after_reset, vec![50], "new reset cycle must re-trigger threshold");
     }

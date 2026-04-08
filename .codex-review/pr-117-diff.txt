@@ -1,0 +1,723 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index 0a0623c..d266648 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -1294,7 +1294,7 @@ checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
+ 
+ [[package]]
+ name = "pidory"
+-version = "0.3.1"
++version = "0.4.0"
+ dependencies = [
+  "poise",
+  "reqwest",
+diff --git a/config.toml.example b/config.toml.example
+index 71bf468..159819a 100644
+--- a/config.toml.example
++++ b/config.toml.example
+@@ -21,6 +21,5 @@ max_chunk_length = 1900       # Discord 2000자 여유분
+ max_chunks = 10               # 초과 시 파일 첨부
+ 
+ # [ratelimit]
+-# file_path = "/tmp/pidory-ratelimits.json"  # statusline-ratelimit-writer.sh 출력 파일 경로
+ # update_interval_secs = 60                   # presence 업데이트 주기 (초)
+ # alert_thresholds = [50, 80]                 # 5h rate limit 경고 임계값 (%)
+diff --git a/src/config.rs b/src/config.rs
+index 724e70a..3642ef2 100644
+--- a/src/config.rs
++++ b/src/config.rs
+@@ -76,8 +76,6 @@ fn default_db_path() -> String {
+ 
+ #[derive(Debug, Deserialize)]
+ pub struct RateLimitConfig {
+-    #[serde(default)]
+-    pub file_path: Option<String>,
+     #[serde(default = "default_update_interval_secs")]
+     pub update_interval_secs: u64,
+     #[serde(default = "default_alert_thresholds")]
+@@ -87,7 +85,6 @@ pub struct RateLimitConfig {
+ impl Default for RateLimitConfig {
+     fn default() -> Self {
+         Self {
+-            file_path: None,
+             update_interval_secs: default_update_interval_secs(),
+             alert_thresholds: default_alert_thresholds(),
+         }
+@@ -346,7 +343,6 @@ binary_path = "claude"
+ [response]
+ "#;
+         let config: Config = toml::from_str(toml_str).unwrap();
+-        assert!(config.ratelimit.file_path.is_none());
+         assert_eq!(config.ratelimit.update_interval_secs, 60);
+         assert_eq!(config.ratelimit.alert_thresholds, vec![50, 80]);
+     }
+@@ -364,15 +360,10 @@ binary_path = "claude"
+ [response]
+ 
+ [ratelimit]
+-file_path = "/tmp/pidory-ratelimits.json"
+ update_interval_secs = 30
+ alert_thresholds = [70, 90]
+ "#;
+         let config: Config = toml::from_str(toml_str).unwrap();
+-        assert_eq!(
+-            config.ratelimit.file_path.as_deref(),
+-            Some("/tmp/pidory-ratelimits.json")
+-        );
+         assert_eq!(config.ratelimit.update_interval_secs, 30);
+         assert_eq!(config.ratelimit.alert_thresholds, vec![70, 90]);
+     }
+diff --git a/src/main.rs b/src/main.rs
+index 2b7b668..3d113e8 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -110,9 +110,12 @@ async fn main() -> Result<(), PidoryError> {
+                     info!("Reset {} orphaned running sessions", reset_count);
+                 }
+ 
++                let (ratelimit_tx, _ratelimit_rx) = tokio::sync::watch::channel(crate::ratelimit::RateLimitInfo::default());
++
+                 let sessions = Arc::new(SessionManager::new(
+                     Arc::new(config.claude.clone()),
+                     config.claude.max_sessions,
++                    ratelimit_tx.clone(),
+                 ));
+ 
+                 let pending_permissions: Arc<Mutex<HashMap<String, PendingPermission>>> = Arc::new(Mutex::new(HashMap::new()));
+@@ -126,10 +129,10 @@ async fn main() -> Result<(), PidoryError> {
+                 // shard reconnect 후에도 최신 ShardMessenger 사용 가능
+                 let (ctx_tx, ctx_rx) = watch::channel(ctx.clone());
+ 
+-                // Rate limit monitor (config.ratelimit.file_path가 Some일 때만)
+-                if let Some(ref file_path) = config.ratelimit.file_path {
++                // Rate limit monitor (watch channel 기반)
++                {
+                     let mut ctx_rx = ctx_rx;
+-                    let file_path = file_path.clone();
++                    let mut ratelimit_rx = ratelimit_tx.subscribe();
+                     let interval_secs = config.ratelimit.update_interval_secs;
+                     let thresholds = config.ratelimit.alert_thresholds.clone();
+                     let lang = config.language;
+@@ -140,25 +143,26 @@ async fn main() -> Result<(), PidoryError> {
+                         let mut interval = tokio::time::interval(
+                             std::time::Duration::from_secs(interval_secs)
+                         );
+-                        tracing::info!("Rate limit monitor started (file: {file_path}, interval: {interval_secs}s)");
++                        tracing::info!("Rate limit monitor started (watch channel, interval: {interval_secs}s)");
+                         loop {
+                             interval.tick().await;
+-                            // watch에서 최신 값이 있으면 갱신 (non-blocking)
+                             ctx_rx.mark_changed();
+                             let fresh_ctx = ctx_rx.borrow_and_update().clone();
+-                            match crate::ratelimit::read_ratelimit_file(&file_path) {
+-                                Some(info) => {
+-                                    let text = crate::ratelimit::RateLimitMonitor::format_presence(&info);
+-                                    fresh_ctx.set_activity(Some(
+-                                        poise::serenity_prelude::ActivityData::watching(&text)
+-                                    ));
+-                                    if let Some(channel_id) = notification_channel {
+-                                        monitor.check_and_alert(&info, &fresh_ctx, channel_id, lang).await;
+-                                    }
+-                                }
+-                                None => {
+-                                    fresh_ctx.set_activity(None);
+-                                }
++                            let info = ratelimit_rx.borrow_and_update().clone();
++                            if info.updated_at == 0 {
++                                fresh_ctx.set_activity(None);
++                                continue;
++                            }
++                            let text = crate::ratelimit::RateLimitMonitor::format_presence(&info);
++                            if text.is_empty() {
++                                fresh_ctx.set_activity(None);
++                            } else {
++                                fresh_ctx.set_activity(Some(
++                                    poise::serenity_prelude::ActivityData::watching(&text)
++                                ));
++                            }
++                            if let Some(channel_id) = notification_channel {
++                                monitor.check_and_alert(&info, &fresh_ctx, channel_id, lang).await;
+                             }
+                         }
+                     });
+diff --git a/src/ratelimit.rs b/src/ratelimit.rs
+index f5b9ac7..0e96b77 100644
+--- a/src/ratelimit.rs
++++ b/src/ratelimit.rs
+@@ -1,18 +1,47 @@
+ use poise::serenity_prelude::{ChannelId, Context};
+-use serde::Deserialize;
+ use std::collections::HashSet;
+ 
+ use crate::i18n::Lang;
+ 
+-#[derive(Debug, Clone, Deserialize)]
++#[derive(Debug, Clone, Default)]
+ pub struct RateLimitInfo {
+-    pub five_hour_pct: u8,
+-    pub seven_day_pct: u8,
+-    pub five_hour_reset: u64,
+-    pub seven_day_reset: u64,
++    pub five_hour_pct: Option<u8>,
++    pub seven_day_pct: Option<u8>,
++    pub five_hour_reset: Option<u64>,
++    pub seven_day_reset: Option<u64>,
++    pub is_using_overage: bool,
+     pub updated_at: u64,
+ }
+ 
++impl RateLimitInfo {
++    pub fn update_from_event(
++        &mut self,
++        rate_limit_type: &str,
++        utilization: f64,
++        resets_at: u64,
++        is_overage: bool,
++    ) {
++        let pct = (utilization * 100.0).round() as u8;
++        let now = std::time::SystemTime::now()
++            .duration_since(std::time::UNIX_EPOCH)
++            .unwrap_or_default()
++            .as_secs();
++        match rate_limit_type {
++            "five_hour" => {
++                self.five_hour_pct = Some(pct);
++                self.five_hour_reset = Some(resets_at);
++            }
++            "seven_day" => {
++                self.seven_day_pct = Some(pct);
++                self.seven_day_reset = Some(resets_at);
++            }
++            _ => return,
++        }
++        self.is_using_overage = is_overage;
++        self.updated_at = now;
++    }
++}
++
+ pub struct RateLimitMonitor {
+     alert_thresholds: Vec<u8>,
+     alerted_thresholds: HashSet<u8>,
+@@ -34,33 +63,63 @@ impl RateLimitMonitor {
+             .unwrap_or_default()
+             .as_secs();
+ 
+-        let five_h_remaining = if info.five_hour_reset > now {
+-            let diff = info.five_hour_reset - now;
+-            let h = diff / 3600;
+-            let m = (diff % 3600) / 60;
+-            format!("({}h{}m)", h, m)
+-        } else {
+-            String::new()
+-        };
++        let mut parts = Vec::new();
++
++        if let Some(pct) = info.five_hour_pct {
++            let effective_pct = if info.five_hour_reset.map_or(true, |r| r <= now) {
++                0
++            } else {
++                pct
++            };
++            let remaining = if let Some(reset) = info.five_hour_reset {
++                if reset > now {
++                    let diff = reset - now;
++                    let h = diff / 3600;
++                    let m = (diff % 3600) / 60;
++                    format!("({}h{}m)", h, m)
++                } else {
++                    String::new()
++                }
++            } else {
++                String::new()
++            };
++            if info.is_using_overage && effective_pct >= 100 {
++                parts.push(format!("5h: {}%+{}", effective_pct, remaining));
++            } else {
++                parts.push(format!("5h: {}%{}", effective_pct, remaining));
++            }
++        }
+ 
+-        format!(
+-            "5h: {}%{} | 7d: {}%",
+-            info.five_hour_pct, five_h_remaining, info.seven_day_pct
+-        )
++        if let Some(pct) = info.seven_day_pct {
++            let effective_pct = if info.seven_day_reset.map_or(true, |r| r <= now) {
++                0
++            } else {
++                pct
++            };
++            if info.is_using_overage && effective_pct >= 100 {
++                parts.push(format!("7d: {}%+", effective_pct));
++            } else {
++                parts.push(format!("7d: {}%", effective_pct));
++            }
++        }
++
++        parts.join(" | ")
+     }
+ 
+     /// Returns the list of thresholds that should trigger alerts (not yet alerted in this reset
+     /// cycle). Also updates internal state: clears alerted set on reset cycle change, records
+     /// newly triggered thresholds.
+     pub fn check_thresholds(&mut self, info: &RateLimitInfo) -> Vec<u8> {
+-        if info.five_hour_reset != self.last_five_hour_reset {
++        let five_hour_reset = info.five_hour_reset.unwrap_or(0);
++        if five_hour_reset != self.last_five_hour_reset {
+             self.alerted_thresholds.clear();
+-            self.last_five_hour_reset = info.five_hour_reset;
++            self.last_five_hour_reset = five_hour_reset;
+         }
+ 
++        let pct = info.five_hour_pct.unwrap_or(0);
+         let mut triggered = Vec::new();
+         for &threshold in &self.alert_thresholds {
+-            if info.five_hour_pct >= threshold && !self.alerted_thresholds.contains(&threshold) {
++            if pct >= threshold && !self.alerted_thresholds.contains(&threshold) {
+                 self.alerted_thresholds.insert(threshold);
+                 triggered.push(threshold);
+             }
+@@ -81,15 +140,15 @@ impl RateLimitMonitor {
+                 .duration_since(std::time::UNIX_EPOCH)
+                 .unwrap_or_default()
+                 .as_secs();
+-            let remaining = if info.five_hour_reset > now {
+-                let diff = info.five_hour_reset - now;
++            let remaining = if info.five_hour_reset.map_or(false, |r| r > now) {
++                let diff = info.five_hour_reset.unwrap() - now;
+                 let h = diff / 3600;
+                 let m = (diff % 3600) / 60;
+                 lang.resets_in(h, m)
+             } else {
+                 String::new()
+             };
+-            let msg = lang.rate_limit_alert(info.five_hour_pct, threshold, &remaining);
++            let msg = lang.rate_limit_alert(info.five_hour_pct.unwrap_or(0), threshold, &remaining);
+             if let Err(e) = channel_id.say(ctx, &msg).await {
+                 tracing::warn!("failed to send rate limit alert: {e}");
+             }
+@@ -97,109 +156,118 @@ impl RateLimitMonitor {
+     }
+ }
+ 
+-pub fn read_ratelimit_file(path: &str) -> Option<RateLimitInfo> {
+-    let content = match std::fs::read_to_string(path) {
+-        Ok(c) => c,
+-        Err(e) => {
+-            tracing::debug!("ratelimit file not found or unreadable: {path}: {e}");
+-            return None;
+-        }
+-    };
+-
+-    match serde_json::from_str::<RateLimitInfo>(&content) {
+-        Ok(info) => Some(info),
+-        Err(e) => {
+-            tracing::warn!("failed to parse ratelimit file {path}: {e}");
+-            None
+-        }
+-    }
+-}
+-
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+-    use std::io::Write;
+ 
+     fn make_info(five_hour_pct: u8, seven_day_pct: u8, five_hour_reset: u64) -> RateLimitInfo {
+         RateLimitInfo {
+-            five_hour_pct,
+-            seven_day_pct,
+-            five_hour_reset,
+-            seven_day_reset: 456,
++            five_hour_pct: Some(five_hour_pct),
++            seven_day_pct: Some(seven_day_pct),
++            five_hour_reset: Some(five_hour_reset),
++            seven_day_reset: Some(456),
++            is_using_overage: false,
+             updated_at: 789,
+         }
+     }
+ 
+     #[test]
+-    fn test_read_valid_file() {
+-        let dir = std::env::temp_dir().join("pidory_test_ratelimit_valid");
+-        std::fs::create_dir_all(&dir).ok();
+-        let path = dir.join("ratelimit.json");
+-        let mut f = std::fs::File::create(&path).unwrap();
+-        write!(
+-            f,
+-            r#"{{"five_hour_pct":42,"seven_day_pct":38,"five_hour_reset":123,"seven_day_reset":456,"context_percent":45,"updated_at":789}}"#
+-        )
+-        .unwrap();
+-
+-        let result = read_ratelimit_file(path.to_str().unwrap());
+-        assert!(result.is_some());
+-        let info = result.unwrap();
+-        assert_eq!(info.five_hour_pct, 42);
+-        assert_eq!(info.seven_day_pct, 38);
+-        assert_eq!(info.five_hour_reset, 123);
+-        assert_eq!(info.seven_day_reset, 456);
+-        assert_eq!(info.updated_at, 789);
+-
+-        std::fs::remove_file(&path).ok();
++    fn test_format_presence_with_remaining() {
++        let future_reset = std::time::SystemTime::now()
++            .duration_since(std::time::UNIX_EPOCH)
++            .unwrap()
++            .as_secs()
++            + 3600 + 1800;
++        let info = RateLimitInfo {
++            five_hour_pct: Some(42),
++            seven_day_pct: Some(38),
++            five_hour_reset: Some(future_reset),
++            seven_day_reset: Some(future_reset + 86400),
++            is_using_overage: false,
++            updated_at: 789,
++        };
++        let s = RateLimitMonitor::format_presence(&info);
++        assert!(s.starts_with("5h: 42%(1h"), "got: {s}");
++        assert!(s.contains("| 7d: 38%"), "got: {s}");
+     }
+ 
+     #[test]
+-    fn test_read_missing_file() {
+-        let result = read_ratelimit_file("/nonexistent/path/ratelimit.json");
+-        assert!(result.is_none());
++    fn test_format_presence_past_reset() {
++        let info = make_info(42, 38, 123);
++        let s = RateLimitMonitor::format_presence(&info);
++        assert_eq!(s, "5h: 0% | 7d: 0%");
+     }
+ 
+     #[test]
+-    fn test_read_invalid_json() {
+-        let dir = std::env::temp_dir().join("pidory_test_ratelimit_invalid");
+-        std::fs::create_dir_all(&dir).ok();
+-        let path = dir.join("bad.json");
+-        let mut f = std::fs::File::create(&path).unwrap();
+-        write!(f, "not json").unwrap();
+-
+-        let result = read_ratelimit_file(path.to_str().unwrap());
+-        assert!(result.is_none());
+-
+-        std::fs::remove_file(&path).ok();
++    fn test_format_presence_default() {
++        let info = RateLimitInfo::default();
++        let s = RateLimitMonitor::format_presence(&info);
++        assert_eq!(s, "");
+     }
+ 
+     #[test]
+-    fn test_format_presence_with_remaining() {
+-        // reset이 미래 시점이면 남은 시간 표시
++    fn test_format_presence_partial() {
+         let future_reset = std::time::SystemTime::now()
+             .duration_since(std::time::UNIX_EPOCH)
+             .unwrap()
+             .as_secs()
+-            + 3600 + 1800; // 1h30m from now
++            + 3600;
+         let info = RateLimitInfo {
+-            five_hour_pct: 42,
+-            seven_day_pct: 38,
+-            five_hour_reset: future_reset,
+-            seven_day_reset: 456,
++            five_hour_pct: Some(42),
++            seven_day_pct: None,
++            five_hour_reset: Some(future_reset),
++            seven_day_reset: None,
++            is_using_overage: false,
+             updated_at: 789,
+         };
+         let s = RateLimitMonitor::format_presence(&info);
+-        assert!(s.starts_with("5h: 42%(1h"), "got: {s}");
+-        assert!(s.contains("| 7d: 38%"), "got: {s}");
++        assert!(s.starts_with("5h: 42%"), "got: {s}");
++        assert!(!s.contains("7d"), "got: {s}");
+     }
+ 
+     #[test]
+-    fn test_format_presence_past_reset() {
+-        // reset이 과거면 남은 시간 없이 표시
+-        let info = make_info(42, 38, 123);
++    fn test_format_presence_stale_reset() {
++        let info = RateLimitInfo {
++            five_hour_pct: Some(50),
++            seven_day_pct: Some(30),
++            five_hour_reset: Some(100),
++            seven_day_reset: Some(200),
++            is_using_overage: false,
++            updated_at: 789,
++        };
+         let s = RateLimitMonitor::format_presence(&info);
+-        assert_eq!(s, "5h: 42% | 7d: 38%");
++        assert_eq!(s, "5h: 0% | 7d: 0%");
++    }
++
++    #[test]
++    fn test_update_from_event_five_hour() {
++        let mut info = RateLimitInfo::default();
++        info.update_from_event("seven_day", 0.57, 999999, false);
++        info.update_from_event("five_hour", 0.24, 888888, false);
++        assert_eq!(info.five_hour_pct, Some(24));
++        assert_eq!(info.five_hour_reset, Some(888888));
++        assert_eq!(info.seven_day_pct, Some(57));
++        assert_eq!(info.seven_day_reset, Some(999999));
++    }
++
++    #[test]
++    fn test_update_from_event_seven_day() {
++        let mut info = RateLimitInfo::default();
++        info.update_from_event("five_hour", 0.24, 888888, false);
++        info.update_from_event("seven_day", 0.57, 999999, false);
++        assert_eq!(info.seven_day_pct, Some(57));
++        assert_eq!(info.seven_day_reset, Some(999999));
++        assert_eq!(info.five_hour_pct, Some(24));
++        assert_eq!(info.five_hour_reset, Some(888888));
++    }
++
++    #[test]
++    fn test_update_from_event_unknown_type() {
++        let mut info = RateLimitInfo::default();
++        info.update_from_event("unknown", 0.5, 12345, false);
++        assert_eq!(info.five_hour_pct, None);
++        assert_eq!(info.seven_day_pct, None);
++        assert_eq!(info.updated_at, 0);
+     }
+ 
+     #[test]
+@@ -237,11 +305,9 @@ mod tests {
+         let first = monitor.check_thresholds(&info1);
+         assert_eq!(first, vec![50]);
+ 
+-        // same reset — deduped
+         let dedup = monitor.check_thresholds(&info1);
+         assert!(dedup.is_empty());
+ 
+-        // new reset cycle (five_hour_reset changed) — alerted_thresholds should clear
+         let info2 = make_info(55, 0, 200);
+         let after_reset = monitor.check_thresholds(&info2);
+         assert_eq!(after_reset, vec![50], "new reset cycle must re-trigger threshold");
+diff --git a/src/subprocess/parser/parse.rs b/src/subprocess/parser/parse.rs
+index 80e9e4e..27ca70b 100644
+--- a/src/subprocess/parser/parse.rs
++++ b/src/subprocess/parser/parse.rs
+@@ -298,10 +298,23 @@ pub fn parse_line(line: &str) -> Result<StreamEvent, serde_json::Error> {
+             let resets_at = rate_limit_info
+                 .and_then(|r| r.get("resetsAt"))
+                 .and_then(|r| r.as_u64());
++            let rate_limit_type = rate_limit_info
++                .and_then(|r| r.get("rateLimitType"))
++                .and_then(|s| s.as_str())
++                .map(|s| s.to_string());
++            let utilization = rate_limit_info
++                .and_then(|r| r.get("utilization"))
++                .and_then(|u| u.as_f64());
++            let is_using_overage = rate_limit_info
++                .and_then(|r| r.get("isUsingOverage"))
++                .and_then(|b| b.as_bool());
+             Ok(StreamEvent::RateLimit {
+                 status,
+                 resets_at,
+                 session_id,
++                rate_limit_type,
++                utilization,
++                is_using_overage,
+             })
+         }
+         "result" => {
+@@ -524,9 +537,39 @@ mod tests {
+     fn parse_rate_limit() {
+         let line = r#"{"type":"rate_limit_event","session_id":"abc","rate_limit_info":{"status":"allowed","resetsAt":12345}}"#;
+         let event = parse_line(line).unwrap();
+-        if let StreamEvent::RateLimit { status, resets_at, .. } = event {
++        if let StreamEvent::RateLimit { status, resets_at, rate_limit_type, utilization, is_using_overage, .. } = event {
+             assert_eq!(status, "allowed");
+             assert_eq!(resets_at, Some(12345));
++            assert_eq!(rate_limit_type, None);
++            assert_eq!(utilization, None);
++            assert_eq!(is_using_overage, None);
++        } else {
++            panic!("Expected RateLimit");
++        }
++    }
++
++    #[test]
++    fn parse_rate_limit_with_utilization() {
++        let line = r#"{"type":"rate_limit_event","session_id":"abc","rate_limit_info":{"status":"allowed_warning","resetsAt":1776042000,"rateLimitType":"seven_day","utilization":0.57,"isUsingOverage":false}}"#;
++        let event = parse_line(line).unwrap();
++        if let StreamEvent::RateLimit { status, resets_at, rate_limit_type, utilization, is_using_overage, .. } = event {
++            assert_eq!(status, "allowed_warning");
++            assert_eq!(resets_at, Some(1776042000));
++            assert_eq!(rate_limit_type, Some("seven_day".to_string()));
++            assert!((utilization.unwrap() - 0.57).abs() < 0.001);
++            assert_eq!(is_using_overage, Some(false));
++        } else {
++            panic!("Expected RateLimit");
++        }
++    }
++
++    #[test]
++    fn parse_rate_limit_five_hour() {
++        let line = r#"{"type":"rate_limit_event","session_id":"abc","rate_limit_info":{"status":"allowed","resetsAt":12345,"rateLimitType":"five_hour","utilization":0.24,"isUsingOverage":false}}"#;
++        let event = parse_line(line).unwrap();
++        if let StreamEvent::RateLimit { rate_limit_type, utilization, .. } = event {
++            assert_eq!(rate_limit_type, Some("five_hour".to_string()));
++            assert!((utilization.unwrap() - 0.24).abs() < 0.001);
+         } else {
+             panic!("Expected RateLimit");
+         }
+diff --git a/src/subprocess/parser/types.rs b/src/subprocess/parser/types.rs
+index f939103..6eb169d 100644
+--- a/src/subprocess/parser/types.rs
++++ b/src/subprocess/parser/types.rs
+@@ -35,6 +35,9 @@ pub enum StreamEvent {
+         status: String,
+         resets_at: Option<u64>,
+         session_id: String,
++        rate_limit_type: Option<String>,
++        utilization: Option<f64>,
++        is_using_overage: Option<bool>,
+     },
+     Result {
+         subtype: String,
+diff --git a/src/subprocess/session_manager.rs b/src/subprocess/session_manager.rs
+index e838290..50281d1 100644
+--- a/src/subprocess/session_manager.rs
++++ b/src/subprocess/session_manager.rs
+@@ -15,6 +15,7 @@ use std::process::Stdio;
+ use crate::config::ClaudeConfig;
+ use crate::error::PidoryError;
+ use crate::i18n::Lang;
++use crate::ratelimit::RateLimitInfo;
+ use crate::PendingPermission;
+ use super::parser::StreamEvent;
+ use super::permission::PermissionRequest;
+@@ -58,15 +59,21 @@ pub struct SessionManager {
+     config: Arc<ClaudeConfig>,
+     max_sessions: usize,
+     pending_recalls: Arc<tokio::sync::Mutex<HashMap<MessageId, (String, Arc<AtomicBool>)>>>,
++    ratelimit_tx: tokio::sync::watch::Sender<RateLimitInfo>,
+ }
+ 
+ impl SessionManager {
+-    pub fn new(config: Arc<ClaudeConfig>, max_sessions: usize) -> Self {
++    pub fn new(
++        config: Arc<ClaudeConfig>,
++        max_sessions: usize,
++        ratelimit_tx: tokio::sync::watch::Sender<RateLimitInfo>,
++    ) -> Self {
+         Self {
+             sessions: Arc::new(Mutex::new(HashMap::new())),
+             config,
+             max_sessions,
+             pending_recalls: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
++            ratelimit_tx,
+         }
+     }
+ 
+@@ -177,6 +184,7 @@ impl SessionManager {
+             interrupt_rx,
+             permission_tx.clone(),
+             Arc::clone(&queue_size),
++            self.ratelimit_tx.clone(),
+             sessions_clone,
+             Arc::clone(&last_activity),
+             Arc::clone(&has_active_bg_tasks),
+diff --git a/src/subprocess/worker.rs b/src/subprocess/worker.rs
+index b9f7a1a..34af1ff 100644
+--- a/src/subprocess/worker.rs
++++ b/src/subprocess/worker.rs
+@@ -12,6 +12,7 @@ use tokio::sync::{mpsc, Mutex};
+ use crate::db::repository;
+ use crate::handler::formatter;
+ use crate::i18n::Lang;
++use crate::ratelimit::RateLimitInfo;
+ use super::background::BackgroundTaskTracker;
+ use super::parser::{parse_line, StreamEvent, ContentBlock, build_control_response_allow, build_control_response_deny, build_control_response_ask_answer};
+ use super::permission::{PermissionCache, PermissionDecision, PermissionRequest};
+@@ -118,6 +119,7 @@ pub(super) struct SessionWorker {
+     has_bg_tasks: Arc<AtomicBool>,
+     is_turn_active: Arc<AtomicBool>,
+     pending_recalls: Arc<tokio::sync::Mutex<HashMap<MessageId, (String, Arc<AtomicBool>)>>>,
++    ratelimit_tx: tokio::sync::watch::Sender<RateLimitInfo>,
+     // Config/Context
+     thread_id: String,
+     channel_id: ChannelId,
+@@ -136,6 +138,7 @@ impl SessionWorker {
+         interrupt_rx: mpsc::Receiver<()>,
+         permission_tx: mpsc::Sender<PermissionRequest>,
+         queue_size: Arc<AtomicUsize>,
++        ratelimit_tx: tokio::sync::watch::Sender<RateLimitInfo>,
+         sessions: Arc<Mutex<HashMap<String, SessionInner>>>,
+         last_activity: Arc<StdMutex<Instant>>,
+         has_bg_tasks: Arc<AtomicBool>,
+@@ -165,6 +168,7 @@ impl SessionWorker {
+             has_bg_tasks,
+             is_turn_active,
+             pending_recalls,
++            ratelimit_tx,
+             thread_id,
+             channel_id,
+             ctx,
+@@ -191,6 +195,7 @@ impl SessionWorker {
+             ref has_bg_tasks,
+             ref is_turn_active,
+             ref pending_recalls,
++            ref ratelimit_tx,
+             ref thread_id,
+             ref channel_id,
+             ref ctx,
+@@ -271,6 +276,7 @@ impl SessionWorker {
+                         is_turn_active,
+                         last_activity,
+                         pending_recalls,
++                        ratelimit_tx,
+                         thread_id,
+                         channel_id,
+                         ctx,
+@@ -841,6 +847,7 @@ async fn run_active_turn(
+     is_turn_active: &Arc<AtomicBool>,
+     last_activity: &Arc<StdMutex<Instant>>,
+     pending_recalls: &Arc<tokio::sync::Mutex<HashMap<MessageId, (String, Arc<AtomicBool>)>>>,
++    ratelimit_tx: &tokio::sync::watch::Sender<RateLimitInfo>,
+     thread_id: &str,
+     channel_id: &ChannelId,
+     ctx: &Context,
+@@ -1053,7 +1060,17 @@ async fn run_active_turn(
+                                             }
+                                             continue 'turn;
+                                         }
+-                                        _ => { continue 'turn; } // Init, RateLimit 등 skip
++                                        StreamEvent::RateLimit { rate_limit_type, utilization, resets_at, is_using_overage, .. } => {
++                                            if let (Some(rlt), Some(util)) = (rate_limit_type, utilization) {
++                                                let resets = resets_at.unwrap_or(0);
++                                                let overage = *is_using_overage.as_ref().unwrap_or(&false);
++                                                ratelimit_tx.send_modify(|info| {
++                                                    info.update_from_event(rlt, *util, resets, overage);
++                                                });
++                                            }
++                                            continue 'turn;
++                                        }
++                                        _ => { continue 'turn; } // Init 등 skip
+                                     }
+                                 }
+ 
+@@ -1137,6 +1154,17 @@ async fn run_active_turn(
+                                     continue 'turn;
+                                 }
+ 
++                                // RateLimit 이벤트 → 공유 상태 업데이트
++                                if let StreamEvent::RateLimit { ref rate_limit_type, utilization, resets_at, is_using_overage, .. } = event {
++                                    if let (Some(rlt), Some(util)) = (rate_limit_type, utilization) {
++                                        let resets = resets_at.unwrap_or(0);
++                                        let overage = is_using_overage.unwrap_or(false);
++                                        ratelimit_tx.send_modify(|info| {
++                                            info.update_from_event(rlt, util, resets, overage);
++                                        });
++                                    }
++                                }
++
+                                 // 일반 이벤트 처리
+                                 let is_result = event.is_result();
+                                 if is_result {
