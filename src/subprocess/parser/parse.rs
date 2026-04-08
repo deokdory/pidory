@@ -284,6 +284,7 @@ pub fn parse_line(line: &str) -> Result<StreamEvent, serde_json::Error> {
             }
         }
         "rate_limit_event" => {
+            tracing::info!("rate_limit_event raw JSON: {}", line);
             let session_id = v
                 .get("session_id")
                 .and_then(|s| s.as_str())
