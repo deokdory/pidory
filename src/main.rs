@@ -110,7 +110,7 @@ async fn main() -> Result<(), PidoryError> {
                     info!("Reset {} orphaned running sessions", reset_count);
                 }
 
-                let (ratelimit_tx, _ratelimit_rx) = tokio::sync::watch::channel(crate::ratelimit::RateLimitInfo::default());
+                let (ratelimit_tx, _) = tokio::sync::watch::channel(crate::ratelimit::RateLimitInfo::default());
 
                 let sessions = Arc::new(SessionManager::new(
                     Arc::new(config.claude.clone()),

@@ -219,6 +219,7 @@ impl SessionWorker {
                 queue_size,
                 has_bg_tasks,
                 pending_recalls,
+                &ratelimit_tx,
                 thread_id,
                 channel_id,
                 ctx,
@@ -332,6 +333,7 @@ async fn handle_between_turns_event(
     queue_size: &Arc<AtomicUsize>,
     has_bg_tasks: &Arc<AtomicBool>,
     pending_recalls: &Arc<tokio::sync::Mutex<HashMap<MessageId, (String, Arc<AtomicBool>)>>>,
+    ratelimit_tx: &tokio::sync::watch::Sender<RateLimitInfo>,
     thread_id: &str,
     channel_id: &ChannelId,
     ctx: &Context,
@@ -397,6 +399,7 @@ async fn handle_between_turns_event(
                                 current_triggered_by,
                                 queue_size,
                                 pending_recalls,
+                                &ratelimit_tx,
                                 thread_id,
                                 channel_id,
                                 ctx,
@@ -445,7 +448,7 @@ async fn handle_between_turns_event(
                             }
                             let perm_result = wait_for_permission(
                                 stdin, reader, line, queue_rx, interrupt_rx,
-                                queue_size, pending_recalls, thread_id, &saved_tool_name, None, &mut resp_rx,
+                                queue_size, pending_recalls, &ratelimit_tx, thread_id, &saved_tool_name, None, &mut resp_rx,
                             ).await;
                             match write_permission_response(perm_result, &saved_request_id, &saved_input, stdin, permission_cache).await {
                                 Ok(true) => return BetweenTurnsAction::Break,
@@ -505,6 +508,7 @@ async fn handle_bg_turn(
     current_triggered_by: &mut UserId,
     queue_size: &Arc<AtomicUsize>,
     pending_recalls: &Arc<tokio::sync::Mutex<HashMap<MessageId, (String, Arc<AtomicBool>)>>>,
+    ratelimit_tx: &tokio::sync::watch::Sender<RateLimitInfo>,
     thread_id: &str,
     channel_id: &ChannelId,
     ctx: &Context,
@@ -600,7 +604,7 @@ async fn handle_bg_turn(
                                     } else {
                                         let perm_result = wait_for_permission(
                                             stdin, reader, line, queue_rx, interrupt_rx,
-                                            queue_size, pending_recalls, thread_id, &saved_tool_name, None, &mut resp_rx,
+                                            queue_size, pending_recalls, &ratelimit_tx, thread_id, &saved_tool_name, None, &mut resp_rx,
                                         ).await;
                                         match write_permission_response(perm_result, &saved_request_id, &saved_input, stdin, permission_cache).await {
                                             Ok(true) | Err(_) => {
@@ -619,6 +623,15 @@ async fn handle_bg_turn(
                             }
                             Ok(StreamEvent::TaskProgress { ref task_id, ref description, .. }) => {
                                 tracker.track_progress(task_id, description);
+                            }
+                            Ok(StreamEvent::RateLimit { rate_limit_type, utilization, resets_at, is_using_overage, .. }) => {
+                                if let (Some(rlt), Some(util)) = (&rate_limit_type, utilization) {
+                                    let resets = resets_at.unwrap_or(0);
+                                    let overage = is_using_overage.unwrap_or(false);
+                                    ratelimit_tx.send_modify(|info| {
+                                        info.update_from_event(rlt, util, resets, overage);
+                                    });
+                                }
                             }
                             Ok(_) => {}
                             Err(e) => {
@@ -688,6 +701,7 @@ async fn wait_for_permission(
     interrupt_rx: &mut mpsc::Receiver<()>,
     queue_size: &Arc<AtomicUsize>,
     pending_recalls: &Arc<tokio::sync::Mutex<HashMap<MessageId, (String, Arc<AtomicBool>)>>>,
+    ratelimit_tx: &tokio::sync::watch::Sender<RateLimitInfo>,
     thread_id: &str,
     saved_tool_name: &str,
     event_tx: Option<&mpsc::Sender<StreamEvent>>,
@@ -763,6 +777,16 @@ async fn wait_for_permission(
                         if !t.is_empty() {
                             match parse_line(t) {
                                 Ok(ev) => {
+                                    // RateLimit 이벤트 → 공유 상태 업데이트
+                                    if let StreamEvent::RateLimit { rate_limit_type, utilization, resets_at, is_using_overage, .. } = &ev {
+                                        if let (Some(rlt), Some(util)) = (rate_limit_type, utilization) {
+                                            let resets = resets_at.unwrap_or(0);
+                                            let overage = is_using_overage.unwrap_or(false);
+                                            ratelimit_tx.send_modify(|info| {
+                                                info.update_from_event(rlt, *util, resets, overage);
+                                            });
+                                        }
+                                    }
                                     if let Some(tx) = event_tx {
                                         let _ = tx.send(ev).await;
                                     } else {
@@ -1048,7 +1072,7 @@ async fn run_active_turn(
                                             }
                                             let perm_result = wait_for_permission(
                                                 stdin, reader, line, queue_rx, interrupt_rx,
-                                                queue_size, pending_recalls, thread_id, &saved_tool_name, Some(&event_tx), &mut resp_rx,
+                                                queue_size, pending_recalls, &ratelimit_tx, thread_id, &saved_tool_name, Some(&event_tx), &mut resp_rx,
                                             ).await;
                                             match write_permission_response(perm_result, &saved_request_id, &saved_input, stdin, permission_cache).await {
                                                 Ok(true) => break 'turn false,
@@ -1133,6 +1157,7 @@ async fn run_active_turn(
                                         interrupt_rx,
                                         queue_size,
                                         pending_recalls,
+                                        &ratelimit_tx,
                                         thread_id,
                                         &saved_tool_name,
                                         Some(&event_tx),
