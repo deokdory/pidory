@@ -387,6 +387,11 @@ pub async fn execute_in_session(
     }
 
     // 직접 실행
+    // stale needs_context 정리 (/new가 아닌 경우에만 — /new는 send 후 insert)
+    if !is_new_command {
+        data.needs_context.lock().await.remove(thread_id);
+    }
+
     emoji::set_reaction(ctx, channel_id, msg_id, ReactionStatus::Running)
         .await
         .ok();
