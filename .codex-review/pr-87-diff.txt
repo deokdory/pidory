@@ -1,0 +1,28 @@
+diff --git a/src/subprocess/parser.rs b/src/subprocess/parser.rs
+index 1f03995..b8a94a0 100644
+--- a/src/subprocess/parser.rs
++++ b/src/subprocess/parser.rs
+@@ -534,7 +534,7 @@ mod tests {
+         let event = parse_line(line).unwrap();
+         if let StreamEvent::Result { context_window, input_tokens, .. } = event {
+             assert_eq!(context_window, 1000000);
+-            assert_eq!(input_tokens, 3 + 26147 + 0); // input + cache_creation + cache_read
++            assert_eq!(input_tokens, 3); // input_tokens only (cache tokens excluded)
+         } else {
+             panic!("expected Result");
+         }
+@@ -896,12 +896,8 @@ pub fn parse_line(line: &str) -> Result<StreamEvent, serde_json::Error> {
+                 .unwrap_or(0) as u32;
+             let usage = v.get("usage");
+             let input_tokens = usage
+-                .and_then(|u| {
+-                    let input = u.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+-                    let cache_creation = u.get("cache_creation_input_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+-                    let cache_read = u.get("cache_read_input_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+-                    Some(input + cache_creation + cache_read)
+-                })
++                .and_then(|u| u.get("input_tokens"))
++                .and_then(|v| v.as_u64())
+                 .unwrap_or(0);
+             let output_tokens = usage
+                 .and_then(|u| u.get("output_tokens"))

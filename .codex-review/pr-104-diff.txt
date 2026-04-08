@@ -1,0 +1,113 @@
+diff --git a/src/subprocess/parser/parse.rs b/src/subprocess/parser/parse.rs
+index aed83bb..d28d8eb 100644
+--- a/src/subprocess/parser/parse.rs
++++ b/src/subprocess/parser/parse.rs
+@@ -353,35 +353,40 @@ pub fn parse_line(line: &str) -> Result<StreamEvent, serde_json::Error> {
+                 .and_then(|u| u.get("output_tokens"))
+                 .and_then(|v| v.as_u64())
+                 .unwrap_or(0);
+-            let context_window = v.get("modelUsage")
++            let main_model = v.get("modelUsage")
+                 .and_then(|m| m.as_object())
+-                .and_then(|m| m.values().next())
++                .and_then(|obj| {
++                    obj.values().max_by_key(|model| {
++                        model.get("contextWindow").and_then(|v| v.as_u64()).unwrap_or(0)
++                    })
++                });
++            let context_window = main_model
+                 .and_then(|model| model.get("contextWindow"))
+                 .and_then(|v| v.as_u64())
+                 .unwrap_or(0);
+-            let cache_creation = usage
+-                .and_then(|u| u.get("cache_creation_input_tokens"))
+-                .and_then(|v| v.as_u64())
+-                .unwrap_or(0);
+-            let cache_read = usage
+-                .and_then(|u| u.get("cache_read_input_tokens"))
+-                .and_then(|v| v.as_u64())
+-                .unwrap_or(0);
+-            let total_input_tokens = input_tokens
+-                .saturating_add(cache_creation)
+-                .saturating_add(cache_read);
+-            let model_usage_raw = v.get("modelUsage")
+-                .map(|m| m.to_string())
+-                .unwrap_or_else(|| "null".to_string());
+-            tracing::info!(
+-                input_tokens,
+-                cache_creation,
+-                cache_read,
+-                total_input_tokens,
+-                context_window,
+-                model_usage_raw,
+-                "ctx% debug: result event usage"
+-            );
++            let total_input_tokens = if let Some(model) = main_model {
++                let input = model.get("inputTokens").and_then(|v| v.as_u64()).unwrap_or(0);
++                let cache_creation = model
++                    .get("cacheCreationInputTokens")
++                    .and_then(|v| v.as_u64())
++                    .unwrap_or(0);
++                let cache_read = model
++                    .get("cacheReadInputTokens")
++                    .and_then(|v| v.as_u64())
++                    .unwrap_or(0);
++                input.saturating_add(cache_creation).saturating_add(cache_read)
++            } else {
++                // fallback: no modelUsage available, sum from top-level usage fields
++                let cache_creation = usage
++                    .and_then(|u| u.get("cache_creation_input_tokens"))
++                    .and_then(|v| v.as_u64())
++                    .unwrap_or(0);
++                let cache_read = usage
++                    .and_then(|u| u.get("cache_read_input_tokens"))
++                    .and_then(|v| v.as_u64())
++                    .unwrap_or(0);
++                input_tokens.saturating_add(cache_creation).saturating_add(cache_read)
++            };
+             Ok(StreamEvent::Result {
+                 subtype,
+                 session_id,
+@@ -776,12 +781,39 @@ mod tests {
+ 
+     #[test]
+     fn parse_result_with_model_usage() {
+-        let line = r#"{"type":"result","subtype":"success","session_id":"abc","is_error":false,"duration_ms":1000,"total_cost_usd":0.16,"num_turns":1,"usage":{"input_tokens":3,"cache_creation_input_tokens":26147,"cache_read_input_tokens":0,"output_tokens":4},"modelUsage":{"claude-opus-4-6[1m]":{"inputTokens":3,"outputTokens":4,"contextWindow":1000000,"maxOutputTokens":64000}}}"#;
++        let line = r#"{"type":"result","subtype":"success","session_id":"abc","is_error":false,"duration_ms":1000,"total_cost_usd":0.16,"num_turns":1,"usage":{"input_tokens":3,"cache_creation_input_tokens":26147,"cache_read_input_tokens":0,"output_tokens":4},"modelUsage":{"claude-opus-4-6[1m]":{"inputTokens":3,"cacheCreationInputTokens":26147,"cacheReadInputTokens":0,"outputTokens":4,"contextWindow":1000000,"maxOutputTokens":64000}}}"#;
+         let event = parse_line(line).unwrap();
+         if let StreamEvent::Result { context_window, input_tokens, total_input_tokens, .. } = event {
+             assert_eq!(context_window, 1000000);
+-            assert_eq!(input_tokens, 3); // input_tokens only (cache tokens excluded)
+-            assert_eq!(total_input_tokens, 26150); // 3 + 26147 + 0
++            assert_eq!(input_tokens, 3); // top-level usage.input_tokens
++            assert_eq!(total_input_tokens, 26150); // 3 + 26147 + 0 (per-model)
++        } else {
++            panic!("expected Result");
++        }
++    }
++
++    #[test]
++    fn parse_result_with_multiple_models() {
++        // 200K + 1M models: should pick 1M model for context_window and total_input_tokens
++        let line = r#"{"type":"result","subtype":"success","session_id":"abc","is_error":false,"duration_ms":5000,"total_cost_usd":1.0,"num_turns":3,"usage":{"input_tokens":17,"cache_creation_input_tokens":263893,"cache_read_input_tokens":1667176,"output_tokens":5067},"modelUsage":{"claude-opus-4-6":{"inputTokens":9,"cacheCreationInputTokens":257281,"cacheReadInputTokens":819053,"contextWindow":200000,"outputTokens":2202},"claude-opus-4-6[1m]":{"inputTokens":8,"cacheCreationInputTokens":6612,"cacheReadInputTokens":848123,"contextWindow":1000000,"outputTokens":2865}}}"#;
++        let event = parse_line(line).unwrap();
++        if let StreamEvent::Result { context_window, input_tokens, total_input_tokens, .. } = event {
++            assert_eq!(context_window, 1000000); // picks the 1M model
++            assert_eq!(input_tokens, 17); // top-level usage.input_tokens unchanged
++            assert_eq!(total_input_tokens, 854743); // 8 + 6612 + 848123 (1M model per-model tokens)
++        } else {
++            panic!("expected Result");
++        }
++    }
++
++    #[test]
++    fn parse_result_model_without_cache_fields() {
++        // modelUsage entry has no cacheCreationInputTokens / cacheReadInputTokens
++        let line = r#"{"type":"result","subtype":"success","session_id":"abc","is_error":false,"duration_ms":500,"total_cost_usd":0.01,"num_turns":1,"usage":{"input_tokens":10,"output_tokens":20},"modelUsage":{"claude-3-5-haiku":{"inputTokens":10,"outputTokens":20,"contextWindow":200000}}}"#;
++        let event = parse_line(line).unwrap();
++        if let StreamEvent::Result { context_window, total_input_tokens, .. } = event {
++            assert_eq!(context_window, 200000);
++            assert_eq!(total_input_tokens, 10); // only inputTokens, no cache fields
+         } else {
+             panic!("expected Result");
+         }
