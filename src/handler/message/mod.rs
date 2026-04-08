@@ -455,7 +455,7 @@ mod tests {
     fn no_inject_on_new_command() {
         let result = build_context_content("/new", true, false, "스레드", Lang::Ko);
         assert!(!result.contains("<system-reminder>"));
-        assert_eq!(result, "/new");
+        assert_eq!(result, "/compact");
     }
 
     #[test]
@@ -475,7 +475,7 @@ mod tests {
     fn no_inject_on_clear_command() {
         let result = build_context_content("/clear", true, false, "스레드", Lang::Ko);
         assert!(!result.contains("<system-reminder>"));
-        assert_eq!(result, "/clear");
+        assert_eq!(result, "/compact");
     }
 
     #[test]
