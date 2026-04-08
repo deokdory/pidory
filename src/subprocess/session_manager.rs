@@ -203,6 +203,7 @@ impl SessionManager {
             lang,
             owner_id,
             Arc::clone(&self.pending_recalls),
+            self.ratelimit_tx.clone(),
         ).run());
 
 
