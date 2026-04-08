@@ -17,6 +17,8 @@ pub struct Config {
     pub ratelimit: RateLimitConfig,
     #[serde(default)]
     pub release: ReleaseConfig,
+    #[serde(default)]
+    pub attachment: AttachmentConfig,
 }
 
 #[derive(Debug, Deserialize)]
@@ -141,6 +143,48 @@ fn default_release_last_tag_file() -> String {
     "/tmp/pidory-last-release.txt".to_string()
 }
 
+#[derive(Debug, Deserialize)]
+pub struct AttachmentConfig {
+    #[serde(default = "default_max_file_size_mb")]
+    pub max_file_size_mb: u64,
+    #[serde(default = "default_max_aggregate_size_mb")]
+    pub max_aggregate_size_mb: u64,
+    #[serde(default = "default_download_timeout_secs_attachment")]
+    pub download_timeout_secs: u64,
+}
+
+impl Default for AttachmentConfig {
+    fn default() -> Self {
+        Self {
+            max_file_size_mb: default_max_file_size_mb(),
+            max_aggregate_size_mb: default_max_aggregate_size_mb(),
+            download_timeout_secs: default_download_timeout_secs_attachment(),
+        }
+    }
+}
+
+impl AttachmentConfig {
+    pub fn max_file_size_bytes(&self) -> u64 {
+        self.max_file_size_mb.saturating_mul(1024 * 1024)
+    }
+
+    pub fn max_aggregate_size_bytes(&self) -> u64 {
+        self.max_aggregate_size_mb.saturating_mul(1024 * 1024)
+    }
+}
+
+fn default_max_file_size_mb() -> u64 {
+    25
+}
+
+fn default_max_aggregate_size_mb() -> u64 {
+    50
+}
+
+fn default_download_timeout_secs_attachment() -> u64 {
+    30
+}
+
 fn default_subprocess_timeout_secs() -> u64 {
     600
 }
@@ -219,6 +263,9 @@ binary_path = "claude"
         assert_eq!(config.database.path, "pidory.db");
         assert_eq!(config.discord.token_env, "PIDORY_DISCORD_TOKEN");
         assert_eq!(config.language, Lang::Ko); // default
+        assert_eq!(config.attachment.max_file_size_mb, 25);
+        assert_eq!(config.attachment.max_aggregate_size_mb, 50);
+        assert_eq!(config.attachment.download_timeout_secs, 30);
     }
 
     #[test]
@@ -421,5 +468,50 @@ binary_path = "claude"
 "#;
         let config: Config = toml::from_str(toml_str).unwrap();
         assert_eq!(config.language, Lang::Ko);
+    }
+
+    #[test]
+    fn parse_config_with_attachment() {
+        let toml_str = r#"
+[discord]
+guild_id = 123
+owner_id = 456
+
+[claude]
+binary_path = "claude"
+
+[response]
+
+[attachment]
+max_file_size_mb = 50
+max_aggregate_size_mb = 100
+download_timeout_secs = 60
+"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.attachment.max_file_size_mb, 50);
+        assert_eq!(config.attachment.max_aggregate_size_mb, 100);
+        assert_eq!(config.attachment.download_timeout_secs, 60);
+        assert_eq!(config.attachment.max_file_size_bytes(), 50 * 1024 * 1024);
+        assert_eq!(config.attachment.max_aggregate_size_bytes(), 100 * 1024 * 1024);
+    }
+
+    #[test]
+    fn parse_config_without_attachment_defaults() {
+        let toml_str = r#"
+[discord]
+guild_id = 123
+owner_id = 456
+
+[claude]
+binary_path = "claude"
+
+[response]
+"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.attachment.max_file_size_mb, 25);
+        assert_eq!(config.attachment.max_aggregate_size_mb, 50);
+        assert_eq!(config.attachment.download_timeout_secs, 30);
+        assert_eq!(config.attachment.max_file_size_bytes(), 25 * 1024 * 1024);
+        assert_eq!(config.attachment.max_aggregate_size_bytes(), 50 * 1024 * 1024);
     }
 }
