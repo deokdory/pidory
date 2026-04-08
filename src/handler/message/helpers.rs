@@ -26,7 +26,66 @@ pub(super) fn build_context_content(
     if !is_new_command && (is_new_session || had_needs_context) {
         let context = lang.session_context(thread_name);
         format!("{}\n\n{}", context, content)
+    } else if is_new_command {
+        "/compact".to_string()
     } else {
         content.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::i18n::Lang;
+
+    #[test]
+    fn test_new_command_becomes_compact() {
+        let result = build_context_content("/new", false, false, "thread", Lang::Ko);
+        assert_eq!(result, "/compact");
+    }
+
+    #[test]
+    fn test_clear_command_becomes_compact() {
+        let result = build_context_content("/clear", false, false, "thread", Lang::Ko);
+        assert_eq!(result, "/compact");
+    }
+
+    #[test]
+    fn test_mixed_case_new_becomes_compact() {
+        let result = build_context_content("/New", false, false, "thread", Lang::Ko);
+        assert_eq!(result, "/compact");
+    }
+
+    #[test]
+    fn test_mixed_case_clear_becomes_compact() {
+        let result = build_context_content("/CLEAR", false, false, "thread", Lang::Ko);
+        assert_eq!(result, "/compact");
+    }
+
+    #[test]
+    fn test_new_command_with_new_session_becomes_compact() {
+        // context inject 안 됨 — /compact 반환
+        let result = build_context_content("/new", true, false, "thread", Lang::Ko);
+        assert_eq!(result, "/compact");
+    }
+
+    #[test]
+    fn test_regular_message_passthrough() {
+        let result = build_context_content("hello", false, false, "thread", Lang::Ko);
+        assert_eq!(result, "hello");
+    }
+
+    #[test]
+    fn test_regular_message_with_new_session_injects_context() {
+        let result = build_context_content("hello", true, false, "my-thread", Lang::Ko);
+        assert!(result.contains("hello"));
+        assert!(result.contains("my-thread"));
+    }
+
+    #[test]
+    fn test_regular_message_with_needs_context_injects_context() {
+        let result = build_context_content("hello", false, true, "my-thread", Lang::Ko);
+        assert!(result.contains("hello"));
+        assert!(result.contains("my-thread"));
     }
 }
