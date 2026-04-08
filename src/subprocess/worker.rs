@@ -38,9 +38,16 @@ fn build_user_message_json(content: &str, downloaded_files: &[String], reply_con
 
     // 1. reply context system-reminder
     if let Some(reply) = reply_context {
+        // Sanitize untrusted reply content to prevent prompt injection
+        let safe_content = reply.original_content
+            .replace("</system-reminder>", "[/system-reminder]")
+            .replace("<system-reminder>", "[system-reminder]");
+        let safe_author = reply.original_author_name
+            .replace("</system-reminder>", "[/system-reminder]")
+            .replace("<system-reminder>", "[system-reminder]");
         text.push_str(&format!(
             "<system-reminder>\n이 메시지는 다음 메시지에 대한 reply(답장)입니다:\n[원본 작성자: {}]\n{}\n</system-reminder>\n\n",
-            reply.original_author_name, reply.original_content
+            safe_author, safe_content
         ));
     }
 
@@ -1482,7 +1489,7 @@ mod tests {
     #[test]
     fn hard_timeout_break_value_is_true() {
         let soft_timeout_fired = true;
-        let outer_break = if soft_timeout_fired { true } else { false };
+        let outer_break = soft_timeout_fired;
         assert!(outer_break, "hard timeout must set outer_break = true to exit the session loop");
     }
 
@@ -1491,7 +1498,7 @@ mod tests {
     #[test]
     fn normal_turn_break_value_is_false() {
         let soft_timeout_fired = false;
-        let outer_break = if soft_timeout_fired { true } else { false };
+        let outer_break = soft_timeout_fired;
         assert!(!outer_break, "normal turn completion must set outer_break = false to keep session alive");
     }
 
