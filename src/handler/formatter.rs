@@ -1,4 +1,5 @@
 use poise::serenity_prelude as serenity;
+use serenity::{CreateAllowedMentions, CreateMessage};
 use tokio::time::{sleep, Duration};
 
 use crate::error::PidoryError;
@@ -665,4 +666,24 @@ pub async fn send_response(
     }
 
     Ok(())
+}
+
+/// Discord에 메시지를 전송한다. reply_to가 있으면 reply로 전송, 없으면 일반 전송.
+/// 향후 reply 기능 활성화 시 사용.
+#[allow(dead_code)]
+pub async fn send_reply(
+    ctx: &serenity::Context,
+    channel_id: serenity::ChannelId,
+    content: &str,
+    reply_to: Option<serenity::MessageId>,
+) -> Result<serenity::Message, serenity::Error> {
+    if let Some(msg_id) = reply_to {
+        let message = CreateMessage::new()
+            .content(content)
+            .reference_message((channel_id, msg_id))
+            .allowed_mentions(CreateAllowedMentions::new());
+        channel_id.send_message(ctx, message).await
+    } else {
+        channel_id.say(ctx, content).await
+    }
 }
