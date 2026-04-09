@@ -24,6 +24,41 @@ impl Lang {
         }
     }
 
+    // ── Progress indicators ──
+    // TODO: Ko/En 문자열 동일 — 한국어 로컬라이제이션 필요 시 분리
+
+    /// Progress: tool 실행 중
+    pub fn progress_tool(&self, name: &str, elapsed: &str) -> String {
+        match self {
+            Lang::Ko => format!("⏱️ {} ({})", name, elapsed),
+            Lang::En => format!("⏱️ {} ({})", name, elapsed),
+        }
+    }
+
+    /// Progress: thinking 중
+    pub fn progress_thinking(&self, elapsed: &str) -> String {
+        match self {
+            Lang::Ko => format!("⏱️ thinking... ({})", elapsed),
+            Lang::En => format!("⏱️ thinking... ({})", elapsed),
+        }
+    }
+
+    /// Progress: tool 완료
+    pub fn progress_tool_done(&self, name: &str, elapsed: &str) -> String {
+        match self {
+            Lang::Ko => format!("⏱️ {} — {}", name, elapsed),
+            Lang::En => format!("⏱️ {} — {}", name, elapsed),
+        }
+    }
+
+    /// Progress: thinking 완료
+    pub fn progress_thinking_done(&self, elapsed: &str) -> String {
+        match self {
+            Lang::Ko => format!("⏱️ thinking — {}", elapsed),
+            Lang::En => format!("⏱️ thinking — {}", elapsed),
+        }
+    }
+
     // ── Commands: register ──
 
     pub fn path_not_exist(&self, path: &str) -> String {

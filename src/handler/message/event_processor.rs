@@ -11,6 +11,7 @@ use tracing::error;
 use crate::db::repository;
 use crate::handler::{emoji, file_attach, formatter};
 use crate::handler::emoji::ReactionStatus;
+use crate::handler::status::ProgressIndicator;
 use crate::i18n::Lang;
 use crate::subprocess::parser::{ContentBlock, StreamEvent};
 
@@ -178,32 +179,73 @@ pub async fn process_turn_events(
             send_event_to_discord(ctx, channel_id, event, &mut tool_use_names, &mut used_tools, max_chunk_length, lang).await;
         }
 
+        // Progress indicator 초기화
+        let mut progress = ProgressIndicator::new(channel_id, lang);
+        let mut tick_interval = tokio::time::interval(Duration::from_secs(1));
+        tick_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
         loop {
-            let stream_event = match event_rx.recv().await {
-                Some(e) => Some(Ok(e)),
-                None => Some(Err(())),
-            };
+            tokio::select! {
+                event = event_rx.recv() => {
+                    match event {
+                        Some(stream_event) => {
+                            // Progress 상태 업데이트 (send_event_to_discord 전에!)
+                            if stream_event.is_control_request() {
+                                progress.on_control_request();
+                            } else {
+                                if progress.is_paused() {
+                                    progress.on_resume();
+                                }
 
-            match stream_event {
-                Some(Ok(stream_event)) => {
-                    typing_paused.store(false, Ordering::Relaxed);
-                    send_event_to_discord(ctx, channel_id, &stream_event, &mut tool_use_names, &mut used_tools, max_chunk_length, lang).await;
+                                if let StreamEvent::Assistant { content, .. } = &stream_event {
+                                    let has_tool_use = content.iter().any(|b| matches!(b, ContentBlock::ToolUse { .. }));
+                                    if has_tool_use {
+                                        for block in content {
+                                            if let ContentBlock::ToolUse { name, .. } = block {
+                                                progress.on_tool_use(name, ctx).await;
+                                            }
+                                        }
+                                    } else {
+                                        // Text-only assistant → thinking timer reset
+                                        progress.on_event();
+                                    }
+                                } else if matches!(&stream_event, StreamEvent::User { .. }) {
+                                    progress.on_tool_result(ctx).await;
+                                } else if !stream_event.is_result() {
+                                    progress.on_event();
+                                }
+                            }
 
-                    if stream_event.is_result() {
-                        got_result = true;
-                    }
-                    let is_result = stream_event.is_result();
-                    events.push(stream_event);
-                    if is_result {
-                        break;
+                            // typing indicator 제어
+                            typing_paused.store(progress.is_active(), Ordering::Relaxed);
+
+                            // 기존 이벤트 처리
+                            send_event_to_discord(ctx, channel_id, &stream_event, &mut tool_use_names, &mut used_tools, max_chunk_length, lang).await;
+
+                            if stream_event.is_result() {
+                                got_result = true;
+                            }
+                            let is_result = stream_event.is_result();
+                            events.push(stream_event);
+                            if is_result {
+                                break;
+                            }
+                        }
+                        None => {
+                            // sender dropped
+                            break;
+                        }
                     }
                 }
-                Some(Err(())) | None => {
-                    // sender dropped
-                    break;
+                _ = tick_interval.tick() => {
+                    progress.tick(ctx).await;
+                    typing_paused.store(progress.is_active(), Ordering::Relaxed);
                 }
             }
         }
+
+        // Turn 종료 시 cleanup
+        progress.cleanup(ctx).await;
     }
 
     // 5. typing indicator 취소

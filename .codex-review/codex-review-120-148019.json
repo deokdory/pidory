@@ -1,0 +1,1 @@
+{"findings":[],"summary":"No bugs, type errors, signature mismatches, or correctness issues found in this diff; it removes a stale `ratelimit_tx` argument so the `SessionWorker::new` call matches its current signature.","files_reviewed":2}
