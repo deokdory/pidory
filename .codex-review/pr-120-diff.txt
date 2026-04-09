@@ -1,0 +1,12 @@
+diff --git a/src/subprocess/session_manager.rs b/src/subprocess/session_manager.rs
+index bfc852c..35f37bc 100644
+--- a/src/subprocess/session_manager.rs
++++ b/src/subprocess/session_manager.rs
+@@ -191,7 +191,6 @@ impl SessionManager {
+             interrupt_rx,
+             permission_tx.clone(),
+             Arc::clone(&queue_size),
+-            self.ratelimit_tx.clone(),
+             sessions_clone,
+             Arc::clone(&last_activity),
+             Arc::clone(&has_active_bg_tasks),

@@ -294,6 +294,7 @@ async fn handle_message(
         }
     }
 
+
     // 원자적 acquire: running이 아닌 경우에만 running으로 전환
     let acquired = repository::try_acquire_session(db, &thread_id).await?;
 
@@ -520,6 +521,7 @@ pub async fn execute_in_session(
             return Ok(());
         }
     }
+
 
     let acquired = repository::try_acquire_session(db, thread_id).await?;
 
