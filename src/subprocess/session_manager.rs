@@ -191,7 +191,6 @@ impl SessionManager {
             interrupt_rx,
             permission_tx.clone(),
             Arc::clone(&queue_size),
-            self.ratelimit_tx.clone(),
             sessions_clone,
             Arc::clone(&last_activity),
             Arc::clone(&has_active_bg_tasks),
