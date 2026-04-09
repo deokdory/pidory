@@ -90,4 +90,32 @@ impl Lang {
             Lang::En => "Session reset. A new session will start with your next message.",
         }
     }
+
+    pub fn session_reset_confirm(&self) -> &'static str {
+        match self {
+            Lang::Ko => "세션이 작업 중입니다. 리셋하시겠습니까?",
+            Lang::En => "Session is busy. Reset it?",
+        }
+    }
+
+    pub fn session_reset_cancelled(&self) -> &'static str {
+        match self {
+            Lang::Ko => "리셋이 취소되었습니다.",
+            Lang::En => "Reset cancelled.",
+        }
+    }
+
+    pub fn session_reset_expired(&self) -> &'static str {
+        match self {
+            Lang::Ko => "리셋 확인이 만료되었습니다.",
+            Lang::En => "Reset confirmation expired.",
+        }
+    }
+
+    pub fn session_reset_interrupt_failed(&self, e: &impl std::fmt::Display) -> String {
+        match self {
+            Lang::Ko => format!("세션 중단 실패: {}", e),
+            Lang::En => format!("Failed to interrupt session: {}", e),
+        }
+    }
 }
