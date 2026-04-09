@@ -20,6 +20,7 @@ pub struct ProgressIndicator {
     pause_elapsed: Duration,
     active: bool,
     lang: Lang,
+    edit_fail_count: u32,
 }
 
 impl ProgressIndicator {
@@ -35,38 +36,31 @@ impl ProgressIndicator {
             pause_elapsed: Duration::ZERO,
             active: false,
             lang,
+            edit_fail_count: 0,
         }
     }
 
     pub async fn on_tool_use(&mut self, name: &str, ctx: &serenity::Context) {
-        if self.active {
-            self.finalize(ctx).await;
-        }
         self.kind = ProgressKind::Tool(name.to_string());
         self.started = Instant::now();
-        self.active = false;
         self.pause_elapsed = Duration::ZERO;
+        if self.active {
+            self.edit_now(ctx).await;
+        }
     }
 
     pub async fn on_tool_result(&mut self, ctx: &serenity::Context) {
-        if self.active {
-            if let ProgressKind::Tool(_) = &self.kind {
-                self.finalize(ctx).await;
-            }
-        }
         self.kind = ProgressKind::Thinking;
         self.started = Instant::now();
-        self.active = false;
         self.pause_elapsed = Duration::ZERO;
+        if self.active {
+            self.edit_now(ctx).await;
+        }
     }
 
-    pub async fn on_event(&mut self, ctx: &serenity::Context) {
+    pub fn on_event(&mut self) {
         if let ProgressKind::Thinking = &self.kind {
-            if self.active {
-                self.finalize(ctx).await;
-            }
             self.started = Instant::now();
-            self.active = false;
             self.pause_elapsed = Duration::ZERO;
         }
         // Tool 상태에서는 no-op — tool timer는 on_tool_result에서만 처리
@@ -88,6 +82,32 @@ impl ProgressIndicator {
         }
     }
 
+    async fn edit_now(&mut self, ctx: &serenity::Context) {
+        if let Some(mid) = self.message_id {
+            let elapsed = (Instant::now() - self.started).saturating_sub(self.pause_elapsed);
+            let text = self.format_in_progress(elapsed);
+            if let Err(e) = self
+                .channel_id
+                .edit_message(ctx, mid, EditMessage::new().content(&text))
+                .await
+            {
+                tracing::warn!("ProgressIndicator: failed to edit message: {}", e);
+                self.edit_fail_count += 1;
+                if self.edit_fail_count >= 3 {
+                    tracing::warn!(
+                        "ProgressIndicator: deactivating after {} consecutive edit failures",
+                        self.edit_fail_count
+                    );
+                    self.active = false;
+                    self.message_id = None;
+                }
+            } else {
+                self.last_edit = Some(Instant::now());
+                self.edit_fail_count = 0;
+            }
+        }
+    }
+
     pub async fn tick(&mut self, ctx: &serenity::Context) {
         if self.paused {
             return;
@@ -96,13 +116,12 @@ impl ProgressIndicator {
         let now = Instant::now();
         let elapsed = (now - self.started).saturating_sub(self.pause_elapsed);
 
-        if elapsed.as_secs() < 15 {
-            return;
-        }
-
-        let text = self.format_in_progress(elapsed);
-
         if !self.active {
+            // 첫 메시지 생성: 15초 임계값 적용
+            if elapsed.as_secs() < 15 {
+                return;
+            }
+            let text = self.format_in_progress(elapsed);
             let msg = CreateMessage::new()
                 .content(&text)
                 .flags(MessageFlags::SUPPRESS_NOTIFICATIONS);
@@ -117,18 +136,9 @@ impl ProgressIndicator {
                 }
             }
         } else if let Some(last) = self.last_edit {
+            // 기존 메시지 갱신: 10초 간격
             if now - last >= Duration::from_secs(10) {
-                if let Some(mid) = self.message_id {
-                    if let Err(e) = self
-                        .channel_id
-                        .edit_message(ctx, mid, EditMessage::new().content(&text))
-                        .await
-                    {
-                        tracing::warn!("ProgressIndicator: failed to edit message: {}", e);
-                    } else {
-                        self.last_edit = Some(now);
-                    }
-                }
+                self.edit_now(ctx).await;
             }
         }
     }
