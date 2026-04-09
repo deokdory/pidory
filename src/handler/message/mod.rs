@@ -16,6 +16,7 @@ use crate::error::PidoryError;
 use crate::handler::attachment_download;
 use crate::handler::emoji;
 use crate::handler::emoji::ReactionStatus;
+use crate::handler::reset_ui;
 use crate::subprocess::parser::StreamEvent;
 use crate::subprocess::session_manager::{QueuedMessage, ReplyContext};
 use crate::Data;
@@ -57,6 +58,52 @@ async fn resolve_reply_context(
         original_content,
         original_author_name: referenced.author.name.clone(),
     })
+}
+
+async fn perform_immediate_reset(
+    ctx: &Context,
+    data: &Data,
+    db: &sqlx::SqlitePool,
+    thread_id: &str,
+    channel_id: poise::serenity_prelude::ChannelId,
+    lang: crate::i18n::Lang,
+) -> Result<(), PidoryError> {
+    // 기존 confirm 버튼 pending이 있으면 만료 처리
+    let old_pending = data.pending_resets.lock().await.remove(thread_id);
+    if let Some(p) = old_pending {
+        let _ = reset_ui::disable_reset_buttons(ctx, channel_id, p.message_id, reset_ui::ResetOutcome::Expired).await;
+    }
+
+    // kill_session
+    match data.sessions.kill_session(thread_id).await {
+        Ok(()) | Err(PidoryError::NotFound(_)) => {}
+        Err(e) => {
+            channel_id
+                .say(ctx, format!("❌ {}", lang.error_with(&e)))
+                .await
+                .ok();
+            return Err(PidoryError::Subprocess(format!("kill_session failed: {}", e)));
+        }
+    }
+
+    // 메모리 맵 정리
+    data.session_skills.lock().await.remove(thread_id);
+    data.pending_permissions.lock().await.retain(|_, p| p.thread_id != thread_id);
+    data.pending_question_groups.lock().await.retain(|_, g| g.thread_id != thread_id);
+    data.needs_context.lock().await.remove(thread_id);
+    data.turn_initiators.lock().await.remove(thread_id);
+    data.turn_participants.lock().await.remove(thread_id);
+
+    // DB 삭제
+    let _ = repository::delete_session(db, thread_id).await;
+
+    // Discord 알림
+    channel_id
+        .say(ctx, format!("-# ♻️ {}", lang.session_reset()))
+        .await
+        .map_err(|e| PidoryError::Discord(Box::new(e)))?;
+
+    Ok(())
 }
 
 async fn handle_message(
@@ -201,13 +248,67 @@ async fn handle_message(
 
     let is_new_command = helpers::is_context_reset_command(&new_message.content);
 
+    if is_new_command {
+        let is_running = session.status == "running";
+        if is_running {
+            // 기존 pending_reset이 있으면 만료 처리
+            let old_pending = data.pending_resets.lock().await.remove(&thread_id);
+            if let Some(p) = old_pending {
+                let _ = reset_ui::disable_reset_buttons(ctx, channel_id, p.message_id, reset_ui::ResetOutcome::Expired).await;
+            }
+
+            // 확인 버튼 메시지 전송
+            let confirm_msg = reset_ui::create_reset_confirm_message(
+                lang.session_reset_confirm(),
+                &thread_id,
+            );
+            let sent = channel_id
+                .send_message(ctx, confirm_msg)
+                .await
+                .map_err(|e| PidoryError::Discord(Box::new(e)))?;
+
+            let pending = reset_ui::PendingReset {
+                message_id: sent.id,
+                thread_id: thread_id.clone(),
+                requested_by: new_message.author.id,
+            };
+            data.pending_resets.lock().await.insert(thread_id.clone(), pending);
+
+            // 30초 타임아웃 spawn
+            let pending_resets_clone = data.pending_resets.clone();
+            let ctx_clone = ctx.clone();
+            let tid = thread_id.clone();
+            let ch = channel_id;
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                let removed = pending_resets_clone.lock().await.remove(&tid);
+                if let Some(p) = removed {
+                    let _ = reset_ui::disable_reset_buttons(&ctx_clone, ch, p.message_id, reset_ui::ResetOutcome::Expired).await;
+                }
+            });
+
+            return Ok(());
+        } else {
+            perform_immediate_reset(ctx, data, db, &thread_id, channel_id, lang).await?;
+            return Ok(());
+        }
+    }
+
+
     // 원자적 acquire: running이 아닌 경우에만 running으로 전환
     let acquired = repository::try_acquire_session(db, &thread_id).await?;
 
     if !acquired {
         // mid-turn inject: event_tx 없이 전송 (context inject 안 함, needs_context 소비 안 함)
         let mid_turn_downloaded_files =
-            download_message_attachments(&new_message.attachments, &project.path, channel_id, msg_id, ctx).await;
+            download_message_attachments(
+                &new_message.attachments,
+                &project.path,
+                channel_id,
+                msg_id,
+                ctx,
+                &data.config.attachment,
+            ).await;
 
         let msg = QueuedMessage {
             content: new_message.content.clone(),
@@ -286,8 +387,22 @@ async fn handle_message(
         .await
         .insert(thread_id.clone(), std::collections::HashSet::from([new_message.author.id]));
 
+    // 첨부파일 있으면 ⏬ reaction 먼저
+    if !new_message.attachments.is_empty() {
+        emoji::set_reaction(ctx, channel_id, msg_id, ReactionStatus::Downloading)
+            .await
+            .ok();
+    }
+
     let primary_downloaded_files =
-        download_message_attachments(&new_message.attachments, &project.path, channel_id, msg_id, ctx).await;
+        download_message_attachments(
+            &new_message.attachments,
+            &project.path,
+            channel_id,
+            msg_id,
+            ctx,
+            &data.config.attachment,
+        ).await;
 
     emoji::set_reaction(ctx, channel_id, msg_id, ReactionStatus::Running)
         .await
@@ -357,6 +472,56 @@ pub async fn execute_in_session(
     let db = &data.db;
 
     let is_new_command = helpers::is_context_reset_command(content);
+    let lang = data.config.language;
+
+    if is_new_command {
+        let session = repository::get_session_by_thread(db, thread_id).await?;
+        let is_running = session.as_ref().map(|s| s.status == "running").unwrap_or(false);
+
+        if is_running {
+            // 기존 pending_reset이 있으면 만료 처리
+            let old_pending = data.pending_resets.lock().await.remove(thread_id);
+            if let Some(p) = old_pending {
+                let _ = reset_ui::disable_reset_buttons(ctx, channel_id, p.message_id, reset_ui::ResetOutcome::Expired).await;
+            }
+
+            // 확인 버튼 메시지 전송
+            let confirm_msg = reset_ui::create_reset_confirm_message(
+                lang.session_reset_confirm(),
+                thread_id,
+            );
+            let sent = channel_id
+                .send_message(ctx, confirm_msg)
+                .await
+                .map_err(|e| PidoryError::Discord(Box::new(e)))?;
+
+            let pending = reset_ui::PendingReset {
+                message_id: sent.id,
+                thread_id: thread_id.to_string(),
+                requested_by: triggered_by,
+            };
+            data.pending_resets.lock().await.insert(thread_id.to_string(), pending);
+
+            // 30초 타임아웃 spawn
+            let pending_resets_clone = data.pending_resets.clone();
+            let ctx_clone = ctx.clone();
+            let tid = thread_id.to_string();
+            let ch = channel_id;
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                let removed = pending_resets_clone.lock().await.remove(&tid);
+                if let Some(p) = removed {
+                    let _ = reset_ui::disable_reset_buttons(&ctx_clone, ch, p.message_id, reset_ui::ResetOutcome::Expired).await;
+                }
+            });
+
+            return Ok(());
+        } else {
+            perform_immediate_reset(ctx, data, db, thread_id, channel_id, lang).await?;
+            return Ok(());
+        }
+    }
+
 
     let acquired = repository::try_acquire_session(db, thread_id).await?;
 
@@ -387,6 +552,11 @@ pub async fn execute_in_session(
     }
 
     // 직접 실행
+    // stale needs_context 정리 (/new가 아닌 경우에만 — /new는 send 후 insert)
+    if !is_new_command {
+        data.needs_context.lock().await.remove(thread_id);
+    }
+
     emoji::set_reaction(ctx, channel_id, msg_id, ReactionStatus::Running)
         .await
         .ok();
@@ -447,6 +617,7 @@ async fn download_message_attachments(
     channel_id: ChannelId,
     msg_id: MessageId,
     ctx: &Context,
+    attachment_config: &crate::config::AttachmentConfig,
 ) -> Vec<String> {
     if attachments.is_empty() {
         return Vec::new();
@@ -456,6 +627,9 @@ async fn download_message_attachments(
         std::path::Path::new(project_path),
         channel_id.get(),
         msg_id.get(),
+        attachment_config.max_file_size_bytes(),
+        attachment_config.max_aggregate_size_bytes(),
+        attachment_config.download_timeout_secs,
     )
     .await;
     for err in &errors {
