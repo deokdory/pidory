@@ -207,12 +207,12 @@ pub async fn process_turn_events(
                                         }
                                     } else {
                                         // Text-only assistant → thinking timer reset
-                                        progress.on_event(ctx).await;
+                                        progress.on_event();
                                     }
                                 } else if matches!(&stream_event, StreamEvent::User { .. }) {
                                     progress.on_tool_result(ctx).await;
                                 } else if !stream_event.is_result() {
-                                    progress.on_event(ctx).await;
+                                    progress.on_event();
                                 }
                             }
 
@@ -239,9 +239,7 @@ pub async fn process_turn_events(
                 }
                 _ = tick_interval.tick() => {
                     progress.tick(ctx).await;
-                    if progress.is_active() {
-                        typing_paused.store(true, Ordering::Relaxed);
-                    }
+                    typing_paused.store(progress.is_active(), Ordering::Relaxed);
                 }
             }
         }

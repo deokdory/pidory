@@ -25,6 +25,7 @@ impl Lang {
     }
 
     // ── Progress indicators ──
+    // TODO: Ko/En 문자열 동일 — 한국어 로컬라이제이션 필요 시 분리
 
     /// Progress: tool 실행 중
     pub fn progress_tool(&self, name: &str, elapsed: &str) -> String {
