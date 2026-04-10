@@ -213,21 +213,24 @@ fn default_max_chunks() -> usize {
     10
 }
 
-pub(crate) fn normalize_project_roots(roots: &[String]) -> Vec<String> {
+pub(crate) fn normalize_project_roots(roots: &[String]) -> Result<Vec<String>, PidoryError> {
     roots
         .iter()
         .map(|root| {
             // Expand leading ~ to $HOME
             let expanded = if root == "~" {
-                match std::env::var("HOME") {
-                    Ok(home) => home,
-                    Err(_) => root.clone(),
-                }
+                std::env::var("HOME").map_err(|_| {
+                    PidoryError::Config(format!(
+                        "project_roots contains '{}' but HOME is not set", root
+                    ))
+                })?
             } else if root.starts_with("~/") {
-                match std::env::var("HOME") {
-                    Ok(home) => format!("{}{}", home, &root[1..]),
-                    Err(_) => root.clone(),
-                }
+                let home = std::env::var("HOME").map_err(|_| {
+                    PidoryError::Config(format!(
+                        "project_roots contains '{}' but HOME is not set", root
+                    ))
+                })?;
+                format!("{}{}", home, &root[1..])
             } else {
                 root.clone()
             };
@@ -243,9 +246,9 @@ pub(crate) fn normalize_project_roots(roots: &[String]) -> Vec<String> {
 
             // Remove trailing slash, but preserve bare "/"
             if resolved.len() > 1 {
-                resolved.trim_end_matches('/').to_string()
+                Ok(resolved.trim_end_matches('/').to_string())
             } else {
-                resolved
+                Ok(resolved)
             }
         })
         .collect()
@@ -266,7 +269,7 @@ impl Config {
             return Err(PidoryError::Config("database.path must not be empty".to_string()));
         }
 
-        config.discord.project_roots = normalize_project_roots(&config.discord.project_roots);
+        config.discord.project_roots = normalize_project_roots(&config.discord.project_roots)?;
 
         Ok(config)
     }
@@ -630,16 +633,14 @@ binary_path = "claude"
     #[test]
     fn normalize_tilde_expansion() {
         let home = std::env::var("HOME").expect("HOME must be set");
-        let result = normalize_project_roots(&["~/test-nonexistent-12345".to_string()]);
+        let result = normalize_project_roots(&["~/test-nonexistent-12345".to_string()]).unwrap();
         assert_eq!(result, vec![format!("{}/test-nonexistent-12345", home)]);
     }
 
     #[test]
     fn normalize_trailing_slash_removed() {
-        let result = normalize_project_roots(&["/tmp/".to_string()]);
-        // /tmp exists, so canonicalize succeeds; either way trailing slash must be gone
+        let result = normalize_project_roots(&["/tmp/".to_string()]).unwrap();
         assert!(!result[0].ends_with('/'));
-        // and it should resolve to something under /tmp (canonicalize may expand symlinks)
         assert!(result[0].starts_with('/'));
     }
 
@@ -647,26 +648,26 @@ binary_path = "claude"
     fn normalize_absolute_path_unchanged() {
         let canonical = std::fs::canonicalize("/tmp").unwrap();
         let expected = canonical.to_string_lossy().into_owned();
-        let result = normalize_project_roots(&["/tmp".to_string()]);
+        let result = normalize_project_roots(&["/tmp".to_string()]).unwrap();
         assert_eq!(result, vec![expected]);
     }
 
     #[test]
     fn normalize_nonexistent_path_kept() {
         let path = "/nonexistent-path-xyz-12345".to_string();
-        let result = normalize_project_roots(&[path.clone()]);
+        let result = normalize_project_roots(&[path.clone()]).unwrap();
         assert_eq!(result, vec![path]);
     }
 
     #[test]
     fn normalize_empty_list() {
-        let result = normalize_project_roots(&[]);
+        let result = normalize_project_roots(&[]).unwrap();
         assert!(result.is_empty());
     }
 
     #[test]
     fn normalize_root_slash_preserved() {
-        let result = normalize_project_roots(&["/".to_string()]);
+        let result = normalize_project_roots(&["/".to_string()]).unwrap();
         assert_eq!(result, vec!["/"]);
     }
 }
