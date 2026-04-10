@@ -35,7 +35,10 @@ impl RateLimitInfo {
                 self.seven_day_pct = Some(pct);
                 self.seven_day_reset = Some(resets_at);
             }
-            _ => return,
+            _ => {
+                tracing::warn!("unknown rate_limit_type: {}", rate_limit_type);
+                return;
+            }
         }
         self.is_using_overage = is_overage;
         self.updated_at = now;
@@ -88,6 +91,8 @@ impl RateLimitMonitor {
             } else {
                 parts.push(format!("5h: {}%{}", effective_pct, remaining));
             }
+        } else if info.updated_at > 0 {
+            parts.push("5h: -%".to_string());
         }
 
         if let Some(pct) = info.seven_day_pct {
@@ -101,6 +106,8 @@ impl RateLimitMonitor {
             } else {
                 parts.push(format!("7d: {}%", effective_pct));
             }
+        } else if info.updated_at > 0 {
+            parts.push("7d: -%".to_string());
         }
 
         parts.join(" | ")
@@ -237,7 +244,7 @@ mod tests {
         };
         let s = RateLimitMonitor::format_presence(&info);
         assert!(s.starts_with("5h: 42%"), "got: {s}");
-        assert!(!s.contains("7d"), "got: {s}");
+        assert!(s.contains("7d: -%"), "got: {s}");
     }
 
     #[test]
@@ -342,5 +349,44 @@ mod tests {
         info2.five_hour_reset = Some(now + 7200); // different reset time
         let after_reset = monitor.check_thresholds(&info2);
         assert_eq!(after_reset, vec![50], "new reset cycle must re-trigger threshold");
+    }
+
+    #[test]
+    fn test_format_presence_five_hour_none_seven_day_some() {
+        let future_reset = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 3600;
+        let info = RateLimitInfo {
+            five_hour_pct: None,
+            seven_day_pct: Some(42),
+            five_hour_reset: None,
+            seven_day_reset: Some(future_reset),
+            is_using_overage: false,
+            updated_at: 100,
+        };
+        let s = RateLimitMonitor::format_presence(&info);
+        assert_eq!(s, "5h: -% | 7d: 42%", "got: {s}");
+    }
+
+    #[test]
+    fn test_format_presence_five_hour_some_seven_day_none() {
+        let future_reset = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 3600;
+        let info = RateLimitInfo {
+            five_hour_pct: Some(30),
+            seven_day_pct: None,
+            five_hour_reset: Some(future_reset),
+            seven_day_reset: None,
+            is_using_overage: false,
+            updated_at: 100,
+        };
+        let s = RateLimitMonitor::format_presence(&info);
+        assert!(s.starts_with("5h: 30%"), "got: {s}");
+        assert!(s.contains("| 7d: -%"), "got: {s}");
     }
 }
