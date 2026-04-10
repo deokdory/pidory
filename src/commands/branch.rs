@@ -8,7 +8,7 @@ use tokio::sync::mpsc;
 use crate::{Context, Error};
 use crate::db::repository;
 use crate::error::PidoryError;
-use crate::handler::message;
+use crate::handler::{formatter, message};
 use crate::subprocess::parser::{ContentBlock, StreamEvent};
 use crate::subprocess::session_manager::QueuedMessage;
 
@@ -261,13 +261,16 @@ pub async fn branch(
     let initial_msg_content =
         format!("{}\n\n{}{}", context_header, summary.summary, extra_display);
 
+    // Discord 2000자 제한 대응: split_message로 분할 전송
+    let chunks = formatter::split_message(&initial_msg_content, 2000);
     let bot_msg = match new_channel_id
-        .say(serenity_ctx, &initial_msg_content)
+        .say(serenity_ctx, &chunks[0])
         .await
     {
         Ok(msg) => msg,
         Err(e) => {
             tracing::error!("Failed to send initial message to new thread: {}", e);
+            cleanup_orphaned_thread(serenity_ctx, db, new_channel_id, &new_thread_id).await;
             ctx.send(
                 poise::CreateReply::default()
                     .content(format!("❌ {}", lang.branch_thread_create_failed())),
@@ -276,10 +279,15 @@ pub async fn branch(
             return Ok(());
         }
     };
+    // 나머지 chunk 전송 (2000자 초과 시)
+    for chunk in &chunks[1..] {
+        let _ = new_channel_id.say(serenity_ctx, chunk).await;
+    }
 
     // DB 세션 생성
     if let Err(e) = repository::create_session(db, &new_thread_id, &parent_channel_str).await {
         tracing::error!("Failed to create DB session for new thread: {}", e);
+        cleanup_orphaned_thread(serenity_ctx, db, new_channel_id, &new_thread_id).await;
         ctx.send(
             poise::CreateReply::default()
                 .content(format!("❌ {}", lang.branch_thread_create_failed())),
@@ -307,6 +315,7 @@ pub async fn branch(
         .await
     {
         tracing::error!("Failed to bootstrap new session: {}", e);
+        cleanup_orphaned_thread(serenity_ctx, db, new_channel_id, &new_thread_id).await;
         ctx.send(
             poise::CreateReply::default()
                 .content(format!(
@@ -361,7 +370,7 @@ pub async fn branch(
 
     if let Err(e) = data.sessions.send_message(&new_thread_id, new_msg).await {
         tracing::error!("Failed to send initial message to new session: {}", e);
-        let _ = repository::update_session_status(db, &new_thread_id, "error").await;
+        cleanup_orphaned_thread(serenity_ctx, db, new_channel_id, &new_thread_id).await;
         ctx.send(
             poise::CreateReply::default()
                 .content(format!("❌ {}", lang.branch_summary_failed())),
@@ -400,6 +409,25 @@ pub async fn branch(
     .await;
 
     Ok(())
+}
+
+// ── cleanup ──
+
+/// Phase B 실패 시 orphaned thread/DB 정리
+async fn cleanup_orphaned_thread(
+    serenity_ctx: &serenity::Context,
+    db: &sqlx::SqlitePool,
+    thread_channel_id: serenity::ChannelId,
+    thread_id: &str,
+) {
+    // DB 세션 삭제 (존재하면)
+    if let Err(e) = repository::delete_session(db, thread_id).await {
+        tracing::warn!("cleanup: failed to delete orphan session {}: {}", thread_id, e);
+    }
+    // 스레드에 에러 메시지 남기기 (삭제 대신 — 삭제는 위험)
+    let _ = thread_channel_id
+        .say(serenity_ctx, "⚠️ 세션 생성에 실패하여 이 스레드는 사용되지 않습니다.")
+        .await;
 }
 
 // ── 요약 수집 ──
