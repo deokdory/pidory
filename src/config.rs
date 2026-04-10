@@ -213,12 +213,50 @@ fn default_max_chunks() -> usize {
     10
 }
 
+pub(crate) fn normalize_project_roots(roots: &[String]) -> Vec<String> {
+    roots
+        .iter()
+        .map(|root| {
+            // Expand leading ~ to $HOME
+            let expanded = if root == "~" {
+                match std::env::var("HOME") {
+                    Ok(home) => home,
+                    Err(_) => root.clone(),
+                }
+            } else if root.starts_with("~/") {
+                match std::env::var("HOME") {
+                    Ok(home) => format!("{}{}", home, &root[1..]),
+                    Err(_) => root.clone(),
+                }
+            } else {
+                root.clone()
+            };
+
+            // Try to canonicalize; fall back to expanded path on failure
+            let resolved = match std::fs::canonicalize(&expanded) {
+                Ok(canonical) => canonical.to_string_lossy().into_owned(),
+                Err(_) => {
+                    tracing::warn!("project root not found, using as-is: {}", expanded);
+                    expanded
+                }
+            };
+
+            // Remove trailing slash, but preserve bare "/"
+            if resolved.len() > 1 {
+                resolved.trim_end_matches('/').to_string()
+            } else {
+                resolved
+            }
+        })
+        .collect()
+}
+
 impl Config {
     pub fn load(path: &str) -> Result<Config, PidoryError> {
         let content = fs::read_to_string(path)
             .map_err(|e| PidoryError::Config(format!("Failed to read config file '{}': {}", path, e)))?;
 
-        let config: Config = toml::from_str(&content)
+        let mut config: Config = toml::from_str(&content)
             .map_err(|e| PidoryError::Config(format!("Failed to parse config file '{}': {}", path, e)))?;
 
         if config.discord.token_env.trim().is_empty() {
@@ -227,6 +265,8 @@ impl Config {
         if config.database.path.trim().is_empty() {
             return Err(PidoryError::Config("database.path must not be empty".to_string()));
         }
+
+        config.discord.project_roots = normalize_project_roots(&config.discord.project_roots);
 
         Ok(config)
     }
@@ -585,5 +625,48 @@ binary_path = "claude"
 "#;
         let config: Config = toml::from_str(toml_str).unwrap();
         assert_eq!(config.discord.default_category_id, Some("123456789".to_string()));
+    }
+
+    #[test]
+    fn normalize_tilde_expansion() {
+        let home = std::env::var("HOME").expect("HOME must be set");
+        let result = normalize_project_roots(&["~/test-nonexistent-12345".to_string()]);
+        assert_eq!(result, vec![format!("{}/test-nonexistent-12345", home)]);
+    }
+
+    #[test]
+    fn normalize_trailing_slash_removed() {
+        let result = normalize_project_roots(&["/tmp/".to_string()]);
+        // /tmp exists, so canonicalize succeeds; either way trailing slash must be gone
+        assert!(!result[0].ends_with('/'));
+        // and it should resolve to something under /tmp (canonicalize may expand symlinks)
+        assert!(result[0].starts_with('/'));
+    }
+
+    #[test]
+    fn normalize_absolute_path_unchanged() {
+        let canonical = std::fs::canonicalize("/tmp").unwrap();
+        let expected = canonical.to_string_lossy().into_owned();
+        let result = normalize_project_roots(&["/tmp".to_string()]);
+        assert_eq!(result, vec![expected]);
+    }
+
+    #[test]
+    fn normalize_nonexistent_path_kept() {
+        let path = "/nonexistent-path-xyz-12345".to_string();
+        let result = normalize_project_roots(&[path.clone()]);
+        assert_eq!(result, vec![path]);
+    }
+
+    #[test]
+    fn normalize_empty_list() {
+        let result = normalize_project_roots(&[]);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn normalize_root_slash_preserved() {
+        let result = normalize_project_roots(&["/".to_string()]);
+        assert_eq!(result, vec!["/"]);
     }
 }
