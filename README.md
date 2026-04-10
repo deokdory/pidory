@@ -51,7 +51,7 @@ This model assumes that users invited to the guild **trust each other**. Only in
 4. Under **Privileged Gateway Intents**, enable **MESSAGE CONTENT INTENT**
 5. Go to **OAuth2** → **URL Generator**:
    - Scopes: `bot`, `applications.commands`
-   - Bot Permissions: `Send Messages`, `Read Message History`, `Add Reactions`, `Manage Messages`, `Use Slash Commands`, `Embed Links`, `Attach Files`
+   - Bot Permissions: `Send Messages`, `Read Message History`, `Add Reactions`, `Manage Messages`, `Manage Channels`, `Create Public Threads`, `Use Slash Commands`, `Embed Links`, `Attach Files`
 6. Open the generated URL and invite the bot to your server
 
 ### 2. Get Discord IDs
