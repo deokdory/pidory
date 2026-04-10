@@ -363,6 +363,13 @@ impl Lang {
         }
     }
 
+    pub fn branch_ready(&self, mention: &str) -> String {
+        match self {
+            Lang::Ko => format!("✅ 세션이 준비되었습니다. {} 메시지를 보내면 작업을 시작합니다.", mention),
+            Lang::En => format!("✅ Session is ready. {} Send a message to start working.", mention),
+        }
+    }
+
     pub fn branch_summary_prompt(&self, extra_context: &str) -> String {
         match self {
             Lang::Ko | Lang::En => {
