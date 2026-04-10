@@ -52,7 +52,8 @@ pub(super) async fn send_event_to_discord(
                     ContentBlock::Text(text) if !text.trim().is_empty() => {
                         let (clean_text, file_paths) = file_attach::extract_file_markers(text);
                         if !clean_text.trim().is_empty() {
-                            let chunks = formatter::split_message(&clean_text, max_chunk_length);
+                            let converted = formatter::convert_markdown_tables(&clean_text);
+                            let chunks = formatter::split_message(&converted, max_chunk_length);
                             for chunk in chunks {
                                 say_silent(ctx, channel_id, chunk).await;
                             }
