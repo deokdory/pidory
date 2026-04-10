@@ -213,12 +213,53 @@ fn default_max_chunks() -> usize {
     10
 }
 
+pub(crate) fn normalize_project_roots(roots: &[String]) -> Result<Vec<String>, PidoryError> {
+    roots
+        .iter()
+        .map(|root| {
+            // Expand leading ~ to $HOME
+            let expanded = if root == "~" {
+                std::env::var("HOME").map_err(|_| {
+                    PidoryError::Config(format!(
+                        "project_roots contains '{}' but HOME is not set", root
+                    ))
+                })?
+            } else if root.starts_with("~/") {
+                let home = std::env::var("HOME").map_err(|_| {
+                    PidoryError::Config(format!(
+                        "project_roots contains '{}' but HOME is not set", root
+                    ))
+                })?;
+                format!("{}{}", home, &root[1..])
+            } else {
+                root.clone()
+            };
+
+            // Try to canonicalize; fall back to expanded path on failure
+            let resolved = match std::fs::canonicalize(&expanded) {
+                Ok(canonical) => canonical.to_string_lossy().into_owned(),
+                Err(_) => {
+                    tracing::warn!("project root not found, using as-is: {}", expanded);
+                    expanded
+                }
+            };
+
+            // Remove trailing slash, but preserve bare "/"
+            if resolved.len() > 1 {
+                Ok(resolved.trim_end_matches('/').to_string())
+            } else {
+                Ok(resolved)
+            }
+        })
+        .collect()
+}
+
 impl Config {
     pub fn load(path: &str) -> Result<Config, PidoryError> {
         let content = fs::read_to_string(path)
             .map_err(|e| PidoryError::Config(format!("Failed to read config file '{}': {}", path, e)))?;
 
-        let config: Config = toml::from_str(&content)
+        let mut config: Config = toml::from_str(&content)
             .map_err(|e| PidoryError::Config(format!("Failed to parse config file '{}': {}", path, e)))?;
 
         if config.discord.token_env.trim().is_empty() {
@@ -227,6 +268,8 @@ impl Config {
         if config.database.path.trim().is_empty() {
             return Err(PidoryError::Config("database.path must not be empty".to_string()));
         }
+
+        config.discord.project_roots = normalize_project_roots(&config.discord.project_roots)?;
 
         Ok(config)
     }
@@ -585,5 +628,46 @@ binary_path = "claude"
 "#;
         let config: Config = toml::from_str(toml_str).unwrap();
         assert_eq!(config.discord.default_category_id, Some("123456789".to_string()));
+    }
+
+    #[test]
+    fn normalize_tilde_expansion() {
+        let home = std::env::var("HOME").expect("HOME must be set");
+        let result = normalize_project_roots(&["~/test-nonexistent-12345".to_string()]).unwrap();
+        assert_eq!(result, vec![format!("{}/test-nonexistent-12345", home)]);
+    }
+
+    #[test]
+    fn normalize_trailing_slash_removed() {
+        let result = normalize_project_roots(&["/tmp/".to_string()]).unwrap();
+        assert!(!result[0].ends_with('/'));
+        assert!(result[0].starts_with('/'));
+    }
+
+    #[test]
+    fn normalize_absolute_path_unchanged() {
+        let canonical = std::fs::canonicalize("/tmp").unwrap();
+        let expected = canonical.to_string_lossy().into_owned();
+        let result = normalize_project_roots(&["/tmp".to_string()]).unwrap();
+        assert_eq!(result, vec![expected]);
+    }
+
+    #[test]
+    fn normalize_nonexistent_path_kept() {
+        let path = "/nonexistent-path-xyz-12345".to_string();
+        let result = normalize_project_roots(&[path.clone()]).unwrap();
+        assert_eq!(result, vec![path]);
+    }
+
+    #[test]
+    fn normalize_empty_list() {
+        let result = normalize_project_roots(&[]).unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn normalize_root_slash_preserved() {
+        let result = normalize_project_roots(&["/".to_string()]).unwrap();
+        assert_eq!(result, vec!["/"]);
     }
 }
