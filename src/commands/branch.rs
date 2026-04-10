@@ -192,8 +192,17 @@ pub async fn branch(
     // 응답 수집 (Discord에 출력하지 않음)
     let timeout = data.config.claude.subprocess_timeout_secs;
     let summary_text = match collect_summary_response(event_rx, timeout).await {
-        Ok(text) => text,
-        Err(_) => {
+        Ok(text) => {
+            // Summary turn 완료 — source session 해제
+            let _ = repository::update_session_status(db, &thread_id, "idle").await;
+            text
+        }
+        Err(e) => {
+            // Timeout → worker가 아직 활성일 수 있으므로 interrupt 먼저
+            if e.to_string().contains("timeout") {
+                let _ = data.sessions.interrupt_session(&thread_id).await;
+            }
+            let _ = repository::update_session_status(db, &thread_id, "idle").await;
             ctx.send(
                 poise::CreateReply::default()
                     .content(format!("❌ {}", lang.branch_summary_failed())),
