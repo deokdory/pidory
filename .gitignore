@@ -11,3 +11,4 @@ config.dev.toml
 .pidory/
 .claude/
 .codex-review/
+scripts/prod-deploy.sh
