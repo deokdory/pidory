@@ -2,7 +2,6 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 
-use super::register::strip_display_prefix;
 use crate::handler::message;
 use crate::{Context, Error};
 
@@ -113,7 +112,6 @@ async fn autocomplete_skill<'a>(
     ctx: Context<'_>,
     partial: &'a str,
 ) -> Vec<poise::serenity_prelude::AutocompleteChoice> {
-    let partial = strip_display_prefix(partial);
     let thread_id = ctx.channel_id().to_string();
     let skills = ctx
         .data()
