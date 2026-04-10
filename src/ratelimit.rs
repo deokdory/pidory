@@ -43,6 +43,33 @@ impl RateLimitInfo {
         self.is_using_overage = is_overage;
         self.updated_at = now;
     }
+
+    /// utilization이 없는 이벤트용: reset/overage/updated_at만 갱신, pct 유지
+    pub fn update_resets_only(
+        &mut self,
+        rate_limit_type: &str,
+        resets_at: u64,
+        is_overage: bool,
+    ) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        match rate_limit_type {
+            "five_hour" => {
+                self.five_hour_reset = Some(resets_at);
+            }
+            "seven_day" => {
+                self.seven_day_reset = Some(resets_at);
+            }
+            _ => {
+                tracing::warn!("unknown rate_limit_type: {}", rate_limit_type);
+                return;
+            }
+        }
+        self.is_using_overage = is_overage;
+        self.updated_at = now;
+    }
 }
 
 pub struct RateLimitMonitor {
