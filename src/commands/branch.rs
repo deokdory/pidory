@@ -402,9 +402,7 @@ pub async fn branch(
         }
         Err(e) => {
             tracing::error!("Failed to drain initial turn for {}: {}", new_thread_id, e);
-            let _ = new_channel_id
-                .say(serenity_ctx, &format!("❌ {}", e))
-                .await;
+            cleanup_orphaned_thread(serenity_ctx, data, new_channel_id, &new_thread_id).await;
         }
     }
 
@@ -493,7 +491,25 @@ async fn drain_initial_turn(
                         }
                         return Err(PidoryError::Subprocess("initial turn channel closed".into()));
                     }
-                    _ => {} // Assistant, User, RateLimit, ControlRequest 등 무시
+                    Some(StreamEvent::Assistant { ref content, .. }) => {
+                        // WARN2: LLM이 프롬프트 무시하고 tool 사용 시도 감지
+                        for block in content {
+                            if let ContentBlock::ToolUse { name, .. } = block {
+                                tracing::warn!(
+                                    "drain_initial_turn: unexpected tool_use '{}' during bootstrap for {}",
+                                    name, thread_id
+                                );
+                            }
+                        }
+                    }
+                    Some(StreamEvent::ControlRequest { .. }) => {
+                        // WARN1: bootstrap 중 permission 요청 — 프롬프트 무시 가능성
+                        tracing::warn!(
+                            "drain_initial_turn: unexpected ControlRequest during bootstrap for {}",
+                            thread_id
+                        );
+                    }
+                    _ => {} // User, RateLimit 등 무시
                 }
             }
             _ = tokio::time::sleep_until(deadline) => {
