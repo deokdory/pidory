@@ -311,6 +311,16 @@ impl SessionManager {
         sessions.len()
     }
 
+    /// 새 세션을 위한 슬롯이 있는지 확인 (현재 수 < max 또는 evictable 세션 존재).
+    /// `/branch`에서 요약 turn 전에 호출하여 토큰 낭비 방지.
+    pub async fn has_available_slot(&self) -> bool {
+        let sessions = self.sessions.lock().await;
+        if sessions.len() < self.max_sessions {
+            return true;
+        }
+        Self::find_evict_target(&sessions).is_some()
+    }
+
     pub async fn interrupt_session(&self, thread_id: &str) -> Result<(), PidoryError> {
         let sessions = self.sessions.lock().await;
         let inner = sessions.get(thread_id).ok_or_else(|| {
@@ -672,5 +682,48 @@ mod tests {
             0,
             "queue_size must remain 0 when try_send fails"
         );
+    }
+
+    // ---------- has_available_slot logic tests ----------
+
+    fn has_slot_mock(sessions: &[(&str, MockSession)], max_sessions: usize) -> bool {
+        if sessions.len() < max_sessions {
+            return true;
+        }
+        find_evict_target_mock(sessions).is_some()
+    }
+
+    #[test]
+    fn has_slot_when_under_max() {
+        let sessions: Vec<(&str, MockSession)> = vec![];
+        assert!(has_slot_mock(&sessions, 2));
+    }
+
+    #[test]
+    fn has_slot_with_evictable() {
+        let now = Instant::now();
+        let sessions = vec![(
+            "thread_a",
+            MockSession {
+                last_activity: now - Duration::from_secs(100),
+                is_turn_active: false,
+                has_bg_tasks: false,
+            },
+        )];
+        assert!(has_slot_mock(&sessions, 1));
+    }
+
+    #[test]
+    fn no_slot_all_busy() {
+        let now = Instant::now();
+        let sessions = vec![(
+            "thread_a",
+            MockSession {
+                last_activity: now,
+                is_turn_active: true,
+                has_bg_tasks: false,
+            },
+        )];
+        assert!(!has_slot_mock(&sessions, 1));
     }
 }
