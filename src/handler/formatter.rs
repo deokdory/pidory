@@ -144,12 +144,12 @@ pub fn split_message(text: &str, max_len: usize) -> Vec<String> {
 
 fn is_table_row(line: &str) -> bool {
     let trimmed = line.trim();
-    trimmed.starts_with('|') && trimmed.ends_with('|')
+    trimmed.len() >= 5 && trimmed.starts_with('|') && trimmed.ends_with('|')
 }
 
 fn is_separator_row(line: &str) -> bool {
     let trimmed = line.trim();
-    if !trimmed.starts_with('|') || !trimmed.ends_with('|') {
+    if trimmed.len() < 5 || !trimmed.starts_with('|') || !trimmed.ends_with('|') {
         return false;
     }
     let inner = &trimmed[1..trimmed.len() - 1];
@@ -212,6 +212,11 @@ fn render_table(header: &[String], alignments: &[CellAlignment], rows: &[Vec<Str
 }
 
 pub(crate) fn convert_markdown_tables(text: &str) -> String {
+    // Fast path: no pipe character means no possible table
+    if !text.contains('|') {
+        return text.to_string();
+    }
+
     let lines: Vec<&str> = text.lines().collect();
     let mut result = String::new();
     let mut in_code_block = false;
@@ -221,7 +226,7 @@ pub(crate) fn convert_markdown_tables(text: &str) -> String {
         let line = lines[i];
 
         // Track code block fences — skip processing inside them
-        if line.trim_start().starts_with("```") {
+        if line.starts_with("```") {
             in_code_block = !in_code_block;
             result.push_str(line);
             result.push('\n');
@@ -252,6 +257,16 @@ pub(crate) fn convert_markdown_tables(text: &str) -> String {
             }
 
             if !data_rows.is_empty() {
+                // If any cell contains an escaped pipe, skip conversion and passthrough
+                let has_escaped_pipe = header_line.contains("\\|")
+                    || data_rows.iter().any(|r| r.contains("\\|"));
+                if has_escaped_pipe {
+                    result.push_str(line);
+                    result.push('\n');
+                    i += 1;
+                    continue;
+                }
+
                 // Parse header cells
                 let header_cells = parse_row_cells(header_line);
 
@@ -697,6 +712,20 @@ mod tests {
         let input = "| a | b |\n|---|---|";
         let result = convert_markdown_tables(input);
         assert_eq!(result, input, "header+separator without data rows should not be converted");
+    }
+
+    #[test]
+    fn convert_table_single_pipe_no_panic() {
+        let input = "|\n|---|\n| x |";
+        let result = convert_markdown_tables(input);
+        assert_eq!(result, input, "single pipe header should not be recognized as table row");
+    }
+
+    #[test]
+    fn convert_table_escaped_pipe_passthrough() {
+        let input = "| a | b \\| c |\n|---|---|\n| 1 | 2 |";
+        let result = convert_markdown_tables(input);
+        assert_eq!(result, input, "table with escaped pipe should pass through unchanged");
     }
 }
 
