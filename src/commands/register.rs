@@ -5,6 +5,131 @@ use poise::serenity_prelude as serenity;
 use crate::{Context, Error};
 use crate::db::repository;
 
+async fn autocomplete_path(
+    ctx: Context<'_>,
+    partial: &str,
+) -> Vec<poise::serenity_prelude::AutocompleteChoice> {
+    let project_roots = ctx.data().config.discord.project_roots.clone();
+
+    if project_roots.is_empty() {
+        return Vec::new();
+    }
+
+    // Helper: check if a path is under one of the project_roots
+    let is_under_roots = |p: &std::path::Path| -> bool {
+        project_roots.iter().any(|root| p.starts_with(root))
+    };
+
+    // Helper: build a display string for a path
+    let make_display = |p: &std::path::Path| -> String {
+        let last = p
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_else(|| p.to_str().unwrap_or(""));
+        let full = p.to_str().unwrap_or("");
+        let combined = format!("{} \u{2014} {}", last, full);
+        if combined.chars().count() > 100 {
+            let truncated: String = combined.chars().take(97).collect();
+            format!("{}...", truncated)
+        } else {
+            combined
+        }
+    };
+
+    if partial.is_empty() {
+        // Return project_roots themselves, each with trailing slash
+        return project_roots
+            .iter()
+            .filter_map(|root| {
+                let value = if root.ends_with('/') {
+                    root.clone()
+                } else {
+                    format!("{}/", root)
+                };
+                if value.len() > 100 {
+                    return None;
+                }
+                let display = make_display(std::path::Path::new(root));
+                Some(poise::serenity_prelude::AutocompleteChoice::new(display, value))
+            })
+            .take(25)
+            .collect();
+    }
+
+    // Determine the directory to list and optional filter prefix
+    let (list_dir, filter_prefix): (String, Option<String>) = if partial.ends_with('/') {
+        (partial.to_string(), None)
+    } else {
+        let p = std::path::Path::new(partial);
+        let parent = p
+            .parent()
+            .map(|par| {
+                let s = par.to_str().unwrap_or("");
+                if s.is_empty() {
+                    "/".to_string()
+                } else if s.ends_with('/') {
+                    s.to_string()
+                } else {
+                    format!("{}/", s)
+                }
+            })
+            .unwrap_or_else(|| "/".to_string());
+        let stem = p
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("")
+            .to_string();
+        (parent, Some(stem))
+    };
+
+    let mut rd = match tokio::fs::read_dir(&list_dir).await {
+        Ok(rd) => rd,
+        Err(_) => return Vec::new(),
+    };
+
+    let mut choices: Vec<poise::serenity_prelude::AutocompleteChoice> = Vec::new();
+
+    while let Ok(Some(entry)) = rd.next_entry().await {
+        let meta = match entry.metadata().await {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        if !meta.is_dir() {
+            continue;
+        }
+        let file_name = entry.file_name();
+        let name_str = match file_name.to_str() {
+            Some(s) => s,
+            None => continue,
+        };
+
+        // Apply filter prefix if any
+        if let Some(ref prefix) = filter_prefix && !name_str.starts_with(prefix.as_str()) {
+            continue;
+        }
+
+        // Build full path value with trailing slash
+        let full_path_buf = std::path::Path::new(&list_dir).join(name_str);
+        let full_path = format!("{}/", full_path_buf.to_str().unwrap_or(""));
+        if full_path.len() > 100 {
+            continue;
+        }
+
+        // Verify it's under a project root after canonicalize (best effort)
+        let canonical = tokio::fs::canonicalize(&full_path_buf).await
+            .unwrap_or(full_path_buf);
+        if !is_under_roots(&canonical) {
+            continue;
+        }
+
+        let display = make_display(&canonical);
+        choices.push(poise::serenity_prelude::AutocompleteChoice::new(display, full_path));
+    }
+
+    choices.truncate(25);
+    choices
+}
+
 #[poise::command(
     slash_command,
     guild_only,
@@ -13,7 +138,9 @@ use crate::db::repository;
 )]
 pub async fn register(
     ctx: Context<'_>,
-    #[description = "Project directory path"] path: String,
+    #[description = "Project directory path"]
+    #[autocomplete = "autocomplete_path"]
+    path: String,
     #[description = "Display name (optional)"] name: Option<String>,
 ) -> Result<(), Error> {
     let channel_id = ctx.channel_id().to_string();
@@ -94,4 +221,247 @@ pub async fn unregister(ctx: Context<'_>) -> Result<(), Error> {
     ctx.send(reply).await?;
 
     Ok(())
+}
+
+#[poise::command(
+    slash_command,
+    guild_only,
+    default_member_permissions = "MANAGE_GUILD",
+    required_permissions = "MANAGE_GUILD",
+)]
+pub async fn new_project(
+    ctx: Context<'_>,
+    #[description = "Project directory path"]
+    #[autocomplete = "autocomplete_path"]
+    path: String,
+    #[description = "Channel name (default: directory name)"] name: Option<String>,
+    #[description = "Category ID (default: config)"] category: Option<String>,
+) -> Result<(), Error> {
+    let lang = ctx.data().config.language;
+    let config = &ctx.data().config;
+
+    // 1. Path must exist
+    if !Path::new(&path).exists() {
+        let reply = poise::CreateReply::default()
+            .content(format!("❌ {}", lang.path_not_exist(&path)))
+            .ephemeral(true);
+        ctx.send(reply).await?;
+        return Ok(());
+    }
+
+    // 2. Canonicalize (best effort)
+    let canonical_path = tokio::fs::canonicalize(&path).await
+        .unwrap_or_else(|_| std::path::PathBuf::from(&path));
+
+    // 3. Verify within project_roots if configured
+    let project_roots = &config.discord.project_roots;
+    if !project_roots.is_empty() {
+        let in_roots = project_roots
+            .iter()
+            .any(|root| canonical_path.starts_with(root));
+        if !in_roots {
+            let reply = poise::CreateReply::default()
+                .content(format!("❌ {}", lang.path_not_in_roots(&path)))
+                .ephemeral(true);
+            ctx.send(reply).await?;
+            return Ok(());
+        }
+    }
+
+    // 4. Determine channel name
+    let raw_name = name.as_deref()
+        .map(String::from)
+        .or_else(|| {
+            Path::new(&path)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .map(String::from)
+        });
+    let channel_name = match raw_name.as_deref().and_then(sanitize_channel_name) {
+        Some(n) => n,
+        None => {
+            let reply = poise::CreateReply::default()
+                .content(format!(
+                    "❌ {} {}",
+                    lang.channel_name_invalid(),
+                    lang.channel_name_specify_hint()
+                ))
+                .ephemeral(true);
+            ctx.send(reply).await?;
+            return Ok(());
+        }
+    };
+
+    // 5. Resolve category
+    let category_id: Option<serenity::ChannelId> = match category
+        .as_deref()
+        .or(config.discord.default_category_id.as_deref())
+    {
+        Some(id_str) => match id_str.parse::<u64>() {
+            Ok(id) => Some(serenity::ChannelId::new(id)),
+            Err(_) => {
+                let reply = poise::CreateReply::default()
+                    .content(format!("❌ {}", lang.category_not_found()))
+                    .ephemeral(true);
+                ctx.send(reply).await?;
+                return Ok(());
+            }
+        },
+        None => None,
+    };
+
+    // 6. Get guild ID
+    let guild_id = match ctx.guild_id() {
+        Some(id) => id,
+        None => {
+            let reply = poise::CreateReply::default()
+                .content("❌ Not in a guild")
+                .ephemeral(true);
+            ctx.send(reply).await?;
+            return Ok(());
+        }
+    };
+
+    // 7. Create the channel
+    let mut builder = serenity::CreateChannel::new(&channel_name)
+        .kind(serenity::ChannelType::Text)
+        .topic(format!("pidory: {path}"));
+    if let Some(cat) = category_id {
+        builder = builder.category(cat);
+    }
+
+    let new_channel = match guild_id.create_channel(ctx.http(), builder).await {
+        Ok(ch) => ch,
+        Err(e) => {
+            tracing::warn!("Failed to create channel: {}", e);
+            let reply = poise::CreateReply::default()
+                .content(format!("❌ {}", lang.channel_create_failed()))
+                .ephemeral(true);
+            ctx.send(reply).await?;
+            return Ok(());
+        }
+    };
+
+    let new_channel_id = new_channel.id.to_string();
+
+    // 8. Register in DB
+    match repository::register_project(
+        &ctx.data().db,
+        &new_channel_id,
+        &path,
+        name.as_deref(),
+    )
+    .await
+    {
+        Ok(_) => {
+            let reply = poise::CreateReply::default()
+                .content(format!(
+                    "✅ {}",
+                    lang.new_project_created(&new_channel_id, &path)
+                ))
+                .ephemeral(true);
+            ctx.send(reply).await?;
+        }
+        Err(e) => {
+            tracing::error!("Channel created but DB registration failed: {}", e);
+            let reply = poise::CreateReply::default()
+                .content(format!(
+                    "⚠️ {}",
+                    lang.channel_created_but_register_failed(&new_channel_id)
+                ))
+                .ephemeral(true);
+            ctx.send(reply).await?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Sanitize a string into a valid Discord channel name.
+///
+/// Rules:
+/// 1. Lowercase the input
+/// 2. Replace any character not in `[a-z0-9-]` with `-`
+/// 3. Collapse consecutive `-` into a single `-`
+/// 4. Strip leading and trailing `-`
+/// 5. Return `None` if the result is shorter than 2 characters
+/// 6. Truncate to 100 characters
+pub(crate) fn sanitize_channel_name(name: &str) -> Option<String> {
+    let lowered = name.to_lowercase();
+
+    // Replace non-alphanumeric/hyphen with hyphen
+    let replaced: String = lowered
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '-' })
+        .collect();
+
+    // Collapse consecutive hyphens
+    let mut collapsed = String::with_capacity(replaced.len());
+    let mut prev_hyphen = false;
+    for c in replaced.chars() {
+        if c == '-' {
+            if !prev_hyphen {
+                collapsed.push(c);
+            }
+            prev_hyphen = true;
+        } else {
+            collapsed.push(c);
+            prev_hyphen = false;
+        }
+    }
+
+    // Strip leading and trailing hyphens, then truncate to 100 chars
+    let trimmed = collapsed.trim_matches('-');
+    let truncated: String = trimmed.chars().take(100).collect();
+
+    if truncated.len() < 2 {
+        None
+    } else {
+        Some(truncated)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sanitize_channel_name;
+
+    #[test]
+    fn basic_sanitize() {
+        assert_eq!(sanitize_channel_name("My Project"), Some("my-project".to_string()));
+    }
+
+    #[test]
+    fn consecutive_hyphens_collapsed() {
+        assert_eq!(sanitize_channel_name("foo--bar"), Some("foo-bar".to_string()));
+    }
+
+    #[test]
+    fn leading_trailing_stripped() {
+        assert_eq!(sanitize_channel_name("-hello-"), Some("hello".to_string()));
+    }
+
+    #[test]
+    fn too_short_returns_none() {
+        assert_eq!(sanitize_channel_name("a"), None);
+        assert_eq!(sanitize_channel_name(""), None);
+        assert_eq!(sanitize_channel_name("---"), None);
+    }
+
+    #[test]
+    fn exactly_two_chars() {
+        assert_eq!(sanitize_channel_name("ab"), Some("ab".to_string()));
+    }
+
+    #[test]
+    fn truncated_to_100() {
+        let long = "a".repeat(200);
+        let result = sanitize_channel_name(&long).unwrap();
+        assert_eq!(result.len(), 100);
+    }
+
+    #[test]
+    fn special_chars_replaced() {
+        assert_eq!(sanitize_channel_name("hello_world!"), Some("hello-world-".to_string().trim_matches('-').to_string()));
+        assert_eq!(sanitize_channel_name("foo/bar/baz"), Some("foo-bar-baz".to_string()));
+    }
 }
