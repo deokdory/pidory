@@ -82,6 +82,13 @@ async fn autocomplete_path(
         (parent, Some(stem))
     };
 
+    // Verify list_dir is under a project root before reading filesystem
+    let list_dir_canonical = tokio::fs::canonicalize(&list_dir).await
+        .unwrap_or_else(|_| std::path::PathBuf::from(&list_dir));
+    if !is_under_roots(&list_dir_canonical) {
+        return Vec::new();
+    }
+
     let mut rd = match tokio::fs::read_dir(&list_dir).await {
         Ok(rd) => rd,
         Err(_) => return Vec::new(),
@@ -124,9 +131,11 @@ async fn autocomplete_path(
 
         let display = make_display(&canonical);
         choices.push(poise::serenity_prelude::AutocompleteChoice::new(display, full_path));
+        if choices.len() >= 25 {
+            break;
+        }
     }
 
-    choices.truncate(25);
     choices
 }
 
@@ -268,6 +277,9 @@ pub async fn new_project(
         }
     }
 
+    // Defer the interaction to avoid Discord's 3-second timeout
+    ctx.defer_ephemeral().await?;
+
     // 4. Determine channel name
     let raw_name = name.as_deref()
         .map(String::from)
@@ -345,10 +357,11 @@ pub async fn new_project(
     let new_channel_id = new_channel.id.to_string();
 
     // 8. Register in DB
+    let canonical_str = canonical_path.to_string_lossy();
     match repository::register_project(
         &ctx.data().db,
         &new_channel_id,
-        &path,
+        &canonical_str,
         name.as_deref(),
     )
     .await
