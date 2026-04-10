@@ -29,6 +29,10 @@ pub struct DiscordConfig {
     pub token_env: String,
     #[serde(default)]
     pub notification_channel_id: Option<u64>,
+    #[serde(default)]
+    pub project_roots: Vec<String>,
+    #[serde(default)]
+    pub default_category_id: Option<String>,
 }
 
 fn default_token_env() -> String {
@@ -266,6 +270,8 @@ binary_path = "claude"
         assert_eq!(config.attachment.max_file_size_mb, 25);
         assert_eq!(config.attachment.max_aggregate_size_mb, 50);
         assert_eq!(config.attachment.download_timeout_secs, 30);
+        assert!(config.discord.project_roots.is_empty());
+        assert!(config.discord.default_category_id.is_none());
     }
 
     #[test]
@@ -513,5 +519,71 @@ binary_path = "claude"
         assert_eq!(config.attachment.download_timeout_secs, 30);
         assert_eq!(config.attachment.max_file_size_bytes(), 25 * 1024 * 1024);
         assert_eq!(config.attachment.max_aggregate_size_bytes(), 50 * 1024 * 1024);
+    }
+
+    #[test]
+    fn parse_config_without_project_roots_defaults_empty() {
+        let toml_str = r#"
+[discord]
+guild_id = 123
+owner_id = 456
+
+[claude]
+binary_path = "claude"
+
+[response]
+"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert!(config.discord.project_roots.is_empty());
+    }
+
+    #[test]
+    fn parse_config_with_project_roots() {
+        let toml_str = r#"
+[discord]
+guild_id = 123
+owner_id = 456
+project_roots = ["/home/user/projects", "/opt/work"]
+
+[claude]
+binary_path = "claude"
+
+[response]
+"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.discord.project_roots, vec!["/home/user/projects", "/opt/work"]);
+    }
+
+    #[test]
+    fn parse_config_without_category_defaults_none() {
+        let toml_str = r#"
+[discord]
+guild_id = 123
+owner_id = 456
+
+[claude]
+binary_path = "claude"
+
+[response]
+"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert!(config.discord.default_category_id.is_none());
+    }
+
+    #[test]
+    fn parse_config_with_category() {
+        let toml_str = r#"
+[discord]
+guild_id = 123
+owner_id = 456
+default_category_id = "123456789"
+
+[claude]
+binary_path = "claude"
+
+[response]
+"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.discord.default_category_id, Some("123456789".to_string()));
     }
 }

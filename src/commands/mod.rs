@@ -9,6 +9,7 @@ pub fn all_commands() -> Vec<poise::Command<Data, Error>> {
     vec![
         register::register(),
         register::unregister(),
+        register::new_project(),
         session::sessions(),
         session::list(),
         session::del(),
