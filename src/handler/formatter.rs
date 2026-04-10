@@ -1,3 +1,4 @@
+use comfy_table::{CellAlignment, ContentArrangement, Table, presets};
 use poise::serenity_prelude as serenity;
 use serenity::{CreateAllowedMentions, CreateMessage};
 use tokio::time::{sleep, Duration};
@@ -23,7 +24,7 @@ pub fn format_response(events: &[StreamEvent], lang: Lang) -> (String, Vec<Strin
                                 let (cleaned, paths) = file_attach::extract_file_markers(text);
                                 file_paths.extend(paths);
                                 if !cleaned.is_empty() {
-                                    parts.push(cleaned);
+                                    parts.push(convert_markdown_tables(&cleaned));
                                 }
                             }
                         }
@@ -139,6 +140,152 @@ pub fn split_message(text: &str, max_len: usize) -> Vec<String> {
     }
 
     chunks
+}
+
+fn is_table_row(line: &str) -> bool {
+    let trimmed = line.trim();
+    trimmed.starts_with('|') && trimmed.ends_with('|')
+}
+
+fn is_separator_row(line: &str) -> bool {
+    let trimmed = line.trim();
+    if !trimmed.starts_with('|') || !trimmed.ends_with('|') {
+        return false;
+    }
+    let inner = &trimmed[1..trimmed.len() - 1];
+    inner.split('|').all(|cell| {
+        let c = cell.trim();
+        if c.is_empty() {
+            return false;
+        }
+        let stripped = c.trim_start_matches(':').trim_end_matches(':');
+        stripped.len() >= 3 && stripped.chars().all(|ch| ch == '-')
+    })
+}
+
+fn parse_row_cells(line: &str) -> Vec<String> {
+    let trimmed = line.trim();
+    let inner = &trimmed[1..trimmed.len() - 1];
+    inner.split('|').map(|c| c.trim().to_string()).collect()
+}
+
+fn parse_alignment(sep_cell: &str) -> CellAlignment {
+    let c = sep_cell.trim();
+    let left_colon = c.starts_with(':');
+    let right_colon = c.ends_with(':');
+    match (left_colon, right_colon) {
+        (true, true) => CellAlignment::Center,
+        (false, true) => CellAlignment::Right,
+        _ => CellAlignment::Left,
+    }
+}
+
+fn render_table(header: &[String], alignments: &[CellAlignment], rows: &[Vec<String>]) -> String {
+    let mut table = Table::new();
+    table.load_preset(presets::UTF8_FULL_CONDENSED);
+    table.set_content_arrangement(ContentArrangement::Dynamic);
+    table.set_width(60);
+
+    let header_cells: Vec<comfy_table::Cell> = header
+        .iter()
+        .enumerate()
+        .map(|(i, h)| {
+            let alignment = alignments.get(i).copied().unwrap_or(CellAlignment::Left);
+            comfy_table::Cell::new(h).set_alignment(alignment)
+        })
+        .collect();
+    table.set_header(header_cells);
+
+    for row in rows {
+        let cells: Vec<comfy_table::Cell> = row
+            .iter()
+            .enumerate()
+            .map(|(i, val)| {
+                let alignment = alignments.get(i).copied().unwrap_or(CellAlignment::Left);
+                comfy_table::Cell::new(val).set_alignment(alignment)
+            })
+            .collect();
+        table.add_row(cells);
+    }
+
+    table.to_string()
+}
+
+pub(crate) fn convert_markdown_tables(text: &str) -> String {
+    let lines: Vec<&str> = text.lines().collect();
+    let mut result = String::new();
+    let mut in_code_block = false;
+    let mut i = 0;
+
+    while i < lines.len() {
+        let line = lines[i];
+
+        // Track code block fences — skip processing inside them
+        if line.trim_start().starts_with("```") {
+            in_code_block = !in_code_block;
+            result.push_str(line);
+            result.push('\n');
+            i += 1;
+            continue;
+        }
+
+        if in_code_block {
+            result.push_str(line);
+            result.push('\n');
+            i += 1;
+            continue;
+        }
+
+        // Check if this could be the start of a markdown table:
+        // line i must be a table row, line i+1 must be a separator row
+        if is_table_row(line) && i + 1 < lines.len() && is_separator_row(lines[i + 1]) {
+            // Collect header + separator + 1+ data rows
+            let header_line = line;
+            let sep_line = lines[i + 1];
+
+            // Collect data rows
+            let mut data_rows: Vec<&str> = Vec::new();
+            let mut j = i + 2;
+            while j < lines.len() && is_table_row(lines[j]) {
+                data_rows.push(lines[j]);
+                j += 1;
+            }
+
+            if !data_rows.is_empty() {
+                // Parse header cells
+                let header_cells = parse_row_cells(header_line);
+
+                // Parse alignments from separator
+                let sep_cells = parse_row_cells(sep_line);
+                let alignments: Vec<CellAlignment> =
+                    sep_cells.iter().map(|c| parse_alignment(c)).collect();
+
+                // Parse data rows
+                let parsed_rows: Vec<Vec<String>> =
+                    data_rows.iter().map(|r| parse_row_cells(r)).collect();
+
+                let rendered = render_table(&header_cells, &alignments, &parsed_rows);
+                result.push_str("```\n");
+                result.push_str(&rendered);
+                result.push('\n');
+                result.push_str("```\n");
+
+                i = j;
+                continue;
+            }
+        }
+
+        result.push_str(line);
+        result.push('\n');
+        i += 1;
+    }
+
+    // Remove trailing newline added by the loop if the original didn't end with one
+    if !text.ends_with('\n') && result.ends_with('\n') {
+        result.pop();
+    }
+
+    result
 }
 
 #[cfg(test)]
@@ -475,6 +622,81 @@ mod tests {
             assert!(!is_noise_tool(Some(name)), "{} should not be a noise tool", name);
         }
         assert!(!is_noise_tool(None));
+    }
+
+    #[test]
+    fn convert_basic_table() {
+        let input = "| a | b |\n|---|---|\n| 1 | 2 |";
+        let result = convert_markdown_tables(input);
+        assert!(result.starts_with("```\n"), "result should start with code fence: {:?}", result);
+        assert!(result.ends_with("\n```"), "result should end with code fence: {:?}", result);
+        assert!(!result.contains("| a |"), "original pipe row should not be present");
+        assert!(result.contains('─'), "result should contain unicode box drawing chars");
+    }
+
+    #[test]
+    fn convert_table_with_alignment() {
+        let input = "| left | center | right |\n|:---|:---:|---:|\n| a | b | c |";
+        let result = convert_markdown_tables(input);
+        assert!(result.contains("```"), "result should contain code block");
+        assert!(result.contains("left"), "header 'left' should be present");
+        assert!(result.contains('a'), "cell value 'a' should be present");
+    }
+
+    #[test]
+    fn convert_table_preserves_surrounding_text() {
+        let input = "before\n| a | b |\n|---|---|\n| 1 | 2 |\nafter";
+        let result = convert_markdown_tables(input);
+        assert!(result.starts_with("before\n```\n"), "result should start with surrounding text then code fence: {:?}", result);
+        assert!(result.contains("```\nafter"), "result should end with code fence then surrounding text: {:?}", result);
+    }
+
+    #[test]
+    fn convert_table_skips_code_block() {
+        let input = "```\n| a | b |\n|---|---|\n| 1 | 2 |\n```";
+        let result = convert_markdown_tables(input);
+        assert_eq!(result, input, "table inside code block should not be converted");
+    }
+
+    #[test]
+    fn convert_table_no_separator_passthrough() {
+        let input = "| not | a | table |";
+        let result = convert_markdown_tables(input);
+        assert_eq!(result, input, "line without separator row should pass through unchanged");
+    }
+
+    #[test]
+    fn convert_table_cjk_chars() {
+        let input = "| 이름 | 값 |\n|---|---|\n| 한글 | 테스트 |";
+        let result = convert_markdown_tables(input);
+        assert!(result.contains("```"), "result should contain code block");
+        assert!(result.contains("이름"), "header '이름' should be present");
+        assert!(result.contains("한글"), "cell '한글' should be present");
+        assert!(result.contains("테스트"), "cell '테스트' should be present");
+    }
+
+    #[test]
+    fn convert_table_empty_cells() {
+        let input = "| a | b |\n|---|---|\n|  | 2 |";
+        let result = convert_markdown_tables(input);
+        assert!(result.contains("```"), "result should contain code block");
+        assert!(result.contains('2'), "non-empty cell value should be present");
+    }
+
+    #[test]
+    fn convert_multiple_tables() {
+        let input = "| a | b |\n|---|---|\n| 1 | 2 |\n\ntext\n\n| c | d |\n|---|---|\n| 3 | 4 |";
+        let result = convert_markdown_tables(input);
+        let fence_count = result.matches("```").count();
+        assert_eq!(fence_count, 4, "two tables should produce 4 code fences, got {}: {:?}", fence_count, result);
+        assert!(result.contains("text"), "surrounding text should be preserved");
+    }
+
+    #[test]
+    fn convert_table_fallback_on_malformed() {
+        let input = "| a | b |\n|---|---|";
+        let result = convert_markdown_tables(input);
+        assert_eq!(result, input, "header+separator without data rows should not be converted");
     }
 }
 
