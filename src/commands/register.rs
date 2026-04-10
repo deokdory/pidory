@@ -11,7 +11,10 @@ async fn autocomplete_path(
 ) -> Vec<poise::serenity_prelude::AutocompleteChoice> {
     let project_roots = ctx.data().config.discord.project_roots.clone();
 
+    tracing::info!(partial = %partial, root_count = project_roots.len(), "autocomplete_path called");
+
     if project_roots.is_empty() {
+        tracing::info!("autocomplete_path: empty roots, returning empty");
         return Vec::new();
     }
 
@@ -86,12 +89,16 @@ async fn autocomplete_path(
     let list_dir_canonical = tokio::fs::canonicalize(&list_dir).await
         .unwrap_or_else(|_| std::path::PathBuf::from(&list_dir));
     if !is_under_roots(&list_dir_canonical) {
+        tracing::info!(list_dir = %list_dir, canonical = %list_dir_canonical.display(), "autocomplete_path: not under roots");
         return Vec::new();
     }
 
     let mut rd = match tokio::fs::read_dir(&list_dir).await {
         Ok(rd) => rd,
-        Err(_) => return Vec::new(),
+        Err(e) => {
+            tracing::info!(list_dir = %list_dir, error = %e, "autocomplete_path: read_dir failed");
+            return Vec::new();
+        }
     };
 
     let mut choices: Vec<poise::serenity_prelude::AutocompleteChoice> = Vec::new();
@@ -129,13 +136,15 @@ async fn autocomplete_path(
             continue;
         }
 
-        let display = make_display(&canonical);
-        choices.push(poise::serenity_prelude::AutocompleteChoice::new(display, full_path));
+        let choice_name = make_display(&canonical);
+        tracing::info!("autocomplete_path: adding choice name={} value={}", choice_name, full_path);
+        choices.push(poise::serenity_prelude::AutocompleteChoice::new(choice_name, full_path));
         if choices.len() >= 25 {
             break;
         }
     }
 
+    tracing::info!(count = choices.len(), "autocomplete_path: returning");
     choices
 }
 
