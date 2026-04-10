@@ -9,3 +9,5 @@ config.dev.toml
 *.env
 .sisyphus/
 .pidory/
+.claude/
+.codex-review/
