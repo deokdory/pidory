@@ -11,7 +11,7 @@ async fn autocomplete_path(
 ) -> Vec<poise::serenity_prelude::AutocompleteChoice> {
     let project_roots = ctx.data().config.discord.project_roots.clone();
 
-    tracing::debug!(partial = %partial, roots = ?project_roots, "autocomplete_path called");
+    tracing::debug!(partial = %partial, root_count = project_roots.len(), "autocomplete_path called");
 
     if project_roots.is_empty() {
         return Vec::new();
@@ -88,14 +88,14 @@ async fn autocomplete_path(
     let list_dir_canonical = tokio::fs::canonicalize(&list_dir).await
         .unwrap_or_else(|_| std::path::PathBuf::from(&list_dir));
     if !is_under_roots(&list_dir_canonical) {
-        tracing::debug!(path = %list_dir_canonical.display(), "path not under any project root");
+        tracing::debug!("path not under any project root");
         return Vec::new();
     }
 
     let mut rd = match tokio::fs::read_dir(&list_dir).await {
         Ok(rd) => rd,
         Err(e) => {
-            tracing::debug!(path = %list_dir, error = %e, "read_dir failed");
+            tracing::debug!(error = %e, "read_dir failed");
             return Vec::new();
         }
     };
