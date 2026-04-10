@@ -272,8 +272,8 @@ impl Lang {
 
     pub fn channel_create_failed(&self) -> &'static str {
         match self {
-            Lang::Ko => "채널 생성에 실패했습니다",
-            Lang::En => "Failed to create channel",
+            Lang::Ko => "채널 생성에 실패했습니다. 봇에 'Manage Channels' 권한이 있는지 확인하세요.",
+            Lang::En => "Failed to create channel. Please check that the bot has the 'Manage Channels' permission.",
         }
     }
 
