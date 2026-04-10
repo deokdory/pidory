@@ -8,7 +8,7 @@ use tokio::sync::mpsc;
 use crate::{Context, Data, Error};
 use crate::db::repository;
 use crate::error::PidoryError;
-use crate::handler::{formatter, message};
+use crate::handler::formatter;
 use crate::subprocess::parser::{ContentBlock, StreamEvent};
 use crate::subprocess::session_manager::QueuedMessage;
 
@@ -324,12 +324,12 @@ pub async fn branch(
     // 새 세션에 컨텍스트 메시지 전송
     let initial_prompt = if extra_context.is_empty() {
         format!(
-            "<system-reminder>이 세션은 \"{}\" 스레드에서 분기되었습니다. 아래는 이전 작업의 요약입니다.</system-reminder>\n\n{}\n\n이전 작업을 이어서 진행해주세요.",
+            "<system-reminder>이 세션은 \"{}\" 스레드에서 분기되었습니다. 아래는 이전 작업의 요약입니다.</system-reminder>\n\n{}\n\nRespond with a single short confirmation that you understood the context. Do NOT use any tools. Do NOT start any work.",
             source_thread_name, summary.summary
         )
     } else {
         format!(
-            "<system-reminder>이 세션은 \"{}\" 스레드에서 분기되었습니다. 아래는 이전 작업의 요약입니다.</system-reminder>\n\n{}\n\n{}",
+            "<system-reminder>이 세션은 \"{}\" 스레드에서 분기되었습니다. 아래는 이전 작업의 요약입니다.</system-reminder>\n\n{}\n\n{}\n\nRespond with a single short confirmation that you understood the context. Do NOT use any tools. Do NOT start any work.",
             source_thread_name, summary.summary, extra_context
         )
     };
@@ -346,19 +346,6 @@ pub async fn branch(
         .await?;
         return Ok(());
     }
-
-    // turn tracking
-    data.turn_initiators
-        .lock()
-        .await
-        .insert(new_thread_id.clone(), ctx.author().id);
-    data.turn_participants
-        .lock()
-        .await
-        .insert(
-            new_thread_id.clone(),
-            std::collections::HashSet::from([ctx.author().id]),
-        );
 
     let (new_event_tx, new_event_rx) = mpsc::channel::<StreamEvent>(64);
     let new_msg = QueuedMessage {
@@ -395,22 +382,29 @@ pub async fn branch(
     )
     .await?;
 
-    // 새 세션의 초기 응답을 Discord에 스트리밍
-    message::process_turn_events(
-        serenity_ctx,
+    // 새 세션의 초기 turn을 조용히 소비 (Discord에 출력하지 않음)
+    let drain_timeout = data.config.claude.subprocess_timeout_secs;
+    match drain_initial_turn(
         new_event_rx,
-        new_channel_id,
-        bot_msg.id,
         &new_thread_id,
         db,
-        data.config.response.max_chunk_length,
-        data.config.response.max_chunks,
         data.session_skills.clone(),
-        lang,
-        data.config.discord.owner_id,
-        data.turn_participants.clone(),
+        drain_timeout,
     )
-    .await;
+    .await
+    {
+        Ok(()) => {
+            // 준비 완료 알림 (요청자 멘션 포함)
+            let mention = format!("<@{}>", ctx.author().id);
+            let _ = new_channel_id
+                .say(serenity_ctx, &lang.branch_ready(&mention))
+                .await;
+        }
+        Err(e) => {
+            tracing::error!("Failed to drain initial turn for {}: {}", new_thread_id, e);
+            cleanup_orphaned_thread(serenity_ctx, data, new_channel_id, &new_thread_id).await;
+        }
+    }
 
     Ok(())
 }
@@ -449,6 +443,89 @@ async fn cleanup_orphaned_thread(
     let _ = thread_channel_id
         .edit_thread(serenity_ctx, EditThread::new().archived(true).locked(true))
         .await;
+}
+
+// ── 초기 turn 소비 ──
+
+/// 새 세션의 initial turn 이벤트를 Discord에 출력하지 않고 조용히 소비하면서
+/// session_id / skills / last_active / status를 DB에 저장.
+async fn drain_initial_turn(
+    mut event_rx: mpsc::Receiver<StreamEvent>,
+    thread_id: &str,
+    db: &sqlx::SqlitePool,
+    session_skills: Arc<tokio::sync::Mutex<std::collections::HashMap<String, Vec<String>>>>,
+    timeout_secs: u64,
+) -> Result<(), PidoryError> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
+
+    loop {
+        tokio::select! {
+            event = event_rx.recv() => {
+                match event {
+                    Some(StreamEvent::Init { skills, .. }) => {
+                        if !skills.is_empty() {
+                            session_skills.lock().await.insert(thread_id.to_string(), skills.clone());
+                        }
+                    }
+                    Some(StreamEvent::Result { session_id, is_error, .. }) => {
+                        if !session_id.is_empty()
+                            && let Err(e) = repository::update_session_id(db, thread_id, &session_id).await
+                        {
+                            tracing::warn!("drain_initial_turn: failed to update session_id: {}", e);
+                        }
+                        if is_error {
+                            if let Err(e) = repository::update_session_status(db, thread_id, "error").await {
+                                tracing::warn!("drain_initial_turn: failed to update status to error: {}", e);
+                            }
+                            return Err(PidoryError::Subprocess("initial turn error".into()));
+                        } else {
+                            if let Err(e) = repository::update_session_status(db, thread_id, "idle").await {
+                                tracing::warn!("drain_initial_turn: failed to update status to idle: {}", e);
+                            }
+                        }
+                        break;
+                    }
+                    None => {
+                        if let Err(e) = repository::update_session_status(db, thread_id, "error").await {
+                            tracing::warn!("drain_initial_turn: failed to update status on channel close: {}", e);
+                        }
+                        return Err(PidoryError::Subprocess("initial turn channel closed".into()));
+                    }
+                    Some(StreamEvent::Assistant { ref content, .. }) => {
+                        // WARN2: LLM이 프롬프트 무시하고 tool 사용 시도 감지
+                        for block in content {
+                            if let ContentBlock::ToolUse { name, .. } = block {
+                                tracing::warn!(
+                                    "drain_initial_turn: unexpected tool_use '{}' during bootstrap for {}",
+                                    name, thread_id
+                                );
+                            }
+                        }
+                    }
+                    Some(StreamEvent::ControlRequest { .. }) => {
+                        // WARN1: bootstrap 중 permission 요청 — 프롬프트 무시 가능성
+                        tracing::warn!(
+                            "drain_initial_turn: unexpected ControlRequest during bootstrap for {}",
+                            thread_id
+                        );
+                    }
+                    _ => {} // User, RateLimit 등 무시
+                }
+            }
+            _ = tokio::time::sleep_until(deadline) => {
+                if let Err(e) = repository::update_session_status(db, thread_id, "error").await {
+                    tracing::warn!("drain_initial_turn: failed to update status on timeout: {}", e);
+                }
+                return Err(PidoryError::Subprocess("initial turn timeout".into()));
+            }
+        }
+    }
+
+    if let Err(e) = repository::update_last_active(db, thread_id).await {
+        tracing::warn!("drain_initial_turn: failed to update last_active: {}", e);
+    }
+
+    Ok(())
 }
 
 // ── 요약 수집 ──
