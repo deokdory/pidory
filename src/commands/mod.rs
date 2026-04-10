@@ -1,3 +1,4 @@
+pub mod branch;
 pub mod recall;
 pub mod register;
 pub mod session;
@@ -16,5 +17,6 @@ pub fn all_commands() -> Vec<poise::Command<Data, Error>> {
         session::stop(),
         skill::skill(),
         recall::recall(),
+        branch::branch(),
     ]
 }

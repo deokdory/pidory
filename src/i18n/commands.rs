@@ -246,4 +246,81 @@ impl Lang {
             Lang::En => format!(" — session: {}…", short_id),
         }
     }
+
+    // ── Commands: branch ──
+
+    pub fn branch_not_in_thread(&self) -> &'static str {
+        match self {
+            Lang::Ko => "스레드 안에서만 사용 가능합니다",
+            Lang::En => "This command can only be used inside a thread",
+        }
+    }
+
+    pub fn branch_no_project(&self) -> &'static str {
+        match self {
+            Lang::Ko => "이 채널에 등록된 프로젝트가 없습니다",
+            Lang::En => "No project registered for this channel",
+        }
+    }
+
+    pub fn branch_no_session(&self) -> &'static str {
+        match self {
+            Lang::Ko => "이 스레드에 활성 세션이 없습니다",
+            Lang::En => "No active session in this thread",
+        }
+    }
+
+    pub fn branch_session_busy(&self) -> &'static str {
+        match self {
+            Lang::Ko => "세션이 작업 중입니다. 완료 후 다시 시도해주세요",
+            Lang::En => "Session is busy. Please try again after it completes",
+        }
+    }
+
+    pub fn branch_no_slot(&self, reason: &str) -> String {
+        match self {
+            Lang::Ko => format!("세션 슬롯이 부족합니다: {}. 잠시 후 다시 시도해주세요", reason),
+            Lang::En => format!("No session slot available: {}. Please try again later", reason),
+        }
+    }
+
+    pub fn branch_summary_failed(&self) -> &'static str {
+        match self {
+            Lang::Ko => "요약 생성에 실패했습니다",
+            Lang::En => "Failed to generate summary",
+        }
+    }
+
+    pub fn branch_thread_created(&self, thread_mention: &str) -> String {
+        match self {
+            Lang::Ko => format!("새 스레드가 생성되었습니다: {}", thread_mention),
+            Lang::En => format!("New thread created: {}", thread_mention),
+        }
+    }
+
+    pub fn branch_thread_create_failed(&self) -> &'static str {
+        match self {
+            Lang::Ko => "스레드 생성에 실패했습니다",
+            Lang::En => "Failed to create thread",
+        }
+    }
+
+    pub fn branch_context_header(&self, source_thread: &str) -> String {
+        match self {
+            Lang::Ko => format!("🔀 {}에서 분기됨", source_thread),
+            Lang::En => format!("🔀 Branched from {}", source_thread),
+        }
+    }
+
+    pub fn branch_summary_prompt(&self, extra_context: &str) -> String {
+        match self {
+            Lang::Ko | Lang::En => {
+                if extra_context.is_empty() {
+                    "Summarize the current conversation and work context for handoff to a new session.\n\nRespond ONLY with a JSON object, no other text. Do NOT use any tools.\n{\"title\": \"short descriptive title for the new thread (max 50 chars, Korean if conversation is in Korean)\", \"summary\": \"comprehensive summary of current project state, ongoing work, key decisions, and relevant file paths (max 2000 chars)\"}".to_string()
+                } else {
+                    format!("Summarize the current conversation and work context for handoff to a new session.\nFocus especially on: {}\n\nRespond ONLY with a JSON object, no other text. Do NOT use any tools.\n{{\"title\": \"short descriptive title for the new thread (max 50 chars, Korean if conversation is in Korean)\", \"summary\": \"comprehensive summary of current project state, ongoing work, key decisions, and relevant file paths (max 2000 chars)\"}}", extra_context)
+                }
+            }
+        }
+    }
 }
