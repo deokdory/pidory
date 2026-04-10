@@ -9,12 +9,10 @@ async fn autocomplete_path(
     ctx: Context<'_>,
     partial: &str,
 ) -> Vec<poise::serenity_prelude::AutocompleteChoice> {
+    let partial = strip_display_prefix(partial);
     let project_roots = ctx.data().config.discord.project_roots.clone();
 
-    tracing::info!(partial = %partial, root_count = project_roots.len(), "autocomplete_path called");
-
     if project_roots.is_empty() {
-        tracing::info!("autocomplete_path: empty roots, returning empty");
         return Vec::new();
     }
 
@@ -89,14 +87,12 @@ async fn autocomplete_path(
     let list_dir_canonical = tokio::fs::canonicalize(&list_dir).await
         .unwrap_or_else(|_| std::path::PathBuf::from(&list_dir));
     if !is_under_roots(&list_dir_canonical) {
-        tracing::info!(list_dir = %list_dir, canonical = %list_dir_canonical.display(), "autocomplete_path: not under roots");
         return Vec::new();
     }
 
     let mut rd = match tokio::fs::read_dir(&list_dir).await {
         Ok(rd) => rd,
-        Err(e) => {
-            tracing::info!(list_dir = %list_dir, error = %e, "autocomplete_path: read_dir failed");
+        Err(_) => {
             return Vec::new();
         }
     };
@@ -137,14 +133,12 @@ async fn autocomplete_path(
         }
 
         let choice_name = make_display(&canonical);
-        tracing::info!("autocomplete_path: adding choice name={} value={}", choice_name, full_path);
         choices.push(poise::serenity_prelude::AutocompleteChoice::new(choice_name, full_path));
         if choices.len() >= 25 {
             break;
         }
     }
 
-    tracing::info!(count = choices.len(), "autocomplete_path: returning");
     choices
 }
 
@@ -399,6 +393,25 @@ pub async fn new_project(
     Ok(())
 }
 
+/// Strip the display prefix added by `make_display` from a partial string.
+///
+/// When Discord autocomplete inserts a selected choice into the input field it
+/// uses the choice *name* (display text), not the value.  `make_display`
+/// formats names as `"{last} \u{2014} {full_path}"`.  The next autocomplete
+/// invocation therefore receives the display string as `partial`.
+///
+/// This function detects that pattern and returns the part after the separator,
+/// i.e. the raw path / value.  If the pattern is not present the original
+/// `partial` is returned unchanged.
+pub(crate) fn strip_display_prefix(partial: &str) -> &str {
+    // Separator is SPACE + U+2014 (EM DASH, 3 UTF-8 bytes) + SPACE = 5 bytes total.
+    const SEP: &str = " \u{2014} ";
+    match partial.find(SEP) {
+        Some(pos) => &partial[pos + SEP.len()..],
+        None => partial,
+    }
+}
+
 /// Sanitize a string into a valid Discord channel name.
 ///
 /// Rules:
@@ -445,7 +458,7 @@ pub(crate) fn sanitize_channel_name(name: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::sanitize_channel_name;
+    use super::{sanitize_channel_name, strip_display_prefix};
 
     #[test]
     fn basic_sanitize() {
@@ -485,5 +498,50 @@ mod tests {
     fn special_chars_replaced() {
         assert_eq!(sanitize_channel_name("hello_world!"), Some("hello-world-".to_string().trim_matches('-').to_string()));
         assert_eq!(sanitize_channel_name("foo/bar/baz"), Some("foo-bar-baz".to_string()));
+    }
+
+    // --- strip_display_prefix tests ---
+
+    #[test]
+    fn strip_display_format_extracts_path() {
+        // make_display produces "{last} \u{2014} {full}" — strip the prefix
+        assert_eq!(
+            strip_display_prefix("projects \u{2014} /home/user/projects"),
+            "/home/user/projects"
+        );
+    }
+
+    #[test]
+    fn strip_plain_path_unchanged() {
+        // No separator present — return as-is
+        assert_eq!(
+            strip_display_prefix("/home/user/projects/"),
+            "/home/user/projects/"
+        );
+    }
+
+    #[test]
+    fn strip_empty_string() {
+        assert_eq!(strip_display_prefix(""), "");
+    }
+
+    #[test]
+    fn strip_truncated_display_extracts_path() {
+        // Simulates a display string whose name portion was truncated at 100 chars
+        // but the separator and path are still present
+        assert_eq!(
+            strip_display_prefix("longname \u{2014} /some/path"),
+            "/some/path"
+        );
+    }
+
+    #[test]
+    fn strip_em_dash_in_path_keeps_remainder() {
+        // Only the FIRST separator should be consumed; em dashes inside the path
+        // are preserved verbatim
+        assert_eq!(
+            strip_display_prefix("test \u{2014} /path/with \u{2014} dash"),
+            "/path/with \u{2014} dash"
+        );
     }
 }
