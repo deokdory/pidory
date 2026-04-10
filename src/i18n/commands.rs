@@ -247,6 +247,57 @@ impl Lang {
         }
     }
 
+    // ── Commands: new-project ──
+
+    pub fn new_project_created(&self, channel: &str, path: &str) -> String {
+        match self {
+            Lang::Ko => format!("채널 <#{}> 이(가) `{}`에 생성되고 등록되었습니다", channel, path),
+            Lang::En => format!("Channel <#{}> created and registered to `{}`", channel, path),
+        }
+    }
+
+    pub fn channel_name_invalid(&self) -> &'static str {
+        match self {
+            Lang::Ko => "유효하지 않은 채널 이름입니다 (2-100자, 영문/숫자/하이픈)",
+            Lang::En => "Invalid channel name (2-100 chars, alphanumeric/hyphen only)",
+        }
+    }
+
+    pub fn channel_name_specify_hint(&self) -> &'static str {
+        match self {
+            Lang::Ko => "name 파라미터로 이름을 직접 지정하세요.",
+            Lang::En => "Please specify a name using the name parameter.",
+        }
+    }
+
+    pub fn channel_create_failed(&self) -> &'static str {
+        match self {
+            Lang::Ko => "채널 생성에 실패했습니다",
+            Lang::En => "Failed to create channel",
+        }
+    }
+
+    pub fn path_not_in_roots(&self, path: &str) -> String {
+        match self {
+            Lang::Ko => format!("`{}`은(는) 허용된 project_roots 안에 없습니다", path),
+            Lang::En => format!("`{}` is not within any allowed project_roots", path),
+        }
+    }
+
+    pub fn category_not_found(&self) -> &'static str {
+        match self {
+            Lang::Ko => "지정된 카테고리를 찾을 수 없습니다",
+            Lang::En => "Specified category not found",
+        }
+    }
+
+    pub fn channel_created_but_register_failed(&self, channel: &str) -> String {
+        match self {
+            Lang::Ko => format!("채널 <#{}>이(가) 생성되었지만 등록에 실패했습니다. `/register`를 수동으로 실행하세요.", channel),
+            Lang::En => format!("Channel <#{}> was created but registration failed. Run `/register` manually.", channel),
+        }
+    }
+
     // ── Commands: branch ──
 
     pub fn branch_not_in_thread(&self) -> &'static str {
