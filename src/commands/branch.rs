@@ -2,10 +2,10 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
-use poise::serenity_prelude::{self as serenity, ChannelType, CreateThread};
+use poise::serenity_prelude::{self as serenity, ChannelType, CreateThread, EditThread};
 use tokio::sync::mpsc;
 
-use crate::{Context, Error};
+use crate::{Context, Data, Error};
 use crate::db::repository;
 use crate::error::PidoryError;
 use crate::handler::{formatter, message};
@@ -27,6 +27,9 @@ pub async fn branch(
     let thread_id = channel_id.to_string();
     let db = &data.db;
 
+    // Discord 3초 interaction deadline 준수: validation 전에 즉시 defer
+    ctx.defer_ephemeral().await?;
+
     // ── Validation ──
 
     // 1. 스레드인지 확인
@@ -40,7 +43,6 @@ pub async fn branch(
         _ => {
             ctx.send(
                 poise::CreateReply::default()
-                    .ephemeral(true)
                     .content(format!("❌ {}", lang.branch_not_in_thread())),
             )
             .await?;
@@ -56,7 +58,6 @@ pub async fn branch(
         None => {
             ctx.send(
                 poise::CreateReply::default()
-                    .ephemeral(true)
                     .content(format!("❌ {}", lang.branch_not_in_thread())),
             )
             .await?;
@@ -71,7 +72,6 @@ pub async fn branch(
         None => {
             ctx.send(
                 poise::CreateReply::default()
-                    .ephemeral(true)
                     .content(format!("❌ {}", lang.branch_no_project())),
             )
             .await?;
@@ -85,7 +85,6 @@ pub async fn branch(
         None => {
             ctx.send(
                 poise::CreateReply::default()
-                    .ephemeral(true)
                     .content(format!("❌ {}", lang.branch_no_session())),
             )
             .await?;
@@ -97,7 +96,6 @@ pub async fn branch(
     if !data.sessions.has_available_slot().await {
         ctx.send(
             poise::CreateReply::default()
-                .ephemeral(true)
                 .content(format!(
                     "❌ {}",
                     lang.branch_no_slot(&format!(
@@ -116,7 +114,6 @@ pub async fn branch(
     if !acquired {
         ctx.send(
             poise::CreateReply::default()
-                .ephemeral(true)
                 .content(format!("❌ {}", lang.branch_session_busy())),
         )
         .await?;
@@ -124,9 +121,6 @@ pub async fn branch(
     }
 
     // ── Phase A: 요약 수집 ──
-
-    // Deferred ephemeral response
-    ctx.defer_ephemeral().await?;
 
     let disallowed_tools: Vec<String> = match &project.disallowed_tools {
         Some(json_str) => serde_json::from_str(json_str).unwrap_or_else(|_| {
@@ -166,12 +160,12 @@ pub async fn branch(
     let extra_context = context.as_deref().unwrap_or("");
     let summary_prompt = lang.branch_summary_prompt(extra_context);
 
-    // 요약 요청 전송
+    // 요약 요청 전송 — source thread의 channel_id를 synthetic MessageId로 사용
     let (event_tx, event_rx) = mpsc::channel::<StreamEvent>(64);
     let summary_msg = QueuedMessage {
         content: summary_prompt,
         channel_id,
-        message_id: serenity::MessageId::new(1), // dummy — 요약 turn에는 reaction 불필요
+        message_id: serenity::MessageId::new(channel_id.get()),
         event_tx: Some(event_tx),
         triggered_by: ctx.author().id,
         cancelled: Arc::new(AtomicBool::new(false)),
@@ -270,7 +264,7 @@ pub async fn branch(
         Ok(msg) => msg,
         Err(e) => {
             tracing::error!("Failed to send initial message to new thread: {}", e);
-            cleanup_orphaned_thread(serenity_ctx, db, new_channel_id, &new_thread_id).await;
+            cleanup_orphaned_thread(serenity_ctx, data, new_channel_id, &new_thread_id).await;
             ctx.send(
                 poise::CreateReply::default()
                     .content(format!("❌ {}", lang.branch_thread_create_failed())),
@@ -287,7 +281,7 @@ pub async fn branch(
     // DB 세션 생성
     if let Err(e) = repository::create_session(db, &new_thread_id, &parent_channel_str).await {
         tracing::error!("Failed to create DB session for new thread: {}", e);
-        cleanup_orphaned_thread(serenity_ctx, db, new_channel_id, &new_thread_id).await;
+        cleanup_orphaned_thread(serenity_ctx, data, new_channel_id, &new_thread_id).await;
         ctx.send(
             poise::CreateReply::default()
                 .content(format!("❌ {}", lang.branch_thread_create_failed())),
@@ -315,7 +309,7 @@ pub async fn branch(
         .await
     {
         tracing::error!("Failed to bootstrap new session: {}", e);
-        cleanup_orphaned_thread(serenity_ctx, db, new_channel_id, &new_thread_id).await;
+        cleanup_orphaned_thread(serenity_ctx, data, new_channel_id, &new_thread_id).await;
         ctx.send(
             poise::CreateReply::default()
                 .content(format!(
@@ -340,8 +334,18 @@ pub async fn branch(
         )
     };
 
-    // 새 세션 acquire
-    let _ = repository::try_acquire_session(db, &new_thread_id).await;
+    // 새 세션 acquire — 실패 시 invariant violation, cleanup 후 abort
+    let new_acquired = repository::try_acquire_session(db, &new_thread_id).await?;
+    if !new_acquired {
+        tracing::error!("Failed to acquire newly created session {}", new_thread_id);
+        cleanup_orphaned_thread(serenity_ctx, data, new_channel_id, &new_thread_id).await;
+        ctx.send(
+            poise::CreateReply::default()
+                .content(format!("❌ {}", lang.branch_session_busy())),
+        )
+        .await?;
+        return Ok(());
+    }
 
     // turn tracking
     data.turn_initiators
@@ -370,7 +374,7 @@ pub async fn branch(
 
     if let Err(e) = data.sessions.send_message(&new_thread_id, new_msg).await {
         tracing::error!("Failed to send initial message to new session: {}", e);
-        cleanup_orphaned_thread(serenity_ctx, db, new_channel_id, &new_thread_id).await;
+        cleanup_orphaned_thread(serenity_ctx, data, new_channel_id, &new_thread_id).await;
         ctx.send(
             poise::CreateReply::default()
                 .content(format!("❌ {}", lang.branch_summary_failed())),
@@ -413,20 +417,37 @@ pub async fn branch(
 
 // ── cleanup ──
 
-/// Phase B 실패 시 orphaned thread/DB 정리
+/// Phase B 실패 시 orphaned thread의 전체 리소스 정리:
+/// 1. SessionManager kill (subprocess + worker + pending_recalls)
+/// 2. 인메모리 tracking 맵 정리
+/// 3. DB 세션 삭제
+/// 4. Discord 스레드 archive + lock
 async fn cleanup_orphaned_thread(
     serenity_ctx: &serenity::Context,
-    db: &sqlx::SqlitePool,
+    data: &Data,
     thread_channel_id: serenity::ChannelId,
     thread_id: &str,
 ) {
-    // DB 세션 삭제 (존재하면)
-    if let Err(e) = repository::delete_session(db, thread_id).await {
+    // 1. SessionManager에서 세션 kill (best-effort, NotFound 허용)
+    if let Err(e) = data.sessions.kill_session(thread_id).await {
+        tracing::debug!("cleanup: kill_session {}: {} (may not exist yet)", thread_id, e);
+    }
+
+    // 2. 인메모리 tracking 정리
+    data.turn_initiators.lock().await.remove(thread_id);
+    data.turn_participants.lock().await.remove(thread_id);
+
+    // 3. DB 세션 삭제
+    if let Err(e) = repository::delete_session(&data.db, thread_id).await {
         tracing::warn!("cleanup: failed to delete orphan session {}: {}", thread_id, e);
     }
-    // 스레드에 에러 메시지 남기기 (삭제 대신 — 삭제는 위험)
+
+    // 4. Discord 스레드에 경고 메시지 → archive + lock
     let _ = thread_channel_id
         .say(serenity_ctx, "⚠️ 세션 생성에 실패하여 이 스레드는 사용되지 않습니다.")
+        .await;
+    let _ = thread_channel_id
+        .edit_thread(serenity_ctx, EditThread::new().archived(true).locked(true))
         .await;
 }
 

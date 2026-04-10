@@ -284,13 +284,6 @@ impl Lang {
         }
     }
 
-    pub fn branch_summarizing(&self) -> &'static str {
-        match self {
-            Lang::Ko => "요약 중...",
-            Lang::En => "Summarizing...",
-        }
-    }
-
     pub fn branch_summary_failed(&self) -> &'static str {
         match self {
             Lang::Ko => "요약 생성에 실패했습니다",
