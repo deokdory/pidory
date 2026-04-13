@@ -10,14 +10,18 @@ Discord ↔ Claude Code CLI bridge. Send messages in a Discord thread and get Cl
 
 ## Features
 
-- Thread-based conversations mapped to Claude Code sessions
-- Long-lived process with message queue + mid-turn message injection
-- Tool permission approve/deny with Discord buttons (Allow / Always Allow / Deny)
-- Real-time intermediate status display
-- Code block-aware message splitting for Discord's 2000 char limit
-- Rate limit monitoring — bot presence shows current usage %, with configurable threshold alerts
-- Session lifecycle management — LRU auto-eviction when max sessions reached, idle timeout cleanup
-- Streaming messages sent without push notifications to reduce spam
+- **Thread-based conversations** — each thread maps to an independent Claude Code session
+- **Long-lived process** — message queue with mid-turn message injection
+- **Tool permissions** — approve/deny with Discord buttons (Allow / Always Allow / Deny)
+- **Interactive questions** — Claude Code's `AskUserQuestion` rendered as buttons, select menus, or modal text input
+- **File attachments** — upload files from Discord to Claude Code, and Claude Code can send files back to Discord
+- **Reply context** — reply to a Discord message to include it as context in your prompt
+- **Progress indicator** — real-time display of long-running tool executions
+- **Message splitting** — code block-aware splitting for Discord's 2000 char limit, with automatic file attachment fallback
+- **Rate limit monitoring** — bot presence shows current usage %, with configurable threshold alerts
+- **Session lifecycle** — LRU auto-eviction when max sessions reached, idle timeout cleanup
+- **Notification suppression** — streaming intermediate messages sent without push notifications
+- **Multi-language UI** — Korean (default) and English
 
 ## Security Model
 
@@ -27,12 +31,11 @@ pidory delegates to Discord's built-in permission system, and sessions are **sha
 - Users in the same thread **share the same Claude Code session**. This means:
   - A tool permission granted as `Always Allow` by one user applies **to the entire session** — subsequent messages from other users in the same thread will be auto-approved for that tool.
   - `/skill` can be invoked by any member and can run arbitrary Claude Code skills in the session.
-- Administrative commands (`/register`, `/unregister`, `/del`, `/status`, `/list`, `/sessions`) require `MANAGE_GUILD` or `MANAGE_CHANNELS` permissions respectively.
+- Administrative commands (`/register`, `/unregister`, `/del`, `/status`, `/list`, `/sessions`) require `MANAGE_GUILD` or `MANAGE_CHANNELS` permissions.
 - `/stop` can only be called by the user who started the current turn (or the `owner_id`).
+- Permission buttons (Allow / Always Allow / Deny) can only be clicked by the user who started the current turn (or the `owner_id`).
 
-**⚠️ Multi-user support is still in beta.** Use with caution.
-
-This model assumes that users invited to the guild **trust each other**. Only invite people you **genuinely trust** to the server running pidory and work together. Otherwise a malicious user could use the bot to execute arbitrary code, manipulate files, or escalate permissions on behalf of other users.
+**Warning: Multi-user support is still in beta.** This model assumes that users invited to the guild **trust each other**. Only invite people you **genuinely trust** to the server running pidory. Otherwise a malicious user could use the bot to execute arbitrary code, manipulate files, or escalate permissions on behalf of other users.
 
 ## Prerequisites
 
@@ -128,18 +131,26 @@ After update, restart the service:
 
 ### Slash Commands
 
-All commands are owner-only (restricted to the `owner_id` set in `config.toml`).
+| Command | Description | Permission |
+|---------|-------------|------------|
+| `/register <path> [name]` | Register a project directory to the current channel | MANAGE_CHANNELS |
+| `/unregister` | Unregister the project from the current channel | MANAGE_CHANNELS |
+| `/new-project <path> [name]` | Create a new channel + thread for a project | owner only |
+| `/list [channel]` | List active sessions for a channel | MANAGE_CHANNELS |
+| `/del [thread_id]` | Delete a session (defaults to current thread) | MANAGE_CHANNELS |
+| `/stop` | Stop the current session's Claude Code process | turn starter or owner |
+| `/status [thread_id]` | Show session status (defaults to current thread) | MANAGE_CHANNELS |
+| `/sessions` | Show global session overview (count, idle time, status) | MANAGE_CHANNELS |
+| `/skill <name> [args]` | Send a slash command (e.g. `/commit`) to the Claude Code session | all members |
+| `/branch [context]` | Fork the current session into a new thread with optional context | owner only |
 
-| Command | Description |
-|---------|-------------|
-| `/register <path> [name]` | Register a project directory to the current channel |
-| `/unregister` | Unregister the project from the current channel |
-| `/list [channel]` | List active sessions for a channel |
-| `/del [thread_id]` | Delete a session (defaults to current thread) |
-| `/stop` | Stop the current session's Claude Code process |
-| `/status [thread_id]` | Show session status (defaults to current thread) |
-| `/skill <name>` | Send a slash command (e.g. `/commit`) to the Claude Code session |
-| /sessions | Show global session overview (count, idle time, status) |
+### Session Reset
+
+Type `/clear` or `/new` as a regular message in a thread to reset the session. A confirmation prompt with buttons will appear — click **Confirm** to reset the Claude Code process and start fresh, or **Cancel** to keep the current session.
+
+### Recall
+
+Right-click a message in a thread → **Apps** → **Recall** to recall a queued message that hasn't been delivered to Claude Code yet. If the message has already been sent, recall is not possible.
 
 ### Chatting with Claude Code
 
@@ -151,62 +162,108 @@ All commands are owner-only (restricted to the `owner_id` set in `config.toml`).
    - **Always Allow** — add to the always-allowed list for this session
    - **Deny** — deny the tool call
 
+### Reply Context
+
+Reply to any message in the thread — pidory will extract the replied-to message content and inject it as context into your prompt so Claude Code can see what you're referring to.
+
+### File Attachments
+
+**Uploading files to Claude Code**: Attach files to your Discord message. pidory downloads them to the project directory and includes their paths in the message sent to Claude Code.
+
+**Receiving files from Claude Code**: When Claude Code sends files back (e.g. images, exports), they appear as Discord file attachments on the bot's message.
+
+### Interactive Questions
+
+When Claude Code asks a question (via `AskUserQuestion`), pidory renders it as an interactive UI:
+
+- **2–5 options** → Discord buttons + a free-text button for custom input
+- **6–25 options** → Select menu + a free-text button
+- **Free-text only** → A button that opens a text input modal
+
+For multi-part questions, all answers are collected before being sent back to Claude Code.
+
+### Progress Indicator
+
+When Claude Code runs a long tool operation, pidory shows a progress indicator message that updates in real-time, showing which tool is currently executing. The indicator pauses when a permission prompt is pending and resumes when resolved.
+
 ## Configuration
 
 `config.toml` fields (see `config.toml.example`):
 
+### [discord]
+
 | Field | Description | Default |
 |-------|-------------|---------|
-| `discord.guild_id` | Your Discord server ID | — |
-| `discord.owner_id` | Your Discord user ID (bot owner) | — |
-| `claude.binary_path` | Path to the `claude` CLI binary | `"claude"` |
-| `claude.default_disallowed_tools` | Tools to block by default | `[]` |
-| `claude.subprocess_timeout_secs` | Max time per Claude Code subprocess | `600` |
-| `claude.max_sessions` | Max concurrent sessions | `10` |
-| `claude.idle_timeout_secs` | Idle session timeout in seconds (0 to disable) | `7200` |
-| `discord.notification_channel_id` | Channel ID for rate limit alerts (optional) | — |
-| `response.max_chunk_length` | Max characters per Discord message | `1900` |
-| `response.max_chunks` | Chunks before falling back to file attachment | `10` |
-| `ratelimit.file_path` | Path to the rate limit JSON file (optional) | — |
-| `ratelimit.update_interval_secs` | How often to read the rate limit file | `60` |
-| `ratelimit.alert_thresholds` | 5h usage % thresholds that trigger alerts | `[50, 80]` |
+| `guild_id` | Your Discord server ID | *required* |
+| `owner_id` | Your Discord user ID (bot owner) | *required* |
+| `token_env` | Environment variable name for the Discord token | `"PIDORY_DISCORD_TOKEN"` |
+| `notification_channel_id` | Channel ID for rate limit alerts (optional) | — |
+| `project_roots` | Root directories for path autocomplete in `/register` | `[]` |
+| `default_category_id` | Default category for `/new-project` channels (optional) | — |
+
+### [claude]
+
+| Field | Description | Default |
+|-------|-------------|---------|
+| `binary_path` | Path to the `claude` CLI binary | `"claude"` |
+| `default_disallowed_tools` | Tools to block by default for new sessions | `[]` |
+| `subprocess_timeout_secs` | Max time per Claude Code subprocess (seconds) | `600` |
+| `max_sessions` | Max concurrent sessions | `10` |
+| `idle_timeout_secs` | Idle session timeout in seconds (0 to disable) | `7200` |
+
+### [database]
+
+| Field | Description | Default |
+|-------|-------------|---------|
+| `path` | SQLite database file path | `"pidory.db"` |
+
+### [response]
+
+| Field | Description | Default |
+|-------|-------------|---------|
+| `max_chunk_length` | Max characters per Discord message | `1900` |
+| `max_chunks` | Number of chunks before falling back to file attachment | `10` |
+
+### [ratelimit]
+
+| Field | Description | Default |
+|-------|-------------|---------|
+| `update_interval_secs` | Bot presence update interval (seconds) | `60` |
+| `alert_thresholds` | 5h usage % thresholds that trigger alerts | `[50, 80]` |
+
+### [attachment]
+
+| Field | Description | Default |
+|-------|-------------|---------|
+| `max_file_size_mb` | Max file size per attachment (MB) | `25` |
+| `max_aggregate_size_mb` | Max total attachment size per message (MB) | `50` |
+| `download_timeout_secs` | File download timeout (seconds) | `30` |
+
+### language
+
+| Field | Description | Default |
+|-------|-------------|---------|
+| `language` | UI language: `"ko"` or `"en"` | `"ko"` |
 
 The Discord token is read from the `PIDORY_DISCORD_TOKEN` environment variable (or `.env` file) — never put it in `config.toml`.
 
 ## Rate Limit Monitoring
 
-pidory can display Claude Code's API rate limit usage as a Discord bot presence (e.g. `Watching 5h: 42%(1h30m) | 7d: 38%`) and send alerts when thresholds are exceeded.
+pidory displays Claude Code's API rate limit usage as a Discord bot presence (e.g. `Watching 5h: 42%(1h30m) | 7d: 38%`) and sends alerts when thresholds are exceeded. Rate limit data is read from Claude Code's `stream-json` output during active sessions.
 
-### How it works
+### Alert Setup
 
-```
-Claude Code statusLine hook → writes /tmp/pidory-ratelimits.json
-pidory reads the file periodically → updates bot presence + sends alerts
-```
-
-Claude Code's `statusLine` receives rate limit data as JSON on stdin. A helper script extracts the usage percentages and writes them to a file that pidory monitors.
-
-### Setup
-
-1. Add the ratelimit writer to your Claude Code statusLine script (`~/.claude/settings.json`):
-
-```bash
-# In your statusLine script, after reading stdin:
-input=$(cat)
-echo "$input" | bash /path/to/pidory/scripts/statusline-ratelimit-writer.sh 2>/dev/null
-# ... rest of your statusLine script
-```
-
-2. Enable monitoring in `config.toml`:
+To receive threshold alerts in a specific channel, set `notification_channel_id` under `[discord]` in `config.toml`.
 
 ```toml
+[discord]
+notification_channel_id = "123456789012345678"
+
 [ratelimit]
-file_path = "/tmp/pidory-ratelimits.json"
-# update_interval_secs = 60
-# alert_thresholds = [50, 80]
+alert_thresholds = [50, 80]
 ```
 
-3. Optionally set `notification_channel_id` under `[discord]` to receive threshold alerts in a specific channel.
+When 5-hour usage reaches a configured threshold, an alert is posted to the notification channel.
 
 ## License
 
