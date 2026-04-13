@@ -119,6 +119,7 @@ impl SessionManager {
                 }
                 self.pending_recalls.lock().await.retain(|_, (tid, _)| tid != &evict_tid);
                 evicted_thread_id = Some(evict_tid);
+                let _ = self.session_count_tx.send(sessions.len());
             } else {
                 return Err(PidoryError::Subprocess(
                     format!("all {} sessions are busy", self.max_sessions)
