@@ -14,8 +14,6 @@ pub struct Config {
     #[serde(default)]
     pub database: DatabaseConfig,
     #[serde(default)]
-    pub ratelimit: RateLimitConfig,
-    #[serde(default)]
     pub release: ReleaseConfig,
     #[serde(default)]
     pub attachment: AttachmentConfig,
@@ -78,31 +76,6 @@ impl Default for DatabaseConfig {
 
 fn default_db_path() -> String {
     "pidory.db".to_string()
-}
-
-#[derive(Debug, Deserialize)]
-pub struct RateLimitConfig {
-    #[serde(default = "default_update_interval_secs")]
-    pub update_interval_secs: u64,
-    #[serde(default = "default_alert_thresholds")]
-    pub alert_thresholds: Vec<u8>,
-}
-
-impl Default for RateLimitConfig {
-    fn default() -> Self {
-        Self {
-            update_interval_secs: default_update_interval_secs(),
-            alert_thresholds: default_alert_thresholds(),
-        }
-    }
-}
-
-fn default_update_interval_secs() -> u64 {
-    60
-}
-
-fn default_alert_thresholds() -> Vec<u8> {
-    vec![50, 80]
 }
 
 #[derive(Debug, Deserialize)]
@@ -424,44 +397,6 @@ binary_path = "claude"
         let result = Config::load(path.to_str().unwrap());
         assert!(result.is_err());
         std::fs::remove_file(&path).ok();
-    }
-
-    #[test]
-    fn parse_config_without_ratelimit() {
-        let toml_str = r#"
-[discord]
-guild_id = 123
-owner_id = 456
-
-[claude]
-binary_path = "claude"
-
-[response]
-"#;
-        let config: Config = toml::from_str(toml_str).unwrap();
-        assert_eq!(config.ratelimit.update_interval_secs, 60);
-        assert_eq!(config.ratelimit.alert_thresholds, vec![50, 80]);
-    }
-
-    #[test]
-    fn parse_config_with_ratelimit() {
-        let toml_str = r#"
-[discord]
-guild_id = 123
-owner_id = 456
-
-[claude]
-binary_path = "claude"
-
-[response]
-
-[ratelimit]
-update_interval_secs = 30
-alert_thresholds = [70, 90]
-"#;
-        let config: Config = toml::from_str(toml_str).unwrap();
-        assert_eq!(config.ratelimit.update_interval_secs, 30);
-        assert_eq!(config.ratelimit.alert_thresholds, vec![70, 90]);
     }
 
     #[test]
