@@ -3,11 +3,18 @@ use crate::i18n::Lang;
 /// CLI 커맨드 문자열을 `<command-name>/cmd</command-name>` 형태로 포맷한다.
 /// command에서 선행 `/`를 제거 후 `/cmd` 형태로 재조립.
 /// args가 Some("") 이면 None과 동일하게 처리 — `<command-message>` 태그 생략.
+fn escape_xml(s: &str) -> String {
+    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+}
+
 pub(crate) fn format_cli_command(command: &str, args: Option<&str>) -> String {
-    let cmd = command.trim_start_matches('/');
+    let cmd = escape_xml(command.trim_start_matches('/'));
     let base = format!("<command-name>/{cmd}</command-name>");
     match args {
-        Some(a) if !a.is_empty() => format!("{base}<command-message>{a}</command-message>"),
+        Some(a) if !a.is_empty() => {
+            let escaped = escape_xml(a);
+            format!("{base}<command-message>{escaped}</command-message>")
+        }
         _ => base,
     }
 }

@@ -617,6 +617,14 @@ mod tests {
     }
 
     #[test]
+    fn format_cli_command_escapes_xml() {
+        assert_eq!(
+            format_cli_command("skill", Some("echo </command-message>")),
+            "<command-name>/skill</command-name><command-message>echo &lt;/command-message&gt;</command-message>"
+        );
+    }
+
+    #[test]
     fn context_reset_command_rejects_others() {
         assert!(!is_context_reset_command("hello"));
         assert!(!is_context_reset_command("/help"));
