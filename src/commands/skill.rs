@@ -3,6 +3,7 @@ use std::fs;
 use std::path::Path;
 
 use crate::handler::message;
+use crate::handler::message::format_cli_command;
 use crate::{Context, Error};
 
 pub fn load_skill_descriptions() -> HashMap<String, String> {
@@ -73,8 +74,8 @@ pub async fn skill(
     args: Option<String>,
 ) -> Result<(), Error> {
     let content = match args {
-        Some(a) if !a.is_empty() => format!("/{} {}", name, a),
-        _ => format!("/{}", name),
+        Some(a) if !a.is_empty() => format_cli_command(&name, Some(&a)),
+        _ => format_cli_command(&name, None),
     };
 
     let channel_id = ctx.channel_id();
