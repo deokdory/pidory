@@ -113,10 +113,13 @@ async fn main() -> Result<(), PidoryError> {
 
                 let (ratelimit_tx, _) = tokio::sync::watch::channel(crate::ratelimit::RateLimitInfo::default());
 
+                let (session_count_tx, _session_count_rx) = watch::channel(0usize);
+
                 let sessions = Arc::new(SessionManager::new(
                     Arc::new(config.claude.clone()),
                     config.claude.max_sessions,
                     ratelimit_tx.clone(),
+                    session_count_tx.clone(),
                 ));
 
                 let pending_permissions: Arc<Mutex<HashMap<String, PendingPermission>>> = Arc::new(Mutex::new(HashMap::new()));
@@ -231,6 +234,37 @@ async fn main() -> Result<(), PidoryError> {
                     });
                 }
 
+                // Session presence monitor (changed() 기반 반응형)
+                {
+                    let max_sessions = config.claude.max_sessions;
+                    let mut session_count_rx = session_count_tx.subscribe();
+                    let mut ctx_rx = ctx_tx.subscribe();
+                    tokio::spawn(async move {
+                        tracing::info!("Session presence monitor started");
+                        {
+                            let count = *session_count_rx.borrow();
+                            let ctx = ctx_rx.borrow().clone();
+                            ctx.set_activity(Some(
+                                serenity::gateway::ActivityData::custom(
+                                    format!("Sessions: {count}/{max_sessions}")
+                                )
+                            ));
+                        }
+                        loop {
+                            if session_count_rx.changed().await.is_err() {
+                                break;
+                            }
+                            let count = *session_count_rx.borrow_and_update();
+                            ctx_rx.mark_changed();
+                            let ctx = ctx_rx.borrow_and_update().clone();
+                            ctx.set_activity(Some(
+                                serenity::gateway::ActivityData::custom(
+                                    format!("Sessions: {count}/{max_sessions}")
+                                )
+                            ));
+                        }
+                    });
+                }
 
                 Ok(Data {
                     config,
