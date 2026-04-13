@@ -3,6 +3,7 @@ mod event_processor;
 mod helpers;
 
 pub use event_processor::process_turn_events;
+pub(crate) use helpers::format_cli_command;
 
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -16,7 +17,6 @@ use crate::error::PidoryError;
 use crate::handler::attachment_download;
 use crate::handler::emoji;
 use crate::handler::emoji::ReactionStatus;
-use crate::handler::reset_ui;
 use crate::subprocess::parser::StreamEvent;
 use crate::subprocess::session_manager::{QueuedMessage, ReplyContext};
 use crate::Data;
@@ -58,52 +58,6 @@ async fn resolve_reply_context(
         original_content,
         original_author_name: referenced.author.name.clone(),
     })
-}
-
-async fn perform_immediate_reset(
-    ctx: &Context,
-    data: &Data,
-    db: &sqlx::SqlitePool,
-    thread_id: &str,
-    channel_id: poise::serenity_prelude::ChannelId,
-    lang: crate::i18n::Lang,
-) -> Result<(), PidoryError> {
-    // 기존 confirm 버튼 pending이 있으면 만료 처리
-    let old_pending = data.pending_resets.lock().await.remove(thread_id);
-    if let Some(p) = old_pending {
-        let _ = reset_ui::disable_reset_buttons(ctx, channel_id, p.message_id, reset_ui::ResetOutcome::Expired).await;
-    }
-
-    // kill_session
-    match data.sessions.kill_session(thread_id).await {
-        Ok(()) | Err(PidoryError::NotFound(_)) => {}
-        Err(e) => {
-            channel_id
-                .say(ctx, format!("❌ {}", lang.error_with(&e)))
-                .await
-                .ok();
-            return Err(PidoryError::Subprocess(format!("kill_session failed: {}", e)));
-        }
-    }
-
-    // 메모리 맵 정리
-    data.session_skills.lock().await.remove(thread_id);
-    data.pending_permissions.lock().await.retain(|_, p| p.thread_id != thread_id);
-    data.pending_question_groups.lock().await.retain(|_, g| g.thread_id != thread_id);
-    data.needs_context.lock().await.remove(thread_id);
-    data.turn_initiators.lock().await.remove(thread_id);
-    data.turn_participants.lock().await.remove(thread_id);
-
-    // DB 삭제
-    let _ = repository::delete_session(db, thread_id).await;
-
-    // Discord 알림
-    channel_id
-        .say(ctx, format!("-# ♻️ {}", lang.session_reset()))
-        .await
-        .map_err(|e| PidoryError::Discord(Box::new(e)))?;
-
-    Ok(())
 }
 
 async fn handle_message(
@@ -246,54 +200,7 @@ async fn handle_message(
         }
     }
 
-    let is_new_command = helpers::is_context_reset_command(&new_message.content);
-
-    if is_new_command {
-        let is_running = session.status == "running";
-        if is_running {
-            // 기존 pending_reset이 있으면 만료 처리
-            let old_pending = data.pending_resets.lock().await.remove(&thread_id);
-            if let Some(p) = old_pending {
-                let _ = reset_ui::disable_reset_buttons(ctx, channel_id, p.message_id, reset_ui::ResetOutcome::Expired).await;
-            }
-
-            // 확인 버튼 메시지 전송
-            let confirm_msg = reset_ui::create_reset_confirm_message(
-                lang.session_reset_confirm(),
-                &thread_id,
-            );
-            let sent = channel_id
-                .send_message(ctx, confirm_msg)
-                .await
-                .map_err(|e| PidoryError::Discord(Box::new(e)))?;
-
-            let pending = reset_ui::PendingReset {
-                message_id: sent.id,
-                thread_id: thread_id.clone(),
-                requested_by: new_message.author.id,
-            };
-            data.pending_resets.lock().await.insert(thread_id.clone(), pending);
-
-            // 30초 타임아웃 spawn
-            let pending_resets_clone = data.pending_resets.clone();
-            let ctx_clone = ctx.clone();
-            let tid = thread_id.clone();
-            let ch = channel_id;
-            tokio::spawn(async move {
-                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
-                let removed = pending_resets_clone.lock().await.remove(&tid);
-                if let Some(p) = removed {
-                    let _ = reset_ui::disable_reset_buttons(&ctx_clone, ch, p.message_id, reset_ui::ResetOutcome::Expired).await;
-                }
-            });
-
-            return Ok(());
-        } else {
-            perform_immediate_reset(ctx, data, db, &thread_id, channel_id, lang).await?;
-            return Ok(());
-        }
-    }
-
+    let is_cli_command = helpers::is_context_reset_command(&new_message.content);
 
     // 원자적 acquire: running이 아닌 경우에만 running으로 전환
     let acquired = repository::try_acquire_session(db, &thread_id).await?;
@@ -310,8 +217,14 @@ async fn handle_message(
                 &data.config.attachment,
             ).await;
 
+        let content = if is_cli_command {
+            helpers::format_cli_command("clear", None)
+        } else {
+            new_message.content.clone()
+        };
+
         let msg = QueuedMessage {
-            content: new_message.content.clone(),
+            content,
             channel_id,
             message_id: msg_id,
             event_tx: None,
@@ -323,8 +236,8 @@ async fn handle_message(
 
         match data.sessions.send_message(&thread_id, msg).await {
             Ok(()) => {
-                // /new가 성공적으로 큐잉된 후에만 flag 세팅
-                if is_new_command {
+                // CLI 커맨드가 성공적으로 큐잉된 후에만 flag 세팅
+                if is_cli_command {
                     data.needs_context.lock().await.insert(thread_id.clone());
                 }
                 // mid-turn inject 사용자를 participants에 추가
@@ -368,12 +281,12 @@ async fn handle_message(
     }
 
     // 직접 실행 경로: context inject 판정 (primary 경로만)
-    let had_needs_context = if !is_new_command {
-        data.needs_context.lock().await.remove(&thread_id)
+    let content = if is_cli_command {
+        helpers::format_cli_command("clear", None)
     } else {
-        false
+        let had_needs_context = data.needs_context.lock().await.remove(&thread_id);
+        helpers::build_context_content(&new_message.content, is_new_session, had_needs_context, &guild_channel.name, lang)
     };
-    let content = helpers::build_context_content(&new_message.content, is_new_session, had_needs_context, &guild_channel.name, lang);
 
     // turn 시작: 이 turn 의 triggering user 를 기록 (permission 위임용)
     data.turn_initiators
@@ -436,8 +349,8 @@ async fn handle_message(
         return Ok(());
     }
 
-    // /new가 성공적으로 전송된 후에만 flag 세팅
-    if is_new_command {
+    // CLI 커맨드가 성공적으로 전송된 후에만 flag 세팅
+    if is_cli_command {
         data.needs_context.lock().await.insert(thread_id.clone());
     }
 
@@ -471,64 +384,20 @@ pub async fn execute_in_session(
 ) -> Result<(), PidoryError> {
     let db = &data.db;
 
-    let is_new_command = helpers::is_context_reset_command(content);
-    let lang = data.config.language;
+    let is_cli_command = helpers::is_context_reset_command(content);
 
-    if is_new_command {
-        let session = repository::get_session_by_thread(db, thread_id).await?;
-        let is_running = session.as_ref().map(|s| s.status == "running").unwrap_or(false);
-
-        if is_running {
-            // 기존 pending_reset이 있으면 만료 처리
-            let old_pending = data.pending_resets.lock().await.remove(thread_id);
-            if let Some(p) = old_pending {
-                let _ = reset_ui::disable_reset_buttons(ctx, channel_id, p.message_id, reset_ui::ResetOutcome::Expired).await;
-            }
-
-            // 확인 버튼 메시지 전송
-            let confirm_msg = reset_ui::create_reset_confirm_message(
-                lang.session_reset_confirm(),
-                thread_id,
-            );
-            let sent = channel_id
-                .send_message(ctx, confirm_msg)
-                .await
-                .map_err(|e| PidoryError::Discord(Box::new(e)))?;
-
-            let pending = reset_ui::PendingReset {
-                message_id: sent.id,
-                thread_id: thread_id.to_string(),
-                requested_by: triggered_by,
-            };
-            data.pending_resets.lock().await.insert(thread_id.to_string(), pending);
-
-            // 30초 타임아웃 spawn
-            let pending_resets_clone = data.pending_resets.clone();
-            let ctx_clone = ctx.clone();
-            let tid = thread_id.to_string();
-            let ch = channel_id;
-            tokio::spawn(async move {
-                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
-                let removed = pending_resets_clone.lock().await.remove(&tid);
-                if let Some(p) = removed {
-                    let _ = reset_ui::disable_reset_buttons(&ctx_clone, ch, p.message_id, reset_ui::ResetOutcome::Expired).await;
-                }
-            });
-
-            return Ok(());
-        } else {
-            perform_immediate_reset(ctx, data, db, thread_id, channel_id, lang).await?;
-            return Ok(());
-        }
-    }
-
+    let effective_content = if is_cli_command {
+        helpers::format_cli_command("clear", None)
+    } else {
+        content.to_string()
+    };
 
     let acquired = repository::try_acquire_session(db, thread_id).await?;
 
     if !acquired {
         // mid-turn inject: event_tx 없이 전송
         let msg = QueuedMessage {
-            content: content.to_string(),
+            content: effective_content,
             channel_id,
             message_id: msg_id,
             event_tx: None,
@@ -538,7 +407,7 @@ pub async fn execute_in_session(
             reply_context: None,
         };
         data.sessions.send_message(thread_id, msg).await?;
-        if is_new_command {
+        if is_cli_command {
             data.needs_context.lock().await.insert(thread_id.to_string());
         }
         // mid-turn inject 사용자를 participants에 추가
@@ -552,8 +421,8 @@ pub async fn execute_in_session(
     }
 
     // 직접 실행
-    // stale needs_context 정리 (/new가 아닌 경우에만 — /new는 send 후 insert)
-    if !is_new_command {
+    // stale needs_context 정리 (CLI 커맨드가 아닌 경우에만 — CLI 커맨드는 send 후 insert)
+    if !is_cli_command {
         data.needs_context.lock().await.remove(thread_id);
     }
 
@@ -563,7 +432,7 @@ pub async fn execute_in_session(
 
     let (event_tx, event_rx) = mpsc::channel::<StreamEvent>(64);
     let msg = QueuedMessage {
-        content: content.to_string(),
+        content: effective_content,
         channel_id,
         message_id: msg_id,
         event_tx: Some(event_tx),
@@ -588,7 +457,7 @@ pub async fn execute_in_session(
         return Err(e);
     }
 
-    if is_new_command {
+    if is_cli_command {
         data.needs_context.lock().await.insert(thread_id.to_string());
     }
 
@@ -640,7 +509,7 @@ async fn download_message_attachments(
 
 #[cfg(test)]
 mod tests {
-    use super::helpers::{build_context_content, format_ctx_suffix, is_context_reset_command};
+    use super::helpers::{build_context_content, format_cli_command, format_ctx_suffix, is_context_reset_command};
     use crate::i18n::Lang;
 
     #[test]
@@ -713,6 +582,38 @@ mod tests {
         assert!(is_context_reset_command("/Clear"));
         assert!(is_context_reset_command("/CLEAR"));
         assert!(is_context_reset_command("  /clear  "));
+    }
+
+    #[test]
+    fn format_cli_command_name_only() {
+        assert_eq!(
+            format_cli_command("clear", None),
+            "<command-name>/clear</command-name>"
+        );
+    }
+
+    #[test]
+    fn format_cli_command_with_args() {
+        assert_eq!(
+            format_cli_command("skill", Some("commit")),
+            "<command-name>/skill</command-name><command-message>commit</command-message>"
+        );
+    }
+
+    #[test]
+    fn format_cli_command_strips_leading_slash() {
+        assert_eq!(
+            format_cli_command("/clear", None),
+            "<command-name>/clear</command-name>"
+        );
+    }
+
+    #[test]
+    fn format_cli_command_empty_args_ignored() {
+        assert_eq!(
+            format_cli_command("compact", Some("")),
+            "<command-name>/compact</command-name>"
+        );
     }
 
     #[test]
