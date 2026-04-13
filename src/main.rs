@@ -136,7 +136,7 @@ async fn main() -> Result<(), PidoryError> {
 
                 // Rate limit monitor (changed() 기반 반응형)
                 {
-                    let ctx_rx = ctx_rx;
+                    let mut ctx_rx = ctx_rx;
                     let mut ratelimit_rx = ratelimit_tx.subscribe();
                     let notification_channel = config.discord.notification_channel_id
                         .map(poise::serenity_prelude::ChannelId::new);
@@ -144,16 +144,22 @@ async fn main() -> Result<(), PidoryError> {
                         let mut monitor = crate::ratelimit::RateLimitMonitor::new();
                         tracing::info!("Rate limit monitor started (reactive, changed() based)");
                         loop {
-                            if ratelimit_rx.changed().await.is_err() {
-                                break;
-                            }
-                            let info = ratelimit_rx.borrow_and_update().clone();
-                            if info.updated_at == 0 {
-                                continue;
-                            }
-                            if let Some(channel_id) = notification_channel {
-                                let fresh_ctx = ctx_rx.borrow().clone();
-                                monitor.notify_if_changed(&info, &fresh_ctx, channel_id).await;
+                            tokio::select! {
+                                result = ratelimit_rx.changed() => {
+                                    if result.is_err() { break; }
+                                    let info = ratelimit_rx.borrow_and_update().clone();
+                                    if info.updated_at == 0 {
+                                        continue;
+                                    }
+                                    if let Some(channel_id) = notification_channel {
+                                        let fresh_ctx = ctx_rx.borrow().clone();
+                                        monitor.notify_if_changed(&info, &fresh_ctx, channel_id).await;
+                                    }
+                                }
+                                result = ctx_rx.changed() => {
+                                    if result.is_err() { break; }
+                                    tracing::debug!("Rate limit monitor: context refreshed");
+                                }
                             }
                         }
                     });
@@ -178,10 +184,16 @@ async fn main() -> Result<(), PidoryError> {
                             );
                             tracing::info!("Release checker started (interval: {interval_secs}s)");
                             loop {
-                                interval.tick().await;
-                                ctx_rx.mark_changed();
-                                let fresh_ctx = ctx_rx.borrow_and_update().clone();
-                                checker.check_and_notify(&fresh_ctx, channel_id, lang).await;
+                                tokio::select! {
+                                    _ = interval.tick() => {
+                                        let fresh_ctx = ctx_rx.borrow().clone();
+                                        checker.check_and_notify(&fresh_ctx, channel_id, lang).await;
+                                    }
+                                    result = ctx_rx.changed() => {
+                                        if result.is_err() { break; }
+                                        tracing::debug!("Release checker: context refreshed");
+                                    }
+                                }
                             }
                         });
                     }
@@ -205,29 +217,35 @@ async fn main() -> Result<(), PidoryError> {
                     tokio::spawn(async move {
                         let mut interval = tokio::time::interval(std::time::Duration::from_secs(300));
                         loop {
-                            interval.tick().await;
-                            let evicted = sessions.sweep_idle_sessions(idle_timeout).await;
-                            if evicted.is_empty() {
-                                continue;
-                            }
-                            tracing::info!("TTL sweep: evicted {} sessions", evicted.len());
-                            for tid in &evicted {
-                                pending_permissions.lock().await.retain(|_, p| p.thread_id != *tid);
-                                pending_question_groups.lock().await.retain(|_, g| g.thread_id != *tid);
-                                session_skills.lock().await.remove(tid);
-                                needs_context.lock().await.remove(tid);
-                                turn_initiators.lock().await.remove(tid);
-                                turn_participants.lock().await.remove(tid);
-                                if let Err(e) = db::repository::update_session_status(&db_clone, tid, "idle").await {
-                                    tracing::warn!("Failed to update session status for TTL sweep thread {}: {}", tid, e);
+                            tokio::select! {
+                                _ = interval.tick() => {
+                                    let evicted = sessions.sweep_idle_sessions(idle_timeout).await;
+                                    if evicted.is_empty() {
+                                        continue;
+                                    }
+                                    tracing::info!("TTL sweep: evicted {} sessions", evicted.len());
+                                    for tid in &evicted {
+                                        pending_permissions.lock().await.retain(|_, p| p.thread_id != *tid);
+                                        pending_question_groups.lock().await.retain(|_, g| g.thread_id != *tid);
+                                        session_skills.lock().await.remove(tid);
+                                        needs_context.lock().await.remove(tid);
+                                        turn_initiators.lock().await.remove(tid);
+                                        turn_participants.lock().await.remove(tid);
+                                        if let Err(e) = db::repository::update_session_status(&db_clone, tid, "idle").await {
+                                            tracing::warn!("Failed to update session status for TTL sweep thread {}: {}", tid, e);
+                                        }
+                                        if let Ok(channel_id) = tid.parse::<u64>() {
+                                            let ctx = ctx_rx.borrow().clone();
+                                            poise::serenity_prelude::ChannelId::new(channel_id)
+                                                .say(&ctx, format!("-# ⏰ {}", lang.session_idle_cleaned()))
+                                                .await
+                                                .ok();
+                                        }
+                                    }
                                 }
-                                if let Ok(channel_id) = tid.parse::<u64>() {
-                                    ctx_rx.mark_changed();
-                                    let ctx = ctx_rx.borrow_and_update().clone();
-                                    poise::serenity_prelude::ChannelId::new(channel_id)
-                                        .say(&ctx, format!("-# ⏰ {}", lang.session_idle_cleaned()))
-                                        .await
-                                        .ok();
+                                result = ctx_rx.changed() => {
+                                    if result.is_err() { break; }
+                                    tracing::debug!("TTL sweep: context refreshed");
                                 }
                             }
                         }
@@ -251,17 +269,29 @@ async fn main() -> Result<(), PidoryError> {
                             ));
                         }
                         loop {
-                            if session_count_rx.changed().await.is_err() {
-                                break;
+                            tokio::select! {
+                                result = session_count_rx.changed() => {
+                                    if result.is_err() { break; }
+                                    let count = *session_count_rx.borrow_and_update();
+                                    let ctx = ctx_rx.borrow().clone();
+                                    ctx.set_activity(Some(
+                                        serenity::gateway::ActivityData::custom(
+                                            format!("Sessions: {count}/{max_sessions}")
+                                        )
+                                    ));
+                                }
+                                result = ctx_rx.changed() => {
+                                    if result.is_err() { break; }
+                                    let count = *session_count_rx.borrow();
+                                    let ctx = ctx_rx.borrow_and_update().clone();
+                                    ctx.set_activity(Some(
+                                        serenity::gateway::ActivityData::custom(
+                                            format!("Sessions: {count}/{max_sessions}")
+                                        )
+                                    ));
+                                    tracing::debug!("Session presence: context refreshed, activity re-applied");
+                                }
                             }
-                            let count = *session_count_rx.borrow_and_update();
-                            ctx_rx.mark_changed();
-                            let ctx = ctx_rx.borrow_and_update().clone();
-                            ctx.set_activity(Some(
-                                serenity::gateway::ActivityData::custom(
-                                    format!("Sessions: {count}/{max_sessions}")
-                                )
-                            ));
                         }
                     });
                 }
