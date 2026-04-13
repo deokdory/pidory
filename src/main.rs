@@ -135,7 +135,6 @@ async fn main() -> Result<(), PidoryError> {
                 {
                     let ctx_rx = ctx_rx;
                     let mut ratelimit_rx = ratelimit_tx.subscribe();
-                    let lang = config.language;
                     let notification_channel = config.discord.notification_channel_id
                         .map(poise::serenity_prelude::ChannelId::new);
                     tokio::spawn(async move {
@@ -151,7 +150,7 @@ async fn main() -> Result<(), PidoryError> {
                             }
                             if let Some(channel_id) = notification_channel {
                                 let fresh_ctx = ctx_rx.borrow().clone();
-                                monitor.notify_if_changed(&info, &fresh_ctx, channel_id, lang).await;
+                                monitor.notify_if_changed(&info, &fresh_ctx, channel_id).await;
                             }
                         }
                     });

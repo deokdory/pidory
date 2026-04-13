@@ -1,7 +1,5 @@
 use poise::serenity_prelude::{ChannelId, Context};
 
-use crate::i18n::Lang;
-
 #[derive(Debug, Clone, Default)]
 pub struct RateLimitInfo {
     pub five_hour_pct: Option<u8>,
@@ -125,16 +123,21 @@ impl RateLimitMonitor {
         info: &RateLimitInfo,
         ctx: &Context,
         channel_id: ChannelId,
-        _lang: Lang,
     ) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
         // ── 5h window ──────────────────────────────────────────────────────────
         let five_hour_reset = info.five_hour_reset.unwrap_or(0);
         if five_hour_reset != self.last_five_hour_reset {
             self.last_five_hour_reset = five_hour_reset;
-            self.last_notified_five_hour_pct = None;
+            self.last_notified_five_hour_pct = info.five_hour_pct;
         }
         if let Some(pct) = info.five_hour_pct
             && self.last_notified_five_hour_pct != Some(pct)
+            && info.five_hour_reset.is_some_and(|r| r > now)
         {
             let msg = Self::format_notification("five_hour", pct, info.five_hour_reset);
             if let Err(e) = channel_id.say(&ctx.http, &msg).await {
@@ -148,10 +151,11 @@ impl RateLimitMonitor {
         let seven_day_reset = info.seven_day_reset.unwrap_or(0);
         if seven_day_reset != self.last_seven_day_reset {
             self.last_seven_day_reset = seven_day_reset;
-            self.last_notified_seven_day_pct = None;
+            self.last_notified_seven_day_pct = info.seven_day_pct;
         }
         if let Some(pct) = info.seven_day_pct
             && self.last_notified_seven_day_pct != Some(pct)
+            && info.seven_day_reset.is_some_and(|r| r > now)
         {
             let msg = Self::format_notification("seven_day", pct, info.seven_day_reset);
             if let Err(e) = channel_id.say(&ctx.http, &msg).await {
