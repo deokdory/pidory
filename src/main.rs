@@ -131,40 +131,27 @@ async fn main() -> Result<(), PidoryError> {
                 // shard reconnect 후에도 최신 ShardMessenger 사용 가능
                 let (ctx_tx, ctx_rx) = watch::channel(ctx.clone());
 
-                // Rate limit monitor (watch channel 기반)
+                // Rate limit monitor (changed() 기반 반응형)
                 {
-                    let mut ctx_rx = ctx_rx;
+                    let ctx_rx = ctx_rx;
                     let mut ratelimit_rx = ratelimit_tx.subscribe();
-                    let interval_secs = config.ratelimit.update_interval_secs;
-                    let thresholds = config.ratelimit.alert_thresholds.clone();
                     let lang = config.language;
                     let notification_channel = config.discord.notification_channel_id
                         .map(poise::serenity_prelude::ChannelId::new);
                     tokio::spawn(async move {
-                        let mut monitor = crate::ratelimit::RateLimitMonitor::new(thresholds);
-                        let mut interval = tokio::time::interval(
-                            std::time::Duration::from_secs(interval_secs)
-                        );
-                        tracing::info!("Rate limit monitor started (watch channel, interval: {interval_secs}s)");
+                        let mut monitor = crate::ratelimit::RateLimitMonitor::new();
+                        tracing::info!("Rate limit monitor started (reactive, changed() based)");
                         loop {
-                            interval.tick().await;
-                            ctx_rx.mark_changed();
-                            let fresh_ctx = ctx_rx.borrow_and_update().clone();
+                            if ratelimit_rx.changed().await.is_err() {
+                                break;
+                            }
                             let info = ratelimit_rx.borrow_and_update().clone();
                             if info.updated_at == 0 {
-                                fresh_ctx.set_activity(None);
                                 continue;
                             }
-                            let text = crate::ratelimit::RateLimitMonitor::format_presence(&info);
-                            if text.is_empty() {
-                                fresh_ctx.set_activity(None);
-                            } else {
-                                fresh_ctx.set_activity(Some(
-                                    poise::serenity_prelude::ActivityData::watching(&text)
-                                ));
-                            }
                             if let Some(channel_id) = notification_channel {
-                                monitor.check_and_alert(&info, &fresh_ctx, channel_id, lang).await;
+                                let fresh_ctx = ctx_rx.borrow().clone();
+                                monitor.notify_if_changed(&info, &fresh_ctx, channel_id, lang).await;
                             }
                         }
                     });
