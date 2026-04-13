@@ -20,6 +20,30 @@ use super::session_manager::{QueuedMessage, SessionInner, ReplyContext};
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
+fn handle_ratelimit_event(
+    ratelimit_tx: &tokio::sync::watch::Sender<RateLimitInfo>,
+    rate_limit_type: Option<&str>,
+    utilization: Option<f64>,
+    resets_at: Option<u64>,
+    is_using_overage: Option<bool>,
+) {
+    if let Some(rlt) = rate_limit_type {
+        let resets = resets_at.unwrap_or(0);
+        let overage = is_using_overage.unwrap_or(false);
+        if let Some(util) = utilization {
+            ratelimit_tx.send_modify(|info| {
+                info.update_from_event(rlt, util, resets, overage);
+            });
+        } else {
+            ratelimit_tx.send_modify(|info| {
+                info.update_resets_only(rlt, resets, overage);
+            });
+        }
+    } else {
+        tracing::debug!("rate_limit_event without rateLimitType: utilization={:?}", utilization);
+    }
+}
+
 async fn say_silent_chunked(ctx: &Context, channel_id: &ChannelId, text: &str) {
     let chunks = formatter::split_message(text, 2000);
     for chunk in chunks {
@@ -645,21 +669,7 @@ async fn handle_bg_turn(
                                 tracker.track_progress(task_id, description);
                             }
                             Ok(StreamEvent::RateLimit { rate_limit_type, utilization, resets_at, is_using_overage, .. }) => {
-                                if let Some(rlt) = &rate_limit_type {
-                                    let resets = resets_at.unwrap_or(0);
-                                    let overage = is_using_overage.unwrap_or(false);
-                                    if let Some(util) = utilization {
-                                        ratelimit_tx.send_modify(|info| {
-                                            info.update_from_event(rlt, util, resets, overage);
-                                        });
-                                    } else {
-                                        ratelimit_tx.send_modify(|info| {
-                                            info.update_resets_only(rlt, resets, overage);
-                                        });
-                                    }
-                                } else {
-                                    tracing::debug!("rate_limit_event without rateLimitType: utilization={:?}", utilization);
-                                }
+                                handle_ratelimit_event(ratelimit_tx, rate_limit_type.as_deref(), utilization, resets_at, is_using_overage);
                             }
                             Ok(_) => {}
                             Err(e) => {
@@ -807,21 +817,7 @@ async fn wait_for_permission(
                                 Ok(ev) => {
                                     // RateLimit 이벤트 → 공유 상태 업데이트
                                     if let StreamEvent::RateLimit { ref rate_limit_type, utilization, resets_at, is_using_overage, .. } = ev {
-                                        if let Some(rlt) = rate_limit_type {
-                                            let resets = resets_at.unwrap_or(0);
-                                            let overage = is_using_overage.unwrap_or(false);
-                                            if let Some(util) = utilization {
-                                                ratelimit_tx.send_modify(|info| {
-                                                    info.update_from_event(rlt, util, resets, overage);
-                                                });
-                                            } else {
-                                                ratelimit_tx.send_modify(|info| {
-                                                    info.update_resets_only(rlt, resets, overage);
-                                                });
-                                            }
-                                        } else {
-                                            tracing::debug!("rate_limit_event without rateLimitType: utilization={:?}", utilization);
-                                        }
+                                        handle_ratelimit_event(ratelimit_tx, rate_limit_type.as_deref(), utilization, resets_at, is_using_overage);
                                     }
                                     if let Some(tx) = event_tx {
                                         let _ = tx.send(ev).await;
@@ -1121,21 +1117,7 @@ async fn run_active_turn(
                                             continue 'turn;
                                         }
                                         StreamEvent::RateLimit { rate_limit_type, utilization, resets_at, is_using_overage, .. } => {
-                                            if let Some(rlt) = rate_limit_type {
-                                                let resets = resets_at.unwrap_or(0);
-                                                let overage = *is_using_overage.as_ref().unwrap_or(&false);
-                                                if let Some(util) = utilization {
-                                                    ratelimit_tx.send_modify(|info| {
-                                                        info.update_from_event(&rlt, *util, resets, overage);
-                                                    });
-                                                } else {
-                                                    ratelimit_tx.send_modify(|info| {
-                                                        info.update_resets_only(&rlt, resets, overage);
-                                                    });
-                                                }
-                                            } else {
-                                                tracing::debug!("rate_limit_event without rateLimitType: utilization={:?}", utilization);
-                                            }
+                                            handle_ratelimit_event(ratelimit_tx, rate_limit_type.as_deref(), *utilization, *resets_at, *is_using_overage);
                                             continue 'turn;
                                         }
                                         _ => { continue 'turn; } // Init 등 skip
@@ -1225,21 +1207,7 @@ async fn run_active_turn(
 
                                 // 일반 이벤트 처리
                                 if let StreamEvent::RateLimit { ref rate_limit_type, utilization, resets_at, is_using_overage, .. } = event {
-                                    if let Some(rlt) = rate_limit_type {
-                                        let resets = resets_at.unwrap_or(0);
-                                        let overage = is_using_overage.unwrap_or(false);
-                                        if let Some(util) = utilization {
-                                            ratelimit_tx.send_modify(|info| {
-                                                info.update_from_event(rlt, util, resets, overage);
-                                            });
-                                        } else {
-                                            ratelimit_tx.send_modify(|info| {
-                                                info.update_resets_only(rlt, resets, overage);
-                                            });
-                                        }
-                                    } else {
-                                        tracing::debug!("rate_limit_event without rateLimitType: utilization={:?}", utilization);
-                                    }
+                                    handle_ratelimit_event(ratelimit_tx, rate_limit_type.as_deref(), utilization, resets_at, is_using_overage);
                                 }
                                 let is_result = event.is_result();
                                 if is_result {
