@@ -24,10 +24,6 @@ path = "pidory.db"            # SQLite DB 경로
 max_chunk_length = 1900       # Discord 2000자 여유분
 max_chunks = 10               # 초과 시 파일 첨부
 
-# [ratelimit]
-# update_interval_secs = 60                   # presence 업데이트 주기 (초)
-# alert_thresholds = [50, 80]                 # 5h rate limit 경고 임계값 (%)
-
 # [attachment]
 # max_file_size_mb = 25         # 파일 1개 최대 크기 (MB) [기본: 25 / Nitro: 500 / Nitro Basic: 50]
 # max_aggregate_size_mb = 50    # 메시지당 첨부파일 총 크기 합계 (MB) [기본: 50]
