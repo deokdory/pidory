@@ -67,6 +67,7 @@ pub struct SessionManager {
     max_sessions: usize,
     pending_recalls: Arc<tokio::sync::Mutex<HashMap<MessageId, (String, Arc<AtomicBool>)>>>,
     ratelimit_tx: tokio::sync::watch::Sender<RateLimitInfo>,
+    session_count_tx: tokio::sync::watch::Sender<usize>,
 }
 
 impl SessionManager {
@@ -74,6 +75,7 @@ impl SessionManager {
         config: Arc<ClaudeConfig>,
         max_sessions: usize,
         ratelimit_tx: tokio::sync::watch::Sender<RateLimitInfo>,
+        session_count_tx: tokio::sync::watch::Sender<usize>,
     ) -> Self {
         Self {
             sessions: Arc::new(Mutex::new(HashMap::new())),
@@ -81,6 +83,7 @@ impl SessionManager {
             max_sessions,
             pending_recalls: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             ratelimit_tx,
+            session_count_tx,
         }
     }
 
@@ -223,6 +226,8 @@ impl SessionManager {
             },
         );
 
+        let _ = self.session_count_tx.send(sessions.len());
+
         Ok(SessionCreateResult { evicted_thread_id })
     }
 
@@ -291,6 +296,8 @@ impl SessionManager {
 
         // 해당 session의 pending_recalls 엔트리 정리
         self.pending_recalls.lock().await.retain(|_, (tid, _)| tid != thread_id);
+
+        let _ = self.session_count_tx.send(sessions.len());
 
         inner
             .child
@@ -371,6 +378,7 @@ impl SessionManager {
         }
         if !evicted.is_empty() {
             self.pending_recalls.lock().await.retain(|_, (tid, _)| !evicted.contains(tid));
+            let _ = self.session_count_tx.send(sessions.len());
         }
         evicted
     }
