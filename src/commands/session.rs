@@ -212,6 +212,7 @@ pub async fn del(
     ctx.data().turn_participants.lock().await.remove(&tid);
     ctx.data().last_tool_name.lock().await.remove(&tid);
     ctx.data().kick_cooldowns.lock().await.remove(&tid);
+    ctx.data().kick_pending.lock().await.remove(&tid);
 
     repository::delete_session(&ctx.data().db, &tid).await?;
 
@@ -348,8 +349,12 @@ pub async fn kick(
         .cloned()
         .unwrap_or_else(|| lang.none_placeholder().to_string());
 
-    // 6. interrupt_session() 호출
+    // 6. kick_pending 등록 (process_turn_events에서 자연 완료 시 제거됨)
+    data.kick_pending.lock().await.insert(thread_id.clone());
+
+    // 7. interrupt_session() 호출
     if let Err(e) = data.sessions.interrupt_session(&thread_id).await {
+        data.kick_pending.lock().await.remove(&thread_id);
         ctx.say(format!("❌ {}", lang.interrupt_failed(&e))).await?;
         return Ok(());
     }
@@ -360,7 +365,7 @@ pub async fn kick(
         .await
         .insert(thread_id.clone(), std::time::Instant::now());
 
-    // 7. Discord 확인 메시지 전송
+    // 8. Discord 확인 메시지 전송
     let reply = ctx
         .say(format!("-# ⛔ {}", lang.kicked()))
         .await?;
@@ -369,17 +374,14 @@ pub async fn kick(
 
     // system-reminder 메시지 구성
     let content = {
-        let reminder = format!(
-            "<system-reminder>\n사용자가 현재 턴을 인터럽트했습니다. 응답이 오래 걸려 뻗은 것으로 판단했습니다.\n마지막 tool use: {}\n이전 작업을 이어서 진행하세요.\n</system-reminder>",
-            last_tool
-        );
+        let reminder = lang.kick_system_reminder(&last_tool);
         match &message {
             Some(msg) => format!("{}\n\n{}", reminder, msg),
             None => reminder,
         }
     };
 
-    // 8. background task에서 DB status poll → 새 턴 시작
+    // 9. background task에서 DB status poll → 새 턴 시작
     let sessions = Arc::clone(&data.sessions);
     let db = data.db.clone();
     let config = Arc::clone(&data.config);
@@ -387,6 +389,7 @@ pub async fn kick(
     let turn_participants = Arc::clone(&data.turn_participants);
     let last_tool_name = Arc::clone(&data.last_tool_name);
     let archived_threads = Arc::clone(&data.archived_threads);
+    let kick_pending = Arc::clone(&data.kick_pending);
     let turn_initiators = Arc::clone(&data.turn_initiators);
     let needs_context = Arc::clone(&data.needs_context);
     let author_id = ctx.author().id;
@@ -396,8 +399,27 @@ pub async fn kick(
         for _ in 0..25 {
             tokio::time::sleep(Duration::from_millis(200)).await;
             match repository::get_session_by_thread(&db, &thread_id).await {
-                Ok(Some(session)) if session.status == "idle" => {
-                    // 세션이 idle 상태가 됐으면 새 턴 시작
+                Ok(Some(session)) if session.status == "idle" || session.status == "error" => {
+                    // W1: kick_pending 확인 — 자연 완료 시 process_turn_events가 제거함
+                    if !kick_pending.lock().await.remove(&thread_id) {
+                        ctx_rx.mark_changed();
+                        let serenity_ctx = ctx_rx.borrow_and_update().clone();
+                        let _ = channel_id
+                            .say(&serenity_ctx, format!("-# ℹ️ {}", lang.kick_natural_completion()))
+                            .await;
+                        return;
+                    }
+
+                    // W2: error 상태 처리
+                    if session.status == "error" {
+                        ctx_rx.mark_changed();
+                        let serenity_ctx = ctx_rx.borrow_and_update().clone();
+                        let _ = channel_id
+                            .say(&serenity_ctx, format!("-# ⚠️ {}", lang.kick_error_state()))
+                            .await;
+                        return;
+                    }
+
                     let acquired = match repository::try_acquire_session(&db, &thread_id).await {
                         Ok(a) => a,
                         Err(e) => {
@@ -406,8 +428,13 @@ pub async fn kick(
                         }
                     };
 
+                    // W3: 다른 메시지가 선점한 경우 알림
                     if !acquired {
-                        // 이미 다른 메시지가 잡음 — 포기
+                        ctx_rx.mark_changed();
+                        let serenity_ctx = ctx_rx.borrow_and_update().clone();
+                        let _ = channel_id
+                            .say(&serenity_ctx, format!("-# ℹ️ {}", lang.kick_preempted()))
+                            .await;
                         return;
                     }
 
@@ -415,6 +442,8 @@ pub async fn kick(
                     let serenity_ctx = ctx_rx.borrow_and_update().clone();
 
                     needs_context.lock().await.remove(&thread_id);
+                    // S1: stale tool name 방지
+                    last_tool_name.lock().await.remove(&thread_id);
 
                     crate::handler::emoji::set_reaction(
                         &serenity_ctx,
@@ -464,17 +493,19 @@ pub async fn kick(
                         turn_participants.clone(),
                         archived_threads.clone(),
                         last_tool_name.clone(),
+                        kick_pending.clone(),
                     )
                     .await;
 
                     return;
                 }
-                Ok(None) => return, // 세션 사라짐
+                Ok(None) => return,
                 _ => continue,
             }
         }
 
-        // 타임아웃
+        // 타임아웃 — kick_pending 정리
+        kick_pending.lock().await.remove(&thread_id);
         ctx_rx.mark_changed();
         let serenity_ctx = ctx_rx.borrow_and_update().clone();
         let _ = channel_id

@@ -174,6 +174,40 @@ impl Lang {
         }
     }
 
+    pub fn kick_system_reminder(&self, last_tool: &str) -> String {
+        match self {
+            Lang::Ko => format!(
+                "<system-reminder>\n사용자가 현재 턴을 인터럽트했습니다. 응답이 오래 걸려 뻗은 것으로 판단했습니다.\n마지막 tool use: {}\n이전 작업을 이어서 진행하세요.\n</system-reminder>",
+                last_tool
+            ),
+            Lang::En => format!(
+                "<system-reminder>\nThe user interrupted the current turn. They determined the response was taking too long.\nLast tool use: {}\nContinue the previous work.\n</system-reminder>",
+                last_tool
+            ),
+        }
+    }
+
+    pub fn kick_natural_completion(&self) -> &'static str {
+        match self {
+            Lang::Ko => "턴이 이미 완료되어 재시작하지 않습니다",
+            Lang::En => "Turn already completed, skipping restart",
+        }
+    }
+
+    pub fn kick_error_state(&self) -> &'static str {
+        match self {
+            Lang::Ko => "세션이 에러 상태입니다. 재시작하지 않습니다",
+            Lang::En => "Session in error state, skipping restart",
+        }
+    }
+
+    pub fn kick_preempted(&self) -> &'static str {
+        match self {
+            Lang::Ko => "다른 메시지가 먼저 처리되어 재시작하지 않습니다",
+            Lang::En => "Another message was processed first, skipping restart",
+        }
+    }
+
     pub fn not_in_thread(&self) -> &'static str {
         match self {
             Lang::Ko => "스레드가 아닙니다. 스레드 ID를 직접 입력하세요.",

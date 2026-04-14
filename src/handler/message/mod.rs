@@ -224,6 +224,7 @@ async fn handle_message(
                 data.turn_participants.lock().await.remove(&evicted_tid);
                 data.last_tool_name.lock().await.remove(&evicted_tid);
                 data.kick_cooldowns.lock().await.remove(&evicted_tid);
+                data.kick_pending.lock().await.remove(&evicted_tid);
                 if let Err(e) = repository::update_session_status(db, &evicted_tid, "idle").await {
                     tracing::warn!("Failed to update session status for evicted thread {}: {}", evicted_tid, e);
                 }
@@ -345,6 +346,8 @@ async fn handle_message(
         .await
         .insert(thread_id.clone(), std::collections::HashSet::from([new_message.author.id]));
 
+    data.last_tool_name.lock().await.remove(&thread_id);
+
     // 첨부파일 있으면 ⏬ reaction 먼저
     if !new_message.attachments.is_empty() {
         emoji::set_reaction(ctx, channel_id, msg_id, ReactionStatus::Downloading)
@@ -414,6 +417,7 @@ async fn handle_message(
         data.turn_participants.clone(),
         data.archived_threads.clone(),
         data.last_tool_name.clone(),
+        data.kick_pending.clone(),
     )
     .await;
 
@@ -495,6 +499,8 @@ pub async fn execute_in_session(
         .await
         .insert(thread_id.to_string(), std::collections::HashSet::from([triggered_by]));
 
+    data.last_tool_name.lock().await.remove(thread_id);
+
     if let Err(e) = data.sessions.send_message(thread_id, msg).await {
         error!("Failed to send message to session {}: {}", thread_id, e);
         emoji::set_reaction(ctx, channel_id, msg_id, ReactionStatus::Error)
@@ -523,6 +529,7 @@ pub async fn execute_in_session(
         data.turn_participants.clone(),
         data.archived_threads.clone(),
         data.last_tool_name.clone(),
+        data.kick_pending.clone(),
     )
     .await;
 
