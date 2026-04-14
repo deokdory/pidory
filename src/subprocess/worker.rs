@@ -121,6 +121,18 @@ fn build_interrupt_json() -> String {
     format!("{}\n", msg)
 }
 
+fn build_get_context_usage_json() -> String {
+    let msg = serde_json::json!({
+        "type": "control_request",
+        "request_id": format!("ctx_{}", std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()),
+        "request": {"subtype": "get_context_usage"}
+    });
+    format!("{}\n", msg)
+}
+
 // ─── T2: Between-turns event action ────────────────────────────────────────
 
 enum BetweenTurnsAction {
@@ -1164,6 +1176,38 @@ async fn run_active_turn(
                                         session_id = sid,
                                         "#36 debug: user turn Result received — ending turn"
                                     );
+                                }
+                                if is_result {
+                                    // get_context_usage spike: send request and log response
+                                    let ctx_req = build_get_context_usage_json();
+                                    if let Err(e) = stdin.write_all(ctx_req.as_bytes()).await {
+                                        tracing::warn!("get_context_usage stdin write error: {}", e);
+                                    } else {
+                                        let _ = stdin.flush().await;
+                                        // 2초 timeout으로 응답 대기
+                                        let mut ctx_line = String::new();
+                                        match tokio::time::timeout(
+                                            Duration::from_secs(2),
+                                            reader.read_line(&mut ctx_line)
+                                        ).await {
+                                            Ok(Ok(n)) if n > 0 => {
+                                                tracing::info!(
+                                                    thread_id = %thread_id,
+                                                    "get_context_usage response: {}",
+                                                    ctx_line.trim()
+                                                );
+                                            }
+                                            Ok(Ok(_)) => {
+                                                tracing::warn!(thread_id = %thread_id, "get_context_usage: empty response (EOF)");
+                                            }
+                                            Ok(Err(e)) => {
+                                                tracing::warn!(thread_id = %thread_id, "get_context_usage read error: {}", e);
+                                            }
+                                            Err(_) => {
+                                                tracing::warn!(thread_id = %thread_id, "get_context_usage: timeout (2s)");
+                                            }
+                                        }
+                                    }
                                 }
                                 let _ = event_tx.send(event).await;
                                 if is_result {
