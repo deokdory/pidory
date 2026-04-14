@@ -13,7 +13,11 @@ pub fn parse_context_usage_response(line: &str) -> Option<ContextUsageInfo> {
     if v.get("type").and_then(|t| t.as_str()) != Some("control_response") {
         return None;
     }
-    let inner = v.get("response")?.get("response")?;
+    let outer = v.get("response")?;
+    if outer.get("subtype").and_then(|s| s.as_str()) != Some("success") {
+        return None;
+    }
+    let inner = outer.get("response")?;
     let total_tokens = inner.get("totalTokens")?.as_u64()?;
     let max_tokens = inner.get("maxTokens")?.as_u64()?;
     Some(ContextUsageInfo {
@@ -916,6 +920,12 @@ mod tests {
     #[test]
     fn parse_context_usage_missing_fields() {
         let json = r#"{"type":"control_response","response":{"subtype":"success","response":{}}}"#;
+        assert!(parse_context_usage_response(json).is_none());
+    }
+
+    #[test]
+    fn parse_context_usage_error_subtype() {
+        let json = r#"{"type":"control_response","response":{"subtype":"error","response":{"totalTokens":100,"maxTokens":1000}}}"#;
         assert!(parse_context_usage_response(json).is_none());
     }
 }
