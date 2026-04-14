@@ -114,7 +114,20 @@ impl RateLimitMonitor {
         format!("⚠️ Rate Limit: {} {}%{}", label, pct, remaining)
     }
 
-    /// Send a Discord notification if the rate limit percentage changed.
+    /// Returns true if `current` is in a different bucket than `last`.
+    ///
+    /// `step` defines the bucket size (e.g. 5 → every 5%, 25 → every 25%).
+    fn bucket_changed(current: u8, last: Option<u8>, step: u8) -> bool {
+        match last {
+            None => true,
+            Some(prev) => current / step != prev / step,
+        }
+    }
+
+    /// Send a Discord notification if the rate limit percentage crossed a bucket boundary.
+    ///
+    /// - 5h window: notifies every 5% bucket
+    /// - 7d window: notifies every 25% bucket
     ///
     /// Detects reset-cycle changes and clears the "last notified" state so the
     /// new cycle re-fires even if the percentage happens to be the same value.
@@ -133,10 +146,10 @@ impl RateLimitMonitor {
         let five_hour_reset = info.five_hour_reset.unwrap_or(0);
         if five_hour_reset != self.last_five_hour_reset {
             self.last_five_hour_reset = five_hour_reset;
-            self.last_notified_five_hour_pct = info.five_hour_pct;
+            self.last_notified_five_hour_pct = None;
         }
         if let Some(pct) = info.five_hour_pct
-            && self.last_notified_five_hour_pct != Some(pct)
+            && Self::bucket_changed(pct, self.last_notified_five_hour_pct, 5)
             && info.five_hour_reset.is_some_and(|r| r > now)
         {
             let msg = Self::format_notification("five_hour", pct, info.five_hour_reset);
@@ -151,10 +164,10 @@ impl RateLimitMonitor {
         let seven_day_reset = info.seven_day_reset.unwrap_or(0);
         if seven_day_reset != self.last_seven_day_reset {
             self.last_seven_day_reset = seven_day_reset;
-            self.last_notified_seven_day_pct = info.seven_day_pct;
+            self.last_notified_seven_day_pct = None;
         }
         if let Some(pct) = info.seven_day_pct
-            && self.last_notified_seven_day_pct != Some(pct)
+            && Self::bucket_changed(pct, self.last_notified_seven_day_pct, 25)
             && info.seven_day_reset.is_some_and(|r| r > now)
         {
             let msg = Self::format_notification("seven_day", pct, info.seven_day_reset);
@@ -234,5 +247,80 @@ mod tests {
         assert_eq!(monitor.last_notified_seven_day_pct, None);
         assert_eq!(monitor.last_five_hour_reset, 0);
         assert_eq!(monitor.last_seven_day_reset, 0);
+    }
+
+    #[test]
+    fn test_bucket_changed_none_always_true() {
+        assert!(RateLimitMonitor::bucket_changed(0, None, 5));
+        assert!(RateLimitMonitor::bucket_changed(50, None, 25));
+        assert!(RateLimitMonitor::bucket_changed(100, None, 5));
+    }
+
+    #[test]
+    fn test_bucket_changed_same_bucket_false() {
+        // 0..4 are all in bucket 0 with step=5
+        assert!(!RateLimitMonitor::bucket_changed(0, Some(0), 5));
+        assert!(!RateLimitMonitor::bucket_changed(4, Some(0), 5));
+        assert!(!RateLimitMonitor::bucket_changed(3, Some(4), 5));
+        // 0..24 are all in bucket 0 with step=25
+        assert!(!RateLimitMonitor::bucket_changed(0, Some(0), 25));
+        assert!(!RateLimitMonitor::bucket_changed(24, Some(0), 25));
+        assert!(!RateLimitMonitor::bucket_changed(10, Some(24), 25));
+    }
+
+    #[test]
+    fn test_bucket_changed_different_bucket_true() {
+        // 4→5 crosses a 5% bucket boundary
+        assert!(RateLimitMonitor::bucket_changed(5, Some(4), 5));
+        assert!(RateLimitMonitor::bucket_changed(10, Some(9), 5));
+        assert!(RateLimitMonitor::bucket_changed(100, Some(99), 5));
+        // 24→25 crosses a 25% bucket boundary
+        assert!(RateLimitMonitor::bucket_changed(25, Some(24), 25));
+        assert!(RateLimitMonitor::bucket_changed(50, Some(24), 25));
+        assert!(RateLimitMonitor::bucket_changed(75, Some(50), 25));
+        assert!(RateLimitMonitor::bucket_changed(100, Some(75), 25));
+    }
+
+    #[test]
+    fn test_bucket_changed_edge_values() {
+        // 0% and 100% edge cases
+        assert!(!RateLimitMonitor::bucket_changed(0, Some(0), 5));
+        assert!(!RateLimitMonitor::bucket_changed(100, Some(100), 5));
+        assert!(RateLimitMonitor::bucket_changed(5, Some(0), 5));
+        assert!(RateLimitMonitor::bucket_changed(0, Some(5), 5));
+    }
+
+    #[test]
+    fn test_reset_rollover_fires_notification() {
+        // Simulate state after notifying at pct=26 (bucket 5 with step=5) in reset cycle 1000.
+        let mut monitor = RateLimitMonitor::new();
+        monitor.last_five_hour_reset = 1000;
+        monitor.last_notified_five_hour_pct = Some(26);
+        monitor.last_seven_day_reset = 1000;
+        monitor.last_notified_seven_day_pct = Some(26);
+
+        // When a new reset cycle arrives (reset=2000), the fix clears last_notified to None.
+        let new_five_hour_reset = 2000u64;
+        if new_five_hour_reset != monitor.last_five_hour_reset {
+            monitor.last_five_hour_reset = new_five_hour_reset;
+            monitor.last_notified_five_hour_pct = None;
+        }
+
+        let new_seven_day_reset = 2000u64;
+        if new_seven_day_reset != monitor.last_seven_day_reset {
+            monitor.last_seven_day_reset = new_seven_day_reset;
+            monitor.last_notified_seven_day_pct = None;
+        }
+
+        // Even though pct=27 is in the same bucket as the previous pct=26, bucket_changed
+        // must return true because last_notified was cleared to None on rollover.
+        assert!(
+            RateLimitMonitor::bucket_changed(27, monitor.last_notified_five_hour_pct, 5),
+            "first notification after 5h reset rollover should fire"
+        );
+        assert!(
+            RateLimitMonitor::bucket_changed(27, monitor.last_notified_seven_day_pct, 25),
+            "first notification after 7d reset rollover should fire"
+        );
     }
 }
