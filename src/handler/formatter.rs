@@ -8,6 +8,16 @@ use crate::handler::file_attach;
 use crate::i18n::Lang;
 use crate::subprocess::parser::{ContentBlock, StreamEvent, ToolResult};
 
+/// Wraps `name` in a Discord inline code span, stripping any backticks from
+/// the name itself to prevent the span from being broken.
+pub fn inline_code(name: &str) -> String {
+    if name.contains('`') {
+        format!("`{}`", name.replace('`', ""))
+    } else {
+        format!("`{}`", name)
+    }
+}
+
 pub fn format_response(events: &[StreamEvent], lang: Lang) -> (String, Vec<String>) {
     let mut parts: Vec<String> = Vec::new();
     let mut file_paths: Vec<String> = Vec::new();

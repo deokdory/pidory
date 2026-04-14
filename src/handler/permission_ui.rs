@@ -11,6 +11,7 @@ use tokio::sync::{Mutex, mpsc};
 use tracing::warn;
 
 use crate::error::PidoryError;
+use crate::handler::formatter::inline_code;
 use crate::handler::question_ui;
 use crate::i18n::Lang;
 use crate::subprocess::permission::{PermissionDecision, PermissionRequest};
@@ -29,8 +30,8 @@ pub fn create_permission_message(
         .map(|r| format!("\n> {}", r))
         .unwrap_or_default();
     let content = format!(
-        "<@{}> 🔒 `{}` {}\n{}{}",
-        triggered_by, tool_name, lang.permission_request_label(), summary, reason
+        "<@{}> 🔒 {} {}\n{}{}",
+        triggered_by, inline_code(tool_name), lang.permission_request_label(), summary, reason
     );
 
     let allow_btn = CreateButton::new(format!("perm:{}:allow", request_id))
@@ -120,7 +121,7 @@ pub async fn disable_permission_buttons(
         "allow" => format!("-# ✅ {}", lang.perm_allowed(tool_name)),
         "always" => format!("-# 🔓 {}", lang.perm_always_allowed(tool_name)),
         "deny" => format!("-# ❌ {}", lang.perm_denied(tool_name)),
-        _ => format!("-# `{}` — {}", tool_name, chosen_action),
+        _ => format!("-# {} — {}", inline_code(tool_name), chosen_action),
     };
 
     let edit = EditMessage::new().content(label).components(vec![]);

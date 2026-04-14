@@ -1,3 +1,5 @@
+use crate::handler::formatter::inline_code;
+
 use super::Lang;
 
 impl Lang {
@@ -40,22 +42,22 @@ impl Lang {
 
     pub fn perm_allowed(&self, tool: &str) -> String {
         match self {
-            Lang::Ko => format!("`{}` — 허용됨", tool),
-            Lang::En => format!("`{}` — Allowed", tool),
+            Lang::Ko => format!("{} — 허용됨", inline_code(tool)),
+            Lang::En => format!("{} — Allowed", inline_code(tool)),
         }
     }
 
     pub fn perm_always_allowed(&self, tool: &str) -> String {
         match self {
-            Lang::Ko => format!("`{}` — 항상 허용됨", tool),
-            Lang::En => format!("`{}` — Always Allowed", tool),
+            Lang::Ko => format!("{} — 항상 허용됨", inline_code(tool)),
+            Lang::En => format!("{} — Always Allowed", inline_code(tool)),
         }
     }
 
     pub fn perm_denied(&self, tool: &str) -> String {
         match self {
-            Lang::Ko => format!("`{}` — 거부됨", tool),
-            Lang::En => format!("`{}` — Denied", tool),
+            Lang::Ko => format!("{} — 거부됨", inline_code(tool)),
+            Lang::En => format!("{} — Denied", inline_code(tool)),
         }
     }
 }
