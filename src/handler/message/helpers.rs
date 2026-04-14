@@ -16,7 +16,7 @@ pub(crate) fn format_cli_command(command: &str, args: Option<&str>) -> String {
     }
 }
 
-pub(super) fn shorten_model_name(model: &str) -> String {
+pub(crate) fn shorten_model_name(model: &str) -> String {
     let base = model.split('@').next().unwrap_or(model);
     match base {
         s if s.starts_with("claude-opus") => "opus".into(),
@@ -26,7 +26,7 @@ pub(super) fn shorten_model_name(model: &str) -> String {
     }
 }
 
-pub(super) fn format_ctx_suffix(input_tokens: u64, context_window: u64) -> String {
+pub(crate) fn format_ctx_suffix(input_tokens: u64, context_window: u64) -> String {
     if context_window == 0 {
         return String::new();
     }
