@@ -2,6 +2,26 @@ use serde_json::Value;
 
 use super::types::{ContentBlock, StreamEvent, ToolResult};
 
+#[derive(Debug, Clone)]
+pub struct ContextUsageInfo {
+    pub total_tokens: u64,
+    pub max_tokens: u64,
+}
+
+pub fn parse_context_usage_response(line: &str) -> Option<ContextUsageInfo> {
+    let v: Value = serde_json::from_str(line).ok()?;
+    if v.get("type").and_then(|t| t.as_str()) != Some("control_response") {
+        return None;
+    }
+    let inner = v.get("response")?.get("response")?;
+    let total_tokens = inner.get("totalTokens")?.as_u64()?;
+    let max_tokens = inner.get("maxTokens")?.as_u64()?;
+    Some(ContextUsageInfo {
+        total_tokens,
+        max_tokens,
+    })
+}
+
 pub fn parse_line(line: &str) -> Result<StreamEvent, serde_json::Error> {
     if line.trim().is_empty() {
         return Ok(StreamEvent::Unknown {
@@ -872,5 +892,30 @@ mod tests {
         } else {
             panic!("expected Result");
         }
+    }
+
+    #[test]
+    fn parse_context_usage_valid() {
+        let json = r#"{"type":"control_response","response":{"subtype":"success","request_id":"ctx_123","response":{"totalTokens":84672,"maxTokens":1000000,"percentage":8,"categories":[],"gridRows":[]}}}"#;
+        let result = parse_context_usage_response(json).unwrap();
+        assert_eq!(result.total_tokens, 84672);
+        assert_eq!(result.max_tokens, 1000000);
+    }
+
+    #[test]
+    fn parse_context_usage_invalid_json() {
+        assert!(parse_context_usage_response("not json").is_none());
+    }
+
+    #[test]
+    fn parse_context_usage_wrong_type() {
+        let json = r#"{"type":"assistant","content":[]}"#;
+        assert!(parse_context_usage_response(json).is_none());
+    }
+
+    #[test]
+    fn parse_context_usage_missing_fields() {
+        let json = r#"{"type":"control_response","response":{"subtype":"success","response":{}}}"#;
+        assert!(parse_context_usage_response(json).is_none());
     }
 }
