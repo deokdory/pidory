@@ -363,6 +363,9 @@ pub(super) async fn handle_interaction(
                 data.needs_context.lock().await.remove(&thread_id);
                 data.turn_initiators.lock().await.remove(&thread_id);
                 data.turn_participants.lock().await.remove(&thread_id);
+                if let Some(mut tracker) = data.todo_trackers.lock().await.remove(&thread_id) {
+                    tracker.cleanup(ctx).await;
+                }
 
                 // Remove from DB (best-effort)
                 let _ = repository::delete_session(&data.db, &thread_id).await;

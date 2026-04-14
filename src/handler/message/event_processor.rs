@@ -47,6 +47,7 @@ pub(super) async fn send_event_to_discord(
     lang: Lang,
     last_tool_name: &std::sync::Arc<tokio::sync::Mutex<HashMap<String, String>>>,
     thread_id: &str,
+    todo_tracker: &mut crate::handler::todo_tracker::TodoTracker,
 ) {
     match event {
         StreamEvent::Assistant { content, .. } => {
@@ -80,10 +81,14 @@ pub(super) async fn send_event_to_discord(
                                 map.insert(thread_id.to_string(), name.clone());
                             }
                         }
-                        let formatted = formatter::format_tool_use(name, input);
-                        let chunks = formatter::split_message(&formatted, max_chunk_length);
-                        for chunk in chunks {
-                            say_silent(ctx, channel_id, chunk).await;
+                        if name == "TodoWrite" {
+                            todo_tracker.update(ctx, input).await;
+                        } else {
+                            let formatted = formatter::format_tool_use(name, input);
+                            let chunks = formatter::split_message(&formatted, max_chunk_length);
+                            for chunk in chunks {
+                                say_silent(ctx, channel_id, chunk).await;
+                            }
                         }
                     }
                     _ => {} // Thinking 또는 빈 Text — 무시
@@ -130,6 +135,7 @@ pub async fn process_turn_events(
     archived_threads: std::sync::Arc<tokio::sync::Mutex<std::collections::HashSet<String>>>,
     last_tool_name: std::sync::Arc<tokio::sync::Mutex<HashMap<String, String>>>,
     kick_pending: std::sync::Arc<tokio::sync::Mutex<std::collections::HashSet<String>>>,
+    todo_tracker: &mut crate::handler::todo_tracker::TodoTracker,
 ) {
     // 1. typing indicator task 시작
     let cancel = CancellationToken::new();
@@ -191,7 +197,7 @@ pub async fn process_turn_events(
     if !fast_complete {
         // 버퍼링된 이벤트 먼저 전송
         for event in &events {
-            send_event_to_discord(ctx, channel_id, event, &mut tool_use_names, &mut used_tools, max_chunk_length, lang, &last_tool_name, thread_id).await;
+            send_event_to_discord(ctx, channel_id, event, &mut tool_use_names, &mut used_tools, max_chunk_length, lang, &last_tool_name, thread_id, todo_tracker).await;
         }
 
         // Progress indicator 초기화
@@ -235,7 +241,7 @@ pub async fn process_turn_events(
                             typing_paused.store(progress.is_active(), Ordering::Relaxed);
 
                             // 기존 이벤트 처리
-                            send_event_to_discord(ctx, channel_id, &stream_event, &mut tool_use_names, &mut used_tools, max_chunk_length, lang, &last_tool_name, thread_id).await;
+                            send_event_to_discord(ctx, channel_id, &stream_event, &mut tool_use_names, &mut used_tools, max_chunk_length, lang, &last_tool_name, thread_id, todo_tracker).await;
 
                             if stream_event.is_result() {
                                 got_result = true;
@@ -261,6 +267,7 @@ pub async fn process_turn_events(
 
         // Turn 종료 시 cleanup
         progress.cleanup(ctx).await;
+        todo_tracker.flush(ctx).await;
     }
 
     // 5. typing indicator 취소
@@ -435,6 +442,20 @@ pub async fn process_turn_events(
 
     // 8. fast-complete path: 기존 format_response + send_response (한 메시지)
     if fast_complete {
+        // fast_complete path에서도 TodoWrite 처리
+        for event in &events {
+            if let StreamEvent::Assistant { content, .. } = event {
+                for block in content {
+                    if let ContentBlock::ToolUse { name, input, .. } = block {
+                        if name == "TodoWrite" {
+                            todo_tracker.update(ctx, input).await;
+                        }
+                    }
+                }
+            }
+        }
+        todo_tracker.flush(ctx).await;
+
         let (response, file_paths) = formatter::format_response(&events, lang);
         let send_ok = if !response.trim().is_empty() {
             match formatter::send_response(ctx, channel_id, &response, max_chunk_length, max_chunks, lang)

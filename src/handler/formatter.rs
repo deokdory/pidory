@@ -1,6 +1,6 @@
 use comfy_table::{CellAlignment, ContentArrangement, Table, presets};
 use poise::serenity_prelude as serenity;
-use serenity::{CreateAllowedMentions, CreateMessage};
+use serenity::{CreateAllowedMentions, CreateEmbed, CreateEmbedFooter, CreateMessage};
 use tokio::time::{sleep, Duration};
 
 use crate::error::PidoryError;
@@ -43,7 +43,10 @@ pub fn format_response(events: &[StreamEvent], lang: Lang) -> (String, Vec<Strin
                         }
                         ContentBlock::ToolUse { id, name, input } => {
                             tool_use_names.insert(id.clone(), name.clone());
-                            parts.push(format_tool_use(name, input));
+                            let formatted = format_tool_use(name, input);
+                            if !formatted.is_empty() {
+                                parts.push(formatted);
+                            }
                         }
                     }
                 }
@@ -631,7 +634,8 @@ mod tests {
     fn format_tool_use_todo_write() {
         let input = serde_json::json!({"todos": []});
         let result = format_tool_use("TodoWrite", &input);
-        assert!(result.contains("**TodoWrite**"));
+        // TodoWrite returns empty string — handled via embed, no inline message needed
+        assert!(result.is_empty());
     }
 
     #[test]
@@ -737,6 +741,182 @@ mod tests {
         let result = convert_markdown_tables(input);
         assert_eq!(result, input, "table with escaped pipe should pass through unchanged");
     }
+
+    // --- format_todo_embed & helper tests ---
+
+    #[test]
+    fn test_todo_status_icon() {
+        assert_eq!(todo_status_icon("completed"), "✅");
+        assert_eq!(todo_status_icon("in_progress"), "🔄");
+        assert_eq!(todo_status_icon("pending"), "⬜");
+        assert_eq!(todo_status_icon("unknown"), "⬜");
+        assert_eq!(todo_status_icon("cancelled"), "⬜");
+        assert_eq!(todo_status_icon(""), "⬜");
+    }
+
+    #[test]
+    fn test_todo_embed_color_all_completed() {
+        let todos = vec![
+            serde_json::json!({"id": "1", "content": "a", "status": "completed"}),
+            serde_json::json!({"id": "2", "content": "b", "status": "completed"}),
+        ];
+        let refs: Vec<&serde_json::Value> = todos.iter().collect();
+        assert_eq!(todo_embed_color(&refs), 0x2ECC71u32, "all completed → green");
+    }
+
+    #[test]
+    fn test_todo_embed_color_has_in_progress() {
+        let todos = vec![
+            serde_json::json!({"id": "1", "content": "a", "status": "completed"}),
+            serde_json::json!({"id": "2", "content": "b", "status": "in_progress"}),
+        ];
+        let refs: Vec<&serde_json::Value> = todos.iter().collect();
+        assert_eq!(todo_embed_color(&refs), 0x3498DBu32, "has in_progress → blue");
+    }
+
+    #[test]
+    fn test_todo_embed_color_all_pending() {
+        let todos = vec![
+            serde_json::json!({"id": "1", "content": "a", "status": "pending"}),
+            serde_json::json!({"id": "2", "content": "b", "status": "pending"}),
+        ];
+        let refs: Vec<&serde_json::Value> = todos.iter().collect();
+        assert_eq!(todo_embed_color(&refs), 0x95A5A6u32, "all pending → gray");
+    }
+
+    #[test]
+    fn test_progress_bar_zero_of_five() {
+        let bar = progress_bar(0, 5);
+        assert_eq!(bar, "[░░░░░░░░░░] 0/5 done");
+    }
+
+    #[test]
+    fn test_progress_bar_three_of_five() {
+        let bar = progress_bar(3, 5);
+        assert_eq!(bar, "[██████░░░░] 3/5 done");
+    }
+
+    #[test]
+    fn test_progress_bar_five_of_five() {
+        let bar = progress_bar(5, 5);
+        assert_eq!(bar, "[██████████] 5/5 done");
+    }
+
+    #[test]
+    fn test_progress_bar_zero_of_zero() {
+        let bar = progress_bar(0, 0);
+        assert_eq!(bar, "[░░░░░░░░░░] 0/0 done");
+    }
+
+    #[test]
+    fn test_format_todo_embed_basic() {
+        let input = serde_json::json!({
+            "todos": [
+                {"id": "1", "content": "Fix bug", "status": "completed"},
+                {"id": "2", "content": "Write tests", "status": "in_progress"},
+                {"id": "3", "content": "Deploy", "status": "pending"}
+            ]
+        });
+        let embed = format_todo_embed(&input).expect("should return Some for non-empty todos");
+        let v = serde_json::to_value(&embed).expect("embed should serialize");
+
+        let title = v["title"].as_str().unwrap_or("");
+        assert_eq!(title, "📋 Tasks · 1/3", "title should show 1/3 completed");
+
+        let desc = v["description"].as_str().unwrap_or("");
+        assert!(desc.contains("✅"), "description should contain ✅ for completed");
+        assert!(desc.contains("🔄"), "description should contain 🔄 for in_progress");
+        assert!(desc.contains("⬜"), "description should contain ⬜ for pending");
+    }
+
+    #[test]
+    fn test_format_todo_embed_all_completed() {
+        let input = serde_json::json!({
+            "todos": [
+                {"id": "1", "content": "a", "status": "completed"},
+                {"id": "2", "content": "b", "status": "completed"},
+            ]
+        });
+        let embed = format_todo_embed(&input).expect("should return Some");
+        let v = serde_json::to_value(&embed).expect("embed should serialize");
+        let color = v["color"].as_u64().unwrap_or(0);
+        assert_eq!(color, 0x2ECC71u64, "all completed → green color");
+    }
+
+    #[test]
+    fn test_format_todo_embed_empty_todos() {
+        let input = serde_json::json!({"todos": []});
+        assert!(format_todo_embed(&input).is_none(), "empty todos array → None");
+    }
+
+    #[test]
+    fn test_format_todo_embed_missing_todos_field() {
+        let input = serde_json::json!({"other": "value"});
+        assert!(format_todo_embed(&input).is_none(), "missing todos field → None");
+    }
+
+    #[test]
+    fn test_format_todo_embed_folding() {
+        // 12 completed + 3 pending = 15 items total
+        let mut todos = vec![];
+        for i in 0..12 {
+            todos.push(serde_json::json!({"id": i.to_string(), "content": format!("done-{}", i), "status": "completed"}));
+        }
+        for i in 0..3 {
+            todos.push(serde_json::json!({"id": format!("p{}", i), "content": format!("todo-{}", i), "status": "pending"}));
+        }
+        let input = serde_json::json!({"todos": todos});
+        let embed = format_todo_embed(&input).expect("should return Some");
+        let v = serde_json::to_value(&embed).expect("serialize");
+        let desc = v["description"].as_str().unwrap_or("");
+        assert!(
+            desc.contains("+9 more completed"),
+            "should fold 9 completed items into '+9 more completed', got: {}",
+            desc
+        );
+    }
+
+    #[test]
+    fn test_format_todo_embed_unknown_status() {
+        let input = serde_json::json!({
+            "todos": [
+                {"id": "1", "content": "Cancelled task", "status": "cancelled"}
+            ]
+        });
+        let embed = format_todo_embed(&input).expect("should return Some");
+        let v = serde_json::to_value(&embed).expect("serialize");
+        let desc = v["description"].as_str().unwrap_or("");
+        assert!(desc.contains("⬜"), "unknown status → ⬜ icon");
+        assert!(desc.contains("Cancelled task"), "content should appear in description");
+    }
+
+    #[test]
+    fn test_format_todo_embed_ordering() {
+        // Items delivered in mixed order; output must be: in_progress → pending → completed
+        let input = serde_json::json!({
+            "todos": [
+                {"id": "1", "content": "Pending item", "status": "pending"},
+                {"id": "2", "content": "Completed item", "status": "completed"},
+                {"id": "3", "content": "InProgress item", "status": "in_progress"},
+            ]
+        });
+        let embed = format_todo_embed(&input).expect("should return Some");
+        let v = serde_json::to_value(&embed).expect("serialize");
+        let desc = v["description"].as_str().unwrap_or("");
+
+        let pos_in_progress = desc.find("InProgress item").expect("InProgress item must appear");
+        let pos_pending = desc.find("Pending item").expect("Pending item must appear");
+        let pos_completed = desc.find("Completed item").expect("Completed item must appear");
+
+        assert!(
+            pos_in_progress < pos_pending,
+            "in_progress should come before pending"
+        );
+        assert!(
+            pos_pending < pos_completed,
+            "pending should come before completed"
+        );
+    }
 }
 
 pub fn format_duration(ms: u64) -> String {
@@ -777,6 +957,166 @@ pub fn format_tokens(input: u64, output: u64) -> String {
 /// 성공 시 Discord에 result를 표시하지 않는 도구 목록
 pub fn is_noise_tool(tool_name: Option<&str>) -> bool {
     matches!(tool_name, Some("Read" | "Grep" | "Glob" | "Write" | "Edit" | "MultiEdit" | "WebSearch" | "WebFetch" | "TodoWrite"))
+}
+
+fn todo_status_icon(status: &str) -> &'static str {
+    match status {
+        "completed" => "✅",
+        "in_progress" => "🔄",
+        _ => "⬜",
+    }
+}
+
+fn todo_embed_color(todos: &[&serde_json::Value]) -> u32 {
+    let has_in_progress = todos.iter().any(|t| {
+        t.get("status").and_then(|s| s.as_str()) == Some("in_progress")
+    });
+    let all_completed = todos.iter().all(|t| {
+        t.get("status").and_then(|s| s.as_str()) == Some("completed")
+    });
+
+    if all_completed {
+        0x2ECC71u32
+    } else if has_in_progress {
+        0x3498DBu32
+    } else {
+        0x95A5A6u32
+    }
+}
+
+fn progress_bar(done: usize, total: usize) -> String {
+    const WIDTH: usize = 10;
+    let filled = if total == 0 {
+        0
+    } else {
+        (done * WIDTH) / total
+    };
+    let bar: String = (0..WIDTH)
+        .map(|i| if i < filled { '█' } else { '░' })
+        .collect();
+    format!("[{}] {}/{} done", bar, done, total)
+}
+
+fn escape_markdown(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        if matches!(ch, '~' | '*' | '_') {
+            out.push('\\');
+        }
+        out.push(ch);
+    }
+    out
+}
+
+fn render_todo_line(todo: &serde_json::Value) -> String {
+    let status = todo.get("status").and_then(|s| s.as_str()).unwrap_or("pending");
+    let content = todo.get("content").and_then(|s| s.as_str()).unwrap_or("");
+    let icon = todo_status_icon(status);
+    match status {
+        "completed" => format!("{} ~~{}~~", icon, escape_markdown(content)),
+        "in_progress" => format!("{} **{}**", icon, escape_markdown(content)),
+        _ => format!("{} {}", icon, escape_markdown(content)),
+    }
+}
+
+pub fn format_todo_embed(input: &serde_json::Value) -> Option<CreateEmbed> {
+    let todos = input.get("todos")?.as_array()?;
+    if todos.is_empty() {
+        return None;
+    }
+
+    let todos_refs: Vec<&serde_json::Value> = todos.iter().collect();
+    let color = todo_embed_color(&todos_refs);
+
+    let done = todos_refs
+        .iter()
+        .filter(|t| t.get("status").and_then(|s| s.as_str()) == Some("completed"))
+        .count();
+    let total = todos_refs.len();
+
+    // Separate into three buckets preserving original order
+    let in_progress: Vec<&serde_json::Value> = todos_refs
+        .iter()
+        .copied()
+        .filter(|t| t.get("status").and_then(|s| s.as_str()) == Some("in_progress"))
+        .collect();
+    let pending: Vec<&serde_json::Value> = todos_refs
+        .iter()
+        .copied()
+        .filter(|t| {
+            !matches!(
+                t.get("status").and_then(|s| s.as_str()),
+                Some("completed") | Some("in_progress")
+            )
+        })
+        .collect();
+    let completed: Vec<&serde_json::Value> = todos_refs
+        .iter()
+        .copied()
+        .filter(|t| t.get("status").and_then(|s| s.as_str()) == Some("completed"))
+        .collect();
+
+    // Fold completed items: show at most last 3 + "+N more completed" suffix
+    const COMPLETED_SHOW: usize = 3;
+    let (shown_completed, hidden_completed) = if completed.len() > COMPLETED_SHOW {
+        let hidden = completed.len() - COMPLETED_SHOW;
+        (&completed[hidden..], hidden)
+    } else {
+        (completed.as_slice(), 0)
+    };
+
+    // Build ordered lines: in_progress → pending → completed (folded)
+    let mut lines: Vec<String> = Vec::new();
+    for t in &in_progress {
+        lines.push(render_todo_line(t));
+    }
+    for t in &pending {
+        lines.push(render_todo_line(t));
+    }
+    for t in shown_completed {
+        lines.push(render_todo_line(t));
+    }
+    if hidden_completed > 0 {
+        lines.push(format!("  ... +{} more completed", hidden_completed));
+    }
+
+    // Build description with 4096-char hard truncation
+    const MAX_DESC: usize = 4096;
+    let mut description = String::new();
+    let mut truncated_count = 0usize;
+    let total_lines = lines.len();
+
+    for (i, line) in lines.iter().enumerate() {
+        let candidate = if description.is_empty() {
+            line.clone()
+        } else {
+            format!("{}\n{}", description, line)
+        };
+
+        if candidate.chars().count() <= MAX_DESC {
+            description = candidate;
+        } else {
+            truncated_count = total_lines - i;
+            break;
+        }
+    }
+
+    if truncated_count > 0 {
+        let suffix = format!("\n... +{} more items", truncated_count);
+        let available = MAX_DESC.saturating_sub(suffix.chars().count());
+        if description.chars().count() > available {
+            description = description.chars().take(available).collect();
+        }
+        description.push_str(&suffix);
+    }
+
+    let embed = CreateEmbed::new()
+        .color(color)
+        .title(format!("📋 Tasks · {}/{}", done, total))
+        .description(description)
+        .footer(CreateEmbedFooter::new(progress_bar(done, total)));
+
+    Some(embed)
 }
 
 /// Bash command max display length. Discord message limit (2000 chars) minus
@@ -855,7 +1195,7 @@ pub fn format_tool_use(name: &str, input: &serde_json::Value) -> String {
             format!("-# 🔧 **WebFetch** {}", url)
         }
         "TodoWrite" => {
-            format!("-# 🔧 **TodoWrite**")
+            String::new()  // embed로 처리됨, 일반 메시지 불필요
         }
         _ => format!("-# 🔧 **{}**", name),
     }
@@ -928,6 +1268,7 @@ pub async fn send_response(
 
     Ok(())
 }
+
 
 /// Discord에 메시지를 전송한다. reply_to가 있으면 reply로 전송, 없으면 일반 전송.
 /// 향후 reply 기능 활성화 시 사용.
