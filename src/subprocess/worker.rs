@@ -568,6 +568,7 @@ async fn handle_bg_turn(
     model_name: &mut String,
 ) {
     let mut used_tools: Vec<String> = Vec::new();
+    let bg_triggered_by = *current_triggered_by;
     'bg_turn: loop {
         line.clear();
         tokio::select! {
@@ -583,7 +584,8 @@ async fn handle_bg_turn(
                         let trimmed = line.trim_end();
                         if trimmed.is_empty() { continue 'bg_turn; }
                         match parse_line(trimmed) {
-                            Ok(StreamEvent::Result { duration_ms, total_cost_usd, input_tokens, output_tokens, context_window, total_input_tokens, .. }) => {
+                            Ok(StreamEvent::Result { duration_ms, total_cost_usd, input_tokens, output_tokens, context_window, total_input_tokens, is_error, ref errors, .. }) => {
+                                let is_interrupted = errors.iter().any(|err| err.contains("aborted"));
                                 let duration = formatter::format_duration(duration_ms);
                                 let cost = formatter::format_cost(total_cost_usd);
                                 let tokens = formatter::format_tokens(input_tokens, output_tokens);
@@ -601,14 +603,20 @@ async fn handle_bg_turn(
                                     .collect();
                                 let stats = parts.join(" · ");
                                 let stats_line = format!("-# {}{}", stats, ctx_suffix);
-                                let mention = format!("<@{}>", current_triggered_by);
+                                let mention = format!("<@{}>", bg_triggered_by);
+                                let icon = if is_interrupted { "⏹️" } else if is_error { "❌" } else { "✅" };
                                 let summary = if used_tools.is_empty() {
-                                    format!("-# ✅ {}\n{}", mention, stats_line)
+                                    format!("-# {} {}\n{}", icon, mention, stats_line)
                                 } else {
-                                    used_tools.dedup();
                                     let tools_str = used_tools.iter().map(|t| formatter::inline_code(t)).collect::<Vec<_>>().join(", ");
-                                    format!("-# ✅ {}\n{}\n-# Tools: {}", mention, stats_line, tools_str)
+                                    format!("-# {} {}\n{}\n-# Tools: {}", icon, mention, stats_line, tools_str)
                                 };
+                                if is_error && !is_interrupted {
+                                    let error_msg = errors.join(", ");
+                                    if !error_msg.is_empty() {
+                                        say_silent_chunked(ctx, channel_id, &format!("-# ❌ {}", error_msg)).await;
+                                    }
+                                }
                                 say_silent_chunked(ctx, channel_id, &summary).await;
                                 if let Err(e) = repository::update_session_status(db, thread_id, "idle").await {
                                     tracing::warn!("Failed to update session status for thread {}: {}", thread_id, e);
