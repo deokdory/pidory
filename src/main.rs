@@ -60,6 +60,7 @@ pub struct Data {
     pub archived_threads: Arc<Mutex<HashSet<String>>>,
     pub turn_initiators: Arc<Mutex<HashMap<String, serenity::UserId>>>,
     pub turn_participants: Arc<Mutex<HashMap<String, HashSet<serenity::UserId>>>>,
+    pub todo_trackers: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<handler::todo_tracker::TodoTracker>>>>>,
     pub skill_descriptions: HashMap<String, String>,
     /// thread_id → 마지막으로 사용된 tool name
     pub last_tool_name: Arc<Mutex<HashMap<String, String>>>,
@@ -325,6 +326,7 @@ async fn main() -> Result<(), PidoryError> {
                     archived_threads: Arc::new(Mutex::new(HashSet::new())),
                     turn_initiators,
                     turn_participants,
+                    todo_trackers: Arc::new(Mutex::new(HashMap::<String, Arc<tokio::sync::Mutex<handler::todo_tracker::TodoTracker>>>::new())),
                     skill_descriptions,
                     last_tool_name,
                     kick_cooldowns,

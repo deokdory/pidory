@@ -144,6 +144,7 @@ pub async fn branch(
             data.pending_permissions.clone(),
             data.pending_question_groups.clone(),
             data.config.discord.owner_id,
+            data.todo_trackers.clone(),
         )
         .await
     {
@@ -305,6 +306,7 @@ pub async fn branch(
             data.pending_permissions.clone(),
             data.pending_question_groups.clone(),
             data.config.discord.owner_id,
+            data.todo_trackers.clone(),
         )
         .await
     {

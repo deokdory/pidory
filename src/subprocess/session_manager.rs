@@ -101,6 +101,7 @@ impl SessionManager {
         pending_permissions: Arc<tokio::sync::Mutex<HashMap<String, PendingPermission>>>,
         pending_question_groups: Arc<tokio::sync::Mutex<HashMap<String, crate::PendingQuestionGroup>>>,
         owner_id: u64,
+        todo_trackers: Arc<tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<crate::handler::todo_tracker::TodoTracker>>>>>,
     ) -> Result<SessionCreateResult, PidoryError> {
         let mut sessions = self.sessions.lock().await;
 
@@ -208,6 +209,7 @@ impl SessionManager {
             owner_id,
             Arc::clone(&self.pending_recalls),
             self.ratelimit_tx.clone(),
+            todo_trackers,
         ).run());
 
 

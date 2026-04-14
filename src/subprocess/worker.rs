@@ -212,6 +212,7 @@ pub(super) struct SessionWorker {
     is_turn_active: Arc<AtomicBool>,
     pending_recalls: Arc<tokio::sync::Mutex<HashMap<MessageId, (String, Arc<AtomicBool>)>>>,
     ratelimit_tx: tokio::sync::watch::Sender<RateLimitInfo>,
+    todo_trackers: Arc<tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<crate::handler::todo_tracker::TodoTracker>>>>>,
     // Config/Context
     thread_id: String,
     channel_id: ChannelId,
@@ -243,6 +244,7 @@ impl SessionWorker {
         owner_id: u64,
         pending_recalls: Arc<tokio::sync::Mutex<HashMap<MessageId, (String, Arc<AtomicBool>)>>>,
         ratelimit_tx: tokio::sync::watch::Sender<RateLimitInfo>,
+        todo_trackers: Arc<tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<crate::handler::todo_tracker::TodoTracker>>>>>,
     ) -> Self {
         Self {
             stdin,
@@ -261,6 +263,7 @@ impl SessionWorker {
             is_turn_active,
             pending_recalls,
             ratelimit_tx,
+            todo_trackers,
             thread_id,
             channel_id,
             ctx,
@@ -288,6 +291,7 @@ impl SessionWorker {
             ref is_turn_active,
             ref pending_recalls,
             ref ratelimit_tx,
+            ref todo_trackers,
             ref thread_id,
             ref channel_id,
             ref ctx,
@@ -314,6 +318,7 @@ impl SessionWorker {
                 has_bg_tasks,
                 pending_recalls,
                 ratelimit_tx,
+                todo_trackers,
                 thread_id,
                 channel_id,
                 ctx,
@@ -430,6 +435,7 @@ async fn handle_between_turns_event(
     has_bg_tasks: &Arc<AtomicBool>,
     pending_recalls: &Arc<tokio::sync::Mutex<HashMap<MessageId, (String, Arc<AtomicBool>)>>>,
     ratelimit_tx: &tokio::sync::watch::Sender<RateLimitInfo>,
+    todo_trackers: &Arc<tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<crate::handler::todo_tracker::TodoTracker>>>>>,
     thread_id: &str,
     channel_id: &ChannelId,
     ctx: &Context,
@@ -497,6 +503,7 @@ async fn handle_between_turns_event(
                                 queue_size,
                                 pending_recalls,
                                 ratelimit_tx,
+                                todo_trackers,
                                 thread_id,
                                 channel_id,
                                 ctx,
@@ -607,6 +614,7 @@ async fn handle_bg_turn(
     queue_size: &Arc<AtomicUsize>,
     pending_recalls: &Arc<tokio::sync::Mutex<HashMap<MessageId, (String, Arc<AtomicBool>)>>>,
     ratelimit_tx: &tokio::sync::watch::Sender<RateLimitInfo>,
+    todo_trackers: &Arc<tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<crate::handler::todo_tracker::TodoTracker>>>>>,
     thread_id: &str,
     channel_id: &ChannelId,
     ctx: &Context,
@@ -664,6 +672,11 @@ async fn handle_bg_turn(
                                     let tools_str = used_tools.iter().map(|t| formatter::inline_code(t)).collect::<Vec<_>>().join(", ");
                                     format!("-# {} {}\n{}\n-# Tools: {}", icon, mention, stats_line, tools_str)
                                 };
+                                // bg turn 종료 — pending TodoWrite flush
+                                let tracker = todo_trackers.lock().await.get(thread_id).cloned();
+                                if let Some(tracker) = tracker {
+                                    tracker.lock().await.flush(ctx).await;
+                                }
                                 if is_error && !is_interrupted {
                                     let error_msg = errors.join(", ");
                                     if !error_msg.is_empty() {
@@ -688,9 +701,21 @@ async fn handle_bg_turn(
                                             if !used_tools.contains(name) {
                                                 used_tools.push(name.clone());
                                             }
-                                            let formatted = formatter::format_tool_use(name, input);
-                                            let bg_text = lang.bg_notification(&formatted);
-                                            say_silent_chunked(ctx, channel_id, &bg_text).await;
+                                            if name == "TodoWrite" {
+                                                let tracker = {
+                                                    let mut map = todo_trackers.lock().await;
+                                                    map.entry(thread_id.to_string())
+                                                        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(
+                                                            crate::handler::todo_tracker::TodoTracker::new(*channel_id)
+                                                        )))
+                                                        .clone()
+                                                };
+                                                tracker.lock().await.update(ctx, input).await;
+                                            } else {
+                                                let formatted = formatter::format_tool_use(name, input);
+                                                let bg_text = lang.bg_notification(&formatted);
+                                                say_silent_chunked(ctx, channel_id, &bg_text).await;
+                                            }
                                         }
                                         _ => {}
                                     }

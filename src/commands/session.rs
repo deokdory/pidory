@@ -213,6 +213,9 @@ pub async fn del(
     ctx.data().last_tool_name.lock().await.remove(&tid);
     ctx.data().kick_cooldowns.lock().await.remove(&tid);
     ctx.data().kick_pending.lock().await.remove(&tid);
+    if let Some(tracker) = ctx.data().todo_trackers.lock().await.remove(&tid) {
+        tracker.lock().await.cleanup(ctx.serenity_context()).await;
+    }
 
     repository::delete_session(&ctx.data().db, &tid).await?;
 
@@ -392,6 +395,7 @@ pub async fn kick(
     let kick_pending = Arc::clone(&data.kick_pending);
     let turn_initiators = Arc::clone(&data.turn_initiators);
     let needs_context = Arc::clone(&data.needs_context);
+    let todo_trackers = Arc::clone(&data.todo_trackers);
     let author_id = ctx.author().id;
     let mut ctx_rx = data.ctx_watch.subscribe();
 
@@ -478,6 +482,15 @@ pub async fn kick(
                         return;
                     }
 
+                    let todo_tracker = {
+                        let mut map = todo_trackers.lock().await;
+                        map.entry(thread_id.clone())
+                            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(
+                                crate::handler::todo_tracker::TodoTracker::new(channel_id)
+                            )))
+                            .clone()
+                    };
+
                     process_turn_events(
                         &serenity_ctx,
                         event_rx,
@@ -494,6 +507,7 @@ pub async fn kick(
                         archived_threads.clone(),
                         last_tool_name.clone(),
                         kick_pending.clone(),
+                        todo_tracker.clone(),
                     )
                     .await;
 
