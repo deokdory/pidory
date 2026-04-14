@@ -1,9 +1,16 @@
-use poise::serenity_prelude as serenity;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::time::Duration;
+
+use poise::serenity_prelude as serenity;
+use tokio::sync::mpsc;
 
 use crate::{Context, Error};
 use crate::db::repository;
+use crate::handler::message::process_turn_events;
 use crate::i18n::Lang;
+use crate::subprocess::parser::StreamEvent;
+use crate::subprocess::session_manager::QueuedMessage;
 
 /// Parse a naive datetime string "YYYY-MM-DD HH:MM:SS[.f]" into Unix seconds.
 /// Returns None if parsing fails.
@@ -203,6 +210,8 @@ pub async fn del(
     ctx.data().needs_context.lock().await.remove(&tid);
     ctx.data().turn_initiators.lock().await.remove(&tid);
     ctx.data().turn_participants.lock().await.remove(&tid);
+    ctx.data().last_tool_name.lock().await.remove(&tid);
+    ctx.data().kick_cooldowns.lock().await.remove(&tid);
 
     repository::delete_session(&ctx.data().db, &tid).await?;
 
@@ -254,6 +263,224 @@ pub async fn stop(ctx: Context<'_>) -> Result<(), Error> {
             ctx.say(format!("❌ {}", lang.interrupt_failed(&e))).await?;
         }
     }
+
+    Ok(())
+}
+
+/// 현재 턴을 인터럽트하고 새 턴을 자동 시작
+#[poise::command(slash_command, guild_only)]
+pub async fn kick(
+    ctx: Context<'_>,
+    #[description = "재시작 시 전달할 메시지"] message: Option<String>,
+) -> Result<(), Error> {
+    let channel_id = ctx.channel_id();
+    let thread_id = channel_id.to_string();
+    let data = ctx.data();
+    let lang = data.config.language;
+
+    // 1. 세션 존재 체크
+    if !data.sessions.session_exists(&thread_id).await {
+        ctx.say(format!("❌ {}", lang.no_session_in_thread())).await?;
+        return Ok(());
+    }
+
+    // 2. cooldown 체크 (5초)
+    {
+        let cooldowns = data.kick_cooldowns.lock().await;
+        if let Some(last_kick) = cooldowns.get(&thread_id)
+            && last_kick.elapsed() < Duration::from_secs(5)
+        {
+            ctx.send(
+                poise::CreateReply::default()
+                    .content(format!("❌ {}", lang.kick_cooldown()))
+                    .ephemeral(true),
+            )
+            .await?;
+            return Ok(());
+        }
+    }
+
+    // 3. 활성 턴 체크
+    let is_active = data
+        .sessions
+        .get_session_info()
+        .await
+        .into_iter()
+        .find(|info| info.thread_id == thread_id)
+        .map(|info| info.is_turn_active)
+        .unwrap_or(false);
+
+    if !is_active {
+        ctx.send(
+            poise::CreateReply::default()
+                .content(format!("❌ {}", lang.kick_no_active_turn()))
+                .ephemeral(true),
+        )
+        .await?;
+        return Ok(());
+    }
+
+    // 4. 권한 체크
+    let triggered_by = data.turn_initiators.lock().await.get(&thread_id).copied();
+    let is_owner = ctx.author().id == serenity::UserId::new(data.config.discord.owner_id);
+
+    let allowed = match triggered_by {
+        Some(tb) => ctx.author().id == tb || is_owner,
+        None => is_owner,
+    };
+
+    if !allowed {
+        ctx.send(
+            poise::CreateReply::default()
+                .content(format!("❌ {}", lang.no_permission()))
+                .ephemeral(true),
+        )
+        .await?;
+        return Ok(());
+    }
+
+    // 5. last_tool_name 조회
+    let last_tool = data
+        .last_tool_name
+        .lock()
+        .await
+        .get(&thread_id)
+        .cloned()
+        .unwrap_or_else(|| lang.none_placeholder().to_string());
+
+    // 6. interrupt_session() 호출
+    if let Err(e) = data.sessions.interrupt_session(&thread_id).await {
+        ctx.say(format!("❌ {}", lang.interrupt_failed(&e))).await?;
+        return Ok(());
+    }
+
+    // cooldown 기록
+    data.kick_cooldowns
+        .lock()
+        .await
+        .insert(thread_id.clone(), std::time::Instant::now());
+
+    // 7. Discord 확인 메시지 전송
+    let reply = ctx
+        .say(format!("-# ⛔ {}", lang.kicked()))
+        .await?;
+    let kick_msg = reply.into_message().await?;
+    let kick_msg_id = kick_msg.id;
+
+    // system-reminder 메시지 구성
+    let content = {
+        let reminder = format!(
+            "<system-reminder>\n사용자가 현재 턴을 인터럽트했습니다. 응답이 오래 걸려 뻗은 것으로 판단했습니다.\n마지막 tool use: {}\n이전 작업을 이어서 진행하세요.\n</system-reminder>",
+            last_tool
+        );
+        match &message {
+            Some(msg) => format!("{}\n\n{}", reminder, msg),
+            None => reminder,
+        }
+    };
+
+    // 8. background task에서 DB status poll → 새 턴 시작
+    let sessions = Arc::clone(&data.sessions);
+    let db = data.db.clone();
+    let config = Arc::clone(&data.config);
+    let session_skills = Arc::clone(&data.session_skills);
+    let turn_participants = Arc::clone(&data.turn_participants);
+    let last_tool_name = Arc::clone(&data.last_tool_name);
+    let archived_threads = Arc::clone(&data.archived_threads);
+    let turn_initiators = Arc::clone(&data.turn_initiators);
+    let needs_context = Arc::clone(&data.needs_context);
+    let author_id = ctx.author().id;
+    let mut ctx_rx = data.ctx_watch.subscribe();
+
+    tokio::spawn(async move {
+        for _ in 0..25 {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            match repository::get_session_by_thread(&db, &thread_id).await {
+                Ok(Some(session)) if session.status == "idle" => {
+                    // 세션이 idle 상태가 됐으면 새 턴 시작
+                    let acquired = match repository::try_acquire_session(&db, &thread_id).await {
+                        Ok(a) => a,
+                        Err(e) => {
+                            tracing::warn!("kick: try_acquire_session failed: {}", e);
+                            return;
+                        }
+                    };
+
+                    if !acquired {
+                        // 이미 다른 메시지가 잡음 — 포기
+                        return;
+                    }
+
+                    ctx_rx.mark_changed();
+                    let serenity_ctx = ctx_rx.borrow_and_update().clone();
+
+                    needs_context.lock().await.remove(&thread_id);
+
+                    crate::handler::emoji::set_reaction(
+                        &serenity_ctx,
+                        channel_id,
+                        kick_msg_id,
+                        crate::handler::emoji::ReactionStatus::Running,
+                    )
+                    .await
+                    .ok();
+
+                    let (event_tx, event_rx) = mpsc::channel::<StreamEvent>(64);
+                    let msg = QueuedMessage {
+                        content: content.clone(),
+                        channel_id,
+                        message_id: kick_msg_id,
+                        event_tx: Some(event_tx),
+                        triggered_by: author_id,
+                        cancelled: Arc::new(AtomicBool::new(false)),
+                        downloaded_files: Vec::new(),
+                        reply_context: None,
+                    };
+
+                    turn_participants
+                        .lock()
+                        .await
+                        .insert(thread_id.clone(), std::collections::HashSet::from([author_id]));
+                    turn_initiators.lock().await.insert(thread_id.clone(), author_id);
+
+                    if let Err(e) = sessions.send_message(&thread_id, msg).await {
+                        tracing::error!("kick: send_message failed: {}", e);
+                        let _ = repository::update_session_status(&db, &thread_id, "error").await;
+                        return;
+                    }
+
+                    process_turn_events(
+                        &serenity_ctx,
+                        event_rx,
+                        channel_id,
+                        kick_msg_id,
+                        &thread_id,
+                        &db,
+                        config.response.max_chunk_length,
+                        config.response.max_chunks,
+                        session_skills.clone(),
+                        config.language,
+                        config.discord.owner_id,
+                        turn_participants.clone(),
+                        archived_threads.clone(),
+                        last_tool_name.clone(),
+                    )
+                    .await;
+
+                    return;
+                }
+                Ok(None) => return, // 세션 사라짐
+                _ => continue,
+            }
+        }
+
+        // 타임아웃
+        ctx_rx.mark_changed();
+        let serenity_ctx = ctx_rx.borrow_and_update().clone();
+        let _ = channel_id
+            .say(&serenity_ctx, format!("❌ {}", lang.kick_timeout()))
+            .await;
+    });
 
     Ok(())
 }

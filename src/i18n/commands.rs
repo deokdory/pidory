@@ -146,6 +146,34 @@ impl Lang {
         }
     }
 
+    pub fn kicked(&self) -> &'static str {
+        match self {
+            Lang::Ko => "턴을 중단하고 재시작합니다",
+            Lang::En => "Turn interrupted, restarting",
+        }
+    }
+
+    pub fn kick_no_active_turn(&self) -> &'static str {
+        match self {
+            Lang::Ko => "진행 중인 턴이 없습니다",
+            Lang::En => "No active turn",
+        }
+    }
+
+    pub fn kick_timeout(&self) -> &'static str {
+        match self {
+            Lang::Ko => "인터럽트 타임아웃: 세션이 응답하지 않습니다",
+            Lang::En => "Interrupt timeout: session not responding",
+        }
+    }
+
+    pub fn kick_cooldown(&self) -> &'static str {
+        match self {
+            Lang::Ko => "잠시 후 다시 시도하세요 (5초 cooldown)",
+            Lang::En => "Please wait before kicking again (5s cooldown)",
+        }
+    }
+
     pub fn not_in_thread(&self) -> &'static str {
         match self {
             Lang::Ko => "스레드가 아닙니다. 스레드 ID를 직접 입력하세요.",

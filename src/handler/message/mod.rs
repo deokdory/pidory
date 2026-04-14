@@ -222,6 +222,8 @@ async fn handle_message(
                 data.needs_context.lock().await.remove(&evicted_tid);
                 data.turn_initiators.lock().await.remove(&evicted_tid);
                 data.turn_participants.lock().await.remove(&evicted_tid);
+                data.last_tool_name.lock().await.remove(&evicted_tid);
+                data.kick_cooldowns.lock().await.remove(&evicted_tid);
                 if let Err(e) = repository::update_session_status(db, &evicted_tid, "idle").await {
                     tracing::warn!("Failed to update session status for evicted thread {}: {}", evicted_tid, e);
                 }
@@ -411,6 +413,7 @@ async fn handle_message(
         data.config.discord.owner_id,
         data.turn_participants.clone(),
         data.archived_threads.clone(),
+        data.last_tool_name.clone(),
     )
     .await;
 
@@ -519,6 +522,7 @@ pub async fn execute_in_session(
         data.config.discord.owner_id,
         data.turn_participants.clone(),
         data.archived_threads.clone(),
+        data.last_tool_name.clone(),
     )
     .await;
 

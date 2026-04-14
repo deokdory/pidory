@@ -9,6 +9,7 @@ mod release;
 mod subprocess;
 
 use std::collections::{HashMap, HashSet};
+use std::time::Instant;
 use commands::skill::load_skill_descriptions;
 use std::sync::Arc;
 
@@ -60,6 +61,10 @@ pub struct Data {
     pub turn_initiators: Arc<Mutex<HashMap<String, serenity::UserId>>>,
     pub turn_participants: Arc<Mutex<HashMap<String, HashSet<serenity::UserId>>>>,
     pub skill_descriptions: HashMap<String, String>,
+    /// thread_id → 마지막으로 사용된 tool name
+    pub last_tool_name: Arc<Mutex<HashMap<String, String>>>,
+    /// thread_id → 마지막 kick 시각
+    pub kick_cooldowns: Arc<Mutex<HashMap<String, Instant>>>,
     /// Event handler가 fresh Context를 background task에 전달하는 채널.
     /// Shard reconnect 후에도 최신 ShardMessenger를 사용할 수 있게 해준다.
     pub ctx_watch: watch::Sender<serenity::Context>,
@@ -200,6 +205,8 @@ async fn main() -> Result<(), PidoryError> {
                     }
                 }
 
+                let last_tool_name: Arc<Mutex<HashMap<String, String>>> = Arc::new(Mutex::new(HashMap::new()));
+                let kick_cooldowns: Arc<Mutex<HashMap<String, Instant>>> = Arc::new(Mutex::new(HashMap::new()));
                 let needs_context = Arc::new(Mutex::new(HashSet::new()));
 
                 // Idle session TTL sweep
@@ -212,6 +219,8 @@ async fn main() -> Result<(), PidoryError> {
                     let needs_context = Arc::clone(&needs_context);
                     let turn_initiators = Arc::clone(&turn_initiators);
                     let turn_participants = Arc::clone(&turn_participants);
+                    let last_tool_name = Arc::clone(&last_tool_name);
+                    let kick_cooldowns = Arc::clone(&kick_cooldowns);
                     let db_clone = db.clone();
                     let lang = config.language;
                     let mut ctx_rx = ctx_tx.subscribe();
@@ -232,6 +241,8 @@ async fn main() -> Result<(), PidoryError> {
                                         needs_context.lock().await.remove(tid);
                                         turn_initiators.lock().await.remove(tid);
                                         turn_participants.lock().await.remove(tid);
+                                        last_tool_name.lock().await.remove(tid);
+                                        kick_cooldowns.lock().await.remove(tid);
                                         if let Err(e) = db::repository::update_session_status(&db_clone, tid, "idle").await {
                                             tracing::warn!("Failed to update session status for TTL sweep thread {}: {}", tid, e);
                                         }
@@ -310,6 +321,8 @@ async fn main() -> Result<(), PidoryError> {
                     turn_initiators,
                     turn_participants,
                     skill_descriptions,
+                    last_tool_name,
+                    kick_cooldowns,
                     ctx_watch: ctx_tx,
                 })
             })
