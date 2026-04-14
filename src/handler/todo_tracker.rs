@@ -24,10 +24,15 @@ impl TodoTracker {
     }
 
     pub async fn update(&mut self, ctx: &serenity::Context, input: &Value) {
-        // todos 비어있으면 return
-        match input.get("todos").and_then(|v| v.as_array()) {
+        let todos = input.get("todos").and_then(|v| v.as_array());
+        match todos {
             Some(arr) if !arr.is_empty() => {}
-            _ => return,
+            Some(_) => {
+                // 빈 배열 = todo 전부 제거 → 기존 embed 삭제
+                self.cleanup(ctx).await;
+                return;
+            }
+            None => return, // todos 필드 자체가 없으면 무시
         }
 
         let embed = match crate::handler::formatter::format_todo_embed(input) {
@@ -95,9 +100,9 @@ impl TodoTracker {
                 );
                 if is_not_found {
                     self.message_id = None;
-                    self.pending_input = Some(input);
                 }
-                // transient error: message_id 유지, pending_input은 그대로
+                // 404든 transient든 pending_input에 최신 상태 복원 (다음 flush/update에서 재시도)
+                self.pending_input = Some(input);
             } else {
                 self.last_edit = Some(Instant::now());
             }
@@ -109,6 +114,8 @@ impl TodoTracker {
 
     /// 세션 종료 시 호출 — unpin + delete.
     pub async fn cleanup(&mut self, ctx: &serenity::Context) {
+        self.pending_input = None;
+
         let mid = match self.message_id.take() {
             Some(id) => id,
             None => return,
@@ -147,9 +154,9 @@ impl TodoTracker {
             );
             if is_not_found {
                 self.message_id = None;
-                self.pending_input = Some(input.clone());
             }
-            // transient error: message_id 유지, pending_input은 그대로
+            // 404든 transient든 pending_input에 최신 상태 복원 (다음 update에서 재시도)
+            self.pending_input = Some(input.clone());
         } else {
             self.last_edit = Some(Instant::now());
         }
