@@ -393,7 +393,7 @@ pub async fn process_turn_events(
             format!("-# ✅ {}\n{}", mentions, stats_line)
         } else {
             used_tools.dedup();
-            format!("-# ✅ {}\n{}\n-# Tools: {}", mentions, stats_line, used_tools.join(", "))
+            format!("-# ✅ {}\n{}\n-# Tools: {}", mentions, stats_line, used_tools.iter().map(|t| formatter::inline_code(t)).collect::<Vec<_>>().join(", "))
         };
         if let Err(e) = repository::update_session_status(db, thread_id, "idle").await {
             tracing::warn!("Failed to update session status for thread {}: {}", thread_id, e);
