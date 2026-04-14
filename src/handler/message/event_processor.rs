@@ -117,6 +117,7 @@ pub async fn process_turn_events(
     lang: Lang,
     owner_id: u64,
     turn_participants: std::sync::Arc<tokio::sync::Mutex<HashMap<String, std::collections::HashSet<UserId>>>>,
+    archived_threads: std::sync::Arc<tokio::sync::Mutex<std::collections::HashSet<String>>>,
 ) {
     // 1. typing indicator task 시작
     let cancel = CancellationToken::new();
@@ -285,6 +286,11 @@ pub async fn process_turn_events(
             false
         }
     });
+
+    if archived_threads.lock().await.remove(thread_id) {
+        tracing::info!(thread_id, "Turn ended silently — thread archived");
+        return;
+    }
 
     // 7. 최종 처리
     if fast_complete {
