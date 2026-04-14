@@ -1,8 +1,5 @@
 use crate::i18n::Lang;
 
-/// CLI 커맨드 문자열을 `<command-name>/cmd</command-name>` 형태로 포맷한다.
-/// command에서 선행 `/`를 제거 후 `/cmd` 형태로 재조립.
-/// args가 Some("") 이면 None과 동일하게 처리 — `<command-message>` 태그 생략.
 fn escape_xml(s: &str) -> String {
     s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
 }
@@ -16,6 +13,16 @@ pub(crate) fn format_cli_command(command: &str, args: Option<&str>) -> String {
             format!("{base}<command-message>{escaped}</command-message>")
         }
         _ => base,
+    }
+}
+
+pub(super) fn shorten_model_name(model: &str) -> String {
+    let base = model.split('@').next().unwrap_or(model);
+    match base {
+        s if s.starts_with("claude-opus") => "opus".into(),
+        s if s.starts_with("claude-sonnet") => "sonnet".into(),
+        s if s.starts_with("claude-haiku") => "haiku".into(),
+        other => other.to_string(),
     }
 }
 

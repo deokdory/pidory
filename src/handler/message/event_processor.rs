@@ -11,6 +11,7 @@ use tracing::error;
 use crate::db::repository;
 use crate::handler::{emoji, file_attach, formatter};
 use crate::handler::emoji::ReactionStatus;
+use crate::handler::message::helpers::shorten_model_name;
 use crate::handler::status::ProgressIndicator;
 use crate::i18n::Lang;
 use crate::subprocess::parser::{ContentBlock, StreamEvent};
@@ -263,12 +264,14 @@ pub async fn process_turn_events(
         }
     }
 
-    // Init skills 캡처
+    // Init skills + model 캡처
+    let mut turn_model = String::new();
     for event in &events {
-        if let StreamEvent::Init { skills, .. } = event {
+        if let StreamEvent::Init { skills, model, .. } = event {
             if !skills.is_empty() {
                 session_skills.lock().await.insert(thread_id.to_string(), skills.clone());
             }
+            turn_model = shorten_model_name(model);
             break;
         }
     }
@@ -366,21 +369,13 @@ pub async fn process_turn_events(
             .ok();
     } else {
         // 정상 완료: 요약 전송
-        let (duration_ms, total_cost_usd, input_tokens, output_tokens, context_window, total_input_tokens, result_session_id) = events.iter().find_map(|e| {
-            if let StreamEvent::Result { duration_ms, total_cost_usd, input_tokens, output_tokens, context_window, total_input_tokens, session_id, .. } = e {
-                Some((*duration_ms, *total_cost_usd, *input_tokens, *output_tokens, *context_window, *total_input_tokens, session_id.clone()))
+        let (duration_ms, total_cost_usd, input_tokens, output_tokens, context_window, total_input_tokens) = events.iter().find_map(|e| {
+            if let StreamEvent::Result { duration_ms, total_cost_usd, input_tokens, output_tokens, context_window, total_input_tokens, .. } = e {
+                Some((*duration_ms, *total_cost_usd, *input_tokens, *output_tokens, *context_window, *total_input_tokens))
             } else {
                 None
             }
-        }).unwrap_or((0, 0.0, 0, 0, 0, 0, String::new()));
-        let session_short = if result_session_id.len() >= 8 {
-            format!(" sid:{}", &result_session_id[..8])
-        } else if !result_session_id.is_empty() {
-            format!(" sid:{}", result_session_id)
-        } else {
-            String::new()
-        };
-
+        }).unwrap_or((0, 0.0, 0, 0, 0, 0));
         let duration = formatter::format_duration(duration_ms);
         let cost = formatter::format_cost(total_cost_usd);
         let tokens = formatter::format_tokens(input_tokens, output_tokens);
@@ -392,11 +387,12 @@ pub async fn process_turn_events(
                 .map(|set| set.iter().map(|uid| format!("<@{}>", uid)).collect::<Vec<_>>().join(" "))
                 .unwrap_or_else(|| format!("<@{}>", owner_id))
         };
+        let model_prefix = if turn_model.is_empty() { String::new() } else { format!("**{}**", turn_model) };
         let summary = if used_tools.is_empty() {
-            format!("-# ✅ {}{}{}{}{} {}", duration, cost, tokens, ctx_suffix, session_short, mentions)
+            format!("-# ✅ {} · {} · {} · {}{} {}", model_prefix, duration, cost, tokens, ctx_suffix, mentions)
         } else {
             used_tools.dedup();
-            format!("-# 🔧 {} — {}{}{}{}{} {}", used_tools.join(", "), duration, cost, tokens, ctx_suffix, session_short, mentions)
+            format!("-# 🔧 {} · {} · {} · {} · {}{} {}", used_tools.join(", "), model_prefix, duration, cost, tokens, ctx_suffix, mentions)
         };
         if let Err(e) = repository::update_session_status(db, thread_id, "idle").await {
             tracing::warn!("Failed to update session status for thread {}: {}", thread_id, e);
@@ -450,25 +446,19 @@ pub async fn process_turn_events(
                     tracing::warn!(%channel_id, "Failed to send turn error notification: {}", e);
                 }
             } else {
-                let (duration_ms, total_cost_usd, input_tokens, output_tokens, context_window, total_input_tokens, fc_session_id) = events.iter().find_map(|e| {
-                    if let StreamEvent::Result { duration_ms, total_cost_usd, input_tokens, output_tokens, context_window, total_input_tokens, session_id, .. } = e {
-                        Some((*duration_ms, *total_cost_usd, *input_tokens, *output_tokens, *context_window, *total_input_tokens, session_id.clone()))
+                let (duration_ms, total_cost_usd, input_tokens, output_tokens, context_window, total_input_tokens) = events.iter().find_map(|e| {
+                    if let StreamEvent::Result { duration_ms, total_cost_usd, input_tokens, output_tokens, context_window, total_input_tokens, .. } = e {
+                        Some((*duration_ms, *total_cost_usd, *input_tokens, *output_tokens, *context_window, *total_input_tokens))
                     } else {
                         None
                     }
-                }).unwrap_or((0, 0.0, 0, 0, 0, 0, String::new()));
+                }).unwrap_or((0, 0.0, 0, 0, 0, 0));
                 let duration = formatter::format_duration(duration_ms);
                 let cost = formatter::format_cost(total_cost_usd);
                 let tokens = formatter::format_tokens(input_tokens, output_tokens);
                 let ctx_suffix = format_ctx_suffix(total_input_tokens, context_window);
-                let fc_session_short = if fc_session_id.len() >= 8 {
-                    format!(" sid:{}", &fc_session_id[..8])
-                } else if !fc_session_id.is_empty() {
-                    format!(" sid:{}", fc_session_id)
-                } else {
-                    String::new()
-                };
-                if let Err(e) = channel_id.say(ctx, &format!("-# ✅ {}{}{}{}{} {}", duration, cost, tokens, ctx_suffix, fc_session_short, mentions)).await {
+                let model_prefix = if turn_model.is_empty() { String::new() } else { format!("**{}**", turn_model) };
+                if let Err(e) = channel_id.say(ctx, &format!("-# ✅ {} · {} · {} · {}{} {}", model_prefix, duration, cost, tokens, ctx_suffix, mentions)).await {
                     tracing::warn!(%channel_id, "Failed to send turn completion notification: {}", e);
                 }
             }
