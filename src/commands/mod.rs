@@ -16,6 +16,7 @@ pub fn all_commands() -> Vec<poise::Command<Data, Error>> {
         session::del(),
         session::status(),
         session::stop(),
+        session::kick(),
         skill::skill(),
         recall::recall(),
         branch::branch(),

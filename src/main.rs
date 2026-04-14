@@ -9,6 +9,7 @@ mod release;
 mod subprocess;
 
 use std::collections::{HashMap, HashSet};
+use std::time::Instant;
 use commands::skill::load_skill_descriptions;
 use std::sync::Arc;
 
@@ -60,6 +61,12 @@ pub struct Data {
     pub turn_initiators: Arc<Mutex<HashMap<String, serenity::UserId>>>,
     pub turn_participants: Arc<Mutex<HashMap<String, HashSet<serenity::UserId>>>>,
     pub skill_descriptions: HashMap<String, String>,
+    /// thread_id → 마지막으로 사용된 tool name
+    pub last_tool_name: Arc<Mutex<HashMap<String, String>>>,
+    /// thread_id → 마지막 kick 시각
+    pub kick_cooldowns: Arc<Mutex<HashMap<String, Instant>>>,
+    /// kick 후 interrupt 대기 중인 thread_id 집합 (자연 완료 시 제거됨)
+    pub kick_pending: Arc<Mutex<HashSet<String>>>,
     /// Event handler가 fresh Context를 background task에 전달하는 채널.
     /// Shard reconnect 후에도 최신 ShardMessenger를 사용할 수 있게 해준다.
     pub ctx_watch: watch::Sender<serenity::Context>,
@@ -200,6 +207,9 @@ async fn main() -> Result<(), PidoryError> {
                     }
                 }
 
+                let last_tool_name: Arc<Mutex<HashMap<String, String>>> = Arc::new(Mutex::new(HashMap::new()));
+                let kick_cooldowns: Arc<Mutex<HashMap<String, Instant>>> = Arc::new(Mutex::new(HashMap::new()));
+                let kick_pending: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
                 let needs_context = Arc::new(Mutex::new(HashSet::new()));
 
                 // Idle session TTL sweep
@@ -212,6 +222,9 @@ async fn main() -> Result<(), PidoryError> {
                     let needs_context = Arc::clone(&needs_context);
                     let turn_initiators = Arc::clone(&turn_initiators);
                     let turn_participants = Arc::clone(&turn_participants);
+                    let last_tool_name = Arc::clone(&last_tool_name);
+                    let kick_cooldowns = Arc::clone(&kick_cooldowns);
+                    let kick_pending = Arc::clone(&kick_pending);
                     let db_clone = db.clone();
                     let lang = config.language;
                     let mut ctx_rx = ctx_tx.subscribe();
@@ -232,6 +245,9 @@ async fn main() -> Result<(), PidoryError> {
                                         needs_context.lock().await.remove(tid);
                                         turn_initiators.lock().await.remove(tid);
                                         turn_participants.lock().await.remove(tid);
+                                        last_tool_name.lock().await.remove(tid);
+                                        kick_cooldowns.lock().await.remove(tid);
+                                        kick_pending.lock().await.remove(tid);
                                         if let Err(e) = db::repository::update_session_status(&db_clone, tid, "idle").await {
                                             tracing::warn!("Failed to update session status for TTL sweep thread {}: {}", tid, e);
                                         }
@@ -253,49 +269,6 @@ async fn main() -> Result<(), PidoryError> {
                     });
                 }
 
-                // Session presence monitor (changed() 기반 반응형)
-                {
-                    let max_sessions = config.claude.max_sessions;
-                    let mut session_count_rx = session_count_tx.subscribe();
-                    let mut ctx_rx = ctx_tx.subscribe();
-                    tokio::spawn(async move {
-                        tracing::info!("Session presence monitor started");
-                        {
-                            let count = *session_count_rx.borrow();
-                            let ctx = ctx_rx.borrow().clone();
-                            ctx.set_activity(Some(
-                                serenity::gateway::ActivityData::custom(
-                                    format!("Sessions: {count}/{max_sessions}")
-                                )
-                            ));
-                        }
-                        loop {
-                            tokio::select! {
-                                result = session_count_rx.changed() => {
-                                    if result.is_err() { break; }
-                                    let count = *session_count_rx.borrow_and_update();
-                                    let ctx = ctx_rx.borrow().clone();
-                                    ctx.set_activity(Some(
-                                        serenity::gateway::ActivityData::custom(
-                                            format!("Sessions: {count}/{max_sessions}")
-                                        )
-                                    ));
-                                }
-                                result = ctx_rx.changed() => {
-                                    if result.is_err() { break; }
-                                    let count = *session_count_rx.borrow();
-                                    let ctx = ctx_rx.borrow_and_update().clone();
-                                    ctx.set_activity(Some(
-                                        serenity::gateway::ActivityData::custom(
-                                            format!("Sessions: {count}/{max_sessions}")
-                                        )
-                                    ));
-                                    tracing::debug!("Session presence: context refreshed, activity re-applied");
-                                }
-                            }
-                        }
-                    });
-                }
 
                 Ok(Data {
                     config,
@@ -310,6 +283,9 @@ async fn main() -> Result<(), PidoryError> {
                     turn_initiators,
                     turn_participants,
                     skill_descriptions,
+                    last_tool_name,
+                    kick_cooldowns,
+                    kick_pending,
                     ctx_watch: ctx_tx,
                 })
             })
