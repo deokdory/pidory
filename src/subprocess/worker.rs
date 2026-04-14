@@ -912,7 +912,6 @@ async fn run_active_turn(
     event_tx: mpsc::Sender<StreamEvent>,
 ) -> bool {
     let mut timeout_deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
-    let mut bg_turn_active = false;
     let mut soft_timeout_fired = false;
 
     let outer_break: bool = 'turn: loop {
@@ -985,9 +984,9 @@ async fn run_active_turn(
                                     _ => "other",
                                 };
                                 if event_name == "result" || event_name == "other" {
-                                    tracing::info!(thread_id = %thread_id, event = event_name, bg_turn_active, "#36 debug: stdout event");
+                                    tracing::info!(thread_id = %thread_id, event = event_name, "#36 debug: stdout event");
                                 } else {
-                                    tracing::debug!(thread_id = %thread_id, event = event_name, bg_turn_active, "stdout event");
+                                    tracing::debug!(thread_id = %thread_id, event = event_name, "stdout event");
                                 }
                                 // Background task 이벤트: user turn 중에도 올 수 있음
                                 match &event {
@@ -1013,118 +1012,12 @@ async fn run_active_turn(
                                             format!("-# ❌ {}", summary)
                                         };
                                         say_silent_chunked(ctx, channel_id, &notify_msg).await;
-                                        bg_turn_active = true;
-                                        tracing::info!(
-                                            thread_id = %thread_id,
-                                            task_id,
-                                            status,
-                                            "#36 debug: bg_turn_active=true (TaskNotification received)"
-                                        );
                                         continue 'turn;
                                     }
                                     _ => {}
                                 }
 
-                                // bg turn 이벤트 처리: bg_turn_active일 때 기존 코드로 안 넘김
-                                if bg_turn_active {
-                                    match &event {
-                                        StreamEvent::Result { session_id, .. } => {
-                                            bg_turn_active = false;
-                                            timeout_deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
-                                            tracing::info!(
-                                                thread_id = %thread_id,
-                                                session_id,
-                                                "#36 debug: bg turn Result consumed (bg_turn_active→false)"
-                                            );
-                                            continue 'turn; // bg turn 끝 — user turn은 계속
-                                        }
-                                        StreamEvent::Assistant { content, .. } => {
-                                            for block in content {
-                                                match block {
-                                                    ContentBlock::Text(text) if !text.trim().is_empty() => {
-                                                        let bg_text = lang.bg_notification(text);
-                                                        say_silent_chunked(ctx, channel_id, &bg_text).await;
-                                                    }
-                                                    ContentBlock::ToolUse { name, input, .. } => {
-                                                        let formatted = formatter::format_tool_use(name, input);
-                                                        let bg_text = lang.bg_notification(&formatted);
-                                                        say_silent_chunked(ctx, channel_id, &bg_text).await;
-                                                    }
-                                                    _ => {}
-                                                }
-                                            }
-                                            continue 'turn;
-                                        }
-                                        StreamEvent::User { tool_results, .. } => {
-                                            for result in tool_results {
-                                                if result.is_error {
-                                                    if let Some(formatted) = formatter::format_tool_result_with_name(result, None, lang) {
-                                                        let bg_text = lang.bg_notification(&formatted);
-                                                        say_silent_chunked(ctx, channel_id, &bg_text).await;
-                                                    }
-                                                }
-                                            }
-                                            continue 'turn;
-                                        }
-                                        StreamEvent::ControlRequest { request_id, tool_name, tool_use_id, input, decision_reason, .. } => {
-                                            if permission_cache.is_always_allowed(tool_name) {
-                                                let resp = build_control_response_allow(request_id, input);
-                                                if let Err(e) = stdin.write_all(resp.as_bytes()).await {
-                                                    tracing::error!("stdin write error (bg turn in user turn auto-allow): {}", e);
-                                                    break 'turn false;
-                                                }
-                                                let _ = stdin.flush().await;
-                                                continue 'turn;
-                                            }
-
-                                            let saved_request_id = request_id.clone();
-                                            let saved_tool_name = tool_name.clone();
-                                            let saved_tool_use_id = tool_use_id.clone();
-                                            let saved_input = input.clone();
-                                            let saved_reason = decision_reason.clone();
-
-                                            let (resp_tx, mut resp_rx) = tokio::sync::oneshot::channel();
-                                            let perm_req = PermissionRequest {
-                                                request_id: saved_request_id.clone(),
-                                                tool_name: saved_tool_name.clone(),
-                                                tool_use_id: saved_tool_use_id,
-                                                input: saved_input.clone(),
-                                                decision_reason: saved_reason,
-                                                response_tx: resp_tx,
-                                                triggered_by: *current_triggered_by,
-                                            };
-                                            if permission_tx.send(perm_req).await.is_err() {
-                                                tracing::error!("permission_tx closed, denying (bg turn in user turn)");
-                                                let resp = build_control_response_deny(&saved_request_id, "Permission handler unavailable");
-                                                if let Err(e) = stdin.write_all(resp.as_bytes()).await {
-                                                    tracing::error!("stdin write error (bg turn in user turn deny): {}", e);
-                                                }
-                                                let _ = stdin.flush().await;
-                                                break 'turn false;
-                                            }
-                                            let perm_result = wait_for_permission(
-                                                stdin, reader, line, queue_rx, interrupt_rx,
-                                                queue_size, pending_recalls, thread_id, &saved_tool_name, Some(&event_tx), ratelimit_tx, &mut resp_rx,
-                                            ).await;
-                                            match write_permission_response(perm_result, &saved_request_id, &saved_input, stdin, permission_cache).await {
-                                                Ok(true) => break 'turn false,
-                                                Err(e) => {
-                                                    tracing::error!("stdin write error (bg turn in user turn permission): {}", e);
-                                                    break 'turn false;
-                                                }
-                                                _ => {}
-                                            }
-                                            continue 'turn;
-                                        }
-                                        StreamEvent::RateLimit { rate_limit_type, utilization, resets_at, is_using_overage, .. } => {
-                                            handle_ratelimit_event(ratelimit_tx, rate_limit_type.as_deref(), *utilization, *resets_at, *is_using_overage);
-                                            continue 'turn;
-                                        }
-                                        _ => { continue 'turn; } // Init 등 skip
-                                    }
-                                }
-
-                                // 기존 user turn 이벤트 처리 (bg_turn_active == false)
+                                // 기존 user turn 이벤트 처리
                                 if let StreamEvent::ControlRequest {
                                     ref request_id,
                                     ref tool_name,
@@ -1215,7 +1108,6 @@ async fn run_active_turn(
                                     tracing::info!(
                                         thread_id = %thread_id,
                                         session_id = sid,
-                                        bg_turn_active,
                                         "#36 debug: user turn Result received — ending turn"
                                     );
                                 }
@@ -1247,7 +1139,6 @@ async fn run_active_turn(
                             tracing::warn!(
                                 thread_id = %thread_id,
                                 timeout_secs,
-                                bg_turn_active,
                                 "#36 debug: Soft timeout fired — sending nudge"
                             );
                             let nudge_line = build_user_message_json("[SYSTEM] No stdout activity for an extended period. A tool may be unresponsive. Check the status of any running tools and recover if needed.", &[], None);
