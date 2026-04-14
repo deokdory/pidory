@@ -77,8 +77,8 @@ async fn handle_thread_closed(ctx: &Context, data: &Data, thread_id: &str) -> Re
     data.turn_initiators.lock().await.remove(thread_id);
     data.turn_participants.lock().await.remove(thread_id);
 
-    if let Some(mut tracker) = data.todo_trackers.lock().await.remove(thread_id) {
-        tracker.cleanup(ctx).await;
+    if let Some(tracker) = data.todo_trackers.lock().await.remove(thread_id) {
+        tracker.lock().await.cleanup(ctx).await;
     }
 
     tracing::info!(thread_id = %thread_id, "Session killed due to thread archive/delete");
@@ -407,11 +407,13 @@ async fn handle_message(
         data.needs_context.lock().await.insert(thread_id.clone());
     }
 
-    let mut todo_tracker = {
+    let todo_tracker = {
         let mut map = data.todo_trackers.lock().await;
-        map.remove(&thread_id).unwrap_or_else(|| {
-            crate::handler::todo_tracker::TodoTracker::new(channel_id)
-        })
+        map.entry(thread_id.clone())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(
+                crate::handler::todo_tracker::TodoTracker::new(channel_id)
+            )))
+            .clone()
     };
 
     process_turn_events(
@@ -430,14 +432,13 @@ async fn handle_message(
         data.archived_threads.clone(),
         data.last_tool_name.clone(),
         data.kick_pending.clone(),
-        &mut todo_tracker,
+        todo_tracker.clone(),
     )
     .await;
 
     if is_cli_command {
-        todo_tracker.cleanup(ctx).await;
-    } else {
-        data.todo_trackers.lock().await.insert(thread_id.clone(), todo_tracker);
+        todo_tracker.lock().await.cleanup(ctx).await;
+        data.todo_trackers.lock().await.remove(&thread_id);
     }
 
     Ok(())
@@ -534,11 +535,13 @@ pub async fn execute_in_session(
     }
 
     let thread_id_string = thread_id.to_string();
-    let mut todo_tracker = {
+    let todo_tracker = {
         let mut map = data.todo_trackers.lock().await;
-        map.remove(&thread_id_string).unwrap_or_else(|| {
-            crate::handler::todo_tracker::TodoTracker::new(channel_id)
-        })
+        map.entry(thread_id_string.clone())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(
+                crate::handler::todo_tracker::TodoTracker::new(channel_id)
+            )))
+            .clone()
     };
 
     process_turn_events(
@@ -557,14 +560,13 @@ pub async fn execute_in_session(
         data.archived_threads.clone(),
         data.last_tool_name.clone(),
         data.kick_pending.clone(),
-        &mut todo_tracker,
+        todo_tracker.clone(),
     )
     .await;
 
     if is_cli_command {
-        todo_tracker.cleanup(ctx).await;
-    } else {
-        data.todo_trackers.lock().await.insert(thread_id_string, todo_tracker);
+        todo_tracker.lock().await.cleanup(ctx).await;
+        data.todo_trackers.lock().await.remove(&thread_id_string);
     }
 
     Ok(())

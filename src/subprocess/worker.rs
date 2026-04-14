@@ -212,7 +212,7 @@ pub(super) struct SessionWorker {
     is_turn_active: Arc<AtomicBool>,
     pending_recalls: Arc<tokio::sync::Mutex<HashMap<MessageId, (String, Arc<AtomicBool>)>>>,
     ratelimit_tx: tokio::sync::watch::Sender<RateLimitInfo>,
-    todo_trackers: Arc<tokio::sync::Mutex<HashMap<String, crate::handler::todo_tracker::TodoTracker>>>,
+    todo_trackers: Arc<tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<crate::handler::todo_tracker::TodoTracker>>>>>,
     // Config/Context
     thread_id: String,
     channel_id: ChannelId,
@@ -244,7 +244,7 @@ impl SessionWorker {
         owner_id: u64,
         pending_recalls: Arc<tokio::sync::Mutex<HashMap<MessageId, (String, Arc<AtomicBool>)>>>,
         ratelimit_tx: tokio::sync::watch::Sender<RateLimitInfo>,
-        todo_trackers: Arc<tokio::sync::Mutex<HashMap<String, crate::handler::todo_tracker::TodoTracker>>>,
+        todo_trackers: Arc<tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<crate::handler::todo_tracker::TodoTracker>>>>>,
     ) -> Self {
         Self {
             stdin,
@@ -435,7 +435,7 @@ async fn handle_between_turns_event(
     has_bg_tasks: &Arc<AtomicBool>,
     pending_recalls: &Arc<tokio::sync::Mutex<HashMap<MessageId, (String, Arc<AtomicBool>)>>>,
     ratelimit_tx: &tokio::sync::watch::Sender<RateLimitInfo>,
-    todo_trackers: &Arc<tokio::sync::Mutex<HashMap<String, crate::handler::todo_tracker::TodoTracker>>>,
+    todo_trackers: &Arc<tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<crate::handler::todo_tracker::TodoTracker>>>>>,
     thread_id: &str,
     channel_id: &ChannelId,
     ctx: &Context,
@@ -614,7 +614,7 @@ async fn handle_bg_turn(
     queue_size: &Arc<AtomicUsize>,
     pending_recalls: &Arc<tokio::sync::Mutex<HashMap<MessageId, (String, Arc<AtomicBool>)>>>,
     ratelimit_tx: &tokio::sync::watch::Sender<RateLimitInfo>,
-    todo_trackers: &Arc<tokio::sync::Mutex<HashMap<String, crate::handler::todo_tracker::TodoTracker>>>,
+    todo_trackers: &Arc<tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<crate::handler::todo_tracker::TodoTracker>>>>>,
     thread_id: &str,
     channel_id: &ChannelId,
     ctx: &Context,
@@ -673,8 +673,9 @@ async fn handle_bg_turn(
                                     format!("-# {} {}\n{}\n-# Tools: {}", icon, mention, stats_line, tools_str)
                                 };
                                 // bg turn 종료 — pending TodoWrite flush
-                                if let Some(tracker_entry) = todo_trackers.lock().await.get_mut(thread_id) {
-                                    tracker_entry.flush(ctx).await;
+                                let tracker = todo_trackers.lock().await.get(thread_id).cloned();
+                                if let Some(tracker) = tracker {
+                                    tracker.lock().await.flush(ctx).await;
                                 }
                                 if is_error && !is_interrupted {
                                     let error_msg = errors.join(", ");
@@ -701,10 +702,15 @@ async fn handle_bg_turn(
                                                 used_tools.push(name.clone());
                                             }
                                             if name == "TodoWrite" {
-                                                let mut map = todo_trackers.lock().await;
-                                                let tracker_entry = map.entry(thread_id.to_string())
-                                                    .or_insert_with(|| crate::handler::todo_tracker::TodoTracker::new(*channel_id));
-                                                tracker_entry.update(ctx, input).await;
+                                                let tracker = {
+                                                    let mut map = todo_trackers.lock().await;
+                                                    map.entry(thread_id.to_string())
+                                                        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(
+                                                            crate::handler::todo_tracker::TodoTracker::new(*channel_id)
+                                                        )))
+                                                        .clone()
+                                                };
+                                                tracker.lock().await.update(ctx, input).await;
                                             } else {
                                                 let formatted = formatter::format_tool_use(name, input);
                                                 let bg_text = lang.bg_notification(&formatted);

@@ -2,6 +2,7 @@ use std::time::{Duration, Instant};
 
 use poise::serenity_prelude::{self as serenity, ChannelId, CreateMessage, EditMessage, MessageFlags, MessageId};
 use serde_json::Value;
+use reqwest::StatusCode;
 
 const COOLDOWN: Duration = Duration::from_secs(3);
 
@@ -88,9 +89,15 @@ impl TodoTracker {
                 .await
             {
                 tracing::warn!("TodoTracker: flush — failed to edit message {}: {}", mid, e);
-                self.message_id = None;
-                // 재생성은 다음 update() 호출에서 처리
-                self.pending_input = Some(input);
+                // 404 Not Found — message_id 리셋, 재생성은 다음 update() 호출에서 처리
+                let is_not_found = matches!(&e,
+                    serenity::Error::Http(http_err) if http_err.status_code() == Some(StatusCode::NOT_FOUND)
+                );
+                if is_not_found {
+                    self.message_id = None;
+                    self.pending_input = Some(input);
+                }
+                // transient error: message_id 유지, pending_input은 그대로
             } else {
                 self.last_edit = Some(Instant::now());
             }
@@ -134,9 +141,15 @@ impl TodoTracker {
             .await
         {
             tracing::warn!("TodoTracker: failed to edit message {}: {}", mid, e);
-            // 404 등 — message_id 리셋, 다음 update()에서 재생성
-            self.message_id = None;
-            self.pending_input = Some(input.clone());
+            // 404 Not Found — message_id 리셋, 다음 update()에서 재생성
+            let is_not_found = matches!(&e,
+                serenity::Error::Http(http_err) if http_err.status_code() == Some(StatusCode::NOT_FOUND)
+            );
+            if is_not_found {
+                self.message_id = None;
+                self.pending_input = Some(input.clone());
+            }
+            // transient error: message_id 유지, pending_input은 그대로
         } else {
             self.last_edit = Some(Instant::now());
         }
