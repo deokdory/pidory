@@ -269,6 +269,49 @@ async fn main() -> Result<(), PidoryError> {
                     });
                 }
 
+                // Session presence monitor (changed() 기반 반응형)
+                {
+                    let max_sessions = config.claude.max_sessions;
+                    let mut session_count_rx = session_count_tx.subscribe();
+                    let mut ctx_rx = ctx_tx.subscribe();
+                    tokio::spawn(async move {
+                        tracing::info!("Session presence monitor started");
+                        {
+                            let count = *session_count_rx.borrow();
+                            let ctx = ctx_rx.borrow().clone();
+                            ctx.set_activity(Some(
+                                serenity::gateway::ActivityData::custom(
+                                    format!("Sessions: {count}/{max_sessions}")
+                                )
+                            ));
+                        }
+                        loop {
+                            tokio::select! {
+                                result = session_count_rx.changed() => {
+                                    if result.is_err() { break; }
+                                    let count = *session_count_rx.borrow_and_update();
+                                    let ctx = ctx_rx.borrow().clone();
+                                    ctx.set_activity(Some(
+                                        serenity::gateway::ActivityData::custom(
+                                            format!("Sessions: {count}/{max_sessions}")
+                                        )
+                                    ));
+                                }
+                                result = ctx_rx.changed() => {
+                                    if result.is_err() { break; }
+                                    let count = *session_count_rx.borrow();
+                                    let ctx = ctx_rx.borrow_and_update().clone();
+                                    ctx.set_activity(Some(
+                                        serenity::gateway::ActivityData::custom(
+                                            format!("Sessions: {count}/{max_sessions}")
+                                        )
+                                    ));
+                                    tracing::debug!("Session presence: context refreshed, activity re-applied");
+                                }
+                            }
+                        }
+                    });
+                }
 
                 Ok(Data {
                     config,
