@@ -11,6 +11,7 @@ use tokio::sync::{mpsc, Mutex};
 
 use crate::db::repository;
 use crate::handler::formatter;
+use crate::handler::message::{shorten_model_name, format_ctx_suffix};
 use crate::i18n::Lang;
 use crate::ratelimit::RateLimitInfo;
 use super::background::BackgroundTaskTracker;
@@ -249,6 +250,8 @@ impl SessionWorker {
             ..
         } = self;
 
+        let mut model_name = String::new();
+
         loop {
             let action = handle_between_turns_event(
                 stdin,
@@ -269,6 +272,7 @@ impl SessionWorker {
                 ctx,
                 db,
                 lang,
+                &mut model_name,
             ).await;
 
             match action {
@@ -328,6 +332,7 @@ impl SessionWorker {
                         timeout_secs,
                         lang,
                         event_tx,
+                        &mut model_name,
                     ).await;
 
                     // 'turn loop 종료 후 항상 리셋 (정상/비정상 모든 break 경로 커버)
@@ -383,6 +388,7 @@ async fn handle_between_turns_event(
     ctx: &Context,
     db: &sqlx::SqlitePool,
     lang: Lang,
+    model_name: &mut String,
 ) -> BetweenTurnsAction {
     line.clear();
     tokio::select! {
@@ -449,6 +455,7 @@ async fn handle_between_turns_event(
                                 ctx,
                                 db,
                                 lang,
+                                model_name,
                             ).await;
 
                             BetweenTurnsAction::Continue
@@ -558,7 +565,9 @@ async fn handle_bg_turn(
     ctx: &Context,
     db: &sqlx::SqlitePool,
     lang: Lang,
+    model_name: &mut String,
 ) {
+    let mut used_tools: Vec<String> = Vec::new();
     'bg_turn: loop {
         line.clear();
         tokio::select! {
@@ -574,7 +583,33 @@ async fn handle_bg_turn(
                         let trimmed = line.trim_end();
                         if trimmed.is_empty() { continue 'bg_turn; }
                         match parse_line(trimmed) {
-                            Ok(StreamEvent::Result { .. }) => {
+                            Ok(StreamEvent::Result { duration_ms, total_cost_usd, input_tokens, output_tokens, context_window, total_input_tokens, .. }) => {
+                                let duration = formatter::format_duration(duration_ms);
+                                let cost = formatter::format_cost(total_cost_usd);
+                                let tokens = formatter::format_tokens(input_tokens, output_tokens);
+                                let ctx_suffix = format_ctx_suffix(total_input_tokens, context_window);
+                                let model_short = if model_name.is_empty() {
+                                    String::new()
+                                } else {
+                                    shorten_model_name(model_name)
+                                };
+                                let model_part = if model_short.is_empty() { String::new() } else { format!("**{}**", model_short) };
+                                let parts: Vec<&str> = [model_part.as_str(), duration.as_str(), cost.as_str(), tokens.as_str()]
+                                    .iter()
+                                    .filter(|s| !s.is_empty())
+                                    .copied()
+                                    .collect();
+                                let stats = parts.join(" · ");
+                                let stats_line = format!("-# {}{}", stats, ctx_suffix);
+                                let mention = format!("<@{}>", current_triggered_by);
+                                let summary = if used_tools.is_empty() {
+                                    format!("-# ✅ {}\n{}", mention, stats_line)
+                                } else {
+                                    used_tools.dedup();
+                                    let tools_str = used_tools.iter().map(|t| formatter::inline_code(t)).collect::<Vec<_>>().join(", ");
+                                    format!("-# ✅ {}\n{}\n-# Tools: {}", mention, stats_line, tools_str)
+                                };
+                                say_silent_chunked(ctx, channel_id, &summary).await;
                                 if let Err(e) = repository::update_session_status(db, thread_id, "idle").await {
                                     tracing::warn!("Failed to update session status for thread {}: {}", thread_id, e);
                                 }
@@ -588,6 +623,9 @@ async fn handle_bg_turn(
                                             say_silent_chunked(ctx, channel_id, &bg_text).await;
                                         }
                                         ContentBlock::ToolUse { name, input, .. } => {
+                                            if !used_tools.contains(name) {
+                                                used_tools.push(name.clone());
+                                            }
                                             let formatted = formatter::format_tool_use(name, input);
                                             let bg_text = lang.bg_notification(&formatted);
                                             say_silent_chunked(ctx, channel_id, &bg_text).await;
@@ -661,6 +699,9 @@ async fn handle_bg_turn(
                                         }
                                     }
                                 }
+                            }
+                            Ok(StreamEvent::Init { ref model, .. }) => {
+                                *model_name = model.clone();
                             }
                             Ok(StreamEvent::TaskStarted { ref task_id, ref task_type, ref description, .. }) => {
                                 tracker.track_started(task_id, task_type, description);
@@ -910,6 +951,7 @@ async fn run_active_turn(
     timeout_secs: u64,
     lang: Lang,
     event_tx: mpsc::Sender<StreamEvent>,
+    model_name: &mut String,
 ) -> bool {
     let mut timeout_deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
     let mut soft_timeout_fired = false;
@@ -1101,6 +1143,9 @@ async fn run_active_turn(
                                 // 일반 이벤트 처리
                                 if let StreamEvent::RateLimit { ref rate_limit_type, utilization, resets_at, is_using_overage, .. } = event {
                                     handle_ratelimit_event(ratelimit_tx, rate_limit_type.as_deref(), utilization, resets_at, is_using_overage);
+                                }
+                                if let StreamEvent::Init { ref model, .. } = event {
+                                    *model_name = model.clone();
                                 }
                                 let is_result = event.is_result();
                                 if is_result {
