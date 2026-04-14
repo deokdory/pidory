@@ -54,7 +54,9 @@ async fn handle_thread_closed(data: &Data, thread_id: &str) -> Result<(), Pidory
         return Ok(());
     }
 
-    data.archived_threads.lock().await.insert(thread_id.to_string());
+    if data.turn_participants.lock().await.contains_key(thread_id) {
+        data.archived_threads.lock().await.insert(thread_id.to_string());
+    }
 
     if let Err(e) = data.sessions.kill_session(thread_id).await {
         warn!("Failed to kill session for closed thread {}: {}", thread_id, e);
