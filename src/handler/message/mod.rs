@@ -4,6 +4,8 @@ mod helpers;
 
 pub use event_processor::process_turn_events;
 pub(crate) use helpers::format_cli_command;
+pub(crate) use helpers::shorten_model_name;
+pub(crate) use helpers::format_ctx_suffix;
 
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
