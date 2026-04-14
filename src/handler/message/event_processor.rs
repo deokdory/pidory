@@ -387,12 +387,13 @@ pub async fn process_turn_events(
                 .map(|set| set.iter().map(|uid| format!("<@{}>", uid)).collect::<Vec<_>>().join(" "))
                 .unwrap_or_else(|| format!("<@{}>", owner_id))
         };
-        let model_prefix = if turn_model.is_empty() { String::new() } else { format!("**{}**", turn_model) };
+        let model_part = if turn_model.is_empty() { String::new() } else { format!("**{}**", turn_model) };
+        let stats_line = format!("-# {} · {} · {} · {}{}", model_part, duration, cost, tokens, ctx_suffix);
         let summary = if used_tools.is_empty() {
-            format!("-# ✅ {} · {} · {} · {}{} {}", model_prefix, duration, cost, tokens, ctx_suffix, mentions)
+            format!("-# ✅ {}\n{}", mentions, stats_line)
         } else {
             used_tools.dedup();
-            format!("-# 🔧 {} · {} · {} · {} · {}{} {}", used_tools.join(", "), model_prefix, duration, cost, tokens, ctx_suffix, mentions)
+            format!("-# ✅ {}\n{}\n-# 🔧 {}", mentions, stats_line, used_tools.join(", "))
         };
         if let Err(e) = repository::update_session_status(db, thread_id, "idle").await {
             tracing::warn!("Failed to update session status for thread {}: {}", thread_id, e);
@@ -457,8 +458,9 @@ pub async fn process_turn_events(
                 let cost = formatter::format_cost(total_cost_usd);
                 let tokens = formatter::format_tokens(input_tokens, output_tokens);
                 let ctx_suffix = format_ctx_suffix(total_input_tokens, context_window);
-                let model_prefix = if turn_model.is_empty() { String::new() } else { format!("**{}**", turn_model) };
-                if let Err(e) = channel_id.say(ctx, &format!("-# ✅ {} · {} · {} · {}{} {}", model_prefix, duration, cost, tokens, ctx_suffix, mentions)).await {
+                let model_part = if turn_model.is_empty() { String::new() } else { format!("**{}**", turn_model) };
+                let stats_line = format!("-# {} · {} · {} · {}{}", model_part, duration, cost, tokens, ctx_suffix);
+                if let Err(e) = channel_id.say(ctx, &format!("-# ✅ {}\n{}", mentions, stats_line)).await {
                     tracing::warn!(%channel_id, "Failed to send turn completion notification: {}", e);
                 }
             }

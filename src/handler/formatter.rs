@@ -560,12 +560,12 @@ mod tests {
 
     #[test]
     fn format_cost_positive_formats_with_leading_space() {
-        assert_eq!(format_cost(0.05), " $0.05");
+        assert_eq!(format_cost(0.05), "$0.05");
     }
 
     #[test]
     fn format_cost_rounds_to_two_decimal_places() {
-        assert_eq!(format_cost(1.234), " $1.23");
+        assert_eq!(format_cost(1.234), "$1.23");
     }
 
     #[test]
@@ -580,17 +580,17 @@ mod tests {
 
     #[test]
     fn format_tokens_small() {
-        assert_eq!(format_tokens(100, 50), " 150 tok");
+        assert_eq!(format_tokens(100, 50), "150 tok");
     }
 
     #[test]
     fn format_tokens_thousands() {
-        assert_eq!(format_tokens(25000, 1200), " 26.2k tok");
+        assert_eq!(format_tokens(25000, 1200), "26.2k tok");
     }
 
     #[test]
     fn format_tokens_millions() {
-        assert_eq!(format_tokens(900000, 200000), " 1.1M tok");
+        assert_eq!(format_tokens(900000, 200000), "1.1M tok");
     }
 
     #[test]
@@ -745,7 +745,7 @@ pub fn format_cost(usd: f64) -> String {
     if usd <= 0.0 {
         String::new()
     } else {
-        format!(" ${:.2}", usd)
+        format!("${:.2}", usd)
     }
 }
 
@@ -761,7 +761,7 @@ pub fn format_tokens(input: u64, output: u64) -> String {
     } else {
         format!("{}", total)
     };
-    format!(" {} tok", formatted)
+    format!("{} tok", formatted)
 }
 
 /// 성공 시 Discord에 result를 표시하지 않는 도구 목록

@@ -561,11 +561,11 @@ mod tests {
 
     #[test]
     fn test_format_ctx_suffix() {
-        assert_eq!(format_ctx_suffix(26150, 1000000), " ctx:2%");
-        assert_eq!(format_ctx_suffix(420000, 1000000), " ctx:42%");
+        assert_eq!(format_ctx_suffix(26150, 1000000), " · ctx:2%");
+        assert_eq!(format_ctx_suffix(420000, 1000000), " · ctx:42%");
         assert_eq!(format_ctx_suffix(0, 0), "");
         assert_eq!(format_ctx_suffix(100, 0), "");
-        assert_eq!(format_ctx_suffix(1000000, 1000000), " ctx:100%");
+        assert_eq!(format_ctx_suffix(1000000, 1000000), " · ctx:100%");
     }
 
     #[test]

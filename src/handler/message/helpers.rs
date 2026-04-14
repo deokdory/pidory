@@ -31,7 +31,7 @@ pub(super) fn format_ctx_suffix(input_tokens: u64, context_window: u64) -> Strin
         return String::new();
     }
     let pct = (input_tokens as f64 / context_window as f64 * 100.0).min(100.0) as u8;
-    format!(" ctx:{}%", pct)
+    format!(" · ctx:{}%", pct)
 }
 
 /// `/new` 또는 `/clear` — 대화 컨텍스트를 리셋하는 명령인지 판정
