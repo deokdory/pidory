@@ -45,6 +45,8 @@ pub(super) async fn send_event_to_discord(
     used_tools: &mut Vec<String>,
     max_chunk_length: usize,
     lang: Lang,
+    last_tool_name: &std::sync::Arc<tokio::sync::Mutex<HashMap<String, String>>>,
+    thread_id: &str,
 ) {
     match event {
         StreamEvent::Assistant { content, .. } => {
@@ -69,6 +71,14 @@ pub(super) async fn send_event_to_discord(
                         tool_use_names.insert(id.clone(), name.clone());
                         if !used_tools.contains(name) {
                             used_tools.push(name.clone());
+                        }
+                        {
+                            let mut map = last_tool_name.lock().await;
+                            if let Some(existing) = map.get_mut(thread_id) {
+                                existing.clone_from(name);
+                            } else {
+                                map.insert(thread_id.to_string(), name.clone());
+                            }
                         }
                         let formatted = formatter::format_tool_use(name, input);
                         let chunks = formatter::split_message(&formatted, max_chunk_length);
@@ -118,6 +128,8 @@ pub async fn process_turn_events(
     owner_id: u64,
     turn_participants: std::sync::Arc<tokio::sync::Mutex<HashMap<String, std::collections::HashSet<UserId>>>>,
     archived_threads: std::sync::Arc<tokio::sync::Mutex<std::collections::HashSet<String>>>,
+    last_tool_name: std::sync::Arc<tokio::sync::Mutex<HashMap<String, String>>>,
+    kick_pending: std::sync::Arc<tokio::sync::Mutex<std::collections::HashSet<String>>>,
 ) {
     // 1. typing indicator task 시작
     let cancel = CancellationToken::new();
@@ -179,7 +191,7 @@ pub async fn process_turn_events(
     if !fast_complete {
         // 버퍼링된 이벤트 먼저 전송
         for event in &events {
-            send_event_to_discord(ctx, channel_id, event, &mut tool_use_names, &mut used_tools, max_chunk_length, lang).await;
+            send_event_to_discord(ctx, channel_id, event, &mut tool_use_names, &mut used_tools, max_chunk_length, lang, &last_tool_name, thread_id).await;
         }
 
         // Progress indicator 초기화
@@ -223,7 +235,7 @@ pub async fn process_turn_events(
                             typing_paused.store(progress.is_active(), Ordering::Relaxed);
 
                             // 기존 이벤트 처리
-                            send_event_to_discord(ctx, channel_id, &stream_event, &mut tool_use_names, &mut used_tools, max_chunk_length, lang).await;
+                            send_event_to_discord(ctx, channel_id, &stream_event, &mut tool_use_names, &mut used_tools, max_chunk_length, lang, &last_tool_name, thread_id).await;
 
                             if stream_event.is_result() {
                                 got_result = true;
@@ -286,6 +298,10 @@ pub async fn process_turn_events(
             false
         }
     });
+
+    if !is_interrupted {
+        kick_pending.lock().await.remove(thread_id);
+    }
 
     if archived_threads.lock().await.remove(thread_id) {
         tracing::info!(thread_id, "Turn ended silently — thread archived");
