@@ -35,8 +35,45 @@ pub async fn handle_event(
         FullEvent::InteractionCreate { interaction } => {
             interaction::handle_interaction(ctx, interaction, data).await
         }
+        FullEvent::ThreadUpdate { new, .. } => {
+            if new.thread_metadata.as_ref().is_some_and(|m| m.archived) {
+                handle_thread_closed(data, &new.id.to_string()).await
+            } else {
+                Ok(())
+            }
+        }
+        FullEvent::ThreadDelete { thread, .. } => {
+            handle_thread_closed(data, &thread.id.to_string()).await
+        }
         _ => Ok(()),
     }
+}
+
+async fn handle_thread_closed(data: &Data, thread_id: &str) -> Result<(), PidoryError> {
+    if !data.sessions.session_exists(thread_id).await {
+        return Ok(());
+    }
+
+    if let Err(e) = data.sessions.kill_session(thread_id).await {
+        warn!("Failed to kill session for closed thread {}: {}", thread_id, e);
+    }
+
+    let db = &data.db;
+    if let Err(e) = repository::update_session_status(db, thread_id, "archived").await {
+        warn!("Failed to update session status for closed thread {}: {}", thread_id, e);
+    }
+
+    data.pending_permissions.lock().await.retain(|_, p| p.thread_id != thread_id);
+    data.pending_question_groups.lock().await.retain(|_, g| g.thread_id != thread_id);
+    data.pending_resets.lock().await.retain(|_, r| r.thread_id != thread_id);
+    data.session_skills.lock().await.remove(thread_id);
+    data.needs_context.lock().await.remove(thread_id);
+    data.turn_initiators.lock().await.remove(thread_id);
+    data.turn_participants.lock().await.remove(thread_id);
+
+    tracing::info!(thread_id = %thread_id, "Session killed due to thread archive/delete");
+
+    Ok(())
 }
 
 async fn resolve_reply_context(
