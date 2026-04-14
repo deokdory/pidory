@@ -40,22 +40,22 @@ impl Lang {
 
     pub fn perm_allowed(&self, tool: &str) -> String {
         match self {
-            Lang::Ko => format!("{} — 허용됨", tool),
-            Lang::En => format!("{} — Allowed", tool),
+            Lang::Ko => format!("`{}` — 허용됨", tool),
+            Lang::En => format!("`{}` — Allowed", tool),
         }
     }
 
     pub fn perm_always_allowed(&self, tool: &str) -> String {
         match self {
-            Lang::Ko => format!("{} — 항상 허용됨", tool),
-            Lang::En => format!("{} — Always Allowed", tool),
+            Lang::Ko => format!("`{}` — 항상 허용됨", tool),
+            Lang::En => format!("`{}` — Always Allowed", tool),
         }
     }
 
     pub fn perm_denied(&self, tool: &str) -> String {
         match self {
-            Lang::Ko => format!("{} — 거부됨", tool),
-            Lang::En => format!("{} — Denied", tool),
+            Lang::Ko => format!("`{}` — 거부됨", tool),
+            Lang::En => format!("`{}` — Denied", tool),
         }
     }
 }

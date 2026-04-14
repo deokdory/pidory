@@ -29,7 +29,7 @@ pub fn create_permission_message(
         .map(|r| format!("\n> {}", r))
         .unwrap_or_default();
     let content = format!(
-        "<@{}> 🔒 **{}** {}\n{}{}",
+        "<@{}> 🔒 `{}` {}\n{}{}",
         triggered_by, tool_name, lang.permission_request_label(), summary, reason
     );
 
@@ -120,7 +120,7 @@ pub async fn disable_permission_buttons(
         "allow" => format!("-# ✅ {}", lang.perm_allowed(tool_name)),
         "always" => format!("-# 🔓 {}", lang.perm_always_allowed(tool_name)),
         "deny" => format!("-# ❌ {}", lang.perm_denied(tool_name)),
-        _ => format!("-# {} — {}", tool_name, chosen_action),
+        _ => format!("-# `{}` — {}", tool_name, chosen_action),
     };
 
     let edit = EditMessage::new().content(label).components(vec![]);
