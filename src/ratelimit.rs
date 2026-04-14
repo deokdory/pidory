@@ -146,7 +146,7 @@ impl RateLimitMonitor {
         let five_hour_reset = info.five_hour_reset.unwrap_or(0);
         if five_hour_reset != self.last_five_hour_reset {
             self.last_five_hour_reset = five_hour_reset;
-            self.last_notified_five_hour_pct = info.five_hour_pct;
+            self.last_notified_five_hour_pct = None;
         }
         if let Some(pct) = info.five_hour_pct
             && Self::bucket_changed(pct, self.last_notified_five_hour_pct, 5)
@@ -164,7 +164,7 @@ impl RateLimitMonitor {
         let seven_day_reset = info.seven_day_reset.unwrap_or(0);
         if seven_day_reset != self.last_seven_day_reset {
             self.last_seven_day_reset = seven_day_reset;
-            self.last_notified_seven_day_pct = info.seven_day_pct;
+            self.last_notified_seven_day_pct = None;
         }
         if let Some(pct) = info.seven_day_pct
             && Self::bucket_changed(pct, self.last_notified_seven_day_pct, 25)
@@ -288,5 +288,39 @@ mod tests {
         assert!(!RateLimitMonitor::bucket_changed(100, Some(100), 5));
         assert!(RateLimitMonitor::bucket_changed(5, Some(0), 5));
         assert!(RateLimitMonitor::bucket_changed(0, Some(5), 5));
+    }
+
+    #[test]
+    fn test_reset_rollover_fires_notification() {
+        // Simulate state after notifying at pct=26 (bucket 5 with step=5) in reset cycle 1000.
+        let mut monitor = RateLimitMonitor::new();
+        monitor.last_five_hour_reset = 1000;
+        monitor.last_notified_five_hour_pct = Some(26);
+        monitor.last_seven_day_reset = 1000;
+        monitor.last_notified_seven_day_pct = Some(26);
+
+        // When a new reset cycle arrives (reset=2000), the fix clears last_notified to None.
+        let new_five_hour_reset = 2000u64;
+        if new_five_hour_reset != monitor.last_five_hour_reset {
+            monitor.last_five_hour_reset = new_five_hour_reset;
+            monitor.last_notified_five_hour_pct = None;
+        }
+
+        let new_seven_day_reset = 2000u64;
+        if new_seven_day_reset != monitor.last_seven_day_reset {
+            monitor.last_seven_day_reset = new_seven_day_reset;
+            monitor.last_notified_seven_day_pct = None;
+        }
+
+        // Even though pct=27 is in the same bucket as the previous pct=26, bucket_changed
+        // must return true because last_notified was cleared to None on rollover.
+        assert!(
+            RateLimitMonitor::bucket_changed(27, monitor.last_notified_five_hour_pct, 5),
+            "first notification after 5h reset rollover should fire"
+        );
+        assert!(
+            RateLimitMonitor::bucket_changed(27, monitor.last_notified_seven_day_pct, 25),
+            "first notification after 7d reset rollover should fire"
+        );
     }
 }
