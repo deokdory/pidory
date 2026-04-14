@@ -618,7 +618,8 @@ async fn handle_bg_turn(
                                     }
                                 }
                                 say_silent_chunked(ctx, channel_id, &summary).await;
-                                if let Err(e) = repository::update_session_status(db, thread_id, "idle").await {
+                                let new_status = if is_error && !is_interrupted { "error" } else { "idle" };
+                                if let Err(e) = repository::update_session_status(db, thread_id, new_status).await {
                                     tracing::warn!("Failed to update session status for thread {}: {}", thread_id, e);
                                 }
                                 break 'bg_turn;
@@ -678,7 +679,7 @@ async fn handle_bg_turn(
                                         input: saved_input.clone(),
                                         decision_reason: saved_reason,
                                         response_tx: resp_tx,
-                                        triggered_by: *current_triggered_by,
+                                        triggered_by: bg_triggered_by,
                                     };
                                     if permission_tx.send(perm_req).await.is_err() {
                                         tracing::error!("permission_tx closed, denying (bg turn)");
