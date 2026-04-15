@@ -310,6 +310,22 @@ impl Lang {
         }
     }
 
+    // ── Commands: sleep ──
+
+    pub fn session_slept(&self) -> &'static str {
+        match self {
+            Lang::Ko => "세션을 슬립 상태로 전환했습니다. 메시지를 보내면 자동으로 재개됩니다.",
+            Lang::En => "Session put to sleep. Send a message to resume.",
+        }
+    }
+
+    pub fn sleep_turn_active(&self) -> &'static str {
+        match self {
+            Lang::Ko => "턴이 진행 중입니다. 완료 후 다시 시도하세요.",
+            Lang::En => "A turn is active. Please try again after it completes.",
+        }
+    }
+
     // ── Commands: model ──
 
     pub fn model_changed(&self, from: &str, to: &str) -> String {

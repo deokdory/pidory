@@ -7,6 +7,7 @@ use tokio::sync::mpsc;
 
 use crate::{Context, Error};
 use crate::db::repository;
+use crate::handler::cleanup::cleanup_session_state;
 use crate::handler::message::process_turn_events;
 use crate::i18n::Lang;
 use crate::subprocess::parser::StreamEvent;
@@ -161,6 +162,51 @@ pub async fn list(
         .ephemeral(true);
     ctx.send(reply).await?;
 
+    Ok(())
+}
+
+/// 세션을 슬립 상태로 전환 (다음 메시지에서 자동 재개)
+#[poise::command(slash_command, guild_only)]
+pub async fn sleep(ctx: Context<'_>) -> Result<(), Error> {
+    let data = ctx.data();
+    let thread_id = ctx.channel_id().to_string();
+    let lang = data.config.language;
+
+    // 1. DB 세션 존재 확인
+    let session = repository::get_session_by_thread(&data.db, &thread_id).await?;
+    if session.is_none() {
+        ctx.say(format!("❌ {}", lang.no_session_in_thread())).await?;
+        return Ok(());
+    }
+
+    // 2. 턴 활성 체크
+    let is_active = data
+        .sessions
+        .get_session_info()
+        .await
+        .into_iter()
+        .find(|info| info.thread_id == thread_id)
+        .map(|info| info.is_turn_active)
+        .unwrap_or(false);
+
+    if is_active {
+        ctx.say(format!("❌ {}", lang.sleep_turn_active())).await?;
+        return Ok(());
+    }
+
+    // 3. kill_session best-effort
+    if let Err(e) = data.sessions.kill_session(&thread_id).await {
+        tracing::debug!(thread_id = %thread_id, error = %e, "sleep: kill_session failed (best-effort)");
+    }
+
+    // 4. DB status → "idle"
+    repository::update_session_status(&data.db, &thread_id, "idle").await?;
+
+    // 5. in-memory cleanup
+    cleanup_session_state(data, &thread_id, ctx.serenity_context()).await;
+
+    // 6. 응답
+    ctx.say(format!("-# 😴 {}", lang.session_slept())).await?;
     Ok(())
 }
 
