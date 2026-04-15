@@ -357,6 +357,14 @@ pub(crate) fn convert_html_details(text: &str) -> String {
         if !in_details && line.contains("<details") {
             // Check for compact single-line form: <details...>...</details>
             if line.contains("</details>") {
+                // Preserve text before <details
+                let tag_pos = line.find("<details").unwrap();
+                let prefix = line[..tag_pos].trim();
+                if !prefix.is_empty() {
+                    result.push_str(prefix);
+                    result.push('\n');
+                }
+
                 // Extract summary if present
                 let compact_header = if line.contains("<summary>") && line.contains("</summary>") {
                     let after_open = line.find("<summary>").map(|i| i + "<summary>".len());
@@ -394,10 +402,24 @@ pub(crate) fn convert_html_details(text: &str) -> String {
                     result.push_str(content);
                     result.push('\n');
                 }
+
+                // Preserve text after </details>
+                let close_pos = line.find("</details>").unwrap();
+                let suffix = line[close_pos + "</details>".len()..].trim();
+                if !suffix.is_empty() {
+                    result.push_str(suffix);
+                    result.push('\n');
+                }
                 continue;
             }
 
-            // Multi-line details block starts
+            // Multi-line details block starts — preserve prefix text
+            let tag_pos = line.find("<details").unwrap();
+            let prefix = line[..tag_pos].trim();
+            if !prefix.is_empty() {
+                result.push_str(prefix);
+                result.push('\n');
+            }
             in_details = true;
             header = None;
             buffer = Vec::new();
@@ -420,6 +442,13 @@ pub(crate) fn convert_html_details(text: &str) -> String {
                         result.push_str(buf_line);
                         result.push('\n');
                     }
+                }
+                // Preserve text after </details>
+                let close_pos = line.find("</details>").unwrap();
+                let suffix = line[close_pos + "</details>".len()..].trim();
+                if !suffix.is_empty() {
+                    result.push_str(suffix);
+                    result.push('\n');
                 }
                 buffer = Vec::new();
                 in_details = false;
@@ -1115,6 +1144,27 @@ mod tests {
         let input = "일반 텍스트\n코드 없음";
         let result = convert_html_details(input);
         assert_eq!(result, input);
+    }
+
+    #[test]
+    fn convert_details_prefix_text_preserved() {
+        let input = "before text <details>\n<summary>T</summary>\ncontent\n</details>";
+        let result = convert_html_details(input);
+        assert_eq!(result, "before text\n**T**\n> content");
+    }
+
+    #[test]
+    fn convert_details_suffix_text_preserved() {
+        let input = "<details>\n<summary>T</summary>\ncontent\n</details> after text";
+        let result = convert_html_details(input);
+        assert_eq!(result, "**T**\n> content\nafter text");
+    }
+
+    #[test]
+    fn convert_details_compact_prefix_suffix_preserved() {
+        let input = "before <details><summary>T</summary>content</details> after";
+        let result = convert_html_details(input);
+        assert_eq!(result, "before\n**T**\n> content\nafter");
     }
 }
 
