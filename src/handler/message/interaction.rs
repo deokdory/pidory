@@ -5,7 +5,7 @@ use poise::serenity_prelude::{Context, UserId};
 use crate::Data;
 use crate::db::repository;
 use crate::error::PidoryError;
-use crate::handler::{next_step_ui, permission_ui, question_ui, reset_ui};
+use crate::handler::{cleanup::cleanup_session_state, next_step_ui, permission_ui, question_ui, reset_ui};
 use crate::i18n::Lang;
 use crate::subprocess::permission::PermissionDecision;
 
@@ -351,22 +351,7 @@ pub(super) async fn handle_interaction(
                 }
 
                 // Clean up in-memory maps
-                data.session_skills.lock().await.remove(&thread_id);
-                data.next_step_buttons.lock().await.remove(&thread_id);
-                data.pending_permissions
-                    .lock()
-                    .await
-                    .retain(|_, p| p.thread_id != thread_id);
-                data.pending_question_groups
-                    .lock()
-                    .await
-                    .retain(|_, g| g.thread_id != thread_id);
-                data.needs_context.lock().await.remove(&thread_id);
-                data.turn_initiators.lock().await.remove(&thread_id);
-                data.turn_participants.lock().await.remove(&thread_id);
-                if let Some(tracker) = data.todo_trackers.lock().await.remove(&thread_id) {
-                    tracker.lock().await.cleanup(ctx).await;
-                }
+                cleanup_session_state(data, &thread_id, ctx).await;
 
                 // Remove from DB (best-effort)
                 let _ = repository::delete_session(&data.db, &thread_id).await;
