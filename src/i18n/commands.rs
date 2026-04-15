@@ -235,15 +235,16 @@ impl Lang {
         status: &str,
         session_id: &str,
         last_active: &str,
+        model: &str,
     ) -> String {
         match self {
             Lang::Ko => format!(
-                "📊 세션 상태\n스레드: <#{}>\n상태: {}\n세션 ID: {}\n마지막 활성: {}",
-                thread_id, status, session_id, last_active
+                "📊 세션 상태\n스레드: <#{}>\n상태: {}\n모델: {}\n세션 ID: {}\n마지막 활성: {}",
+                thread_id, status, model, session_id, last_active
             ),
             Lang::En => format!(
-                "📊 Session Status\nThread: <#{}>\nStatus: {}\nSession ID: {}\nLast Active: {}",
-                thread_id, status, session_id, last_active
+                "📊 Session Status\nThread: <#{}>\nStatus: {}\nModel: {}\nSession ID: {}\nLast Active: {}",
+                thread_id, status, model, session_id, last_active
             ),
         }
     }
@@ -306,6 +307,36 @@ impl Lang {
         match self {
             Lang::Ko => format!(" — 세션: {}…", short_id),
             Lang::En => format!(" — session: {}…", short_id),
+        }
+    }
+
+    // ── Commands: model ──
+
+    pub fn model_changed(&self, from: &str, to: &str) -> String {
+        match self {
+            Lang::Ko => format!("모델 변경: {} → {} (다음 메시지부터 적용)", from, to),
+            Lang::En => format!("Model changed: {} → {} (applies from next message)", from, to),
+        }
+    }
+
+    pub fn model_current(&self, model: &str) -> String {
+        match self {
+            Lang::Ko => format!("현재 모델: {}", model),
+            Lang::En => format!("Current model: {}", model),
+        }
+    }
+
+    pub fn model_turn_active(&self) -> &'static str {
+        match self {
+            Lang::Ko => "턴 진행 중에는 모델을 변경할 수 없습니다",
+            Lang::En => "Cannot change model during an active turn",
+        }
+    }
+
+    pub fn model_invalid(&self, name: &str) -> String {
+        match self {
+            Lang::Ko => format!("지원하지 않는 모델입니다: {}", name),
+            Lang::En => format!("Unsupported model: {}", name),
         }
     }
 

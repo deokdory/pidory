@@ -563,7 +563,8 @@ pub async fn status(
                 .as_deref()
                 .map(|t| format_relative(t, lang))
                 .unwrap_or_else(|| lang.never_placeholder().to_string());
-            lang.session_status_display(&s.thread_id, &s.status, session_id_line, &last_active_line)
+            let model_line = s.model.as_deref().unwrap_or("default");
+            lang.session_status_display(&s.thread_id, &s.status, session_id_line, &last_active_line, model_line)
         }
     };
 

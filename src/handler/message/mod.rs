@@ -204,6 +204,7 @@ async fn handle_message(
             &project.path,
             session.session_id.as_deref(),
             &disallowed_tools,
+            session.model.as_deref().or(data.config.claude.default_model.as_deref()),
             ctx.clone(),
             channel_id,
             data.db.clone(),

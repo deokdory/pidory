@@ -343,6 +343,7 @@ pub async fn process_turn_events(
                 session_skills.lock().await.insert(thread_id.to_string(), skills.clone());
             }
             turn_model = shorten_model_name(model);
+            let _ = repository::update_session_model(db, thread_id, &turn_model).await;
             break;
         }
     }

@@ -18,4 +18,5 @@ pub struct Session {
     pub status: String,
     pub created_at: String,
     pub last_active_at: Option<String>,
+    pub model: Option<String>,
 }
