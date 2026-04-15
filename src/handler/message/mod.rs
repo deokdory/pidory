@@ -17,6 +17,7 @@ use tracing::{error, warn};
 use crate::db::repository;
 use crate::error::PidoryError;
 use crate::handler::attachment_download;
+use crate::handler::cleanup::cleanup_session_state;
 use crate::handler::emoji;
 use crate::handler::emoji::ReactionStatus;
 use crate::subprocess::parser::StreamEvent;
@@ -69,18 +70,7 @@ async fn handle_thread_closed(ctx: &Context, data: &Data, thread_id: &str) -> Re
         warn!("Failed to update session status for closed thread {}: {}", thread_id, e);
     }
 
-    data.pending_permissions.lock().await.retain(|_, p| p.thread_id != thread_id);
-    data.pending_question_groups.lock().await.retain(|_, g| g.thread_id != thread_id);
-    data.pending_resets.lock().await.retain(|_, r| r.thread_id != thread_id);
-    data.session_skills.lock().await.remove(thread_id);
-    data.next_step_buttons.lock().await.remove(thread_id);
-    data.needs_context.lock().await.remove(thread_id);
-    data.turn_initiators.lock().await.remove(thread_id);
-    data.turn_participants.lock().await.remove(thread_id);
-
-    if let Some(tracker) = data.todo_trackers.lock().await.remove(thread_id) {
-        tracker.lock().await.cleanup(ctx).await;
-    }
+    cleanup_session_state(data, thread_id, ctx).await;
 
     tracing::info!(thread_id = %thread_id, "Session killed due to thread archive/delete");
 
@@ -181,6 +171,10 @@ async fn handle_message(
             s
         }
         None => {
+            // 세션 없는 스레드에서 /clear → 무시 (새 세션 생성 안 함)
+            if helpers::is_context_reset_command(&new_message.content) {
+                return Ok(());
+            }
             tracing::info!("Creating new session for thread {}", thread_id);
             is_new_session = true;
             repository::create_session(db, &thread_id, &parent_channel_id).await?
@@ -255,12 +249,24 @@ async fn handle_message(
 
     let is_reset_command = helpers::is_context_reset_command(&new_message.content);
     let compact_args = helpers::parse_compact_command(&new_message.content);
-    let is_cli_command = is_reset_command || compact_args.is_some();
+    let is_cli_command = compact_args.is_some();
 
     // 원자적 acquire: running이 아닌 경우에만 running으로 전환
     let acquired = repository::try_acquire_session(db, &thread_id).await?;
 
     if !acquired {
+        // mid-turn /clear: 세션 즉시 kill
+        if is_reset_command {
+            let _ = data.sessions.kill_session(&thread_id).await;
+            cleanup_session_state(data, &thread_id, ctx).await;
+            let _ = repository::delete_session(db, &thread_id).await;
+            channel_id
+                .say(ctx, format!("-# ♻️ {}", lang.session_reset()))
+                .await
+                .ok();
+            return Ok(());
+        }
+
         // mid-turn inject: event_tx 없이 전송 (context inject 안 함, needs_context 소비 안 함)
         let mid_turn_downloaded_files =
             download_message_attachments(
@@ -272,9 +278,7 @@ async fn handle_message(
                 &data.config.attachment,
             ).await;
 
-        let content = if is_reset_command {
-            helpers::format_cli_command("clear", None)
-        } else if let Some(args) = compact_args {
+        let content = if let Some(args) = compact_args {
             helpers::format_cli_command("compact", args)
         } else {
             new_message.content.clone()
@@ -337,10 +341,20 @@ async fn handle_message(
         return Ok(());
     }
 
+    // /clear: 세션 kill + cleanup + DB delete
+    if is_reset_command {
+        let _ = data.sessions.kill_session(&thread_id).await;
+        cleanup_session_state(data, &thread_id, ctx).await;
+        let _ = repository::delete_session(db, &thread_id).await;
+        channel_id
+            .say(ctx, format!("-# ♻️ {}", lang.session_reset()))
+            .await
+            .ok();
+        return Ok(());
+    }
+
     // 직접 실행 경로: context inject 판정 (primary 경로만)
-    let content = if is_reset_command {
-        helpers::format_cli_command("clear", None)
-    } else if let Some(args) = compact_args {
+    let content = if let Some(args) = compact_args {
         helpers::format_cli_command("compact", args)
     } else {
         let had_needs_context = data.needs_context.lock().await.remove(&thread_id);
@@ -445,11 +459,6 @@ async fn handle_message(
     )
     .await;
 
-    if is_reset_command {
-        todo_tracker.lock().await.cleanup(ctx).await;
-        data.todo_trackers.lock().await.remove(&thread_id);
-    }
-
     Ok(())
 }
 
@@ -466,20 +475,31 @@ pub async fn execute_in_session(
 
     let is_reset_command = helpers::is_context_reset_command(content);
     let compact_args = helpers::parse_compact_command(content);
-    let is_cli_command = is_reset_command || compact_args.is_some();
+    let is_cli_command = compact_args.is_some();
 
-    let effective_content = if is_reset_command {
-        helpers::format_cli_command("clear", None)
-    } else if let Some(args) = compact_args {
-        helpers::format_cli_command("compact", args)
-    } else {
-        content.to_string()
-    };
+    let lang = data.config.language;
 
     let acquired = repository::try_acquire_session(db, thread_id).await?;
 
     if !acquired {
+        // mid-turn /clear: 세션 즉시 kill
+        if is_reset_command {
+            let _ = data.sessions.kill_session(thread_id).await;
+            cleanup_session_state(data, thread_id, ctx).await;
+            let _ = repository::delete_session(db, thread_id).await;
+            channel_id
+                .say(ctx, format!("-# ♻️ {}", lang.session_reset()))
+                .await
+                .ok();
+            return Ok(());
+        }
+
         // mid-turn inject: event_tx 없이 전송
+        let effective_content = if let Some(args) = compact_args {
+            helpers::format_cli_command("compact", args)
+        } else {
+            content.to_string()
+        };
         let msg = QueuedMessage {
             content: effective_content,
             channel_id,
@@ -504,11 +524,29 @@ pub async fn execute_in_session(
         return Ok(());
     }
 
+    // /clear: 세션 kill + cleanup + DB delete
+    if is_reset_command {
+        let _ = data.sessions.kill_session(thread_id).await;
+        cleanup_session_state(data, thread_id, ctx).await;
+        let _ = repository::delete_session(db, thread_id).await;
+        channel_id
+            .say(ctx, format!("-# ♻️ {}", lang.session_reset()))
+            .await
+            .ok();
+        return Ok(());
+    }
+
     // 직접 실행
     // stale needs_context 정리 (CLI 커맨드가 아닌 경우에만 — CLI 커맨드는 send 후 insert)
     if !is_cli_command {
         data.needs_context.lock().await.remove(thread_id);
     }
+
+    let effective_content = if let Some(args) = compact_args {
+        helpers::format_cli_command("compact", args)
+    } else {
+        content.to_string()
+    };
 
     emoji::set_reaction(ctx, channel_id, msg_id, ReactionStatus::Running)
         .await

@@ -13,7 +13,6 @@ pub fn all_commands() -> Vec<poise::Command<Data, Error>> {
         register::new_project(),
         session::sessions(),
         session::list(),
-        session::del(),
         session::status(),
         session::stop(),
         session::kick(),
