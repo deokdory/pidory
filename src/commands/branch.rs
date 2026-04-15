@@ -137,6 +137,7 @@ pub async fn branch(
             &project.path,
             session.session_id.as_deref(),
             &disallowed_tools,
+            session.model.as_deref().or(data.config.claude.default_model.as_deref()),
             serenity_ctx.clone(),
             channel_id,
             data.db.clone(),
@@ -299,6 +300,7 @@ pub async fn branch(
             &project.path,
             None, // 새 세션 — session_id 없음
             &disallowed_tools,
+            None,
             serenity_ctx.clone(),
             new_channel_id,
             data.db.clone(),

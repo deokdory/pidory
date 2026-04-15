@@ -94,6 +94,7 @@ impl SessionManager {
         project_path: &str,
         session_id: Option<&str>,
         disallowed_tools: &[String],
+        model: Option<&str>,
         ctx: Context,
         channel_id: ChannelId,
         db: sqlx::SqlitePool,
@@ -141,6 +142,10 @@ impl SessionManager {
 
         if let Some(sid) = session_id {
             cmd.arg("--resume").arg(sid);
+        }
+
+        if let Some(m) = model {
+            cmd.arg("--model").arg(m);
         }
 
         if !disallowed_tools.is_empty() {
