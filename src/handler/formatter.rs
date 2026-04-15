@@ -787,25 +787,25 @@ mod tests {
     #[test]
     fn test_progress_bar_zero_of_five() {
         let bar = progress_bar(0, 5);
-        assert_eq!(bar, "[░░░░░░░░░░] 0/5 done");
+        assert_eq!(bar, "▱▱▱▱▱▱▱▱▱▱ 0/5 done");
     }
 
     #[test]
     fn test_progress_bar_three_of_five() {
         let bar = progress_bar(3, 5);
-        assert_eq!(bar, "[██████░░░░] 3/5 done");
+        assert_eq!(bar, "▰▰▰▰▰▰▱▱▱▱ 3/5 done");
     }
 
     #[test]
     fn test_progress_bar_five_of_five() {
         let bar = progress_bar(5, 5);
-        assert_eq!(bar, "[██████████] 5/5 done");
+        assert_eq!(bar, "▰▰▰▰▰▰▰▰▰▰ 5/5 done");
     }
 
     #[test]
     fn test_progress_bar_zero_of_zero() {
         let bar = progress_bar(0, 0);
-        assert_eq!(bar, "[░░░░░░░░░░] 0/0 done");
+        assert_eq!(bar, "▱▱▱▱▱▱▱▱▱▱ 0/0 done");
     }
 
     #[test]
@@ -821,7 +821,7 @@ mod tests {
         let v = serde_json::to_value(&embed).expect("embed should serialize");
 
         let title = v["title"].as_str().unwrap_or("");
-        assert_eq!(title, "📋 Tasks · 1/3", "title should show 1/3 completed");
+        assert_eq!(title, "Tasks · 1/3", "title should show 1/3 completed");
 
         let desc = v["description"].as_str().unwrap_or("");
         assert!(desc.contains("✅"), "description should contain ✅ for completed");
@@ -992,9 +992,9 @@ fn progress_bar(done: usize, total: usize) -> String {
         (done * WIDTH) / total
     };
     let bar: String = (0..WIDTH)
-        .map(|i| if i < filled { '█' } else { '░' })
+        .map(|i| if i < filled { '▰' } else { '▱' })
         .collect();
-    format!("[{}] {}/{} done", bar, done, total)
+    format!("{} {}/{} done", bar, done, total)
 }
 
 fn escape_markdown(s: &str) -> String {
@@ -1110,9 +1110,11 @@ pub fn format_todo_embed(input: &serde_json::Value) -> Option<CreateEmbed> {
         description.push_str(&suffix);
     }
 
+    let description = format!("\n{}\n", description);
+
     let embed = CreateEmbed::new()
         .color(color)
-        .title(format!("📋 Tasks · {}/{}", done, total))
+        .title(format!("Tasks · {}/{}", done, total))
         .description(description)
         .footer(CreateEmbedFooter::new(progress_bar(done, total)));
 
