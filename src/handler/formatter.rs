@@ -1,6 +1,6 @@
 use comfy_table::{CellAlignment, ContentArrangement, Table, presets};
 use poise::serenity_prelude as serenity;
-use serenity::{CreateAllowedMentions, CreateEmbed, CreateEmbedFooter, CreateMessage};
+use serenity::{CreateAllowedMentions, CreateEmbed, CreateMessage};
 use tokio::time::{sleep, Duration};
 
 use crate::error::PidoryError;
@@ -785,30 +785,6 @@ mod tests {
     }
 
     #[test]
-    fn test_progress_bar_zero_of_five() {
-        let bar = progress_bar(0, 5);
-        assert_eq!(bar, "▱▱▱▱▱▱▱▱▱▱ 0/5 done");
-    }
-
-    #[test]
-    fn test_progress_bar_three_of_five() {
-        let bar = progress_bar(3, 5);
-        assert_eq!(bar, "▰▰▰▰▰▰▱▱▱▱ 3/5 done");
-    }
-
-    #[test]
-    fn test_progress_bar_five_of_five() {
-        let bar = progress_bar(5, 5);
-        assert_eq!(bar, "▰▰▰▰▰▰▰▰▰▰ 5/5 done");
-    }
-
-    #[test]
-    fn test_progress_bar_zero_of_zero() {
-        let bar = progress_bar(0, 0);
-        assert_eq!(bar, "▱▱▱▱▱▱▱▱▱▱ 0/0 done");
-    }
-
-    #[test]
     fn test_format_todo_embed_basic() {
         let input = serde_json::json!({
             "todos": [
@@ -984,19 +960,6 @@ fn todo_embed_color(todos: &[&serde_json::Value]) -> u32 {
     }
 }
 
-fn progress_bar(done: usize, total: usize) -> String {
-    const WIDTH: usize = 10;
-    let filled = if total == 0 {
-        0
-    } else {
-        (done * WIDTH) / total
-    };
-    let bar: String = (0..WIDTH)
-        .map(|i| if i < filled { '▰' } else { '▱' })
-        .collect();
-    format!("{} {}/{} done", bar, done, total)
-}
-
 fn escape_markdown(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for ch in s.chars() {
@@ -1115,8 +1078,7 @@ pub fn format_todo_embed(input: &serde_json::Value) -> Option<CreateEmbed> {
     let embed = CreateEmbed::new()
         .color(color)
         .title(format!("Tasks · {}/{}", done, total))
-        .description(description)
-        .footer(CreateEmbedFooter::new(progress_bar(done, total)));
+        .description(description);
 
     Some(embed)
 }
