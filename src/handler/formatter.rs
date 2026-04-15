@@ -34,7 +34,8 @@ pub fn format_response(events: &[StreamEvent], lang: Lang) -> (String, Vec<Strin
                                 let (cleaned, paths) = file_attach::extract_file_markers(text);
                                 file_paths.extend(paths);
                                 if !cleaned.is_empty() {
-                                    parts.push(convert_markdown_tables(&cleaned));
+                                    let table_converted = convert_markdown_tables(&cleaned);
+                                    parts.push(convert_html_details(&table_converted));
                                 }
                             }
                         }
@@ -306,6 +307,149 @@ pub(crate) fn convert_markdown_tables(text: &str) -> String {
         result.push_str(line);
         result.push('\n');
         i += 1;
+    }
+
+    // Remove trailing newline added by the loop if the original didn't end with one
+    if !text.ends_with('\n') && result.ends_with('\n') {
+        result.pop();
+    }
+
+    result
+}
+
+pub(crate) fn convert_html_details(text: &str) -> String {
+    // Fast path: no details tag means nothing to convert
+    if !text.contains("<details") {
+        return text.to_owned();
+    }
+
+    let lines: Vec<&str> = text.lines().collect();
+    let mut result = String::new();
+    let mut in_code_block = false;
+
+    let mut in_details = false;
+    let mut header: Option<String> = None;
+    let mut buffer: Vec<String> = Vec::new();
+
+    for line in &lines {
+        // Track code block fences — skip processing inside them
+        if line.starts_with("```") {
+            in_code_block = !in_code_block;
+            if in_details {
+                buffer.push(line.to_string());
+            } else {
+                result.push_str(line);
+                result.push('\n');
+            }
+            continue;
+        }
+
+        if in_code_block {
+            if in_details {
+                buffer.push(line.to_string());
+            } else {
+                result.push_str(line);
+                result.push('\n');
+            }
+            continue;
+        }
+
+        if !in_details && line.contains("<details") {
+            // Check for compact single-line form: <details...>...</details>
+            if line.contains("</details>") {
+                // Extract summary if present
+                let compact_header = if line.contains("<summary>") && line.contains("</summary>") {
+                    let after_open = line.find("<summary>").map(|i| i + "<summary>".len());
+                    let before_close = line.find("</summary>");
+                    if let (Some(start), Some(end)) = (after_open, before_close)
+                        && start <= end
+                    {
+                        let content = &line[start..end];
+                        Some(format!("**{}**", content.trim().replace("**", "")))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+
+                // Extract content between </summary> and </details>
+                let content_start = line
+                    .find("</summary>")
+                    .map(|i| i + "</summary>".len())
+                    .unwrap_or_else(|| line.find('>').map(|i| i + 1).unwrap_or(line.len()));
+                let content_end = line.find("</details>").unwrap_or(line.len());
+                let content = if content_start <= content_end {
+                    line[content_start..content_end].trim()
+                } else {
+                    ""
+                };
+
+                if let Some(h) = compact_header {
+                    result.push_str(&h);
+                    result.push('\n');
+                }
+                if !content.is_empty() {
+                    result.push_str("> ");
+                    result.push_str(content);
+                    result.push('\n');
+                }
+                continue;
+            }
+
+            // Multi-line details block starts
+            in_details = true;
+            header = None;
+            buffer = Vec::new();
+            continue;
+        }
+
+        if in_details {
+            if line.contains("</details>") {
+                // Flush buffer to result
+                if let Some(h) = header.take() {
+                    result.push_str(&h);
+                    result.push('\n');
+                }
+                for buf_line in &buffer {
+                    if buf_line.is_empty() {
+                        result.push('>');
+                        result.push('\n');
+                    } else {
+                        result.push_str("> ");
+                        result.push_str(buf_line);
+                        result.push('\n');
+                    }
+                }
+                buffer = Vec::new();
+                in_details = false;
+                continue;
+            }
+
+            if line.contains("<summary>") && line.contains("</summary>") {
+                let after_open = line.find("<summary>").map(|i| i + "<summary>".len());
+                let before_close = line.find("</summary>");
+                if let (Some(start), Some(end)) = (after_open, before_close)
+                    && start <= end
+                {
+                    let content = &line[start..end];
+                    header = Some(format!("**{}**", content.trim().replace("**", "")));
+                    continue;
+                }
+            }
+
+            // Regular content line inside details
+            buffer.push(line.to_string());
+            continue;
+        }
+
+        result.push_str(line);
+        result.push('\n');
+    }
+
+    // Malformed: still inside details at EOF — return original text
+    if in_details {
+        return text.to_owned();
     }
 
     // Remove trailing newline added by the loop if the original didn't end with one
@@ -892,6 +1036,85 @@ mod tests {
             pos_pending < pos_completed,
             "pending should come before completed"
         );
+    }
+
+    // --- convert_html_details tests ---
+
+    #[test]
+    fn convert_details_basic() {
+        let input = "<details>\n<summary>제목</summary>\n내용\n</details>";
+        let result = convert_html_details(input);
+        assert_eq!(result, "**제목**\n> 내용");
+    }
+
+    #[test]
+    fn convert_details_without_summary() {
+        let input = "<details>\n내용만\n</details>";
+        let result = convert_html_details(input);
+        assert_eq!(result, "> 내용만");
+    }
+
+    #[test]
+    fn convert_details_in_code_block() {
+        let input = "```\n<details>\n<summary>코드 예시</summary>\n</details>\n```";
+        let result = convert_html_details(input);
+        assert_eq!(result, input);
+    }
+
+    #[test]
+    fn convert_details_compact_single_line() {
+        let input = "<details><summary>Title</summary>Content</details>";
+        let result = convert_html_details(input);
+        assert_eq!(result, "**Title**\n> Content");
+    }
+
+    #[test]
+    fn convert_details_malformed_no_closing() {
+        let input = "<details>\n<summary>열림</summary>\n내용";
+        let result = convert_html_details(input);
+        assert_eq!(result, input);
+    }
+
+    #[test]
+    fn convert_details_with_attributes() {
+        let input = "<details open>\n<summary>펼침</summary>\n내용\n</details>";
+        let result = convert_html_details(input);
+        assert_eq!(result, "**펼침**\n> 내용");
+    }
+
+    #[test]
+    fn convert_details_empty_lines_in_content() {
+        let input = "<details>\n<summary>제목</summary>\n첫째\n\n둘째\n</details>";
+        let result = convert_html_details(input);
+        assert_eq!(result, "**제목**\n> 첫째\n>\n> 둘째");
+    }
+
+    #[test]
+    fn convert_details_consecutive() {
+        let input = "<details>\n<summary>A</summary>\n1\n</details>\n<details>\n<summary>B</summary>\n2\n</details>";
+        let result = convert_html_details(input);
+        assert_eq!(result, "**A**\n> 1\n**B**\n> 2");
+    }
+
+    #[test]
+    fn convert_details_preserves_surrounding_text() {
+        let input = "앞 텍스트\n<details>\n<summary>제목</summary>\n내용\n</details>\n뒤 텍스트";
+        let result = convert_html_details(input);
+        assert_eq!(result, "앞 텍스트\n**제목**\n> 내용\n뒤 텍스트");
+    }
+
+    #[test]
+    fn convert_details_nested_flat() {
+        let input = "<details>\n<summary>외부</summary>\n<details>\n<summary>내부</summary>\n내용\n</details>\n</details>";
+        let result = convert_html_details(input);
+        assert_eq!(result, "**내부**\n> <details>\n> 내용\n</details>");
+    }
+
+    #[test]
+    fn convert_details_no_details_passthrough() {
+        let input = "일반 텍스트\n코드 없음";
+        let result = convert_html_details(input);
+        assert_eq!(result, input);
     }
 }
 
