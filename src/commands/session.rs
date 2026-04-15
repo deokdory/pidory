@@ -179,7 +179,26 @@ pub async fn sleep(ctx: Context<'_>) -> Result<(), Error> {
         return Ok(());
     }
 
-    // 2. 턴 활성 체크
+    // 2. 권한 체크: 세션 시작자 또는 owner만 허용
+    let triggered_by = data.turn_initiators.lock().await.get(&thread_id).copied();
+    let is_owner = ctx.author().id == serenity::UserId::new(data.config.discord.owner_id);
+
+    let allowed = match triggered_by {
+        Some(tb) => ctx.author().id == tb || is_owner,
+        None => is_owner,
+    };
+
+    if !allowed {
+        ctx.send(
+            poise::CreateReply::default()
+                .content(format!("❌ {}", lang.no_permission()))
+                .ephemeral(true),
+        )
+        .await?;
+        return Ok(());
+    }
+
+    // 3. 턴 활성 체크
     let is_active = data
         .sessions
         .get_session_info()
