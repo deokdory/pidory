@@ -206,6 +206,7 @@ pub async fn del(
     // Kill session if running (ignore failure — process may have already exited)
     let _ = ctx.data().sessions.kill_session(&tid).await;
     ctx.data().session_skills.lock().await.remove(&tid);
+    ctx.data().next_step_buttons.lock().await.remove(&tid);
     ctx.data().pending_permissions.lock().await.retain(|_, p| p.thread_id != tid);
     ctx.data().needs_context.lock().await.remove(&tid);
     ctx.data().turn_initiators.lock().await.remove(&tid);
@@ -396,6 +397,7 @@ pub async fn kick(
     let turn_initiators = Arc::clone(&data.turn_initiators);
     let needs_context = Arc::clone(&data.needs_context);
     let todo_trackers = Arc::clone(&data.todo_trackers);
+    let next_step_buttons = Arc::clone(&data.next_step_buttons);
     let author_id = ctx.author().id;
     let mut ctx_rx = data.ctx_watch.subscribe();
 
@@ -508,6 +510,7 @@ pub async fn kick(
                         last_tool_name.clone(),
                         kick_pending.clone(),
                         todo_tracker.clone(),
+                        next_step_buttons.clone(),
                     )
                     .await;
 
