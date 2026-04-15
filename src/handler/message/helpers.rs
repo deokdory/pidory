@@ -26,12 +26,42 @@ pub(crate) fn shorten_model_name(model: &str) -> String {
     }
 }
 
-pub(crate) fn format_ctx_suffix(input_tokens: u64, context_window: u64) -> String {
-    if context_window == 0 {
-        return String::new();
+pub enum CtxDisplayMode {
+    Pending,
+    Accurate(u8),
+    Approximate(u8),
+}
+
+impl CtxDisplayMode {
+    pub fn from_tokens(input_tokens: u64, context_window: u64, is_accurate: bool) -> Self {
+        if context_window == 0 {
+            if is_accurate {
+                return Self::Accurate(0);
+            } else {
+                return Self::Approximate(0);
+            }
+        }
+        let pct = ((input_tokens as f64 / context_window as f64 * 100.0).min(100.0)) as u8;
+        if is_accurate { Self::Accurate(pct) } else { Self::Approximate(pct) }
     }
-    let pct = (input_tokens as f64 / context_window as f64 * 100.0).min(100.0) as u8;
-    format!(" · ctx:{}%", pct)
+}
+
+pub(crate) fn format_ctx_suffix(mode: CtxDisplayMode) -> String {
+    match mode {
+        CtxDisplayMode::Pending => " · ctx:-%".to_string(),
+        CtxDisplayMode::Accurate(pct) => {
+            if pct == 0 {
+                return String::new();
+            }
+            format!(" · ctx:{pct}%")
+        }
+        CtxDisplayMode::Approximate(pct) => {
+            if pct == 0 {
+                return String::new();
+            }
+            format!(" · ctx:~{pct}%")
+        }
+    }
 }
 
 /// `/new` 또는 `/clear` — 대화 컨텍스트를 리셋하는 명령인지 판정

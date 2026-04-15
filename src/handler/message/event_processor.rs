@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use poise::serenity_prelude::{ChannelId, Context, CreateMessage, MessageFlags, MessageId, UserId};
+use poise::serenity_prelude::{ChannelId, Context, CreateMessage, EditMessage, MessageFlags, MessageId, UserId};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::error;
@@ -16,7 +16,7 @@ use crate::handler::status::ProgressIndicator;
 use crate::i18n::Lang;
 use crate::subprocess::parser::{ContentBlock, StreamEvent};
 
-use super::helpers::format_ctx_suffix;
+use super::helpers::{format_ctx_suffix, CtxDisplayMode};
 
 const DISCORD_MSG_LIMIT: usize = 2000;
 
@@ -316,6 +316,29 @@ pub async fn process_turn_events(
         }
     });
 
+    // ContextUsageUpdate 대기 (정상 완료 시에만)
+    let ctx_update = if got_result && !has_cli_error && !is_interrupted {
+        match tokio::time::timeout(Duration::from_secs(15), event_rx.recv()).await {
+            Ok(Some(StreamEvent::ContextUsageUpdate { total_input_tokens, context_window, is_accurate })) => {
+                Some((total_input_tokens, context_window, is_accurate))
+            }
+            Ok(Some(_other)) => {
+                tracing::warn!(thread_id, "Unexpected event after Result");
+                None
+            }
+            Ok(None) => {
+                tracing::debug!(thread_id, "event_tx dropped before ContextUsageUpdate");
+                None
+            }
+            Err(_) => {
+                tracing::warn!(thread_id, "ContextUsageUpdate timeout (15s)");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     if !is_interrupted {
         kick_pending.lock().await.remove(thread_id);
     }
@@ -408,17 +431,17 @@ pub async fn process_turn_events(
             .ok();
     } else {
         // 정상 완료: 요약 전송
-        let (duration_ms, total_cost_usd, input_tokens, output_tokens, context_window, total_input_tokens) = events.iter().find_map(|e| {
-            if let StreamEvent::Result { duration_ms, total_cost_usd, input_tokens, output_tokens, context_window, total_input_tokens, .. } = e {
-                Some((*duration_ms, *total_cost_usd, *input_tokens, *output_tokens, *context_window, *total_input_tokens))
+        let (duration_ms, total_cost_usd, input_tokens, output_tokens) = events.iter().find_map(|e| {
+            if let StreamEvent::Result { duration_ms, total_cost_usd, input_tokens, output_tokens, .. } = e {
+                Some((*duration_ms, *total_cost_usd, *input_tokens, *output_tokens))
             } else {
                 None
             }
-        }).unwrap_or((0, 0.0, 0, 0, 0, 0));
+        }).unwrap_or((0, 0.0, 0, 0));
         let duration = formatter::format_duration(duration_ms);
         let cost = formatter::format_cost(total_cost_usd);
         let tokens = formatter::format_tokens(input_tokens, output_tokens);
-        let ctx_suffix = format_ctx_suffix(total_input_tokens, context_window);
+        let ctx_suffix = format_ctx_suffix(CtxDisplayMode::Pending);
         let mentions = {
             let parts = turn_participants.lock().await;
             parts.get(thread_id)
@@ -444,8 +467,21 @@ pub async fn process_turn_events(
         if let Err(e) = repository::update_session_status(db, thread_id, "idle").await {
             tracing::warn!("Failed to update session status for thread {}: {}", thread_id, e);
         }
-        if let Err(e) = channel_id.say(ctx, &summary).await {
+        let footer_result = channel_id.say(ctx, &summary).await;
+        if let Err(ref e) = footer_result {
             tracing::warn!(%channel_id, "Failed to send turn summary: {}", e);
+        }
+
+        // ContextUsageUpdate로 footer edit
+        if let (Some((tokens, window, accurate)), Ok(msg)) = (&ctx_update, &footer_result) {
+            let mode = CtxDisplayMode::from_tokens(*tokens, *window, *accurate);
+            let new_ctx = format_ctx_suffix(mode);
+            if new_ctx != ctx_suffix {
+                let updated = summary.replace(&ctx_suffix, &new_ctx);
+                if let Err(e) = channel_id.edit_message(ctx, msg.id, EditMessage::new().content(&updated)).await {
+                    tracing::warn!(%channel_id, "Failed to edit footer ctx: {}", e);
+                }
+            }
         }
 
         emoji::set_reaction(ctx, channel_id, msg_id, ReactionStatus::Done)
@@ -510,21 +546,35 @@ pub async fn process_turn_events(
                     tracing::warn!(%channel_id, "Failed to send turn error notification: {}", e);
                 }
             } else {
-                let (duration_ms, total_cost_usd, input_tokens, output_tokens, context_window, total_input_tokens) = events.iter().find_map(|e| {
-                    if let StreamEvent::Result { duration_ms, total_cost_usd, input_tokens, output_tokens, context_window, total_input_tokens, .. } = e {
-                        Some((*duration_ms, *total_cost_usd, *input_tokens, *output_tokens, *context_window, *total_input_tokens))
+                let (duration_ms, total_cost_usd, input_tokens, output_tokens) = events.iter().find_map(|e| {
+                    if let StreamEvent::Result { duration_ms, total_cost_usd, input_tokens, output_tokens, .. } = e {
+                        Some((*duration_ms, *total_cost_usd, *input_tokens, *output_tokens))
                     } else {
                         None
                     }
-                }).unwrap_or((0, 0.0, 0, 0, 0, 0));
+                }).unwrap_or((0, 0.0, 0, 0));
                 let duration = formatter::format_duration(duration_ms);
                 let cost = formatter::format_cost(total_cost_usd);
                 let tokens = formatter::format_tokens(input_tokens, output_tokens);
-                let ctx_suffix = format_ctx_suffix(total_input_tokens, context_window);
+                let ctx_suffix = format_ctx_suffix(CtxDisplayMode::Pending);
                 let model_part = if turn_model.is_empty() { String::new() } else { format!("**{}**", turn_model) };
                 let stats_line = format!("-# {} · {} · {} · {}{}", model_part, duration, cost, tokens, ctx_suffix);
-                if let Err(e) = channel_id.say(ctx, &format!("-# ✅ {}\n{}", mentions, stats_line)).await {
+                let fc_summary = format!("-# ✅ {}\n{}", mentions, stats_line);
+                let fc_footer = channel_id.say(ctx, &fc_summary).await;
+                if let Err(ref e) = fc_footer {
                     tracing::warn!(%channel_id, "Failed to send turn completion notification: {}", e);
+                }
+
+                // ContextUsageUpdate로 footer edit
+                if let (Some((tokens, window, accurate)), Ok(msg)) = (&ctx_update, &fc_footer) {
+                    let mode = CtxDisplayMode::from_tokens(*tokens, *window, *accurate);
+                    let new_ctx = format_ctx_suffix(mode);
+                    if new_ctx != ctx_suffix {
+                        let updated = fc_summary.replace(&ctx_suffix, &new_ctx);
+                        if let Err(e) = channel_id.edit_message(ctx, msg.id, EditMessage::new().content(&updated)).await {
+                            tracing::warn!(%channel_id, "Failed to edit footer ctx: {}", e);
+                        }
+                    }
                 }
             }
         }

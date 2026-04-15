@@ -11,7 +11,7 @@ use tokio::sync::{mpsc, Mutex};
 
 use crate::db::repository;
 use crate::handler::formatter;
-use crate::handler::message::{shorten_model_name, format_ctx_suffix};
+use crate::handler::message::{shorten_model_name, format_ctx_suffix, CtxDisplayMode};
 use crate::i18n::Lang;
 use crate::ratelimit::RateLimitInfo;
 use super::background::BackgroundTaskTracker;
@@ -146,7 +146,7 @@ async fn fetch_context_usage(
     let _ = stdin.flush().await;
     let mut ctx_line = String::new();
     match tokio::time::timeout(
-        Duration::from_secs(2),
+        Duration::from_secs(12),
         reader.read_line(&mut ctx_line),
     ).await {
         Ok(Ok(n)) if n > 0 => {
@@ -162,7 +162,7 @@ async fn fetch_context_usage(
             None
         }
         Err(_) => {
-            tracing::warn!(thread_id = %thread_id, "get_context_usage: timeout (2s)");
+            tracing::warn!(thread_id = %thread_id, "get_context_usage: timeout (12s)");
             None
         }
     }
@@ -643,15 +643,14 @@ async fn handle_bg_turn(
                             Ok(StreamEvent::Result { duration_ms, total_cost_usd, input_tokens, output_tokens, context_window, total_input_tokens, is_error, ref errors, .. }) => {
                                 let is_interrupted = errors.iter().any(|err| err.contains("aborted"));
                                 // get_context_usage로 정확한 ctx% 확보
-                                let (context_window, total_input_tokens) = if let Some(ctx) = fetch_context_usage(stdin, reader, thread_id).await {
-                                    (ctx.max_tokens, ctx.total_tokens)
-                                } else {
-                                    (context_window, total_input_tokens)
+                                let ctx_mode = match fetch_context_usage(stdin, reader, thread_id).await {
+                                    Some(ctx) => CtxDisplayMode::from_tokens(ctx.total_tokens, ctx.max_tokens, true),
+                                    None => CtxDisplayMode::from_tokens(total_input_tokens, context_window, false),
                                 };
                                 let duration = formatter::format_duration(duration_ms);
                                 let cost = formatter::format_cost(total_cost_usd);
                                 let tokens = formatter::format_tokens(input_tokens, output_tokens);
-                                let ctx_suffix = format_ctx_suffix(total_input_tokens, context_window);
+                                let ctx_suffix = format_ctx_suffix(ctx_mode);
                                 let model_short = if model_name.is_empty() {
                                     String::new()
                                 } else {
@@ -1118,7 +1117,7 @@ async fn run_active_turn(
                             continue 'turn;
                         }
                         match parse_line(trimmed) {
-                            Ok(mut event) => {
+                            Ok(event) => {
                                 let event_name = match &event {
                                     StreamEvent::Assistant { .. } => "assistant",
                                     StreamEvent::User { .. } => "user",
@@ -1259,16 +1258,33 @@ async fn run_active_turn(
                                         "#36 debug: user turn Result received — ending turn"
                                     );
                                 }
-                                if is_result {
-                                    if let Some(ctx) = fetch_context_usage(stdin, reader, thread_id).await {
-                                        if let StreamEvent::Result { ref mut total_input_tokens, ref mut context_window, .. } = event {
-                                            *total_input_tokens = ctx.total_tokens;
-                                            *context_window = ctx.max_tokens;
-                                        }
-                                    }
-                                }
+                                // Result의 fallback 값 캡처 (fetch 실패 시 사용)
+                                let fallback = if is_result {
+                                    if let StreamEvent::Result { total_input_tokens, context_window, .. } = &event {
+                                        Some((*total_input_tokens, *context_window))
+                                    } else { None }
+                                } else { None };
+
+                                // Result를 fetch 완료 전에 즉시 전송
                                 let _ = event_tx.send(event).await;
+
                                 if is_result {
+                                    // fetch 후 ContextUsageUpdate 전송
+                                    let (fb_tokens, fb_window) = fallback.unwrap_or((0, 0));
+                                    let update = match fetch_context_usage(stdin, reader, thread_id).await {
+                                        Some(ctx) => StreamEvent::ContextUsageUpdate {
+                                            total_input_tokens: ctx.total_tokens,
+                                            context_window: ctx.max_tokens,
+                                            is_accurate: true,
+                                        },
+                                        None => StreamEvent::ContextUsageUpdate {
+                                            total_input_tokens: fb_tokens,
+                                            context_window: fb_window,
+                                            is_accurate: false,
+                                        },
+                                    };
+                                    let _ = event_tx.send(update).await;
+
                                     is_turn_active.store(false, Ordering::Relaxed);
                                     *last_activity.lock().unwrap_or_else(|p| p.into_inner()) = Instant::now();
                                     break 'turn false;

@@ -87,6 +87,11 @@ pub enum StreamEvent {
         output_file: Option<String>,
         session_id: String,
     },
+    ContextUsageUpdate {
+        total_input_tokens: u64,
+        context_window: u64,
+        is_accurate: bool,
+    },
     Unknown {
         raw: Value,
     },
@@ -105,6 +110,7 @@ impl StreamEvent {
             StreamEvent::TaskStarted { session_id, .. } => Some(session_id),
             StreamEvent::TaskProgress { session_id, .. } => Some(session_id),
             StreamEvent::TaskNotification { session_id, .. } => Some(session_id),
+            StreamEvent::ContextUsageUpdate { .. } => None,
             StreamEvent::Unknown { .. } => None,
         }
     }

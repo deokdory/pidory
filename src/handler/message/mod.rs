@@ -6,6 +6,7 @@ pub use event_processor::process_turn_events;
 pub(crate) use helpers::format_cli_command;
 pub(crate) use helpers::shorten_model_name;
 pub(crate) use helpers::format_ctx_suffix;
+pub use helpers::CtxDisplayMode;
 
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -601,7 +602,7 @@ async fn download_message_attachments(
 
 #[cfg(test)]
 mod tests {
-    use super::helpers::{build_context_content, format_cli_command, format_ctx_suffix, is_context_reset_command};
+    use super::helpers::{build_context_content, format_cli_command, format_ctx_suffix, is_context_reset_command, CtxDisplayMode};
     use crate::i18n::Lang;
 
     #[test]
@@ -653,11 +654,76 @@ mod tests {
 
     #[test]
     fn test_format_ctx_suffix() {
-        assert_eq!(format_ctx_suffix(26150, 1000000), " · ctx:2%");
-        assert_eq!(format_ctx_suffix(420000, 1000000), " · ctx:42%");
-        assert_eq!(format_ctx_suffix(0, 0), "");
-        assert_eq!(format_ctx_suffix(100, 0), "");
-        assert_eq!(format_ctx_suffix(1000000, 1000000), " · ctx:100%");
+        assert_eq!(format_ctx_suffix(CtxDisplayMode::Pending), " · ctx:-%");
+        assert_eq!(format_ctx_suffix(CtxDisplayMode::Accurate(45)), " · ctx:45%");
+        assert_eq!(format_ctx_suffix(CtxDisplayMode::Approximate(45)), " · ctx:~45%");
+        assert_eq!(format_ctx_suffix(CtxDisplayMode::Accurate(0)), "");
+        assert_eq!(format_ctx_suffix(CtxDisplayMode::Approximate(0)), "");
+        // from_tokens
+        assert_eq!(format_ctx_suffix(CtxDisplayMode::from_tokens(26150, 1000000, true)), " · ctx:2%");
+        assert_eq!(format_ctx_suffix(CtxDisplayMode::from_tokens(420000, 1000000, true)), " · ctx:42%");
+        assert_eq!(format_ctx_suffix(CtxDisplayMode::from_tokens(0, 0, true)), "");
+        assert_eq!(format_ctx_suffix(CtxDisplayMode::from_tokens(100, 0, false)), "");
+    }
+
+    #[test]
+    fn test_ctx_display_mode_accurate_boundary() {
+        // 상한값 99%
+        assert_eq!(format_ctx_suffix(CtxDisplayMode::Accurate(99)), " · ctx:99%");
+        // 100% (최대값)
+        assert_eq!(format_ctx_suffix(CtxDisplayMode::Accurate(100)), " · ctx:100%");
+        // 1% (최솟값 비제로)
+        assert_eq!(format_ctx_suffix(CtxDisplayMode::Accurate(1)), " · ctx:1%");
+    }
+
+    #[test]
+    fn test_ctx_display_mode_approximate_boundary() {
+        // 상한값 99%
+        assert_eq!(format_ctx_suffix(CtxDisplayMode::Approximate(99)), " · ctx:~99%");
+        // 100% (최대값)
+        assert_eq!(format_ctx_suffix(CtxDisplayMode::Approximate(100)), " · ctx:~100%");
+        // 1% (최솟값 비제로)
+        assert_eq!(format_ctx_suffix(CtxDisplayMode::Approximate(1)), " · ctx:~1%");
+    }
+
+    #[test]
+    fn test_ctx_display_mode_from_tokens_accurate() {
+        // 정확 모드: 45%
+        let mode = CtxDisplayMode::from_tokens(450000, 1000000, true);
+        assert!(matches!(mode, CtxDisplayMode::Accurate(45)));
+        assert_eq!(format_ctx_suffix(mode), " · ctx:45%");
+
+        // 정확 모드: context_window == 0 → Accurate(0) → 빈 문자열
+        let mode = CtxDisplayMode::from_tokens(100, 0, true);
+        assert!(matches!(mode, CtxDisplayMode::Accurate(0)));
+        assert_eq!(format_ctx_suffix(mode), "");
+
+        // 정확 모드: input_tokens > context_window → 100%로 클램프
+        let mode = CtxDisplayMode::from_tokens(2000000, 1000000, true);
+        assert!(matches!(mode, CtxDisplayMode::Accurate(100)));
+    }
+
+    #[test]
+    fn test_ctx_display_mode_from_tokens_approximate() {
+        // 근사 모드: 42%
+        let mode = CtxDisplayMode::from_tokens(420000, 1000000, false);
+        assert!(matches!(mode, CtxDisplayMode::Approximate(42)));
+        assert_eq!(format_ctx_suffix(mode), " · ctx:~42%");
+
+        // 근사 모드: context_window == 0 → Approximate(0) → 빈 문자열
+        let mode = CtxDisplayMode::from_tokens(100, 0, false);
+        assert!(matches!(mode, CtxDisplayMode::Approximate(0)));
+        assert_eq!(format_ctx_suffix(mode), "");
+
+        // 근사 모드: input_tokens > context_window → 100%로 클램프
+        let mode = CtxDisplayMode::from_tokens(2000000, 1000000, false);
+        assert!(matches!(mode, CtxDisplayMode::Approximate(100)));
+    }
+
+    #[test]
+    fn test_ctx_display_mode_pending() {
+        // Pending은 항상 " · ctx:-%"
+        assert_eq!(format_ctx_suffix(CtxDisplayMode::Pending), " · ctx:-%");
     }
 
     #[test]
