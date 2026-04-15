@@ -708,8 +708,8 @@ async fn handle_bg_turn(
                                         ContentBlock::ToolUse { name, input, .. } => {
                                             if name == "Skill" {
                                                 if let Some(skill_name) = input.get("skill").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
-                                                    if !used_skills.contains(&skill_name.to_string()) {
-                                                        used_skills.push(skill_name.to_string());
+                                                    if !used_skills.iter().any(|s| s == skill_name) {
+                                                        used_skills.push(skill_name.to_owned());
                                                     }
                                                 } else if !used_tools.contains(name) {
                                                     used_tools.push(name.clone());
