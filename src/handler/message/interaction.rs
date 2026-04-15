@@ -423,7 +423,8 @@ pub(super) async fn handle_interaction(
             .create_response(
                 ctx,
                 poise::serenity_prelude::CreateInteractionResponse::UpdateMessage(
-                    poise::serenity_prelude::CreateInteractionResponseMessage::new(),
+                    poise::serenity_prelude::CreateInteractionResponseMessage::new()
+                        .components(vec![]),
                 ),
             )
             .await
@@ -443,6 +444,10 @@ pub(super) async fn handle_interaction(
             return Ok(());
         }
 
+        if data.next_step_buttons.lock().await.remove(&thread_id).is_none() {
+            return Ok(());
+        }
+
         let channel_id = component.channel_id;
         let msg_id = component.message.id;
 
@@ -457,12 +462,6 @@ pub(super) async fn handle_interaction(
                 .await
                 .ok();
             return Ok(());
-        }
-
-        if let Some(btn_msg_id) = data.next_step_buttons.lock().await.remove(&thread_id) {
-            next_step_ui::disable_next_step_buttons(ctx, channel_id, btn_msg_id)
-                .await
-                .ok();
         }
 
         let cli_command = super::helpers::format_cli_command("skill", Some(&skill_name));

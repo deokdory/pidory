@@ -147,10 +147,9 @@ fn extract_skill_names(text: &str) -> Vec<&str> {
             continue;
         }
 
-        // Extend while lowercase alphanumeric or hyphen
         let mut end = start;
         while end < bytes.len()
-            && (bytes[end].is_ascii_alphanumeric() || bytes[end] == b'-')
+            && (bytes[end].is_ascii_lowercase() || bytes[end].is_ascii_digit() || bytes[end] == b'-')
         {
             end += 1;
         }
@@ -174,21 +173,21 @@ pub fn create_next_step_components(skills: &[String], thread_id: &str) -> Vec<Cr
         return vec![];
     }
 
-    // custom_id limit is 100 chars. prefix "nxt:" = 4, ":" separator = 1, total prefix overhead = 5.
-    // thread_id + skill must fit in 95 chars; truncate thread_id if needed.
     const MAX_CUSTOM_ID: usize = 100;
-    const PREFIX_LEN: usize = "nxt:".len() + ":".len(); // 5
 
     let buttons: Vec<CreateButton> = skills
         .iter()
         .take(5)
-        .map(|skill| {
-            let available = MAX_CUSTOM_ID.saturating_sub(PREFIX_LEN).saturating_sub(skill.len());
-            let truncated_thread_id: String = thread_id.chars().take(available).collect();
-            let custom_id = format!("nxt:{}:{}", truncated_thread_id, skill);
-            CreateButton::new(custom_id)
-                .label(format!("/{}", skill))
-                .style(ButtonStyle::Secondary)
+        .filter_map(|skill| {
+            let custom_id = format!("nxt:{}:{}", thread_id, skill);
+            if custom_id.len() > MAX_CUSTOM_ID {
+                return None;
+            }
+            Some(
+                CreateButton::new(custom_id)
+                    .label(format!("/{}", skill))
+                    .style(ButtonStyle::Secondary),
+            )
         })
         .collect();
 
@@ -200,6 +199,9 @@ pub fn create_next_step_components(skills: &[String], thread_id: &str) -> Vec<Cr
 pub fn parse_next_step_custom_id(custom_id: &str) -> Option<(String, String)> {
     let rest = custom_id.strip_prefix("nxt:")?;
     let (thread_part, skill_name) = rest.rsplit_once(':')?;
+    if skill_name.is_empty() {
+        return None;
+    }
     Some((thread_part.to_string(), skill_name.to_string()))
 }
 
@@ -368,9 +370,8 @@ mod tests {
 
     #[test]
     fn parse_next_step_empty_skill() {
-        // "nxt:123:" — skill part is empty string after last ':'
         let result = parse_next_step_custom_id("nxt:123:");
-        assert_eq!(result, Some(("123".to_string(), "".to_string())));
+        assert_eq!(result, None);
     }
 
     #[test]
