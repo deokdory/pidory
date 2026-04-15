@@ -5,7 +5,7 @@ use poise::serenity_prelude::{Context, UserId};
 use crate::Data;
 use crate::db::repository;
 use crate::error::PidoryError;
-use crate::handler::{permission_ui, question_ui, reset_ui};
+use crate::handler::{next_step_ui, permission_ui, question_ui, reset_ui};
 use crate::i18n::Lang;
 use crate::subprocess::permission::PermissionDecision;
 
@@ -352,6 +352,7 @@ pub(super) async fn handle_interaction(
 
                 // Clean up in-memory maps
                 data.session_skills.lock().await.remove(&thread_id);
+                data.next_step_buttons.lock().await.remove(&thread_id);
                 data.pending_permissions
                     .lock()
                     .await
@@ -410,6 +411,71 @@ pub(super) async fn handle_interaction(
                 .ok();
             }
         }
+
+        return Ok(());
+    }
+
+    // Try next-step skill button: nxt:{thread_id}:{skill_name}
+    if let Some((thread_id, skill_name)) =
+        next_step_ui::parse_next_step_custom_id(&component.data.custom_id)
+    {
+        component
+            .create_response(
+                ctx,
+                poise::serenity_prelude::CreateInteractionResponse::UpdateMessage(
+                    poise::serenity_prelude::CreateInteractionResponseMessage::new()
+                        .components(vec![]),
+                ),
+            )
+            .await
+            .ok();
+
+        let is_owner = component.user.id == UserId::new(data.config.discord.owner_id);
+        if !is_owner {
+            component
+                .create_followup(
+                    ctx,
+                    poise::serenity_prelude::CreateInteractionResponseFollowup::new()
+                        .content(format!("❌ {}", lang.no_permission()))
+                        .ephemeral(true),
+                )
+                .await
+                .ok();
+            return Ok(());
+        }
+
+        if data.next_step_buttons.lock().await.remove(&thread_id).is_none() {
+            return Ok(());
+        }
+
+        let channel_id = component.channel_id;
+        let msg_id = component.message.id;
+
+        if !data.sessions.session_exists(&thread_id).await {
+            component
+                .create_followup(
+                    ctx,
+                    poise::serenity_prelude::CreateInteractionResponseFollowup::new()
+                        .content(format!("❌ {}", lang.no_session_in_thread()))
+                        .ephemeral(true),
+                )
+                .await
+                .ok();
+            return Ok(());
+        }
+
+        let cli_command = super::helpers::format_cli_command("skill", Some(&skill_name));
+        super::execute_in_session(
+            ctx,
+            data,
+            &thread_id,
+            channel_id,
+            msg_id,
+            &cli_command,
+            component.user.id,
+        )
+        .await
+        .ok();
 
         return Ok(());
     }

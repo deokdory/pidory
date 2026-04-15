@@ -68,6 +68,8 @@ pub struct Data {
     pub kick_cooldowns: Arc<Mutex<HashMap<String, Instant>>>,
     /// kick 후 interrupt 대기 중인 thread_id 집합 (자연 완료 시 제거됨)
     pub kick_pending: Arc<Mutex<HashSet<String>>>,
+    /// thread_id → next-step 버튼이 붙은 메시지 ID (다음 턴 시 비활성화용)
+    pub next_step_buttons: Arc<Mutex<HashMap<String, serenity::MessageId>>>,
     /// Event handler가 fresh Context를 background task에 전달하는 채널.
     /// Shard reconnect 후에도 최신 ShardMessenger를 사용할 수 있게 해준다.
     pub ctx_watch: watch::Sender<serenity::Context>,
@@ -212,6 +214,7 @@ async fn main() -> Result<(), PidoryError> {
                 let kick_cooldowns: Arc<Mutex<HashMap<String, Instant>>> = Arc::new(Mutex::new(HashMap::new()));
                 let kick_pending: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
                 let needs_context = Arc::new(Mutex::new(HashSet::new()));
+                let next_step_buttons: Arc<Mutex<HashMap<String, serenity::MessageId>>> = Arc::new(Mutex::new(HashMap::new()));
 
                 // Idle session TTL sweep
                 {
@@ -226,6 +229,7 @@ async fn main() -> Result<(), PidoryError> {
                     let last_tool_name = Arc::clone(&last_tool_name);
                     let kick_cooldowns = Arc::clone(&kick_cooldowns);
                     let kick_pending = Arc::clone(&kick_pending);
+                    let next_step_buttons = Arc::clone(&next_step_buttons);
                     let db_clone = db.clone();
                     let lang = config.language;
                     let mut ctx_rx = ctx_tx.subscribe();
@@ -249,6 +253,7 @@ async fn main() -> Result<(), PidoryError> {
                                         last_tool_name.lock().await.remove(tid);
                                         kick_cooldowns.lock().await.remove(tid);
                                         kick_pending.lock().await.remove(tid);
+                                        next_step_buttons.lock().await.remove(tid);
                                         if let Err(e) = db::repository::update_session_status(&db_clone, tid, "idle").await {
                                             tracing::warn!("Failed to update session status for TTL sweep thread {}: {}", tid, e);
                                         }
@@ -331,6 +336,7 @@ async fn main() -> Result<(), PidoryError> {
                     last_tool_name,
                     kick_cooldowns,
                     kick_pending,
+                    next_step_buttons,
                     ctx_watch: ctx_tx,
                 })
             })
