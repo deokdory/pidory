@@ -101,6 +101,21 @@ pub async fn update_session_id(
     Ok(())
 }
 
+pub async fn update_session_model(
+    pool: &SqlitePool,
+    thread_id: &str,
+    model: &str,
+) -> Result<(), PidoryError> {
+    sqlx::query("UPDATE sessions SET model = ? WHERE thread_id = ?")
+        .bind(model)
+        .bind(thread_id)
+        .execute(pool)
+        .await
+        .map_err(PidoryError::Db)?;
+
+    Ok(())
+}
+
 pub async fn update_session_status(
     pool: &SqlitePool,
     thread_id: &str,
@@ -246,6 +261,12 @@ mod tests {
         update_session_id(&pool, "th1", "uuid-123").await.unwrap();
         let s = get_session_by_thread(&pool, "th1").await.unwrap().unwrap();
         assert_eq!(s.session_id, Some("uuid-123".to_string()));
+
+        // update model
+        assert!(s.model.is_none());
+        update_session_model(&pool, "th1", "claude-opus-4-5").await.unwrap();
+        let s = get_session_by_thread(&pool, "th1").await.unwrap().unwrap();
+        assert_eq!(s.model, Some("claude-opus-4-5".to_string()));
 
         // update status
         update_session_status(&pool, "th1", "running").await.unwrap();

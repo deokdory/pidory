@@ -50,6 +50,8 @@ pub struct ClaudeConfig {
     pub max_sessions: usize,
     #[serde(default = "default_idle_timeout_secs")]
     pub idle_timeout_secs: u64,
+    #[serde(default)]
+    pub default_model: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
