@@ -43,6 +43,7 @@ pub(super) async fn send_event_to_discord(
     event: &StreamEvent,
     tool_use_names: &mut HashMap<String, String>,
     used_tools: &mut Vec<String>,
+    used_skills: &mut Vec<String>,
     max_chunk_length: usize,
     lang: Lang,
     last_tool_name: &std::sync::Arc<tokio::sync::Mutex<HashMap<String, String>>>,
@@ -70,7 +71,15 @@ pub(super) async fn send_event_to_discord(
                     }
                     ContentBlock::ToolUse { id, name, input } => {
                         tool_use_names.insert(id.clone(), name.clone());
-                        if !used_tools.contains(name) {
+                        if name == "Skill" {
+                            if let Some(skill_name) = input.get("skill").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+                                if !used_skills.iter().any(|s| s == skill_name) {
+                                    used_skills.push(skill_name.to_owned());
+                                }
+                            } else if !used_tools.contains(name) {
+                                used_tools.push(name.clone());
+                            }
+                        } else if !used_tools.contains(name) {
                             used_tools.push(name.clone());
                         }
                         {
@@ -193,11 +202,12 @@ pub async fn process_turn_events(
     // 4. 빠른 완료가 아니면 나머지 이벤트 루프
     let mut tool_use_names: HashMap<String, String> = HashMap::new();
     let mut used_tools: Vec<String> = Vec::new();
+    let mut used_skills: Vec<String> = Vec::new();
 
     if !fast_complete {
         // 버퍼링된 이벤트 먼저 전송
         for event in &events {
-            send_event_to_discord(ctx, channel_id, event, &mut tool_use_names, &mut used_tools, max_chunk_length, lang, &last_tool_name, thread_id, todo_tracker.clone()).await;
+            send_event_to_discord(ctx, channel_id, event, &mut tool_use_names, &mut used_tools, &mut used_skills, max_chunk_length, lang, &last_tool_name, thread_id, todo_tracker.clone()).await;
         }
 
         // Progress indicator 초기화
@@ -241,7 +251,7 @@ pub async fn process_turn_events(
                             typing_paused.store(progress.is_active(), Ordering::Relaxed);
 
                             // 기존 이벤트 처리
-                            send_event_to_discord(ctx, channel_id, &stream_event, &mut tool_use_names, &mut used_tools, max_chunk_length, lang, &last_tool_name, thread_id, todo_tracker.clone()).await;
+                            send_event_to_discord(ctx, channel_id, &stream_event, &mut tool_use_names, &mut used_tools, &mut used_skills, max_chunk_length, lang, &last_tool_name, thread_id, todo_tracker.clone()).await;
 
                             if stream_event.is_result() {
                                 got_result = true;
@@ -418,12 +428,19 @@ pub async fn process_turn_events(
         };
         let model_part = if turn_model.is_empty() { String::new() } else { format!("**{}**", turn_model) };
         let stats_line = format!("-# {} · {} · {} · {}{}", model_part, duration, cost, tokens, ctx_suffix);
-        let summary = if used_tools.is_empty() {
-            format!("-# ✅ {}\n{}", mentions, stats_line)
+        let tools_line = if used_tools.is_empty() {
+            String::new()
         } else {
             used_tools.dedup();
-            format!("-# ✅ {}\n{}\n-# Tools: {}", mentions, stats_line, used_tools.iter().map(|t| formatter::inline_code(t)).collect::<Vec<_>>().join(", "))
+            format!("\n-# Tools: {}", used_tools.iter().map(|t| formatter::inline_code(t)).collect::<Vec<_>>().join(", "))
         };
+        let skills_line = if used_skills.is_empty() {
+            String::new()
+        } else {
+            used_skills.dedup();
+            format!("\n-# Skills: {}", used_skills.iter().map(|s| formatter::inline_code(s)).collect::<Vec<_>>().join(", "))
+        };
+        let summary = format!("-# ✅ {}\n{}{}{}", mentions, stats_line, tools_line, skills_line);
         if let Err(e) = repository::update_session_status(db, thread_id, "idle").await {
             tracing::warn!("Failed to update session status for thread {}: {}", thread_id, e);
         }
