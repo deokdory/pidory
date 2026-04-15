@@ -15,7 +15,7 @@ use crate::handler::message::{shorten_model_name, format_ctx_suffix};
 use crate::i18n::Lang;
 use crate::ratelimit::RateLimitInfo;
 use super::background::BackgroundTaskTracker;
-use super::parser::{parse_line, StreamEvent, ContentBlock, build_control_response_allow, build_control_response_deny, build_control_response_ask_answer, parse_context_usage_response, ContextUsageInfo};
+use super::parser::{parse_line, StreamEvent, ContentBlock, build_control_response_allow, build_control_response_deny, build_control_response_ask_answer};
 use super::permission::{PermissionCache, PermissionDecision, PermissionRequest};
 use super::session_manager::{QueuedMessage, SessionInner, ReplyContext};
 
@@ -119,53 +119,6 @@ fn build_interrupt_json() -> String {
         "request": {"subtype": "interrupt"}
     });
     format!("{}\n", msg)
-}
-
-fn build_get_context_usage_json() -> String {
-    let msg = serde_json::json!({
-        "type": "control_request",
-        "request_id": format!("ctx_{}", std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis()),
-        "request": {"subtype": "get_context_usage"}
-    });
-    format!("{}\n", msg)
-}
-
-async fn fetch_context_usage(
-    stdin: &mut ChildStdin,
-    reader: &mut BufReader<ChildStdout>,
-    thread_id: &str,
-) -> Option<ContextUsageInfo> {
-    let ctx_req = build_get_context_usage_json();
-    if let Err(e) = stdin.write_all(ctx_req.as_bytes()).await {
-        tracing::warn!(thread_id = %thread_id, "get_context_usage stdin write error: {}", e);
-        return None;
-    }
-    let _ = stdin.flush().await;
-    let mut ctx_line = String::new();
-    match tokio::time::timeout(
-        Duration::from_secs(2),
-        reader.read_line(&mut ctx_line),
-    ).await {
-        Ok(Ok(n)) if n > 0 => {
-            tracing::debug!(thread_id = %thread_id, "get_context_usage response received");
-            parse_context_usage_response(ctx_line.trim())
-        }
-        Ok(Ok(_)) => {
-            tracing::warn!(thread_id = %thread_id, "get_context_usage: empty response (EOF)");
-            None
-        }
-        Ok(Err(e)) => {
-            tracing::warn!(thread_id = %thread_id, "get_context_usage read error: {}", e);
-            None
-        }
-        Err(_) => {
-            tracing::warn!(thread_id = %thread_id, "get_context_usage: timeout (2s)");
-            None
-        }
-    }
 }
 
 // ─── T2: Between-turns event action ────────────────────────────────────────
@@ -642,12 +595,6 @@ async fn handle_bg_turn(
                         match parse_line(trimmed) {
                             Ok(StreamEvent::Result { duration_ms, total_cost_usd, input_tokens, output_tokens, context_window, total_input_tokens, is_error, ref errors, .. }) => {
                                 let is_interrupted = errors.iter().any(|err| err.contains("aborted"));
-                                // get_context_usage로 정확한 ctx% 확보
-                                let (context_window, total_input_tokens) = if let Some(ctx) = fetch_context_usage(stdin, reader, thread_id).await {
-                                    (ctx.max_tokens, ctx.total_tokens)
-                                } else {
-                                    (context_window, total_input_tokens)
-                                };
                                 let duration = formatter::format_duration(duration_ms);
                                 let cost = formatter::format_cost(total_cost_usd);
                                 let tokens = formatter::format_tokens(input_tokens, output_tokens);
@@ -1118,7 +1065,7 @@ async fn run_active_turn(
                             continue 'turn;
                         }
                         match parse_line(trimmed) {
-                            Ok(mut event) => {
+                            Ok(event) => {
                                 let event_name = match &event {
                                     StreamEvent::Assistant { .. } => "assistant",
                                     StreamEvent::User { .. } => "user",
@@ -1258,14 +1205,6 @@ async fn run_active_turn(
                                         session_id = sid,
                                         "#36 debug: user turn Result received — ending turn"
                                     );
-                                }
-                                if is_result {
-                                    if let Some(ctx) = fetch_context_usage(stdin, reader, thread_id).await {
-                                        if let StreamEvent::Result { ref mut total_input_tokens, ref mut context_window, .. } = event {
-                                            *total_input_tokens = ctx.total_tokens;
-                                            *context_window = ctx.max_tokens;
-                                        }
-                                    }
                                 }
                                 let _ = event_tx.send(event).await;
                                 if is_result {
