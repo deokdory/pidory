@@ -5,7 +5,7 @@ fn validate_model_name(name: &str) -> Option<String> {
     let normalized = name.to_lowercase();
     match normalized.as_str() {
         "opus" | "sonnet" | "haiku" => Some(normalized),
-        s if s.starts_with("claude-") => Some(normalized),
+        s if s.strip_prefix("claude-").is_some_and(|rest| !rest.is_empty()) => Some(normalized),
         _ => None,
     }
 }
@@ -170,8 +170,13 @@ mod tests {
 
     #[test]
     fn validate_partial_claude_prefix_rejected() {
-        // "claude" alone doesn't start with "claude-"
         assert_eq!(validate_model_name("claude"), None);
+    }
+
+    #[test]
+    fn validate_bare_claude_dash_rejected() {
+        assert_eq!(validate_model_name("claude-"), None);
+        assert_eq!(validate_model_name("CLAUDE-"), None);
     }
 }
 
