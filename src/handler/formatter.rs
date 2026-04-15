@@ -1197,6 +1197,17 @@ pub fn format_tool_use(name: &str, input: &serde_json::Value) -> String {
         "TodoWrite" => {
             String::new()  // embed로 처리됨, 일반 메시지 불필요
         }
+        "Skill" => {
+            let skill_name = input
+                .get("skill")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if skill_name.is_empty() {
+                format!("-# 🔧 **Skill**")
+            } else {
+                format!("-# 🔧 **Skill** {}", skill_name)
+            }
+        }
         _ => format!("-# 🔧 **{}**", name),
     }
 }

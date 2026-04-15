@@ -623,6 +623,7 @@ async fn handle_bg_turn(
     model_name: &mut String,
 ) {
     let mut used_tools: Vec<String> = Vec::new();
+    let mut used_skills: Vec<String> = Vec::new();
     let bg_triggered_by = *current_triggered_by;
     'bg_turn: loop {
         line.clear();
@@ -666,12 +667,19 @@ async fn handle_bg_turn(
                                 let stats_line = format!("-# {}{}", stats, ctx_suffix);
                                 let mention = format!("<@{}>", bg_triggered_by);
                                 let icon = if is_interrupted { "⏹️" } else if is_error { "❌" } else { "✅" };
-                                let summary = if used_tools.is_empty() {
-                                    format!("-# {} {}\n{}", icon, mention, stats_line)
+                                let tools_line = if used_tools.is_empty() {
+                                    String::new()
                                 } else {
                                     let tools_str = used_tools.iter().map(|t| formatter::inline_code(t)).collect::<Vec<_>>().join(", ");
-                                    format!("-# {} {}\n{}\n-# Tools: {}", icon, mention, stats_line, tools_str)
+                                    format!("\n-# Tools: {}", tools_str)
                                 };
+                                let skills_line = if used_skills.is_empty() {
+                                    String::new()
+                                } else {
+                                    used_skills.dedup();
+                                    format!("\n-# Skills: {}", used_skills.iter().map(|s| formatter::inline_code(s)).collect::<Vec<_>>().join(", "))
+                                };
+                                let summary = format!("-# {} {}\n{}{}{}", icon, mention, stats_line, tools_line, skills_line);
                                 // bg turn 종료 — pending TodoWrite flush
                                 let tracker = todo_trackers.lock().await.get(thread_id).cloned();
                                 if let Some(tracker) = tracker {
@@ -698,7 +706,15 @@ async fn handle_bg_turn(
                                             say_silent_chunked(ctx, channel_id, &bg_text).await;
                                         }
                                         ContentBlock::ToolUse { name, input, .. } => {
-                                            if !used_tools.contains(name) {
+                                            if name == "Skill" {
+                                                if let Some(skill_name) = input.get("skill").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+                                                    if !used_skills.contains(&skill_name.to_string()) {
+                                                        used_skills.push(skill_name.to_string());
+                                                    }
+                                                } else if !used_tools.contains(name) {
+                                                    used_tools.push(name.clone());
+                                                }
+                                            } else if !used_tools.contains(name) {
                                                 used_tools.push(name.clone());
                                             }
                                             if name == "TodoWrite" {
