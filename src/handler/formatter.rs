@@ -35,7 +35,9 @@ pub fn format_response(events: &[StreamEvent], lang: Lang) -> (String, Vec<Strin
                                 file_paths.extend(paths);
                                 if !cleaned.is_empty() {
                                     let table_converted = convert_markdown_tables(&cleaned);
-                                    parts.push(convert_html_details(&table_converted));
+                                    let details_converted = convert_html_details(&table_converted);
+                                    let stripped = super::next_step_ui::strip_next_step_markers(&details_converted);
+                                    parts.push(stripped);
                                 }
                             }
                         }
