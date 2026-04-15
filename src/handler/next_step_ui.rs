@@ -103,7 +103,7 @@ pub fn extract_next_steps(events: &[StreamEvent], valid_skills: &[String]) -> Ve
     let mut seen: HashSet<String> = HashSet::new();
     let mut result: Vec<String> = Vec::new();
 
-    for skill in extract_skill_names(&stripped) {
+    for skill in parse_next_step_marker(&stripped) {
         if result.len() >= 5 {
             break;
         }
@@ -116,51 +116,65 @@ pub fn extract_next_steps(events: &[StreamEvent], valid_skills: &[String]) -> Ve
     result
 }
 
-/// Extracts raw skill name candidates (without leading `/`) from text.
-/// A valid skill reference is `/` preceded by whitespace, backtick, `(`, `[`, or start-of-string,
-/// followed by a lowercase ASCII letter and then lowercase letters, digits, or hyphens.
-fn extract_skill_names(text: &str) -> Vec<&str> {
+/// Parses `<!-- next: skill1, skill2 -->` markers from text.
+/// Returns skill names without leading `/`.
+fn parse_next_step_marker(text: &str) -> Vec<&str> {
     let mut skills = Vec::new();
+    let mut pos = 0;
 
-    // Use char_indices to handle multi-byte chars correctly while checking prev byte.
-    let bytes = text.as_bytes();
-
-    for (i, &b) in bytes.iter().enumerate() {
-        if b != b'/' {
-            continue;
-        }
-
-        // Check preceding character
-        let prev_ok = if i == 0 {
-            true
-        } else {
-            matches!(bytes[i - 1], b' ' | b'\t' | b'\n' | b'\r' | b'`' | b'(' | b'[')
+    while pos < text.len() {
+        let remaining = &text[pos..];
+        let Some(open) = remaining.find("<!--") else {
+            break;
         };
-
-        if !prev_ok {
-            continue;
+        let after_open = &remaining[open + 4..];
+        let Some(close) = after_open.find("-->") else {
+            break;
+        };
+        let inner = after_open[..close].trim();
+        if let Some(list) = inner.strip_prefix("next:") {
+            for item in list.split(',') {
+                let skill = item.trim().trim_start_matches('/');
+                if !skill.is_empty() {
+                    skills.push(skill);
+                }
+            }
         }
-
-        // Must start with lowercase ASCII letter
-        let start = i + 1;
-        if start >= bytes.len() || !bytes[start].is_ascii_lowercase() {
-            continue;
-        }
-
-        let mut end = start;
-        while end < bytes.len()
-            && (bytes[end].is_ascii_lowercase() || bytes[end].is_ascii_digit() || bytes[end] == b'-')
-        {
-            end += 1;
-        }
-
-        if end > start {
-            // Safety: all bytes in [start..end] are ASCII
-            skills.push(&text[start..end]);
-        }
+        pos += open + 4 + close + 3;
     }
 
     skills
+}
+
+/// Strips `<!-- next: ... -->` markers from text for display.
+pub fn strip_next_step_markers(text: &str) -> String {
+    let mut result = String::with_capacity(text.len());
+    let mut pos = 0;
+
+    while pos < text.len() {
+        let remaining = &text[pos..];
+        let Some(open) = remaining.find("<!--") else {
+            result.push_str(remaining);
+            break;
+        };
+        let after_open = &remaining[open + 4..];
+        let Some(close) = after_open.find("-->") else {
+            result.push_str(remaining);
+            break;
+        };
+        let inner = after_open[..close].trim();
+        if inner.starts_with("next:") {
+            result.push_str(&remaining[..open]);
+            pos += open + 4 + close + 3;
+        } else {
+            result.push_str(&remaining[..open + 4 + close + 3]);
+            pos += open + 4 + close + 3;
+        }
+    }
+
+    let len = result.trim_end().len();
+    result.truncate(len);
+    result
 }
 
 // ─── UI helpers ─────────────────────────────────────────────────────────────
@@ -233,75 +247,138 @@ mod tests {
         names.iter().map(|s| s.to_string()).collect()
     }
 
-    // 1. Normal detection
+    // ─── parse_next_step_marker ─────────────────────────────────────────────
+
     #[test]
-    fn detects_valid_skill() {
-        let events = vec![make_assistant("`/session-commit` 해")];
+    fn marker_single_skill() {
+        let result = parse_next_step_marker("<!-- next: session-commit -->");
+        assert_eq!(result, vec!["session-commit"]);
+    }
+
+    #[test]
+    fn marker_multiple_skills() {
+        let result = parse_next_step_marker("<!-- next: session-commit, my-pr, verify -->");
+        assert_eq!(result, vec!["session-commit", "my-pr", "verify"]);
+    }
+
+    #[test]
+    fn marker_with_slash_prefix() {
+        let result = parse_next_step_marker("<!-- next: /session-commit, /my-pr -->");
+        assert_eq!(result, vec!["session-commit", "my-pr"]);
+    }
+
+    #[test]
+    fn marker_empty() {
+        let result = parse_next_step_marker("<!-- next: -->");
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn marker_no_spaces() {
+        let result = parse_next_step_marker("<!--next:session-commit-->");
+        assert_eq!(result, vec!["session-commit"]);
+    }
+
+    #[test]
+    fn marker_extra_spaces() {
+        let result = parse_next_step_marker("<!--  next:  session-commit ,  my-pr  -->");
+        assert_eq!(result, vec!["session-commit", "my-pr"]);
+    }
+
+    #[test]
+    fn marker_empty_entries() {
+        let result = parse_next_step_marker("<!-- next: skill1,,skill2 -->");
+        assert_eq!(result, vec!["skill1", "skill2"]);
+    }
+
+    #[test]
+    fn no_marker_returns_empty() {
+        let result = parse_next_step_marker("일반 텍스트 /session-commit");
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn multiple_markers_combined() {
+        let text = "part1\n<!-- next: build -->\npart2\n<!-- next: verify -->";
+        let result = parse_next_step_marker(text);
+        assert_eq!(result, vec!["build", "verify"]);
+    }
+
+    #[test]
+    fn non_next_html_comment_ignored() {
+        let result = parse_next_step_marker("<!-- some other comment -->");
+        assert!(result.is_empty());
+    }
+
+    // ─── extract_next_steps (marker-based) ──────────────────────────────────
+
+    #[test]
+    fn detects_marker_skill() {
+        let events = vec![make_assistant("작업 완료\n<!-- next: session-commit -->")];
         let result = extract_next_steps(&events, &skills(&["session-commit"]));
         assert_eq!(result, vec!["session-commit"]);
     }
 
-    // 2. Skill inside fenced code block is ignored
     #[test]
-    fn ignores_skill_in_fenced_code_block() {
-        let text = "일반 텍스트\n```\n/build\n```\n여기는 아님";
+    fn ignores_plain_slash_skill() {
+        let events = vec![make_assistant("`/session-commit` 해")];
+        let result = extract_next_steps(&events, &skills(&["session-commit"]));
+        assert_eq!(result, Vec::<String>::new());
+    }
+
+    #[test]
+    fn ignores_marker_in_code_block() {
+        let text = "일반 텍스트\n```\n<!-- next: build -->\n```\n여기는 아님";
         let events = vec![make_assistant(text)];
         let result = extract_next_steps(&events, &skills(&["build"]));
         assert_eq!(result, Vec::<String>::new());
     }
 
-    // 3. Natural language slash (e.g. "커밋/push") doesn't match
     #[test]
-    fn ignores_natural_language_slash() {
-        let events = vec![make_assistant("커밋/push 할까?")];
-        let result = extract_next_steps(&events, &skills(&["push"]));
-        assert_eq!(result, Vec::<String>::new());
-    }
-
-    // 4. Empty valid_skills returns empty
-    #[test]
-    fn empty_valid_skills_returns_empty() {
-        let events = vec![make_assistant("/session-commit 해")];
-        let result = extract_next_steps(&events, &[]);
-        assert_eq!(result, Vec::<String>::new());
-    }
-
-    // 5. Deduplication
-    #[test]
-    fn deduplicates_skills() {
-        let events = vec![make_assistant("/build 먼저, 그다음 /build 또")];
+    fn filters_invalid_skills() {
+        let events = vec![make_assistant("<!-- next: build, nonexistent -->")];
         let result = extract_next_steps(&events, &skills(&["build"]));
         assert_eq!(result, vec!["build"]);
     }
 
-    // 6. Maximum 5 skills
     #[test]
-    fn limits_to_five_skills() {
-        let text = "/a /b /c /d /e /f";
-        let events = vec![make_assistant(text)];
+    fn deduplicates_marker_skills() {
+        let events = vec![make_assistant("<!-- next: build, build -->")];
+        let result = extract_next_steps(&events, &skills(&["build"]));
+        assert_eq!(result, vec!["build"]);
+    }
+
+    #[test]
+    fn limits_to_five() {
+        let events = vec![make_assistant("<!-- next: a, b, c, d, e, f -->")];
         let valid = skills(&["a", "b", "c", "d", "e", "f"]);
         let result = extract_next_steps(&events, &valid);
         assert_eq!(result.len(), 5);
     }
 
-    // 7. Empty events returns empty
     #[test]
     fn empty_events_returns_empty() {
         let result = extract_next_steps(&[], &skills(&["build"]));
         assert_eq!(result, Vec::<String>::new());
     }
 
-    // 8. Only the last Assistant event's text is used
+    #[test]
+    fn empty_valid_skills_returns_empty() {
+        let events = vec![make_assistant("<!-- next: session-commit -->")];
+        let result = extract_next_steps(&events, &[]);
+        assert_eq!(result, Vec::<String>::new());
+    }
+
     #[test]
     fn uses_only_last_assistant_event() {
-        let first = make_assistant("/session-commit 해줘");
+        let first = make_assistant("<!-- next: session-commit -->");
         let last = make_assistant("이번엔 아무것도 없어요");
         let events = vec![first, last];
         let result = extract_next_steps(&events, &skills(&["session-commit"]));
         assert_eq!(result, Vec::<String>::new());
     }
 
-    // strip_fenced_code_blocks helpers
+    // ─── strip_fenced_code_blocks ───────────────────────────────────────────
 
     #[test]
     fn strip_removes_fenced_block() {
@@ -327,20 +404,37 @@ mod tests {
         assert!(result.contains("end"));
     }
 
-    // Skill with opening bracket/parenthesis before slash
+    // ─── strip_next_step_markers ────────────────────────────────────────────
+
     #[test]
-    fn detects_skill_after_bracket() {
-        let events = vec![make_assistant("([/craft] 해봐)")];
-        let result = extract_next_steps(&events, &skills(&["craft"]));
-        assert_eq!(result, vec!["craft"]);
+    fn strips_marker_from_text() {
+        let result = strip_next_step_markers("작업 완료\n<!-- next: session-commit -->");
+        assert_eq!(result, "작업 완료");
     }
 
-    // Skill at start of string
     #[test]
-    fn detects_skill_at_start_of_string() {
-        let events = vec![make_assistant("/verify 실행해")];
-        let result = extract_next_steps(&events, &skills(&["verify"]));
-        assert_eq!(result, vec!["verify"]);
+    fn strips_marker_trailing_newline() {
+        let result = strip_next_step_markers("작업 완료\n<!-- next: session-commit -->\n");
+        assert_eq!(result, "작업 완료");
+    }
+
+    #[test]
+    fn no_marker_unchanged() {
+        let text = "일반 텍스트입니다";
+        let result = strip_next_step_markers(text);
+        assert_eq!(result, text);
+    }
+
+    #[test]
+    fn multiple_markers_stripped() {
+        let result = strip_next_step_markers("text<!-- next: a -->middle<!-- next: b -->end");
+        assert_eq!(result, "textmiddleend");
+    }
+
+    #[test]
+    fn preserves_non_next_html_comment() {
+        let result = strip_next_step_markers("text<!-- some comment -->end");
+        assert_eq!(result, "text<!-- some comment -->end");
     }
 
     // ─── parse_next_step_custom_id ───────────────────────────────────────────
