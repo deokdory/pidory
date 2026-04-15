@@ -87,6 +87,11 @@ pub enum StreamEvent {
         output_file: Option<String>,
         session_id: String,
     },
+    CompactBoundary {
+        pre_tokens: Option<u64>,
+        trigger: Option<String>,
+        session_id: String,
+    },
     Unknown {
         raw: Value,
     },
@@ -105,6 +110,7 @@ impl StreamEvent {
             StreamEvent::TaskStarted { session_id, .. } => Some(session_id),
             StreamEvent::TaskProgress { session_id, .. } => Some(session_id),
             StreamEvent::TaskNotification { session_id, .. } => Some(session_id),
+            StreamEvent::CompactBoundary { session_id, .. } => Some(session_id),
             StreamEvent::Unknown { .. } => None,
         }
     }

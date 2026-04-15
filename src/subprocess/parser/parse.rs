@@ -156,6 +156,25 @@ pub fn parse_line(line: &str) -> Result<StreamEvent, serde_json::Error> {
                     output_file,
                     session_id,
                 })
+            } else if subtype == "compact_boundary" {
+                let session_id = v
+                    .get("session_id")
+                    .and_then(|s| s.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let compact_metadata = v.get("compact_metadata");
+                let pre_tokens = compact_metadata
+                    .and_then(|m| m.get("pre_tokens"))
+                    .and_then(|t| t.as_u64());
+                let trigger = compact_metadata
+                    .and_then(|m| m.get("trigger"))
+                    .and_then(|t| t.as_str())
+                    .map(|s| s.to_string());
+                Ok(StreamEvent::CompactBoundary {
+                    pre_tokens,
+                    trigger,
+                    session_id,
+                })
             } else {
                 Ok(StreamEvent::Unknown { raw: v })
             }
@@ -844,6 +863,34 @@ mod tests {
         let line = r#"{"type":"result","subtype":"success","session_id":"abc","is_error":false,"duration_ms":500,"total_cost_usd":0.01,"num_turns":1,"usage":{"input_tokens":10,"output_tokens":20},"modelUsage":{"claude-3-5-haiku":{"inputTokens":10,"outputTokens":20,"contextWindow":200000}}}"#;
         let event = parse_line(line).unwrap();
         if let StreamEvent::Result { context_window, total_input_tokens, .. } = event {
+    #[test]
+    fn parse_compact_boundary_with_metadata() {
+        let line = r#"{"type":"system","subtype":"compact_boundary","session_id":"abc","compact_metadata":{"pre_tokens":12345,"trigger":"manual"}}"#;
+        let event = parse_line(line).unwrap();
+        match event {
+            StreamEvent::CompactBoundary { pre_tokens, trigger, session_id } => {
+                assert_eq!(session_id, "abc");
+                assert_eq!(pre_tokens, Some(12345));
+                assert_eq!(trigger, Some("manual".to_string()));
+            }
+            _ => panic!("Expected CompactBoundary"),
+        }
+    }
+
+    #[test]
+    fn parse_compact_boundary_without_metadata() {
+        let line = r#"{"type":"system","subtype":"compact_boundary","session_id":"abc"}"#;
+        let event = parse_line(line).unwrap();
+        match event {
+            StreamEvent::CompactBoundary { pre_tokens, trigger, session_id } => {
+                assert_eq!(session_id, "abc");
+                assert_eq!(pre_tokens, None);
+                assert_eq!(trigger, None);
+            }
+            _ => panic!("Expected CompactBoundary"),
+        }
+    }
+
             assert_eq!(context_window, 200000);
             assert_eq!(total_input_tokens, 10); // only inputTokens, no cache fields
         } else {
