@@ -442,7 +442,7 @@ async fn handle_message(
     )
     .await;
 
-    if is_cli_command {
+    if is_reset_command {
         todo_tracker.lock().await.cleanup(ctx).await;
         data.todo_trackers.lock().await.remove(&thread_id);
     }

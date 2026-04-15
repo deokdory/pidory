@@ -863,6 +863,13 @@ mod tests {
         let line = r#"{"type":"result","subtype":"success","session_id":"abc","is_error":false,"duration_ms":500,"total_cost_usd":0.01,"num_turns":1,"usage":{"input_tokens":10,"output_tokens":20},"modelUsage":{"claude-3-5-haiku":{"inputTokens":10,"outputTokens":20,"contextWindow":200000}}}"#;
         let event = parse_line(line).unwrap();
         if let StreamEvent::Result { context_window, total_input_tokens, .. } = event {
+            assert_eq!(context_window, 200000);
+            assert_eq!(total_input_tokens, 10); // only inputTokens, no cache fields
+        } else {
+            panic!("expected Result");
+        }
+    }
+
     #[test]
     fn parse_compact_boundary_with_metadata() {
         let line = r#"{"type":"system","subtype":"compact_boundary","session_id":"abc","compact_metadata":{"pre_tokens":12345,"trigger":"manual"}}"#;
@@ -888,13 +895,6 @@ mod tests {
                 assert_eq!(trigger, None);
             }
             _ => panic!("Expected CompactBoundary"),
-        }
-    }
-
-            assert_eq!(context_window, 200000);
-            assert_eq!(total_input_tokens, 10); // only inputTokens, no cache fields
-        } else {
-            panic!("expected Result");
         }
     }
 
