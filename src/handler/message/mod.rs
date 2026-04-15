@@ -73,6 +73,7 @@ async fn handle_thread_closed(ctx: &Context, data: &Data, thread_id: &str) -> Re
     data.pending_question_groups.lock().await.retain(|_, g| g.thread_id != thread_id);
     data.pending_resets.lock().await.retain(|_, r| r.thread_id != thread_id);
     data.session_skills.lock().await.remove(thread_id);
+    data.next_step_buttons.lock().await.remove(thread_id);
     data.needs_context.lock().await.remove(thread_id);
     data.turn_initiators.lock().await.remove(thread_id);
     data.turn_participants.lock().await.remove(thread_id);
@@ -224,6 +225,7 @@ async fn handle_message(
                 data.pending_permissions.lock().await.retain(|_, p| p.thread_id != evicted_tid);
                 data.pending_question_groups.lock().await.retain(|_, g| g.thread_id != evicted_tid);
                 data.session_skills.lock().await.remove(&evicted_tid);
+                data.next_step_buttons.lock().await.remove(&evicted_tid);
                 data.needs_context.lock().await.remove(&evicted_tid);
                 data.turn_initiators.lock().await.remove(&evicted_tid);
                 data.turn_participants.lock().await.remove(&evicted_tid);
@@ -433,6 +435,7 @@ async fn handle_message(
         data.last_tool_name.clone(),
         data.kick_pending.clone(),
         todo_tracker.clone(),
+        data.next_step_buttons.clone(),
     )
     .await;
 
@@ -561,6 +564,7 @@ pub async fn execute_in_session(
         data.last_tool_name.clone(),
         data.kick_pending.clone(),
         todo_tracker.clone(),
+        data.next_step_buttons.clone(),
     )
     .await;
 

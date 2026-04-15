@@ -9,7 +9,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::error;
 
 use crate::db::repository;
-use crate::handler::{emoji, file_attach, formatter};
+use crate::handler::{emoji, file_attach, formatter, next_step_ui};
 use crate::handler::emoji::ReactionStatus;
 use crate::handler::message::helpers::shorten_model_name;
 use crate::handler::status::ProgressIndicator;
@@ -19,6 +19,38 @@ use crate::subprocess::parser::{ContentBlock, StreamEvent};
 use super::helpers::format_ctx_suffix;
 
 const DISCORD_MSG_LIMIT: usize = 2000;
+
+async fn send_summary_with_buttons(
+    ctx: &Context,
+    channel_id: ChannelId,
+    summary: &str,
+    thread_id: &str,
+    events: &[StreamEvent],
+    session_skills: &Arc<tokio::sync::Mutex<HashMap<String, Vec<String>>>>,
+    next_step_buttons: &Arc<tokio::sync::Mutex<HashMap<String, MessageId>>>,
+) {
+    let skills_for_thread = session_skills.lock().await
+        .get(thread_id).cloned().unwrap_or_default();
+    let next_steps = next_step_ui::extract_next_steps(events, &skills_for_thread);
+    let components = next_step_ui::create_next_step_components(&next_steps, thread_id);
+    if components.is_empty() {
+        if let Err(e) = channel_id.say(ctx, summary).await {
+            tracing::warn!(%channel_id, "Failed to send turn summary: {}", e);
+        }
+    } else {
+        match channel_id.send_message(ctx, CreateMessage::new().content(summary).components(components)).await {
+            Ok(msg) => {
+                next_step_buttons.lock().await.insert(thread_id.to_string(), msg.id);
+            }
+            Err(e) => {
+                tracing::warn!(%channel_id, "Failed to send turn summary with buttons: {}", e);
+                if let Err(e2) = channel_id.say(ctx, summary).await {
+                    tracing::warn!(%channel_id, "Fallback summary also failed: {}", e2);
+                }
+            }
+        }
+    }
+}
 
 pub(super) async fn say_silent(ctx: &Context, channel_id: ChannelId, content: impl Into<String>) {
     let text = content.into();
@@ -146,7 +178,15 @@ pub async fn process_turn_events(
     last_tool_name: std::sync::Arc<tokio::sync::Mutex<HashMap<String, String>>>,
     kick_pending: std::sync::Arc<tokio::sync::Mutex<std::collections::HashSet<String>>>,
     todo_tracker: Arc<tokio::sync::Mutex<crate::handler::todo_tracker::TodoTracker>>,
+    next_step_buttons: Arc<tokio::sync::Mutex<HashMap<String, MessageId>>>,
 ) {
+    // 0. 이전 턴의 next-step 버튼 비활성화
+    if let Some(prev_msg_id) = next_step_buttons.lock().await.remove(thread_id) {
+        next_step_ui::disable_next_step_buttons(ctx, channel_id, prev_msg_id)
+            .await
+            .ok();
+    }
+
     // 1. typing indicator task 시작
     let cancel = CancellationToken::new();
     let cancel_clone = cancel.clone();
@@ -445,9 +485,10 @@ pub async fn process_turn_events(
         if let Err(e) = repository::update_session_status(db, thread_id, "idle").await {
             tracing::warn!("Failed to update session status for thread {}: {}", thread_id, e);
         }
-        if let Err(e) = channel_id.say(ctx, &summary).await {
-            tracing::warn!(%channel_id, "Failed to send turn summary: {}", e);
-        }
+        send_summary_with_buttons(
+            ctx, channel_id, &summary, thread_id, &events,
+            &session_skills, &next_step_buttons,
+        ).await;
 
         emoji::set_reaction(ctx, channel_id, msg_id, ReactionStatus::Done)
             .await
@@ -524,9 +565,11 @@ pub async fn process_turn_events(
                 let ctx_suffix = format_ctx_suffix(total_input_tokens, context_window);
                 let model_part = if turn_model.is_empty() { String::new() } else { format!("**{}**", turn_model) };
                 let stats_line = format!("-# {} · {} · {} · {}{}", model_part, duration, cost, tokens, ctx_suffix);
-                if let Err(e) = channel_id.say(ctx, &format!("-# ✅ {}\n{}", mentions, stats_line)).await {
-                    tracing::warn!(%channel_id, "Failed to send turn completion notification: {}", e);
-                }
+                let fast_summary = format!("-# ✅ {}\n{}", mentions, stats_line);
+                send_summary_with_buttons(
+                    ctx, channel_id, &fast_summary, thread_id, &events,
+                    &session_skills, &next_step_buttons,
+                ).await;
             }
         }
     }
