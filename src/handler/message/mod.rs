@@ -253,7 +253,9 @@ async fn handle_message(
         }
     }
 
-    let is_cli_command = helpers::is_context_reset_command(&new_message.content);
+    let is_reset_command = helpers::is_context_reset_command(&new_message.content);
+    let compact_args = helpers::parse_compact_command(&new_message.content);
+    let is_cli_command = is_reset_command || compact_args.is_some();
 
     // 원자적 acquire: running이 아닌 경우에만 running으로 전환
     let acquired = repository::try_acquire_session(db, &thread_id).await?;
@@ -270,8 +272,10 @@ async fn handle_message(
                 &data.config.attachment,
             ).await;
 
-        let content = if is_cli_command {
+        let content = if is_reset_command {
             helpers::format_cli_command("clear", None)
+        } else if let Some(args) = compact_args {
+            helpers::format_cli_command("compact", args)
         } else {
             new_message.content.clone()
         };
@@ -334,8 +338,10 @@ async fn handle_message(
     }
 
     // 직접 실행 경로: context inject 판정 (primary 경로만)
-    let content = if is_cli_command {
+    let content = if is_reset_command {
         helpers::format_cli_command("clear", None)
+    } else if let Some(args) = compact_args {
+        helpers::format_cli_command("compact", args)
     } else {
         let had_needs_context = data.needs_context.lock().await.remove(&thread_id);
         helpers::build_context_content(&new_message.content, is_new_session, had_needs_context, &guild_channel.name, lang)
@@ -439,7 +445,7 @@ async fn handle_message(
     )
     .await;
 
-    if is_cli_command {
+    if is_reset_command {
         todo_tracker.lock().await.cleanup(ctx).await;
         data.todo_trackers.lock().await.remove(&thread_id);
     }
@@ -458,10 +464,14 @@ pub async fn execute_in_session(
 ) -> Result<(), PidoryError> {
     let db = &data.db;
 
-    let is_cli_command = helpers::is_context_reset_command(content);
+    let is_reset_command = helpers::is_context_reset_command(content);
+    let compact_args = helpers::parse_compact_command(content);
+    let is_cli_command = is_reset_command || compact_args.is_some();
 
-    let effective_content = if is_cli_command {
+    let effective_content = if is_reset_command {
         helpers::format_cli_command("clear", None)
+    } else if let Some(args) = compact_args {
+        helpers::format_cli_command("compact", args)
     } else {
         content.to_string()
     };
