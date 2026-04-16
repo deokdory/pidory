@@ -251,15 +251,6 @@ async fn handle_message(
     let acquired = repository::try_acquire_session(db, &thread_id).await?;
 
     if !acquired {
-        // mid-turn /clear: 진행 중인 턴을 조용히 종료시키고 세션 삭제
-        if is_reset_command {
-            data.archived_threads.lock().await.insert(thread_id.clone());
-            let _ = data.sessions.kill_session(&thread_id).await;
-            cleanup_session_state(data, &thread_id, ctx).await;
-            let _ = repository::delete_session(db, &thread_id).await;
-            return Ok(());
-        }
-
         // mid-turn inject: event_tx 없이 전송 (context inject 안 함, needs_context 소비 안 함)
         let mid_turn_downloaded_files =
             download_message_attachments(
@@ -331,14 +322,6 @@ async fn handle_message(
             }
         }
 
-        return Ok(());
-    }
-
-    // /clear: 세션 kill + cleanup + DB delete
-    if is_reset_command {
-        let _ = data.sessions.kill_session(&thread_id).await;
-        cleanup_session_state(data, &thread_id, ctx).await;
-        let _ = repository::delete_session(db, &thread_id).await;
         return Ok(());
     }
 
