@@ -18,6 +18,8 @@ pub fn all_commands() -> Vec<poise::Command<Data, Error>> {
         session::stop(),
         session::kick(),
         session::sleep(),
+        session::clear(),
+        session::new(),
         skill::skill(),
         model::model(),
         recall::recall(),

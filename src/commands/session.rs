@@ -230,6 +230,76 @@ pub async fn sleep(ctx: Context<'_>) -> Result<(), Error> {
     Ok(())
 }
 
+async fn clear_impl(ctx: Context<'_>) -> Result<(), Error> {
+    let data = ctx.data();
+    let thread_id = ctx.channel_id().to_string();
+    let lang = data.config.language;
+
+    // 1. DB 세션 존재 확인
+    let session = repository::get_session_by_thread(&data.db, &thread_id).await?;
+    if session.is_none() {
+        ctx.send(
+            poise::CreateReply::default()
+                .content(format!("❌ {}", lang.no_session_in_thread()))
+                .ephemeral(true),
+        )
+        .await?;
+        return Ok(());
+    }
+
+    // 2. 권한 체크: 세션 시작자 또는 owner만 허용
+    let triggered_by = data.turn_initiators.lock().await.get(&thread_id).copied();
+    let is_owner = ctx.author().id == serenity::UserId::new(data.config.discord.owner_id);
+
+    let allowed = match triggered_by {
+        Some(tb) => ctx.author().id == tb || is_owner,
+        None => is_owner,
+    };
+
+    if !allowed {
+        ctx.send(
+            poise::CreateReply::default()
+                .content(format!("❌ {}", lang.no_permission()))
+                .ephemeral(true),
+        )
+        .await?;
+        return Ok(());
+    }
+
+    // 3. defer (kill은 ~1s+ 소요)
+    ctx.defer().await?;
+
+    // 4. archived_threads 먼저 등록 (kill 전, mid-turn stale output 억제)
+    data.archived_threads.lock().await.insert(thread_id.clone());
+
+    // 5. kill_session (결과 무시)
+    let _ = data.sessions.kill_session(&thread_id).await;
+
+    // 6. in-memory cleanup
+    cleanup_session_state(data, &thread_id, ctx.serenity_context()).await;
+
+    // 7. DB 세션 삭제 (결과 무시)
+    let _ = repository::delete_session(&data.db, &thread_id).await;
+
+    // 8. 공개 응답
+    let mention = format!("<@{}>", ctx.author().id);
+    ctx.say(format!("-# ♻️ {}", lang.session_cleared_by(&mention))).await?;
+
+    Ok(())
+}
+
+/// 세션을 완전히 클리어 (프로세스 종료 + DB 삭제) — `/new`와 동일 기능
+#[poise::command(slash_command, guild_only)]
+pub async fn clear(ctx: Context<'_>) -> Result<(), Error> {
+    clear_impl(ctx).await
+}
+
+/// 새 세션 시작 (기존 세션 종료 후 초기화) — `/clear`와 동일 기능
+#[poise::command(slash_command, guild_only)]
+pub async fn new(ctx: Context<'_>) -> Result<(), Error> {
+    clear_impl(ctx).await
+}
+
 /// 진행 중인 Claude Code 작업 중단
 #[poise::command(slash_command, guild_only)]
 pub async fn stop(ctx: Context<'_>) -> Result<(), Error> {
