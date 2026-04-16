@@ -155,6 +155,7 @@ pub async fn run_permission_handler(
 ) {
     while let Some(perm_req) = permission_rx.recv().await {
         let triggered_by = perm_req.triggered_by;
+        tracing::info!(thread_id = %thread_id, request_id = %perm_req.request_id, tool_name = %perm_req.tool_name, "permission request received from worker");
 
         if perm_req.tool_name == "AskUserQuestion" {
             let count = question_ui::question_count(&perm_req.input);
@@ -261,8 +262,11 @@ pub async fn run_permission_handler(
             lang,
         );
 
+        let log_request_id = perm_req.request_id.clone();
+        let log_tool_name = perm_req.tool_name.clone();
         match channel_id.send_message(&ctx, msg).await {
             Ok(sent) => {
+                tracing::info!(thread_id = %thread_id, request_id = %log_request_id, tool_name = %log_tool_name, "permission message sent");
                 let pending = PendingPermission {
                     response_tx: perm_req.response_tx,
                     tool_name: perm_req.tool_name,
@@ -275,14 +279,63 @@ pub async fn run_permission_handler(
                     .lock()
                     .await
                     .insert(perm_req.request_id, pending);
+                tracing::info!(thread_id = %thread_id, request_id = %log_request_id, tool_name = %log_tool_name, "pending_permission inserted");
             }
             Err(e) => {
+                tracing::info!(thread_id = %thread_id, request_id = %log_request_id, tool_name = %log_tool_name, "permission message send failed");
                 warn!("Failed to send permission message: {}", e);
                 // 전송 실패 시 deny
                 let _ = perm_req.response_tx.send(PermissionDecision::Deny);
             }
         }
     }
+}
+
+/// dismiss_pending_by_tool 의 반환 타입.
+pub(crate) struct DismissedEntry {
+    pub request_id: String,
+    pub message_id: MessageId,
+    pub thread_id: String,
+}
+
+/// `thread_id` + `tool_name` 이 모두 일치하는 대기 permission 을 HashMap 에서 remove + response_tx 로 decision 전송.
+/// `pending_permissions` 는 모든 세션이 공유하는 global 맵이므로 반드시 thread_id 로 격리해야 cross-session dismiss 를 막을 수 있다.
+/// AskUserQuestion 은 제외 (sub-request id 패턴 `{rid}__q{idx}` 은 tool_name 이 "AskUserQuestion" 이므로 자연 배제).
+/// 반환: 실제로 dismiss 된 entry 들의 메시지 메타정보 (buttons disable 용).
+pub(crate) async fn dismiss_pending_by_tool(
+    pending_permissions: &Arc<Mutex<HashMap<String, crate::PendingPermission>>>,
+    thread_id: &str,
+    tool_name: &str,
+    decision: PermissionDecision,
+    exclude_request_id: &str,
+) -> Vec<DismissedEntry> {
+    if tool_name == "AskUserQuestion" {
+        return Vec::new();
+    }
+
+    let mut map = pending_permissions.lock().await;
+    let matched_ids: Vec<String> = map
+        .iter()
+        .filter(|(rid, p)| {
+            p.tool_name == tool_name
+                && p.thread_id == thread_id
+                && rid.as_str() != exclude_request_id
+        })
+        .map(|(rid, _)| rid.clone())
+        .collect();
+
+    let mut dismissed = Vec::with_capacity(matched_ids.len());
+    for rid in matched_ids {
+        if let Some(entry) = map.remove(&rid) {
+            let _ = entry.response_tx.send(decision.clone());
+            dismissed.push(DismissedEntry {
+                request_id: rid,
+                message_id: entry.message_id,
+                thread_id: entry.thread_id,
+            });
+        }
+    }
+    dismissed
 }
 
 #[cfg(test)]
@@ -443,6 +496,232 @@ mod tests {
         let (_, action) = parse_permission_custom_id("perm:id:Allow").unwrap();
         // Action is returned as-is, case sensitive
         assert_eq!(action, "Allow");
+    }
+
+    // ── dismiss_pending_by_tool ───────────────────────────────────────────────
+
+    fn make_pending(
+        tool_name: &str,
+    ) -> (
+        crate::PendingPermission,
+        tokio::sync::oneshot::Receiver<PermissionDecision>,
+    ) {
+        make_pending_for_thread(tool_name, "thread-test")
+    }
+
+    fn make_pending_for_thread(
+        tool_name: &str,
+        thread_id: &str,
+    ) -> (
+        crate::PendingPermission,
+        tokio::sync::oneshot::Receiver<PermissionDecision>,
+    ) {
+        let (tx, rx) = tokio::sync::oneshot::channel::<PermissionDecision>();
+        let pending = crate::PendingPermission {
+            response_tx: tx,
+            tool_name: tool_name.to_string(),
+            message_id: MessageId::new(12345),
+            thread_id: thread_id.to_string(),
+            triggered_by: UserId::new(99999),
+            input: None,
+        };
+        (pending, rx)
+    }
+
+    #[tokio::test]
+    async fn dismiss_pending_by_tool_removes_matching_entries() {
+        let map: Arc<Mutex<HashMap<String, crate::PendingPermission>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+
+        let (p1, _rx1) = make_pending("WebFetch");
+        let (p2, _rx2) = make_pending("WebFetch");
+        let (p3, _rx3) = make_pending("Read");
+        let (p4, _rx4) = make_pending("AskUserQuestion");
+
+        {
+            let mut m = map.lock().await;
+            m.insert("1".to_string(), p1);
+            m.insert("2".to_string(), p2);
+            m.insert("3".to_string(), p3);
+            m.insert("4".to_string(), p4);
+        }
+
+        let dismissed = dismiss_pending_by_tool(
+            &map,
+            "thread-test",
+            "WebFetch",
+            PermissionDecision::Allow,
+            "nonexistent",
+        )
+        .await;
+
+        assert_eq!(dismissed.len(), 2);
+
+        let map_locked = map.lock().await;
+        assert_eq!(map_locked.len(), 2);
+        assert!(map_locked.contains_key("3"), "Read entry must survive");
+        assert!(
+            map_locked.contains_key("4"),
+            "AskUserQuestion entry must survive"
+        );
+
+        let mut rids: Vec<&str> = dismissed.iter().map(|e| e.request_id.as_str()).collect();
+        rids.sort();
+        assert_eq!(rids, vec!["1", "2"]);
+    }
+
+    #[tokio::test]
+    async fn dismiss_pending_by_tool_excludes_caller_request_id() {
+        let map: Arc<Mutex<HashMap<String, crate::PendingPermission>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+
+        let (p1, _rx1) = make_pending("WebFetch");
+        let (p2, _rx2) = make_pending("WebFetch");
+
+        {
+            let mut m = map.lock().await;
+            m.insert("1".to_string(), p1);
+            m.insert("2".to_string(), p2);
+        }
+
+        let dismissed = dismiss_pending_by_tool(
+            &map,
+            "thread-test",
+            "WebFetch",
+            PermissionDecision::Allow,
+            "1",
+        )
+        .await;
+
+        assert_eq!(dismissed.len(), 1);
+        assert_eq!(dismissed[0].request_id, "2");
+
+        let map_locked = map.lock().await;
+        assert!(
+            map_locked.contains_key("1"),
+            "Excluded entry (rid=1) must remain"
+        );
+        assert!(
+            !map_locked.contains_key("2"),
+            "Non-excluded entry (rid=2) must be removed"
+        );
+    }
+
+    #[tokio::test]
+    async fn dismiss_pending_by_tool_ignores_ask_user_question() {
+        let map: Arc<Mutex<HashMap<String, crate::PendingPermission>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+
+        let (p1, _rx1) = make_pending("AskUserQuestion");
+        let (p2, _rx2) = make_pending("AskUserQuestion");
+
+        {
+            let mut m = map.lock().await;
+            m.insert("1".to_string(), p1);
+            m.insert("2".to_string(), p2);
+        }
+
+        let dismissed = dismiss_pending_by_tool(
+            &map,
+            "thread-test",
+            "AskUserQuestion",
+            PermissionDecision::Allow,
+            "nonexistent",
+        )
+        .await;
+
+        assert_eq!(
+            dismissed.len(),
+            0,
+            "AskUserQuestion must trigger early-return"
+        );
+
+        let map_locked = map.lock().await;
+        assert_eq!(
+            map_locked.len(),
+            2,
+            "All AskUserQuestion entries must be untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn dismiss_pending_by_tool_sends_decision_via_response_tx() {
+        let map: Arc<Mutex<HashMap<String, crate::PendingPermission>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+
+        let (p1, rx1) = make_pending("WebFetch");
+
+        {
+            let mut m = map.lock().await;
+            m.insert("1".to_string(), p1);
+        }
+
+        let dismissed = dismiss_pending_by_tool(
+            &map,
+            "thread-test",
+            "WebFetch",
+            PermissionDecision::AlwaysAllow,
+            "nonexistent",
+        )
+        .await;
+
+        assert_eq!(dismissed.len(), 1);
+
+        let decision = rx1.await.expect("response_tx must have fired");
+        assert_eq!(decision, PermissionDecision::AlwaysAllow);
+    }
+
+    /// Cross-session dismiss 방지: 다른 thread_id 의 pending 은 같은 tool_name 이어도 건드리지 않는다.
+    /// `pending_permissions` 는 global 맵이므로 thread_id 필터 없이 dismiss 하면
+    /// 세션 A 의 AlwaysAllow 클릭이 세션 B 의 pending 을 자동 Allow 시키는 버그가 발생한다.
+    #[tokio::test]
+    async fn dismiss_pending_by_tool_isolates_by_thread_id() {
+        let map: Arc<Mutex<HashMap<String, crate::PendingPermission>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+
+        let (p_a1, _rx_a1) = make_pending_for_thread("WebFetch", "thread-A");
+        let (p_a2, _rx_a2) = make_pending_for_thread("WebFetch", "thread-A");
+        let (p_b1, mut rx_b1) = make_pending_for_thread("WebFetch", "thread-B");
+        let (p_b2, mut rx_b2) = make_pending_for_thread("WebFetch", "thread-B");
+
+        {
+            let mut m = map.lock().await;
+            m.insert("a1".to_string(), p_a1);
+            m.insert("a2".to_string(), p_a2);
+            m.insert("b1".to_string(), p_b1);
+            m.insert("b2".to_string(), p_b2);
+        }
+
+        // thread-A 에서 a1 을 AlwaysAllow 클릭 → a2 만 dismiss, thread-B 는 건드리지 않음.
+        let dismissed = dismiss_pending_by_tool(
+            &map,
+            "thread-A",
+            "WebFetch",
+            PermissionDecision::Allow,
+            "a1",
+        )
+        .await;
+
+        assert_eq!(dismissed.len(), 1, "only thread-A's a2 must be dismissed");
+        assert_eq!(dismissed[0].request_id, "a2");
+        assert_eq!(dismissed[0].thread_id, "thread-A");
+
+        let map_locked = map.lock().await;
+        assert!(map_locked.contains_key("a1"), "excluded a1 must remain");
+        assert!(!map_locked.contains_key("a2"), "a2 must be dismissed");
+        assert!(map_locked.contains_key("b1"), "thread-B's b1 must remain");
+        assert!(map_locked.contains_key("b2"), "thread-B's b2 must remain");
+        drop(map_locked);
+
+        // thread-B 의 response_tx 는 firing 되지 않았어야 한다.
+        assert!(
+            rx_b1.try_recv().is_err(),
+            "thread-B's b1 must NOT receive a decision (cross-session leak)"
+        );
+        assert!(
+            rx_b2.try_recv().is_err(),
+            "thread-B's b2 must NOT receive a decision (cross-session leak)"
+        );
     }
 
     // ── run_permission_handler: lifecycle — tx drop causes exit ──────────────
