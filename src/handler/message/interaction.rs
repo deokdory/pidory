@@ -152,11 +152,10 @@ pub(super) async fn handle_interaction(
             .await
             .ok();
 
-            // "always" 클릭 시 같은 thread + tool_name 의 대기 중인 다른 permission 도 자동 dismiss
+            // "always" 클릭 시 같은 tool_name 의 대기 중인 다른 permission 도 자동 dismiss
             if action == "always" {
                 let dismissed = permission_ui::dismiss_pending_by_tool(
                     &data.pending_permissions,
-                    &thread_id,
                     &tool_name,
                     PermissionDecision::Allow,
                     &request_id,
