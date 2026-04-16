@@ -228,7 +228,7 @@ async fn handle_message(
                 }
                 if let Ok(id) = evicted_tid.parse::<u64>() {
                     ChannelId::new(id)
-                        .say(ctx, format!("-# ⚠️ {}", lang.session_evicted()))
+                        .leave_thread(ctx)
                         .await
                         .ok();
                 }

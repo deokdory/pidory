@@ -221,17 +221,16 @@ pub async fn sleep(ctx: Context<'_>) -> Result<(), Error> {
     // 4. DB status → "idle"
     repository::update_session_status(&data.db, &thread_id, "idle").await?;
 
-    // 5. in-memory cleanup
+    // 5. 응답 (cleanup 전에 전송 — cleanup의 leave_thread 후 재참여 방지)
+    ctx.say(format!("-# 😴 {}", lang.session_slept())).await?;
+
+    // 6. in-memory cleanup + leave thread
     cleanup_session_state(data, &thread_id, ctx.serenity_context()).await;
 
-    // 6. 응답
-    ctx.say(format!("-# 😴 {}", lang.session_slept())).await?;
     Ok(())
 }
 
-/// 세션을 완전히 클리어 (프로세스 종료 + DB 삭제) — `/new`와 동일 기능
-#[poise::command(slash_command, guild_only)]
-pub async fn clear(ctx: Context<'_>) -> Result<(), Error> {
+async fn clear_impl(ctx: Context<'_>) -> Result<(), Error> {
     let data = ctx.data();
     let thread_id = ctx.channel_id().to_string();
     let lang = data.config.language;
@@ -289,10 +288,16 @@ pub async fn clear(ctx: Context<'_>) -> Result<(), Error> {
     Ok(())
 }
 
+/// 세션을 완전히 클리어 (프로세스 종료 + DB 삭제) — `/new`와 동일 기능
+#[poise::command(slash_command, guild_only)]
+pub async fn clear(ctx: Context<'_>) -> Result<(), Error> {
+    clear_impl(ctx).await
+}
+
 /// 새 세션 시작 (기존 세션 종료 후 초기화) — `/clear`와 동일 기능
 #[poise::command(slash_command, guild_only)]
 pub async fn new(ctx: Context<'_>) -> Result<(), Error> {
-    clear(ctx).await
+    clear_impl(ctx).await
 }
 
 /// 진행 중인 Claude Code 작업 중단
