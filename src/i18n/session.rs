@@ -91,6 +91,13 @@ impl Lang {
         }
     }
 
+    pub fn session_cleared_by(&self, mention: &str) -> String {
+        match self {
+            Lang::Ko => format!("{}님에 의해서 세션이 클리어 되었습니다", mention),
+            Lang::En => format!("Session cleared by {}", mention),
+        }
+    }
+
     pub fn session_reset_confirm(&self) -> &'static str {
         match self {
             Lang::Ko => "세션이 작업 중입니다. 리셋하시겠습니까?",
