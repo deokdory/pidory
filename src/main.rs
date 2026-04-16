@@ -231,7 +231,6 @@ async fn main() -> Result<(), PidoryError> {
                     let kick_pending = Arc::clone(&kick_pending);
                     let next_step_buttons = Arc::clone(&next_step_buttons);
                     let db_clone = db.clone();
-                    let lang = config.language;
                     let mut ctx_rx = ctx_tx.subscribe();
                     tokio::spawn(async move {
                         let mut interval = tokio::time::interval(std::time::Duration::from_secs(300));
@@ -260,7 +259,7 @@ async fn main() -> Result<(), PidoryError> {
                                         if let Ok(channel_id) = tid.parse::<u64>() {
                                             let ctx = ctx_rx.borrow().clone();
                                             poise::serenity_prelude::ChannelId::new(channel_id)
-                                                .say(&ctx, format!("-# ⏰ {}", lang.session_idle_cleaned()))
+                                                .leave_thread(&ctx)
                                                 .await
                                                 .ok();
                                         }
