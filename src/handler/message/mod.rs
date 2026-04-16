@@ -232,7 +232,7 @@ async fn handle_message(
                 }
                 if let Ok(id) = evicted_tid.parse::<u64>() {
                     ChannelId::new(id)
-                        .say(ctx, format!("-# ⚠️ {}", lang.session_evicted()))
+                        .leave_thread(ctx)
                         .await
                         .ok();
                 }
@@ -262,10 +262,6 @@ async fn handle_message(
             let _ = data.sessions.kill_session(&thread_id).await;
             cleanup_session_state(data, &thread_id, ctx).await;
             let _ = repository::delete_session(db, &thread_id).await;
-            channel_id
-                .say(ctx, format!("-# ♻️ {}", lang.session_reset()))
-                .await
-                .ok();
             return Ok(());
         }
 
@@ -348,10 +344,6 @@ async fn handle_message(
         let _ = data.sessions.kill_session(&thread_id).await;
         cleanup_session_state(data, &thread_id, ctx).await;
         let _ = repository::delete_session(db, &thread_id).await;
-        channel_id
-            .say(ctx, format!("-# ♻️ {}", lang.session_reset()))
-            .await
-            .ok();
         return Ok(());
     }
 

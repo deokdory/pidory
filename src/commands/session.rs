@@ -221,11 +221,12 @@ pub async fn sleep(ctx: Context<'_>) -> Result<(), Error> {
     // 4. DB status → "idle"
     repository::update_session_status(&data.db, &thread_id, "idle").await?;
 
-    // 5. in-memory cleanup
+    // 5. 응답 (cleanup 전에 전송 — cleanup의 leave_thread 후 재참여 방지)
+    ctx.say(format!("-# 😴 {}", lang.session_slept())).await?;
+
+    // 6. in-memory cleanup + leave thread
     cleanup_session_state(data, &thread_id, ctx.serenity_context()).await;
 
-    // 6. 응답
-    ctx.say(format!("-# 😴 {}", lang.session_slept())).await?;
     Ok(())
 }
 
