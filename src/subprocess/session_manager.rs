@@ -173,7 +173,8 @@ impl SessionManager {
 
         let (queue_tx, queue_rx) = mpsc::channel::<QueuedMessage>(5);
         let queue_size = Arc::new(AtomicUsize::new(0));
-        let (permission_tx, permission_rx) = mpsc::channel::<PermissionRequest>(8);
+        // #229: 병렬 control_request 최대 32개 pending 허용. MAX_PENDING_CR 상수와 동기 (worker.rs).
+        let (permission_tx, permission_rx) = mpsc::channel::<PermissionRequest>(32);
         let (interrupt_tx, interrupt_rx) = mpsc::channel::<()>(1);
 
         let last_activity = Arc::new(StdMutex::new(Instant::now()));
