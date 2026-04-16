@@ -171,10 +171,6 @@ async fn handle_message(
             s
         }
         None => {
-            // 세션 없는 스레드에서 /clear → 무시 (새 세션 생성 안 함)
-            if helpers::is_context_reset_command(&new_message.content) {
-                return Ok(());
-            }
             tracing::info!("Creating new session for thread {}", thread_id);
             is_new_session = true;
             repository::create_session(db, &thread_id, &parent_channel_id).await?
@@ -248,7 +244,6 @@ async fn handle_message(
         }
     }
 
-    let is_reset_command = helpers::is_context_reset_command(&new_message.content);
     let compact_args = helpers::parse_compact_command(&new_message.content);
     let is_cli_command = compact_args.is_some();
 
@@ -256,19 +251,6 @@ async fn handle_message(
     let acquired = repository::try_acquire_session(db, &thread_id).await?;
 
     if !acquired {
-        // mid-turn /clear: 진행 중인 턴을 조용히 종료시키고 세션 삭제
-        if is_reset_command {
-            data.archived_threads.lock().await.insert(thread_id.clone());
-            let _ = data.sessions.kill_session(&thread_id).await;
-            cleanup_session_state(data, &thread_id, ctx).await;
-            let _ = repository::delete_session(db, &thread_id).await;
-            channel_id
-                .say(ctx, format!("-# ♻️ {}", lang.session_reset()))
-                .await
-                .ok();
-            return Ok(());
-        }
-
         // mid-turn inject: event_tx 없이 전송 (context inject 안 함, needs_context 소비 안 함)
         let mid_turn_downloaded_files =
             download_message_attachments(
@@ -340,18 +322,6 @@ async fn handle_message(
             }
         }
 
-        return Ok(());
-    }
-
-    // /clear: 세션 kill + cleanup + DB delete
-    if is_reset_command {
-        let _ = data.sessions.kill_session(&thread_id).await;
-        cleanup_session_state(data, &thread_id, ctx).await;
-        let _ = repository::delete_session(db, &thread_id).await;
-        channel_id
-            .say(ctx, format!("-# ♻️ {}", lang.session_reset()))
-            .await
-            .ok();
         return Ok(());
     }
 
@@ -475,28 +445,12 @@ pub async fn execute_in_session(
 ) -> Result<(), PidoryError> {
     let db = &data.db;
 
-    let is_reset_command = helpers::is_context_reset_command(content);
     let compact_args = helpers::parse_compact_command(content);
     let is_cli_command = compact_args.is_some();
-
-    let lang = data.config.language;
 
     let acquired = repository::try_acquire_session(db, thread_id).await?;
 
     if !acquired {
-        // mid-turn /clear: 진행 중인 턴을 조용히 종료시키고 세션 삭제
-        if is_reset_command {
-            data.archived_threads.lock().await.insert(thread_id.to_string());
-            let _ = data.sessions.kill_session(thread_id).await;
-            cleanup_session_state(data, thread_id, ctx).await;
-            let _ = repository::delete_session(db, thread_id).await;
-            channel_id
-                .say(ctx, format!("-# ♻️ {}", lang.session_reset()))
-                .await
-                .ok();
-            return Ok(());
-        }
-
         // mid-turn inject: event_tx 없이 전송
         let effective_content = if let Some(args) = compact_args {
             helpers::format_cli_command("compact", args)
@@ -524,18 +478,6 @@ pub async fn execute_in_session(
             .entry(thread_id.to_string())
             .or_default()
             .insert(triggered_by);
-        return Ok(());
-    }
-
-    // /clear: 세션 kill + cleanup + DB delete
-    if is_reset_command {
-        let _ = data.sessions.kill_session(thread_id).await;
-        cleanup_session_state(data, thread_id, ctx).await;
-        let _ = repository::delete_session(db, thread_id).await;
-        channel_id
-            .say(ctx, format!("-# ♻️ {}", lang.session_reset()))
-            .await
-            .ok();
         return Ok(());
     }
 
@@ -656,7 +598,7 @@ async fn download_message_attachments(
 
 #[cfg(test)]
 mod tests {
-    use super::helpers::{build_context_content, format_cli_command, format_ctx_suffix, is_context_reset_command};
+    use super::helpers::{build_context_content, format_cli_command, format_ctx_suffix};
     use crate::i18n::Lang;
 
     #[test]
@@ -674,36 +616,10 @@ mod tests {
     }
 
     #[test]
-    fn no_inject_on_new_command() {
-        let result = build_context_content("/new", true, false, "스레드", Lang::Ko);
-        assert!(!result.contains("<system-reminder>"));
-        assert_eq!(result, "/new");
-    }
-
-    #[test]
     fn no_inject_normal_message() {
         let result = build_context_content("일반 메시지", false, false, "스레드", Lang::Ko);
         assert!(!result.contains("<system-reminder>"));
         assert_eq!(result, "일반 메시지");
-    }
-
-    #[test]
-    fn new_command_case_insensitive() {
-        let result = build_context_content("/New", true, false, "스레드", Lang::Ko);
-        assert!(!result.contains("<system-reminder>"));
-    }
-
-    #[test]
-    fn no_inject_on_clear_command() {
-        let result = build_context_content("/clear", true, false, "스레드", Lang::Ko);
-        assert!(!result.contains("<system-reminder>"));
-        assert_eq!(result, "/clear");
-    }
-
-    #[test]
-    fn clear_command_case_insensitive() {
-        let result = build_context_content("/Clear", true, false, "스레드", Lang::Ko);
-        assert!(!result.contains("<system-reminder>"));
     }
 
     #[test]
@@ -713,22 +629,6 @@ mod tests {
         assert_eq!(format_ctx_suffix(0, 0), "");
         assert_eq!(format_ctx_suffix(100, 0), "");
         assert_eq!(format_ctx_suffix(1000000, 1000000), " · ctx:100%");
-    }
-
-    #[test]
-    fn context_reset_command_new() {
-        assert!(is_context_reset_command("/new"));
-        assert!(is_context_reset_command("/New"));
-        assert!(is_context_reset_command("/NEW"));
-        assert!(is_context_reset_command("  /new  "));
-    }
-
-    #[test]
-    fn context_reset_command_clear() {
-        assert!(is_context_reset_command("/clear"));
-        assert!(is_context_reset_command("/Clear"));
-        assert!(is_context_reset_command("/CLEAR"));
-        assert!(is_context_reset_command("  /clear  "));
     }
 
     #[test]
@@ -771,12 +671,4 @@ mod tests {
         );
     }
 
-    #[test]
-    fn context_reset_command_rejects_others() {
-        assert!(!is_context_reset_command("hello"));
-        assert!(!is_context_reset_command("/help"));
-        assert!(!is_context_reset_command("/newbie"));
-        assert!(!is_context_reset_command("/clearance"));
-        assert!(!is_context_reset_command(""));
-    }
 }
