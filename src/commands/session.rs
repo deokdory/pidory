@@ -229,7 +229,7 @@ pub async fn sleep(ctx: Context<'_>) -> Result<(), Error> {
     Ok(())
 }
 
-/// 세션을 완전히 클리어 (프로세스 종료 + DB 삭제)
+/// 세션을 완전히 클리어 (프로세스 종료 + DB 삭제) — `/new`와 동일 기능
 #[poise::command(slash_command, guild_only)]
 pub async fn clear(ctx: Context<'_>) -> Result<(), Error> {
     let data = ctx.data();
@@ -287,6 +287,12 @@ pub async fn clear(ctx: Context<'_>) -> Result<(), Error> {
     ctx.say(format!("-# ♻️ {}", lang.session_cleared_by(&mention))).await?;
 
     Ok(())
+}
+
+/// 새 세션 시작 (기존 세션 종료 후 초기화) — `/clear`와 동일 기능
+#[poise::command(slash_command, guild_only)]
+pub async fn new(ctx: Context<'_>) -> Result<(), Error> {
+    clear(ctx).await
 }
 
 /// 진행 중인 Claude Code 작업 중단
