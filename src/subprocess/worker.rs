@@ -494,10 +494,18 @@ async fn handle_between_turns_event(
                             let perm_req = PermissionRequest {
                                 request_id: saved_request_id.clone(),
                                 tool_name: saved_tool_name.clone(),
+                                tool_use_id: saved_tool_use_id.clone(),
+                                input: saved_input.clone(),
+                                decision_reason: saved_reason.clone(),
+                                response_tx: resp_tx,
+                                triggered_by: *current_triggered_by,
+                            };
+                            let initial_cr = InitialControlRequest {
+                                request_id: saved_request_id.clone(),
+                                tool_name: saved_tool_name.clone(),
                                 tool_use_id: saved_tool_use_id,
                                 input: saved_input.clone(),
                                 decision_reason: saved_reason,
-                                response_tx: resp_tx,
                                 triggered_by: *current_triggered_by,
                             };
                             let result = wait_for_permissions(
@@ -1352,10 +1360,18 @@ async fn run_active_turn(
                                     let perm_req = PermissionRequest {
                                         request_id: saved_request_id.clone(),
                                         tool_name: saved_tool_name.clone(),
+                                        tool_use_id: saved_tool_use_id.clone(),
+                                        input: saved_input.clone(),
+                                        decision_reason: saved_decision_reason.clone(),
+                                        response_tx: resp_tx,
+                                        triggered_by: *current_triggered_by,
+                                    };
+                                    let initial_cr = InitialControlRequest {
+                                        request_id: saved_request_id.clone(),
+                                        tool_name: saved_tool_name.clone(),
                                         tool_use_id: saved_tool_use_id,
                                         input: saved_input.clone(),
                                         decision_reason: saved_decision_reason,
-                                        response_tx: resp_tx,
                                         triggered_by: *current_triggered_by,
                                     };
                                     let result = wait_for_permissions(
