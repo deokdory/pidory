@@ -106,6 +106,8 @@ pub(super) async fn handle_interaction(
             return Ok(());
         };
 
+        tracing::info!(request_id = %request_id, action = %action, "permission button clicked");
+
         // interaction defer — 메시지 업데이트로 응답 (3초 제약)
         component
             .create_response(
@@ -148,6 +150,36 @@ pub(super) async fn handle_interaction(
             )
             .await
             .ok();
+
+            // "always" 클릭 시 같은 tool_name 의 대기 중인 다른 permission 도 자동 dismiss
+            if action == "always" {
+                let dismissed = permission_ui::dismiss_pending_by_tool(
+                    &data.pending_permissions,
+                    &tool_name,
+                    PermissionDecision::Allow,
+                    &request_id,
+                )
+                .await;
+
+                for d in &dismissed {
+                    permission_ui::disable_permission_buttons(
+                        ctx,
+                        component.channel_id,
+                        d.message_id,
+                        "always",
+                        &tool_name,
+                        lang,
+                    )
+                    .await
+                    .ok();
+                    tracing::info!(
+                        thread_id = %d.thread_id,
+                        request_id = %d.request_id,
+                        tool_name = %tool_name,
+                        "permission auto-dismissed by always_allow chain"
+                    );
+                }
+            }
         }
 
         return Ok(());
