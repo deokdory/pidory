@@ -15,7 +15,7 @@ use crate::handler::message::{shorten_model_name, format_ctx_suffix};
 use crate::i18n::Lang;
 use crate::ratelimit::RateLimitInfo;
 use super::background::BackgroundTaskTracker;
-use super::parser::{parse_line, StreamEvent, ContentBlock, build_control_response_allow, build_control_response_deny, build_control_response_ask_answer};
+use super::parser::{parse_line, StreamEvent, ContentBlock, build_control_response_allow, build_control_response_allow_probed, build_control_response_deny, build_control_response_ask_answer, ProbeMode};
 use super::permission::{PermissionCache, PermissionDecision, PermissionRequest};
 use super::session_manager::{QueuedMessage, SessionInner, ReplyContext};
 
@@ -955,7 +955,12 @@ async fn write_permission_response(
             Ok(false)
         }
         PermissionWaitResult::AlwaysAllow(tool_name) => {
-            let resp = build_control_response_allow(request_id, input);
+            let resp = build_control_response_allow_probed(
+                request_id,
+                input,
+                &ProbeMode::from_env(),
+                &tool_name,
+            );
             stdin.write_all(resp.as_bytes()).await?;
             stdin.flush().await?;
             permission_cache.add_always_allow(&tool_name);
