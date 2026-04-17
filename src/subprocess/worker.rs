@@ -468,7 +468,9 @@ async fn handle_between_turns_event(
                             BetweenTurnsAction::Continue
                         }
                         Ok(StreamEvent::ControlRequest { ref request_id, ref tool_name, ref tool_use_id, ref input, ref decision_reason, .. }) => {
+                            tracing::info!("control_request received: tool={} request_id={} input={:?}", tool_name, request_id, input);
                             if permission_cache.is_always_allowed(tool_name) {
+                                tracing::info!("cache hit: tool={} — auto-allow (bypass flag = {})", tool_name, std::env::var("PIDORY_SPIKE_BYPASS_CACHE").unwrap_or_default());
                                 let resp = build_control_response_allow(request_id, input);
                                 if let Err(e) = stdin.write_all(resp.as_bytes()).await {
                                     tracing::error!("stdin write error (between turns auto-allow): {}", e);
@@ -695,7 +697,9 @@ async fn handle_bg_turn(
                                 }
                             }
                             Ok(StreamEvent::ControlRequest { ref request_id, ref tool_name, ref tool_use_id, ref input, ref decision_reason, .. }) => {
+                                tracing::info!("control_request received: tool={} request_id={} input={:?}", tool_name, request_id, input);
                                 if permission_cache.is_always_allowed(tool_name) {
+                                    tracing::info!("cache hit: tool={} — auto-allow (bypass flag = {})", tool_name, std::env::var("PIDORY_SPIKE_BYPASS_CACHE").unwrap_or_default());
                                     let resp = build_control_response_allow(request_id, input);
                                     if let Err(e) = stdin.write_all(resp.as_bytes()).await {
                                         tracing::error!("stdin write error (bg turn auto-allow): {}", e);
@@ -1124,7 +1128,9 @@ async fn run_active_turn(
                                     let saved_input = input.clone();
                                     let saved_decision_reason = decision_reason.clone();
 
+                                    tracing::info!("control_request received: tool={} request_id={} input={:?}", saved_tool_name, saved_request_id, saved_input);
                                     if permission_cache.is_always_allowed(&saved_tool_name) {
+                                        tracing::info!("cache hit: tool={} — auto-allow (bypass flag = {})", saved_tool_name, std::env::var("PIDORY_SPIKE_BYPASS_CACHE").unwrap_or_default());
                                         // auto-allow from cache
                                         let resp = build_control_response_allow(&saved_request_id, &saved_input);
                                         if let Err(e) = stdin.write_all(resp.as_bytes()).await {
