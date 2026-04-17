@@ -4,6 +4,7 @@ pub mod recall;
 pub mod register;
 pub mod session;
 pub mod skill;
+pub mod update;
 
 use crate::{Data, Error};
 
@@ -24,5 +25,6 @@ pub fn all_commands() -> Vec<poise::Command<Data, Error>> {
         model::model(),
         recall::recall(),
         branch::branch(),
+        update::update(),
     ]
 }

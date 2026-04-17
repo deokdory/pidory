@@ -7,6 +7,7 @@ mod i18n;
 mod ratelimit;
 mod release;
 mod subprocess;
+mod update;
 
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
@@ -94,6 +95,54 @@ async fn main() -> Result<(), PidoryError> {
 
     info!("Starting pidory v{}...", env!("CARGO_PKG_VERSION"));
 
+    // Self-check: stale lock 정리 + 업데이트 마커 확인 → 필요 시 자동 롤백
+    let worktree_opt = match update::worktree::detect_worktree() {
+        Ok(w) => Some(w),
+        Err(e) => {
+            tracing::warn!("Worktree detection failed: {:?}. Self-check skipped.", e);
+            None
+        }
+    };
+
+    if let Some(worktree) = &worktree_opt {
+        if let Err(e) = update::lock::cleanup_stale(worktree) {
+            tracing::warn!("cleanup_stale failed: {:?}", e);
+        }
+        match update::marker::check_and_recover(worktree) {
+            update::marker::RecoveryAction::Normal => {}
+            update::marker::RecoveryAction::Rolling { from, to, attempt } => {
+                tracing::warn!("Rolling back: from={} to={} attempt={}", from, to, attempt);
+                let db_path = std::path::PathBuf::from(&config.database.path);
+                if let Err(e) = update::backup::restore_binary(worktree) {
+                    tracing::error!("restore_binary failed: {:?}", e);
+                }
+                if let Err(e) = update::backup::restore_db(&db_path) {
+                    tracing::error!("restore_db failed: {:?}", e);
+                }
+                let rollback_marker = worktree.join("target").join("release").join(".update-rolled-back");
+                let rollback_info = serde_json::json!({
+                    "from": from,
+                    "to": to,
+                    "attempt": attempt,
+                });
+                let _ = std::fs::write(&rollback_marker, rollback_info.to_string());
+                let _ = update::restart::schedule_restart();
+                std::process::exit(0);
+            }
+        }
+    }
+
+    // ready watchdog spawn (worktree 있을 때만)
+    let ready_tx_cell: Arc<std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>> = {
+        if let Some(worktree) = worktree_opt.clone() {
+            let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<()>();
+            tokio::spawn(update::marker::ready_watchdog(worktree, ready_rx));
+            Arc::new(std::sync::Mutex::new(Some(ready_tx)))
+        } else {
+            Arc::new(std::sync::Mutex::new(None))
+        }
+    };
+
     let config_clone = config.clone();
     let framework = poise::Framework::builder()
         .options(poise::FrameworkOptions {
@@ -106,7 +155,33 @@ async fn main() -> Result<(), PidoryError> {
         })
         .setup(move |ctx, _ready, framework| {
             let config = config_clone.clone();
+            let ready_tx_cell = ready_tx_cell.clone();
+            let worktree_opt = worktree_opt.clone();
             Box::pin(async move {
+                // Discord gateway 연결됨 → ready signal 송신 → watchdog 정상 종료
+                if let Some(tx) = ready_tx_cell.lock().unwrap().take() {
+                    let _ = tx.send(());
+                }
+
+                // 롤백 알림 (있으면)
+                if let Some(worktree) = &worktree_opt {
+                    let rollback_marker = worktree.join("target").join("release").join(".update-rolled-back");
+                    if rollback_marker.exists() {
+                        if let Ok(contents) = std::fs::read_to_string(&rollback_marker) {
+                            if let Some(channel_id) = config.discord.notification_channel_id {
+                                let msg = format!(
+                                    "⚠️ 업데이트 후 부팅 실패로 자동 롤백됨. 상세: {}",
+                                    contents
+                                );
+                                let _ = poise::serenity_prelude::ChannelId::new(channel_id)
+                                    .say(&ctx, msg)
+                                    .await;
+                            }
+                        }
+                        let _ = std::fs::remove_file(&rollback_marker);
+                    }
+                }
+
                 // guild-only 커맨드 등록
                 poise::builtins::register_in_guild(ctx, &framework.options().commands, guild_id)
                     .await
