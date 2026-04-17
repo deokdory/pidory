@@ -1,9 +1,16 @@
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use poise::serenity_prelude as serenity;
 
 use crate::update;
 use crate::{Context, Error};
+
+/// Discord message content 하드 한계. 초과 시 서버가 edit을 거절해버려
+/// "빌드 실패" stderr_tail처럼 긴 메시지가 사용자에게 사라져버린다.
+const DISCORD_CONTENT_LIMIT: usize = 2000;
+/// 연속 edit 최소 간격. Discord rate limit에 걸리지 않도록 완충.
+const EDIT_MIN_GAP: Duration = Duration::from_millis(150);
 
 // ── GitHub API helper ─────────────────────────────────────────────────────────
 
@@ -30,13 +37,42 @@ async fn fetch_latest_tag(repo: &str, token: Option<&str>) -> Result<String, Str
 
 // ── Status edit helper ────────────────────────────────────────────────────────
 
+/// `char_indices` 기반 안전한 절단. UTF-8 multi-byte 경계를 침범하지 않는다.
+fn truncate_for_discord(s: &str, limit: usize) -> String {
+    if s.len() <= limit {
+        return s.to_string();
+    }
+    let suffix = "…(truncated)";
+    let budget = limit.saturating_sub(suffix.len());
+    let mut cut = 0usize;
+    for (i, _) in s.char_indices() {
+        if i > budget {
+            break;
+        }
+        cut = i;
+    }
+    let mut out = String::with_capacity(limit);
+    out.push_str(&s[..cut]);
+    out.push_str(suffix);
+    out
+}
+
 async fn update_status(
     reply: &poise::ReplyHandle<'_>,
     ctx: Context<'_>,
+    last_edit: &mut Option<Instant>,
     content: String,
 ) -> Result<(), Error> {
-    let msg = poise::CreateReply::default().content(content);
+    if let Some(last) = *last_edit {
+        let elapsed = last.elapsed();
+        if elapsed < EDIT_MIN_GAP {
+            tokio::time::sleep(EDIT_MIN_GAP - elapsed).await;
+        }
+    }
+    let safe = truncate_for_discord(&content, DISCORD_CONTENT_LIMIT);
+    let msg = poise::CreateReply::default().content(safe);
     reply.edit(ctx, msg).await?;
+    *last_edit = Some(Instant::now());
     Ok(())
 }
 
@@ -69,17 +105,18 @@ pub async fn update(
     let reply = ctx
         .send(poise::CreateReply::default().content("🔍 업데이트 준비 중..."))
         .await?;
+    let mut last_edit: Option<Instant> = None;
 
     // ── Step 3: worktree 감지 + sanity ────────────────────────────────────────
     let worktree = match update::worktree::detect_worktree() {
         Ok(p) => p,
         Err(e) => {
-            update_status(&reply, ctx, format!("❌ worktree 감지 실패: {}", e)).await?;
+            update_status(&reply, ctx, &mut last_edit, format!("❌ worktree 감지 실패: {}", e)).await?;
             return Ok(());
         }
     };
     if let Err(e) = update::worktree::sanity_check(&worktree) {
-        update_status(&reply, ctx, format!("❌ worktree sanity 실패: {}", e)).await?;
+        update_status(&reply, ctx, &mut last_edit, format!("❌ worktree sanity 실패: {}", e)).await?;
         return Ok(());
     }
 
@@ -90,13 +127,14 @@ pub async fn update(
             update_status(
                 &reply,
                 ctx,
+                &mut last_edit,
                 format!("❌ 이미 업데이트 진행 중 (PID={})", pid),
             )
             .await?;
             return Ok(());
         }
         Err(e) => {
-            update_status(&reply, ctx, format!("❌ 락 획득 실패: {}", e)).await?;
+            update_status(&reply, ctx, &mut last_edit, format!("❌ 락 획득 실패: {}", e)).await?;
             return Ok(());
         }
     };
@@ -105,12 +143,12 @@ pub async fn update(
     let is_dirty = match update::worktree::is_dirty(&worktree) {
         Ok(d) => d,
         Err(e) => {
-            update_status(&reply, ctx, format!("❌ dirty 체크 실패: {}", e)).await?;
+            update_status(&reply, ctx, &mut last_edit, format!("❌ dirty 체크 실패: {}", e)).await?;
             return Ok(());
         }
     };
     if is_dirty {
-        update_status(&reply, ctx, lang.update_dirty_tree().to_string()).await?;
+        update_status(&reply, ctx, &mut last_edit, lang.update_dirty_tree().to_string()).await?;
         return Ok(());
     }
 
@@ -124,12 +162,12 @@ pub async fn update(
         .map(|info| info.thread_id.clone())
         .collect();
     if !active_threads.is_empty() && !force {
-        update_status(&reply, ctx, lang.update_active_turns(&active_threads)).await?;
+        update_status(&reply, ctx, &mut last_edit, lang.update_active_turns(&active_threads)).await?;
         return Ok(());
     }
 
     // ── Step 7: 최신 태그 조회 ────────────────────────────────────────────────
-    update_status(&reply, ctx, "🔍 최신 릴리스 확인 중...".to_string()).await?;
+    update_status(&reply, ctx, &mut last_edit, "🔍 최신 릴리스 확인 중...".to_string()).await?;
     let token = data
         .config
         .release
@@ -139,22 +177,29 @@ pub async fn update(
     let latest_tag = match fetch_latest_tag(&data.config.release.repo, token.as_deref()).await {
         Ok(tag) => tag,
         Err(e) => {
-            update_status(&reply, ctx, format!("❌ 최신 태그 조회 실패: {}", e)).await?;
+            update_status(&reply, ctx, &mut last_edit, format!("❌ 최신 태그 조회 실패: {}", e)).await?;
             return Ok(());
         }
     };
 
     // ── Step 8: 버전 비교 ─────────────────────────────────────────────────────
     let current = update::version::current_version();
-    if !update::version::needs_update(current, &latest_tag, force) {
-        update_status(&reply, ctx, lang.update_already_latest(current)).await?;
-        return Ok(());
+    match update::version::needs_update(current, &latest_tag, force) {
+        Ok(true) => {}
+        Ok(false) => {
+            update_status(&reply, ctx, &mut last_edit, lang.update_already_latest(current)).await?;
+            return Ok(());
+        }
+        Err(e) => {
+            update_status(&reply, ctx, &mut last_edit, format!("❌ 버전 파싱 실패: {}", e)).await?;
+            return Ok(());
+        }
     }
 
     // ── Step 9: 디스크 공간 검사 ──────────────────────────────────────────────
-    update_status(&reply, ctx, "💾 디스크 공간 확인 중...".to_string()).await?;
+    update_status(&reply, ctx, &mut last_edit, "💾 디스크 공간 확인 중...".to_string()).await?;
     if let Err(e) = update::backup::check_disk_space(&worktree, 2 * 1024 * 1024 * 1024) {
-        update_status(&reply, ctx, format!("❌ 디스크 공간 부족: {}", e)).await?;
+        update_status(&reply, ctx, &mut last_edit, format!("❌ 디스크 공간 부족: {}", e)).await?;
         return Ok(());
     }
 
@@ -162,11 +207,12 @@ pub async fn update(
     update_status(
         &reply,
         ctx,
+        &mut last_edit,
         format!("📡 태그 fetch 중... ({}→{})", current, latest_tag),
     )
     .await?;
     if let Err(e) = update::git::fetch_tags(&worktree).await {
-        update_status(&reply, ctx, format!("❌ git fetch 실패: {}", e)).await?;
+        update_status(&reply, ctx, &mut last_edit, format!("❌ git fetch 실패: {}", e)).await?;
         return Ok(());
     }
 
@@ -174,29 +220,30 @@ pub async fn update(
     update_status(
         &reply,
         ctx,
+        &mut last_edit,
         format!("🔀 {} 체크아웃 중...", latest_tag),
     )
     .await?;
     if let Err(e) = update::git::checkout_tag(&worktree, &latest_tag).await {
-        update_status(&reply, ctx, format!("❌ git checkout 실패: {}", e)).await?;
+        update_status(&reply, ctx, &mut last_edit, format!("❌ git checkout 실패: {}", e)).await?;
         return Ok(());
     }
 
     // ── Step 12: 바이너리 백업 ────────────────────────────────────────────────
-    update_status(&reply, ctx, "📦 바이너리 백업 중...".to_string()).await?;
+    update_status(&reply, ctx, &mut last_edit, "📦 바이너리 백업 중...".to_string()).await?;
     if let Err(e) = update::backup::backup_binary(&worktree) {
-        update_status(&reply, ctx, format!("❌ 바이너리 백업 실패: {}", e)).await?;
+        update_status(&reply, ctx, &mut last_edit, format!("❌ 바이너리 백업 실패: {}", e)).await?;
         return Ok(());
     }
 
     // ── Step 13: DB 백업 ──────────────────────────────────────────────────────
     if let Err(e) = update::backup::backup_db(std::path::Path::new(&data.config.database.path)) {
-        update_status(&reply, ctx, format!("❌ DB 백업 실패: {}", e)).await?;
+        update_status(&reply, ctx, &mut last_edit, format!("❌ DB 백업 실패: {}", e)).await?;
         return Ok(());
     }
 
     // ── Step 14: 빌드 ─────────────────────────────────────────────────────────
-    update_status(&reply, ctx, "🔨 빌드 중... (수 분 소요될 수 있습니다)".to_string()).await?;
+    update_status(&reply, ctx, &mut last_edit, "🔨 빌드 중... (수 분 소요될 수 있습니다)".to_string()).await?;
     let build_start = std::time::Instant::now();
     let line_counter = Arc::new(std::sync::Mutex::new(0usize));
     let counter_clone = Arc::clone(&line_counter);
@@ -208,11 +255,11 @@ pub async fn update(
     {
         Ok(d) => d,
         Err(update::Error::BuildFailed { stderr_tail }) => {
-            update_status(&reply, ctx, lang.update_build_failed(&stderr_tail)).await?;
+            update_status(&reply, ctx, &mut last_edit, lang.update_build_failed(&stderr_tail)).await?;
             return Ok(());
         }
         Err(e) => {
-            update_status(&reply, ctx, format!("❌ 빌드 실패: {}", e)).await?;
+            update_status(&reply, ctx, &mut last_edit, format!("❌ 빌드 실패: {}", e)).await?;
             return Ok(());
         }
     };
@@ -221,34 +268,44 @@ pub async fn update(
     update_status(
         &reply,
         ctx,
+        &mut last_edit,
         format!("✅ 빌드 완료 ({}s, {} 라인)", build_secs, line_count),
     )
     .await?;
 
     // ── Step 14.5: skills sync ────────────────────────────────────────────────
-    update_status(&reply, ctx, "📚 skills 동기화 중...".to_string()).await?;
+    update_status(&reply, ctx, &mut last_edit, "📚 skills 동기화 중...".to_string()).await?;
     match update::skills::sync_skills(&worktree) {
         Ok(n) => {
             tracing::info!("synced {} skills", n);
         }
         Err(e) => {
-            update_status(&reply, ctx, format!("❌ skills sync 실패: {}", e)).await?;
+            update_status(&reply, ctx, &mut last_edit, format!("❌ skills sync 실패: {}", e)).await?;
             return Ok(());
         }
     }
 
     // ── Step 15: 마커 생성 ────────────────────────────────────────────────────
     if let Err(e) = update::marker::create_marker(&worktree, current, &latest_tag) {
-        update_status(&reply, ctx, format!("❌ 마커 생성 실패: {}", e)).await?;
+        update_status(&reply, ctx, &mut last_edit, format!("❌ 마커 생성 실패: {}", e)).await?;
         return Ok(());
     }
 
     // ── Step 16: 재시작 스케줄 ────────────────────────────────────────────────
     let new_version = latest_tag.strip_prefix('v').unwrap_or(&latest_tag);
     if let Err(e) = update::restart::schedule_restart() {
+        // 스케줄 실패 시 pending 마커를 제거해야 한다.
+        // 그렇지 않으면 operator가 수동으로 재시작할 때 check_and_recover가
+        // 마커를 보고 롤백 경로로 진입, 정상 수동 배포를 망친다.
+        if let Err(cleanup_err) = update::marker::confirm_ready(&worktree) {
+            tracing::error!(
+                "failed to clean up pending marker after restart-schedule failure: {cleanup_err}"
+            );
+        }
         update_status(
             &reply,
             ctx,
+            &mut last_edit,
             format!(
                 "❌ 재시작 스케줄 실패: {}\n(빌드는 성공했습니다. 수동으로 재시작하세요.)",
                 e
@@ -258,6 +315,6 @@ pub async fn update(
         return Ok(());
     }
 
-    update_status(&reply, ctx, lang.update_complete(new_version)).await?;
+    update_status(&reply, ctx, &mut last_edit, lang.update_complete(new_version)).await?;
     Ok(())
 }

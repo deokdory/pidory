@@ -1,5 +1,6 @@
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use super::Error;
 
@@ -34,16 +35,40 @@ pub fn backup_db(db_path: &Path) -> Result<PathBuf, Error> {
 
     let db_str = db_path.to_string_lossy();
     let backup_str = backup_path.to_string_lossy();
-    let dot_cmd = format!(".backup '{}'", backup_str);
 
-    let output = Command::new("sqlite3")
-        .args([db_str.as_ref(), dot_cmd.as_str()])
-        .output()
+    // SQL 싱글쿼트 이스케이프(`'` → `''`)로 경로 내 싱글쿼트 주입 방지.
+    // stdin으로 명령 전달하여 dot-command arg 파싱의 모호함도 제거한다.
+    let escaped = backup_str.replace('\'', "''");
+    let dot_cmd = format!(".backup '{}'\n", escaped);
+
+    let mut child = Command::new("sqlite3")
+        .arg(db_str.as_ref())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .map_err(|e| Error::BackupFailed(format!("sqlite3 spawn failed: {}", e)))?;
+
+    {
+        let stdin = child
+            .stdin
+            .as_mut()
+            .ok_or_else(|| Error::BackupFailed("sqlite3 stdin unavailable".to_string()))?;
+        stdin
+            .write_all(dot_cmd.as_bytes())
+            .map_err(|e| Error::BackupFailed(format!("sqlite3 stdin write failed: {}", e)))?;
+    }
+
+    let output = child
+        .wait_with_output()
+        .map_err(|e| Error::BackupFailed(format!("sqlite3 wait failed: {}", e)))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-        return Err(Error::BackupFailed(format!("sqlite3 .backup failed: {}", stderr)));
+        return Err(Error::BackupFailed(format!(
+            "sqlite3 .backup failed: {}",
+            stderr
+        )));
     }
 
     Ok(backup_path)
@@ -132,8 +157,10 @@ pub fn check_disk_space(worktree: &Path, min_bytes: u64) -> Result<(), Error> {
 
     #[cfg(not(target_os = "linux"))]
     {
+        // macOS/BSD에서는 `df --output=avail` 플래그가 없어 best-effort로 통과.
+        // 실제 디스크 부족은 뒤따르는 copy/rename 단계에서 감지된다.
         let _ = (worktree, min_bytes);
-        unimplemented!("check_disk_space is only supported on Linux")
+        Ok(())
     }
 }
 

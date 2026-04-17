@@ -104,6 +104,12 @@ async fn main() -> Result<(), PidoryError> {
         }
     };
 
+    // check_and_recover가 마커를 수정/삭제하기 전에 기록 — watchdog gate 용도.
+    let had_pending_marker = worktree_opt
+        .as_ref()
+        .map(|w| w.join("target").join("release").join(".update-pending").exists())
+        .unwrap_or(false);
+
     if let Some(worktree) = &worktree_opt {
         if let Err(e) = update::lock::cleanup_stale(worktree) {
             tracing::warn!("cleanup_stale failed: {:?}", e);
@@ -113,31 +119,57 @@ async fn main() -> Result<(), PidoryError> {
             update::marker::RecoveryAction::Rolling { from, to, attempt } => {
                 tracing::warn!("Rolling back: from={} to={} attempt={}", from, to, attempt);
                 let db_path = std::path::PathBuf::from(&config.database.path);
+                let mut restore_failed = false;
                 if let Err(e) = update::backup::restore_binary(worktree) {
                     tracing::error!("restore_binary failed: {:?}", e);
+                    restore_failed = true;
                 }
                 if let Err(e) = update::backup::restore_db(&db_path) {
                     tracing::error!("restore_db failed: {:?}", e);
+                    restore_failed = true;
                 }
                 let rollback_marker = worktree.join("target").join("release").join(".update-rolled-back");
                 let rollback_info = serde_json::json!({
                     "from": from,
                     "to": to,
                     "attempt": attempt,
+                    "restore_failed": restore_failed,
                 });
                 let _ = std::fs::write(&rollback_marker, rollback_info.to_string());
-                let _ = update::restart::schedule_restart();
+
+                if restore_failed {
+                    // 복원 자체가 실패한 상태에서 재시작을 예약하면, attempts 한계에 도달한 뒤
+                    // check_and_recover가 marker를 삭제하고 Normal 경로로 떨어져
+                    // 망가진 새 바이너리가 steady state로 자리잡는다.
+                    // 대신 비정상 종료하여 systemd의 Restart=on-failure에 의존하고,
+                    // 마커를 그대로 두어 다음 부팅에서도 롤백 시도를 계속한다.
+                    tracing::error!(
+                        "rollback restore failed — exiting 1 without scheduling, marker preserved"
+                    );
+                    std::process::exit(1);
+                }
+
+                if let Err(e) = update::restart::schedule_restart() {
+                    tracing::error!("rollback schedule_restart failed: {:?}", e);
+                    std::process::exit(1);
+                }
                 std::process::exit(0);
             }
         }
     }
 
-    // ready watchdog spawn (worktree 있을 때만)
+    // ready watchdog spawn — pending 마커가 존재했을 때만 arm.
+    // 일반 부팅(업데이트 없음)에서 watchdog이 Discord 장애 등으로 60초 내
+    // 준비 신호를 못 받으면 불필요한 강제 재시작 루프가 시작되기 때문이다.
     let ready_tx_cell: Arc<std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>> = {
-        if let Some(worktree) = worktree_opt.clone() {
-            let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<()>();
-            tokio::spawn(update::marker::ready_watchdog(worktree, ready_rx));
-            Arc::new(std::sync::Mutex::new(Some(ready_tx)))
+        if had_pending_marker {
+            if let Some(worktree) = worktree_opt.clone() {
+                let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<()>();
+                tokio::spawn(update::marker::ready_watchdog(worktree, ready_rx));
+                Arc::new(std::sync::Mutex::new(Some(ready_tx)))
+            } else {
+                Arc::new(std::sync::Mutex::new(None))
+            }
         } else {
             Arc::new(std::sync::Mutex::new(None))
         }

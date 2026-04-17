@@ -1,9 +1,17 @@
-use std::fs;
-use std::io;
+use std::fs::{self, OpenOptions};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+#[cfg(not(target_os = "linux"))]
 use std::process::Command;
+use std::time::Duration;
 
 use super::Error;
+
+/// Max attempts for the acquire loop. Generous because contention races on
+/// empty lock files burn iterations via sleep+retry.
+const ACQUIRE_MAX_ATTEMPTS: u32 = 16;
+/// Base backoff when we observe an empty lock file (concurrent writer mid-init).
+const EMPTY_LOCK_BACKOFF: Duration = Duration::from_millis(5);
 
 /// Holds the update lock. Deletes the lock file on drop.
 #[derive(Debug)]
@@ -46,10 +54,12 @@ fn is_alive(pid: u32) -> bool {
     }
 }
 
-/// Acquire the update lock for `worktree`.
+/// Atomically acquire the update lock for `worktree`.
 ///
-/// Returns `Err(Error::LockHeld(pid))` if another live process holds the lock.
-/// Stale locks (dead PID) are removed automatically.
+/// Uses `O_CREAT | O_EXCL` (via `create_new(true)`) so only one caller can
+/// create the lock file. Stale locks (dead PID / unparseable) are removed and
+/// the create is retried a bounded number of times to avoid infinite loops
+/// under pathological PID reuse.
 pub fn acquire(worktree: &Path) -> Result<LockGuard, Error> {
     let path = lock_path(worktree);
 
@@ -58,28 +68,70 @@ pub fn acquire(worktree: &Path) -> Result<LockGuard, Error> {
         fs::create_dir_all(parent).map_err(|e| Error::BackupFailed(e.to_string()))?;
     }
 
-    // Check existing lock file.
-    match fs::read_to_string(&path) {
-        Ok(contents) => {
-            if let Ok(pid) = contents.trim().parse::<u32>() {
-                if is_alive(pid) {
-                    return Err(Error::LockHeld(pid));
+    let my_pid = std::process::id();
+
+    for attempt in 0..ACQUIRE_MAX_ATTEMPTS {
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(mut f) => {
+                f.write_all(my_pid.to_string().as_bytes())
+                    .map_err(|e| Error::BackupFailed(e.to_string()))?;
+                // Durable write: crash before fsync could leave a zero-length lock
+                // that other processes would treat as stale.
+                f.sync_all()
+                    .map_err(|e| Error::BackupFailed(e.to_string()))?;
+
+                // Read-back verification: between create_new and this point, another
+                // thread that observed our empty file could have removed it and
+                // created its own. If the path now maps to a different PID (or is
+                // gone), we did not actually acquire the lock → retry.
+                match fs::read_to_string(&path) {
+                    Ok(check) if check.trim().parse::<u32>().ok() == Some(my_pid) => {
+                        return Ok(LockGuard { path, pid: my_pid });
+                    }
+                    _ => continue,
                 }
-                // Stale — remove and continue.
             }
-            // Unparseable content or dead PID → treat as stale, remove.
-            let _ = fs::remove_file(&path);
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                match fs::read_to_string(&path) {
+                    Ok(contents) => {
+                        let trimmed = contents.trim();
+                        if trimmed.is_empty() {
+                            // Concurrent creator is mid-write. Back off without
+                            // removing the file — removing it here is what causes
+                            // double-winner races.
+                            std::thread::sleep(EMPTY_LOCK_BACKOFF * (attempt + 1));
+                            continue;
+                        }
+                        match trimmed.parse::<u32>() {
+                            Ok(pid) if is_alive(pid) => {
+                                return Err(Error::LockHeld(pid));
+                            }
+                            _ => {
+                                // Verified dead or persistently garbage → clean up and retry.
+                                let _ = fs::remove_file(&path);
+                                continue;
+                            }
+                        }
+                    }
+                    Err(e2) if e2.kind() == io::ErrorKind::NotFound => {
+                        // Raced with a concurrent cleanup — retry create.
+                        continue;
+                    }
+                    Err(e2) => return Err(Error::BackupFailed(e2.to_string())),
+                }
+            }
+            Err(e) => return Err(Error::BackupFailed(e.to_string())),
         }
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {
-            // No lock file — proceed.
-        }
-        Err(e) => return Err(Error::BackupFailed(e.to_string())),
     }
 
-    let my_pid = std::process::id();
-    fs::write(&path, my_pid.to_string()).map_err(|e| Error::BackupFailed(e.to_string()))?;
-
-    Ok(LockGuard { path, pid: my_pid })
+    // Excessive contention — treat as transient failure to avoid infinite loop.
+    Err(Error::BackupFailed(
+        "lock acquisition failed after repeated contention".to_string(),
+    ))
 }
 
 /// Remove the lock file if it belongs to a dead process.
@@ -112,6 +164,8 @@ pub fn cleanup_stale(worktree: &Path) -> Result<(), Error> {
 mod tests {
     use super::*;
     use std::fs;
+    use std::sync::{Arc, Barrier};
+    use std::thread;
     use tempfile::TempDir;
 
     fn make_worktree() -> TempDir {
@@ -219,5 +273,43 @@ mod tests {
         let worktree = make_worktree();
         // No lock file created.
         cleanup_stale(worktree.path()).expect("cleanup_stale on missing file should be OK");
+    }
+
+    /// Concurrent `acquire` from multiple threads must yield exactly one winner.
+    /// Regression test for TOCTOU race (#240 review).
+    #[test]
+    fn acquire_is_atomic_under_contention() {
+        let worktree = Arc::new(make_worktree());
+        let n = 8usize;
+        let barrier = Arc::new(Barrier::new(n));
+        let mut handles = Vec::with_capacity(n);
+
+        for _ in 0..n {
+            let worktree = Arc::clone(&worktree);
+            let barrier = Arc::clone(&barrier);
+            handles.push(thread::spawn(move || {
+                barrier.wait();
+                acquire(worktree.path())
+            }));
+        }
+
+        let mut ok_count = 0;
+        let mut held_count = 0;
+        let mut guards = Vec::new();
+        for h in handles {
+            match h.join().unwrap() {
+                Ok(g) => {
+                    ok_count += 1;
+                    guards.push(g);
+                }
+                Err(Error::LockHeld(_)) => held_count += 1,
+                Err(e) => panic!("unexpected error: {:?}", e),
+            }
+        }
+
+        assert_eq!(ok_count, 1, "exactly one winner expected");
+        assert_eq!(held_count, n - 1, "others must observe LockHeld");
+
+        drop(guards);
     }
 }

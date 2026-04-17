@@ -1,3 +1,5 @@
+use std::fs::OpenOptions;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, UNIX_EPOCH};
 
@@ -52,8 +54,18 @@ pub fn create_marker(
         .map_err(|e| Error::BackupFailed(format!("json serialize failed: {e}")))?;
 
     let path = marker_path(worktree);
-    std::fs::write(&path, json)
+    // fsync로 내구성 보장 — crash 직후 빈 마커/부분 write를 다른 부팅 경로가
+    // 오해하지 않도록 한다.
+    let mut f = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&path)
+        .map_err(|e| Error::BackupFailed(format!("open marker failed: {e}")))?;
+    f.write_all(json.as_bytes())
         .map_err(|e| Error::BackupFailed(format!("write marker failed: {e}")))?;
+    f.sync_all()
+        .map_err(|e| Error::BackupFailed(format!("sync marker failed: {e}")))?;
 
     Ok(())
 }

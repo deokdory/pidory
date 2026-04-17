@@ -38,9 +38,15 @@ pub fn sanity_check(path: &Path) -> Result<(), Error> {
     let contents = std::fs::read_to_string(&cargo_toml)
         .map_err(|_| Error::NotPidoryWorktree)?;
 
-    let has_name = contents
-        .lines()
-        .any(|line| line.trim() == r#"name = "pidory""#);
+    // 공백 허용 매칭: `name="pidory"`, `name =  "pidory"` 등 모두 매칭.
+    let has_name = contents.lines().any(|line| {
+        let normalized: String = line
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join("")
+            .to_string();
+        normalized == r#"name="pidory""#
+    });
 
     if !has_name {
         return Err(Error::NotPidoryWorktree);
@@ -56,36 +62,25 @@ pub fn sanity_check(path: &Path) -> Result<(), Error> {
 }
 
 pub fn is_dirty(path: &Path) -> Result<bool, Error> {
-    // working tree dirty 확인
-    let wt = Command::new("git")
-        .args(["-C", &path.to_string_lossy(), "diff", "--quiet"])
+    // git status --porcelain --untracked-files=normal로 modified/staged/untracked 전부 감지.
+    // 비어있으면 clean, 아니면 dirty.
+    let output = Command::new("git")
+        .args([
+            "-C",
+            &path.to_string_lossy(),
+            "status",
+            "--porcelain",
+            "--untracked-files=normal",
+        ])
         .output()
         .map_err(|e| Error::FetchFailed(e.to_string()))?;
 
-    // exit code 1 = dirty, 0 = clean, other = git error
-    match wt.status.code() {
-        Some(0) => {}
-        Some(1) => return Ok(true),
-        _ => {
-            let stderr = String::from_utf8_lossy(&wt.stderr).to_string();
-            return Err(Error::FetchFailed(stderr));
-        }
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        return Err(Error::FetchFailed(stderr));
     }
 
-    // staged dirty 확인
-    let staged = Command::new("git")
-        .args(["-C", &path.to_string_lossy(), "diff", "--cached", "--quiet"])
-        .output()
-        .map_err(|e| Error::FetchFailed(e.to_string()))?;
-
-    match staged.status.code() {
-        Some(0) => Ok(false),
-        Some(1) => Ok(true),
-        _ => {
-            let stderr = String::from_utf8_lossy(&staged.stderr).to_string();
-            Err(Error::FetchFailed(stderr))
-        }
-    }
+    Ok(!output.stdout.is_empty())
 }
 
 pub fn current_commit(path: &Path) -> Result<String, Error> {
@@ -282,6 +277,33 @@ mod tests {
 
         let dirty = is_dirty(path).expect("is_dirty");
         assert!(dirty, "staged 파일이 있으므로 dirty 이어야 함");
+    }
+
+    #[test]
+    fn is_dirty_with_untracked_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path();
+
+        make_test_repo(path);
+
+        // untracked 파일 하나만 추가 (add/commit 없음)
+        fs::write(path.join("untracked.txt"), "hello").expect("write");
+
+        let dirty = is_dirty(path).expect("is_dirty");
+        assert!(dirty, "untracked 파일이 있으므로 dirty 이어야 함");
+    }
+
+    #[test]
+    fn sanity_check_accepts_spaced_name_line() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path();
+
+        // 탭·비표준 공백 배치
+        let content = "[package]\nname\t=   \"pidory\"\nversion = \"0.0.0\"\n";
+        fs::write(path.join("Cargo.toml"), content).expect("write");
+        fs::create_dir(path.join(".git")).expect("mkdir .git");
+
+        assert!(sanity_check(path).is_ok());
     }
 
     #[test]

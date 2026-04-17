@@ -1,3 +1,13 @@
+use thiserror::Error;
+
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum VersionError {
+    #[error("malformed current version: {0}")]
+    MalformedCurrent(String),
+    #[error("malformed latest tag: {0}")]
+    MalformedLatest(String),
+}
+
 pub fn current_version() -> &'static str {
     env!("CARGO_PKG_VERSION")
 }
@@ -21,22 +31,17 @@ pub fn parse_tag(tag: &str) -> Option<[u32; 3]> {
     Some([a, b, c])
 }
 
-pub fn needs_update(current: &str, latest_tag: &str, force: bool) -> bool {
+pub fn needs_update(current: &str, latest_tag: &str, force: bool) -> Result<bool, VersionError> {
     if force {
-        return true;
+        return Ok(true);
     }
 
-    let current_ver = match parse_tag(current) {
-        Some(v) => v,
-        None => return false,
-    };
+    let current_ver =
+        parse_tag(current).ok_or_else(|| VersionError::MalformedCurrent(current.to_string()))?;
+    let latest_ver = parse_tag(latest_tag)
+        .ok_or_else(|| VersionError::MalformedLatest(latest_tag.to_string()))?;
 
-    let latest_ver = match parse_tag(latest_tag) {
-        Some(v) => v,
-        None => return false,
-    };
-
-    latest_ver > current_ver
+    Ok(latest_ver > current_ver)
 }
 
 #[cfg(test)]
@@ -75,31 +80,42 @@ mod tests {
 
     #[test]
     fn needs_update_newer_available() {
-        assert!(needs_update("0.6.3", "v0.6.4", false));
+        assert_eq!(needs_update("0.6.3", "v0.6.4", false), Ok(true));
     }
 
     #[test]
     fn needs_update_same_version() {
-        assert!(!needs_update("0.6.4", "v0.6.4", false));
+        assert_eq!(needs_update("0.6.4", "v0.6.4", false), Ok(false));
     }
 
     #[test]
     fn needs_update_force_flag() {
-        assert!(needs_update("0.6.4", "v0.6.4", true));
+        assert_eq!(needs_update("0.6.4", "v0.6.4", true), Ok(true));
     }
 
     #[test]
     fn needs_update_downgrade() {
-        assert!(!needs_update("0.6.5", "v0.6.4", false));
+        assert_eq!(needs_update("0.6.5", "v0.6.4", false), Ok(false));
     }
 
     #[test]
     fn needs_update_semver_numeric_comparison() {
-        assert!(needs_update("0.6.3", "v0.6.10", false));
+        assert_eq!(needs_update("0.6.3", "v0.6.10", false), Ok(true));
     }
 
     #[test]
     fn needs_update_malformed_current() {
-        assert!(!needs_update("abc", "v0.6.4", false));
+        assert_eq!(
+            needs_update("abc", "v0.6.4", false),
+            Err(VersionError::MalformedCurrent("abc".to_string()))
+        );
+    }
+
+    #[test]
+    fn needs_update_malformed_latest() {
+        assert_eq!(
+            needs_update("0.6.3", "garbage", false),
+            Err(VersionError::MalformedLatest("garbage".to_string()))
+        );
     }
 }
