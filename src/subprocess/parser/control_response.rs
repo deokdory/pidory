@@ -59,6 +59,71 @@ pub fn build_control_response_ask_answer(
     format!("{}\n", json)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProbeMode {
+    None,
+    Bogus,
+    Real,
+}
+
+impl ProbeMode {
+    pub fn from_env() -> Self {
+        match std::env::var("PIDORY_SPIKE_PROBE").as_deref() {
+            Ok("bogus") => Self::Bogus,
+            Ok("real") => Self::Real,
+            _ => Self::None,
+        }
+    }
+}
+
+/// Spike-only: builds allow response with optional probe fields.
+/// ProbeMode::None — identical to build_control_response_allow.
+/// ProbeMode::Bogus — adds __pidory_probe: true to response (tests schema tolerance).
+/// ProbeMode::Real — adds updatedPermissions using derive_rule_content; omits field if None.
+#[allow(dead_code)]
+pub fn build_control_response_allow_probed(
+    request_id: &str,
+    input: &Value,
+    probe_mode: &ProbeMode,
+    tool_name: &str,
+) -> String {
+    let mut response_inner = serde_json::json!({
+        "behavior": "allow",
+        "updatedInput": input
+    });
+
+    match probe_mode {
+        ProbeMode::None => {}
+        ProbeMode::Bogus => {
+            response_inner["__pidory_probe"] = serde_json::Value::Bool(true);
+        }
+        ProbeMode::Real => {
+            if let Some((tool, rule)) = crate::subprocess::rule_content::derive_rule_content(tool_name, input) {
+                response_inner["updatedPermissions"] = serde_json::json!([{
+                    "type": "addRules",
+                    "rules": [{
+                        "toolName": tool,
+                        "ruleContent": rule,
+                    }],
+                    "behavior": "allow",
+                    "destination": "session"
+                }]);
+            }
+            // derive_rule_content 가 None 이면 updatedPermissions 필드 생략 (backward-safe)
+        }
+    }
+
+    let response = serde_json::json!({
+        "type": "control_response",
+        "response": {
+            "subtype": "success",
+            "request_id": request_id,
+            "response": response_inner
+        }
+    });
+    format!("{}\n", response)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -143,5 +208,87 @@ mod ask_answer_tests {
         let answers = HashMap::from([("q_0".to_string(), "test".to_string())]);
         let out = build_control_response_ask_answer("req-3", &input, &answers);
         assert!(out.ends_with('\n'));
+    }
+}
+
+#[cfg(test)]
+mod probe_mode_tests {
+    use super::*;
+
+    #[test]
+    fn probe_mode_none_is_identical_to_original() {
+        let input = serde_json::json!({"command": "ls"});
+        let orig = build_control_response_allow("req-1", &input);
+        let probed = build_control_response_allow_probed("req-1", &input, &ProbeMode::None, "Bash");
+        let v_orig: serde_json::Value = serde_json::from_str(orig.trim()).unwrap();
+        let v_probed: serde_json::Value = serde_json::from_str(probed.trim()).unwrap();
+        assert_eq!(v_orig["response"]["response"]["behavior"], v_probed["response"]["response"]["behavior"]);
+        assert!(v_probed["response"]["response"].get("__pidory_probe").is_none());
+        assert!(v_probed["response"]["response"].get("updatedPermissions").is_none());
+    }
+
+    #[test]
+    fn probe_mode_bogus_adds_probe_field() {
+        let input = serde_json::json!({});
+        let probed = build_control_response_allow_probed("req-2", &input, &ProbeMode::Bogus, "Bash");
+        let v: serde_json::Value = serde_json::from_str(probed.trim()).unwrap();
+        assert_eq!(v["response"]["response"]["__pidory_probe"], true);
+        assert_eq!(v["response"]["response"]["behavior"], "allow");
+    }
+
+    #[test]
+    fn probe_mode_real_adds_updated_permissions_field() {
+        let input = serde_json::json!({"command": "ls"});
+        let probed = build_control_response_allow_probed("req-3", &input, &ProbeMode::Real, "Bash");
+        let v: serde_json::Value = serde_json::from_str(probed.trim()).unwrap();
+        assert!(v["response"]["response"]["updatedPermissions"].is_array());
+    }
+
+    #[test]
+    fn probe_mode_from_env_defaults_to_none() {
+        unsafe { std::env::remove_var("PIDORY_SPIKE_PROBE") };
+        assert_eq!(ProbeMode::from_env(), ProbeMode::None);
+    }
+
+    #[test]
+    fn control_response_updated_permissions_bash() {
+        let input = serde_json::json!({"command": "npm test"});
+        let probed = build_control_response_allow_probed("req-1", &input, &ProbeMode::Real, "Bash");
+        let v: serde_json::Value = serde_json::from_str(probed.trim()).unwrap();
+        let perms = &v["response"]["response"]["updatedPermissions"];
+        assert!(perms.is_array());
+        assert_eq!(perms[0]["type"], "addRules");
+        assert_eq!(perms[0]["behavior"], "allow");
+        assert_eq!(perms[0]["destination"], "session");
+        assert_eq!(perms[0]["rules"][0]["toolName"], "Bash");
+        assert_eq!(perms[0]["rules"][0]["ruleContent"], "npm test");
+    }
+
+    #[test]
+    fn control_response_updated_permissions_webfetch_domain() {
+        let input = serde_json::json!({"url": "https://example.com/foo"});
+        let probed = build_control_response_allow_probed("req-2", &input, &ProbeMode::Real, "WebFetch");
+        let v: serde_json::Value = serde_json::from_str(probed.trim()).unwrap();
+        let perms = &v["response"]["response"]["updatedPermissions"];
+        assert_eq!(perms[0]["rules"][0]["toolName"], "WebFetch");
+        assert_eq!(perms[0]["rules"][0]["ruleContent"], "domain:example.com");
+    }
+
+    #[test]
+    fn control_response_updated_permissions_grep_returns_none() {
+        let input = serde_json::json!({"pattern": "*.rs"});
+        let probed = build_control_response_allow_probed("req-3", &input, &ProbeMode::Real, "Grep");
+        let v: serde_json::Value = serde_json::from_str(probed.trim()).unwrap();
+        assert!(v["response"]["response"].get("updatedPermissions").is_none(),
+            "Grep 은 derive_rule_content 에서 None → updatedPermissions 필드 자체가 없어야 함");
+    }
+
+    #[test]
+    fn control_response_probe_none_ignores_tool_name() {
+        let input = serde_json::json!({"command": "ls"});
+        let probed = build_control_response_allow_probed("req-4", &input, &ProbeMode::None, "Bash");
+        let v: serde_json::Value = serde_json::from_str(probed.trim()).unwrap();
+        assert!(v["response"]["response"].get("updatedPermissions").is_none());
+        assert!(v["response"]["response"].get("__pidory_probe").is_none());
     }
 }
