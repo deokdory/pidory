@@ -448,6 +448,7 @@ pub fn parse_line(line: &str) -> Result<StreamEvent, serde_json::Error> {
                 .and_then(|r| r.get("decision_reason"))
                 .and_then(|s| s.as_str())
                 .map(|s| s.to_string());
+            tracing::info!("control_request received: tool={} request_id={} input={:?}", tool_name, request_id, input);
             Ok(StreamEvent::ControlRequest {
                 request_id,
                 tool_name,
