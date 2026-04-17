@@ -101,6 +101,11 @@ else
         -e "s|__PROJECT_DIR__|$PROJECT_DIR|g" \
         -e "s|__HOME_DIR__|$HOME_DIR|g" \
         "$SCRIPT_DIR/pidory.service" | sudo tee /etc/systemd/system/pidory.service > /dev/null
+    # pidory-delayed-restart.service 설치
+    sed -e "s|__USER__|$USER_NAME|g" \
+        -e "s|__PROJECT_DIR__|$PROJECT_DIR|g" \
+        -e "s|__HOME_DIR__|$HOME_DIR|g" \
+        "$SCRIPT_DIR/pidory-delayed-restart.service" | sudo tee /etc/systemd/system/pidory-delayed-restart.service > /dev/null
     sudo systemctl daemon-reload
     sudo systemctl enable pidory
 

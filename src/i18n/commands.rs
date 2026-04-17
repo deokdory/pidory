@@ -490,4 +490,62 @@ impl Lang {
             }
         }
     }
+
+    // ── Commands: update ──
+
+    pub fn update_in_progress(&self) -> &'static str {
+        match self {
+            Lang::Ko => "⏳ 업데이트 진행 중...",
+            Lang::En => "⏳ Update in progress...",
+        }
+    }
+
+    pub fn update_already_latest(&self, version: &str) -> String {
+        match self {
+            Lang::Ko => format!("✅ 이미 최신 버전 v{}입니다.", version),
+            Lang::En => format!("✅ Already on latest v{}.", version),
+        }
+    }
+
+    pub fn update_dirty_tree(&self) -> &'static str {
+        match self {
+            Lang::Ko => "❌ 작업 트리에 커밋되지 않은 변경이 있습니다. 먼저 정리하세요.",
+            Lang::En => "❌ Working tree has uncommitted changes. Clean up first.",
+        }
+    }
+
+    pub fn update_active_turns(&self, threads: &[String]) -> String {
+        let joined = threads.join(", ");
+        match self {
+            Lang::Ko => format!(
+                "❌ 활성 턴이 있습니다: {}\n`force:true`로 강제 진행 가능합니다.",
+                joined
+            ),
+            Lang::En => format!(
+                "❌ Active turns in: {}\nUse `force:true` to override.",
+                joined
+            ),
+        }
+    }
+
+    pub fn update_build_failed(&self, stderr_tail: &str) -> String {
+        match self {
+            Lang::Ko => format!("❌ 빌드 실패:\n```\n{}\n```", stderr_tail),
+            Lang::En => format!("❌ Build failed:\n```\n{}\n```", stderr_tail),
+        }
+    }
+
+    pub fn update_complete(&self, version: &str) -> String {
+        match self {
+            Lang::Ko => format!("✅ v{} 빌드 완료. 30초 후 재시작합니다.", version),
+            Lang::En => format!("✅ v{} built. Restarting in 30 seconds.", version),
+        }
+    }
+
+    pub fn update_rollback(&self) -> &'static str {
+        match self {
+            Lang::Ko => "⚠️ 업데이트 후 부팅 실패로 자동 롤백됨.",
+            Lang::En => "⚠️ Update failed to boot — auto-rolled back.",
+        }
+    }
 }
