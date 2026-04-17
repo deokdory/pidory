@@ -31,4 +31,12 @@ pub async fn cleanup_session_state(data: &Data, thread_id: &str, ctx: &Context) 
     if let Some(tracker) = tracker {
         tracker.lock().await.cleanup(ctx).await;
     }
+
+    // Leave the thread — the member list now signals session liveness
+    if let Ok(id) = thread_id.parse::<u64>() {
+        poise::serenity_prelude::ChannelId::new(id)
+            .leave_thread(ctx)
+            .await
+            .ok();
+    }
 }
