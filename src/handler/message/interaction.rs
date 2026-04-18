@@ -65,8 +65,8 @@ pub(super) async fn handle_question_cancel(
             let mut to_disable = Vec::new();
             for idx in 0..total {
                 let sub_id = question_ui::make_sub_request_id(&group_id, idx);
+                // p.response_tx here is a dummy_tx; dropping it via scope-end is harmless.
                 if let Some(p) = perms.remove(&sub_id) {
-                    drop(p.response_tx); // dummy_tx, harmless
                     to_disable.push(p.message_id);
                 }
             }

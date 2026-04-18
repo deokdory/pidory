@@ -227,13 +227,11 @@ pub fn parse_question_modal_id(custom_id: &str) -> Option<String> {
 }
 
 /// Parses `ask_cancel:{request_id}` cancel button custom_id.
-/// Note: does NOT match `ask_cancel_confirm:` or `ask_cancel_abort:` prefixes.
+///
+/// Safe vs `ask_cancel_confirm:` / `ask_cancel_abort:` because those have `_` right
+/// after `ask_cancel`, not `:` — `strip_prefix("ask_cancel:")` cannot match them.
 pub fn parse_question_cancel_button_id(custom_id: &str) -> Option<String> {
-    let stripped = custom_id.strip_prefix("ask_cancel:")?;
-    // Reject if the remainder starts with "confirm:" or "abort:" (extra safety)
-    // In practice strip_prefix("ask_cancel:") already won't match "ask_cancel_confirm:" or
-    // "ask_cancel_abort:" because those have '_' right after "ask_cancel", not ':'.
-    Some(stripped.to_string())
+    custom_id.strip_prefix("ask_cancel:").map(|s| s.to_string())
 }
 
 /// Parses `ask_cancel_confirm:{request_id}` confirm-yes button custom_id.
