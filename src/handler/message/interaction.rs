@@ -44,6 +44,51 @@ pub(super) async fn verify_component_auth(
     Some(triggered_by)
 }
 
+/// Cancels a question (single or multi-question group) by sending Deny to Claude
+/// and disabling all related Discord messages.
+pub(super) async fn handle_question_cancel(
+    data: &Data,
+    ctx: &Context,
+    request_id: &str,
+    channel_id: poise::serenity_prelude::ChannelId,
+    lang: Lang,
+) {
+    let canceled_label = lang.question_canceled_label();
+
+    if let Some((group_id, _)) = question_ui::parse_sub_request_id(request_id) {
+        // Multi-question: remove group → send Deny via real response_tx
+        let group = data.pending_question_groups.lock().await.remove(&group_id);
+        if let Some(g) = group {
+            let _ = g.response_tx.send(PermissionDecision::Deny);
+            let total = question_ui::question_count(&g.input);
+            let mut perms = data.pending_permissions.lock().await;
+            let mut to_disable = Vec::new();
+            for idx in 0..total {
+                let sub_id = question_ui::make_sub_request_id(&group_id, idx);
+                // p.response_tx here is a dummy_tx; dropping it via scope-end is harmless.
+                if let Some(p) = perms.remove(&sub_id) {
+                    to_disable.push(p.message_id);
+                }
+            }
+            drop(perms);
+            for mid in to_disable {
+                let _ = question_ui::disable_question_components_with_label(
+                    ctx, channel_id, mid, canceled_label,
+                ).await;
+            }
+        }
+    } else {
+        // Single question: pending_permissions has the real response_tx
+        let pending = data.pending_permissions.lock().await.remove(request_id);
+        if let Some(p) = pending {
+            let _ = p.response_tx.send(PermissionDecision::Deny);
+            let _ = question_ui::disable_question_components_with_label(
+                ctx, channel_id, p.message_id, canceled_label,
+            ).await;
+        }
+    }
+}
+
 /// Handles a question answer — either direct (single question) or group (multi-question).
 ///
 /// For single questions, the caller has already removed the PendingPermission and passes
@@ -244,6 +289,76 @@ pub(super) async fn handle_interaction(
                 ctx,
                 poise::serenity_prelude::CreateInteractionResponse::Modal(
                     question_ui::create_question_modal(&request_id, lang),
+                ),
+            )
+            .await
+            .ok();
+
+        return Ok(());
+    }
+
+    // Try question cancel button: ask_cancel:{request_id}
+    // Opens an ephemeral confirm/abort dialog without modifying the original message.
+    if let Some(request_id) =
+        question_ui::parse_question_cancel_button_id(&component.data.custom_id)
+    {
+        let Some(_triggered_by) = verify_component_auth(component, ctx, data, &request_id, lang).await else {
+            return Ok(());
+        };
+
+        component
+            .create_response(
+                ctx,
+                poise::serenity_prelude::CreateInteractionResponse::Message(
+                    question_ui::create_cancel_confirm_message(&request_id, lang),
+                ),
+            )
+            .await
+            .ok();
+
+        return Ok(());
+    }
+
+    // Try question cancel confirm button: ask_cancel_confirm:{request_id}
+    // Updates the ephemeral message and sends Deny to Claude.
+    if let Some(request_id) =
+        question_ui::parse_question_cancel_confirm_id(&component.data.custom_id)
+    {
+        let Some(_triggered_by) = verify_component_auth(component, ctx, data, &request_id, lang).await else {
+            return Ok(());
+        };
+
+        // Update ephemeral message to show cancellation
+        component
+            .create_response(
+                ctx,
+                poise::serenity_prelude::CreateInteractionResponse::UpdateMessage(
+                    poise::serenity_prelude::CreateInteractionResponseMessage::new()
+                        .content(format!("-# {}", lang.question_canceled_label()))
+                        .components(vec![]),
+                ),
+            )
+            .await
+            .ok();
+
+        handle_question_cancel(data, ctx, &request_id, component.channel_id, lang).await;
+        return Ok(());
+    }
+
+    // Try question cancel abort button: ask_cancel_abort:{request_id}
+    // The ephemeral confirm message is only visible to the clicker, so no auth check is
+    // strictly necessary. We still parse the id for correctness but skip verify_component_auth.
+    if let Some(_request_id) =
+        question_ui::parse_question_cancel_abort_id(&component.data.custom_id)
+    {
+        // Collapse the ephemeral confirm dialog back to a neutral indicator.
+        component
+            .create_response(
+                ctx,
+                poise::serenity_prelude::CreateInteractionResponse::UpdateMessage(
+                    poise::serenity_prelude::CreateInteractionResponseMessage::new()
+                        .content("-# ↩️")
+                        .components(vec![]),
                 ),
             )
             .await
