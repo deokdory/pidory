@@ -18,8 +18,8 @@ use crate::handler::message::{shorten_model_name, format_ctx_suffix};
 use crate::i18n::Lang;
 use crate::ratelimit::RateLimitInfo;
 use super::background::BackgroundTaskTracker;
-use super::parser::{parse_line, StreamEvent, ContentBlock, build_control_response_allow, build_control_response_allow_probed, build_control_response_deny, build_control_response_ask_answer, ProbeMode};
-use super::permission::{PermissionCache, PermissionDecision, PermissionRequest};
+use super::parser::{parse_line, StreamEvent, ContentBlock, build_control_response_allow, build_control_response_deny, build_control_response_ask_answer};
+use super::permission::{PermissionCache, PermissionRequest};
 use super::session_manager::{QueuedMessage, SessionInner, ReplyContext};
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
@@ -472,40 +472,12 @@ async fn handle_between_turns_event(
                             BetweenTurnsAction::Continue
                         }
                         Ok(StreamEvent::ControlRequest { ref request_id, ref tool_name, ref tool_use_id, ref input, ref decision_reason, .. }) => {
-                            tracing::info!("control_request received: tool={} request_id={} input={:?}", tool_name, request_id, input);
-                            if permission_cache.is_always_allowed(tool_name) {
-                                tracing::info!("cache hit: tool={} — auto-allow (bypass flag = {})", tool_name, std::env::var("PIDORY_SPIKE_BYPASS_CACHE").unwrap_or_default());
-                                let resp = build_control_response_allow(request_id, input);
-                                if let Err(e) = stdin.write_all(resp.as_bytes()).await {
-                                    tracing::error!("stdin write error (between turns auto-allow): {}", e);
-                                    return BetweenTurnsAction::Break;
-                                }
-                                let _ = stdin.flush().await;
-                                return BetweenTurnsAction::Continue;
-                            }
-
-                            let saved_request_id = request_id.clone();
-                            let saved_tool_name = tool_name.clone();
-                            let saved_tool_use_id = tool_use_id.clone();
-                            let saved_input = input.clone();
-                            let saved_reason = decision_reason.clone();
-
-                            let (resp_tx, mut resp_rx) = tokio::sync::oneshot::channel();
-                            let perm_req = PermissionRequest {
-                                request_id: saved_request_id.clone(),
-                                tool_name: saved_tool_name.clone(),
-                                tool_use_id: saved_tool_use_id.clone(),
-                                input: saved_input.clone(),
-                                decision_reason: saved_reason.clone(),
-                                response_tx: resp_tx,
-                                triggered_by: *current_triggered_by,
-                            };
                             let initial_cr = InitialControlRequest {
-                                request_id: saved_request_id.clone(),
-                                tool_name: saved_tool_name.clone(),
-                                tool_use_id: saved_tool_use_id,
-                                input: saved_input.clone(),
-                                decision_reason: saved_reason,
+                                request_id: request_id.clone(),
+                                tool_name: tool_name.clone(),
+                                tool_use_id: tool_use_id.clone(),
+                                input: input.clone(),
+                                decision_reason: decision_reason.clone(),
                                 triggered_by: *current_triggered_by,
                             };
                             let result = wait_for_permissions(
@@ -698,12 +670,24 @@ async fn handle_bg_turn(
                                 }
                             }
                             Ok(StreamEvent::ControlRequest { ref request_id, ref tool_name, ref tool_use_id, ref input, ref decision_reason, .. }) => {
-                                tracing::info!("control_request received: tool={} request_id={} input={:?}", tool_name, request_id, input);
-                                if permission_cache.is_always_allowed(tool_name) {
-                                    tracing::info!("cache hit: tool={} — auto-allow (bypass flag = {})", tool_name, std::env::var("PIDORY_SPIKE_BYPASS_CACHE").unwrap_or_default());
-                                    let resp = build_control_response_allow(request_id, input);
-                                    if let Err(e) = stdin.write_all(resp.as_bytes()).await {
-                                        tracing::error!("stdin write error (bg turn auto-allow): {}", e);
+                                let initial_cr = InitialControlRequest {
+                                    request_id: request_id.clone(),
+                                    tool_name: tool_name.clone(),
+                                    tool_use_id: tool_use_id.clone(),
+                                    input: input.clone(),
+                                    decision_reason: decision_reason.clone(),
+                                    triggered_by: bg_triggered_by,
+                                };
+                                let result = wait_for_permissions(
+                                    stdin, reader, line, queue_rx, interrupt_rx,
+                                    queue_size, pending_recalls, thread_id,
+                                    None,
+                                    ratelimit_tx, permission_cache, permission_tx,
+                                    initial_cr,
+                                ).await;
+                                match result {
+                                    PermissionsWaitResult::AllResolved { .. } => {}
+                                    PermissionsWaitResult::Interrupted | PermissionsWaitResult::ChannelClosed => {
                                         if let Err(e) = repository::update_session_status(db, thread_id, "idle").await {
                                             tracing::warn!("Failed to update session status for thread {}: {}", thread_id, e);
                                         }
@@ -800,12 +784,7 @@ async fn write_permission_response(
             Ok(false)
         }
         PermissionWaitResult::AlwaysAllow(tool_name) => {
-            let resp = build_control_response_allow_probed(
-                request_id,
-                input,
-                &ProbeMode::from_env(),
-                &tool_name,
-            );
+            let resp = build_control_response_allow(request_id, input);
             stdin.write_all(resp.as_bytes()).await?;
             stdin.flush().await?;
             permission_cache.add_always_allow(&tool_name);
@@ -1332,46 +1311,12 @@ async fn run_active_turn(
                                     ref input,
                                     ref decision_reason,
                                 } = event {
-                                    // Clone all fields before any move
-                                    let saved_request_id = request_id.clone();
-                                    let saved_tool_name = tool_name.clone();
-                                    let saved_tool_use_id = tool_use_id.clone();
-                                    let saved_input = input.clone();
-                                    let saved_decision_reason = decision_reason.clone();
-
-                                    tracing::info!("control_request received: tool={} request_id={} input={:?}", saved_tool_name, saved_request_id, saved_input);
-                                    if permission_cache.is_always_allowed(&saved_tool_name) {
-                                        tracing::info!("cache hit: tool={} — auto-allow (bypass flag = {})", saved_tool_name, std::env::var("PIDORY_SPIKE_BYPASS_CACHE").unwrap_or_default());
-                                        // auto-allow from cache
-                                        let resp = build_control_response_allow(&saved_request_id, &saved_input);
-                                        if let Err(e) = stdin.write_all(resp.as_bytes()).await {
-                                            tracing::error!("stdin write error (auto-allow): {}", e);
-                                            break 'turn false;
-                                        }
-                                        let _ = stdin.flush().await;
-                                        continue 'turn;
-                                    }
-
-                                    // event_tx로 ControlRequest 전달 (handler에서 버튼 표시)
-                                    let _ = event_tx.send(event).await;
-
-                                    // permission 요청 생성
-                                    let (resp_tx, mut resp_rx) = tokio::sync::oneshot::channel();
-                                    let perm_req = PermissionRequest {
-                                        request_id: saved_request_id.clone(),
-                                        tool_name: saved_tool_name.clone(),
-                                        tool_use_id: saved_tool_use_id.clone(),
-                                        input: saved_input.clone(),
-                                        decision_reason: saved_decision_reason.clone(),
-                                        response_tx: resp_tx,
-                                        triggered_by: *current_triggered_by,
-                                    };
                                     let initial_cr = InitialControlRequest {
-                                        request_id: saved_request_id.clone(),
-                                        tool_name: saved_tool_name.clone(),
-                                        tool_use_id: saved_tool_use_id,
-                                        input: saved_input.clone(),
-                                        decision_reason: saved_decision_reason,
+                                        request_id: request_id.clone(),
+                                        tool_name: tool_name.clone(),
+                                        tool_use_id: tool_use_id.clone(),
+                                        input: input.clone(),
+                                        decision_reason: decision_reason.clone(),
                                         triggered_by: *current_triggered_by,
                                     };
                                     let result = wait_for_permissions(

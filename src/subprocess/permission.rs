@@ -34,9 +34,6 @@ impl PermissionCache {
     }
 
     pub fn is_always_allowed(&self, tool_name: &str) -> bool {
-        if std::env::var("PIDORY_SPIKE_BYPASS_CACHE").as_deref() == Ok("1") {
-            return false;
-        }
         self.allowed_tools.contains(tool_name)
     }
 
@@ -94,15 +91,6 @@ mod tests {
         cache.add_always_allow("Bash");
         cache.add_always_allow("Bash");
         assert!(cache.is_always_allowed("Bash"));
-    }
-
-    #[test]
-    fn permission_cache_bypass_flag_overrides_always_allow() {
-        unsafe { std::env::set_var("PIDORY_SPIKE_BYPASS_CACHE", "1") };
-        let mut cache = PermissionCache::new();
-        cache.add_always_allow("Bash");
-        assert!(!cache.is_always_allowed("Bash"), "bypass flag must return false even if cached");
-        unsafe { std::env::remove_var("PIDORY_SPIKE_BYPASS_CACHE") };
     }
 
     #[test]
