@@ -14,8 +14,6 @@ RestartSec=10
 # Config — dev
 Environment=PIDORY_CONFIG=__PROJECT_DIR__/config.dev.toml
 Environment=RUST_LOG=info
-Environment=PIDORY_SPIKE_BYPASS_CACHE=1
-Environment=PIDORY_SPIKE_PROBE=none
 
 EnvironmentFile=-__PROJECT_DIR__/config.dev.env
 
