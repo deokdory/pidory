@@ -180,6 +180,7 @@ pub(super) async fn handle_interaction(
 
         if let Some(p) = pending {
             let tool_name = p.tool_name.clone();
+            let thread_id = p.thread_id.clone();
             let message_id = p.message_id;
             // decision 전송 (실패해도 무시)
             let _ = p.response_tx.send(decision);
@@ -196,10 +197,11 @@ pub(super) async fn handle_interaction(
             .await
             .ok();
 
-            // "always" 클릭 시 같은 tool_name 의 대기 중인 다른 permission 도 자동 dismiss
+            // "always" 클릭 시 같은 thread + tool_name 의 대기 중인 다른 permission 도 자동 dismiss
             if action == "always" {
                 let dismissed = permission_ui::dismiss_pending_by_tool(
                     &data.pending_permissions,
+                    &thread_id,
                     &tool_name,
                     PermissionDecision::Allow,
                     &request_id,
