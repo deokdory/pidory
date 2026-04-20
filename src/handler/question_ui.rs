@@ -1,7 +1,7 @@
 use poise::serenity_prelude::{
-    ButtonStyle, ChannelId, Context, CreateActionRow, CreateButton, CreateInputText, CreateMessage,
-    CreateModal, CreateSelectMenu, CreateSelectMenuKind, CreateSelectMenuOption, EditMessage,
-    InputTextStyle, MessageId, UserId,
+    ButtonStyle, ChannelId, Context, CreateActionRow, CreateButton, CreateInputText,
+    CreateInteractionResponseMessage, CreateMessage, CreateModal, CreateSelectMenu,
+    CreateSelectMenuKind, CreateSelectMenuOption, EditMessage, InputTextStyle, MessageId, UserId,
 };
 use serde_json::Value;
 
@@ -52,6 +52,7 @@ pub fn create_question_message(
 /// - 2-5 options → Buttons (+ free text button)
 /// - 6-25 options → Select Menu (+ free text button)
 /// - No options → Free text button only
+/// + Cancel button (with ephemeral confirm)
 pub fn create_question_message_for_index(
     input: &Value,
     question_index: usize,
@@ -123,6 +124,16 @@ pub fn create_question_message_for_index(
             .collect();
         components.push(CreateActionRow::Buttons(buttons));
     }
+
+    let text_button = CreateButton::new(format!("ask_text:{}", rid))
+        .label(lang.question_write_answer())
+        .style(ButtonStyle::Secondary);
+    components.push(CreateActionRow::Buttons(vec![text_button]));
+
+    let cancel_button = CreateButton::new(format!("ask_cancel:{}", rid))
+        .label(lang.question_cancel())
+        .style(ButtonStyle::Danger);
+    components.push(CreateActionRow::Buttons(vec![cancel_button]));
 
     CreateMessage::new().content(content).components(components)
 }
@@ -215,6 +226,28 @@ pub fn parse_question_modal_id(custom_id: &str) -> Option<String> {
     custom_id.strip_prefix("ask_modal:").map(|s| s.to_string())
 }
 
+/// Parses `ask_cancel:{request_id}` cancel button custom_id.
+///
+/// Safe vs `ask_cancel_confirm:` / `ask_cancel_abort:` because those have `_` right
+/// after `ask_cancel`, not `:` — `strip_prefix("ask_cancel:")` cannot match them.
+pub fn parse_question_cancel_button_id(custom_id: &str) -> Option<String> {
+    custom_id.strip_prefix("ask_cancel:").map(|s| s.to_string())
+}
+
+/// Parses `ask_cancel_confirm:{request_id}` confirm-yes button custom_id.
+pub fn parse_question_cancel_confirm_id(custom_id: &str) -> Option<String> {
+    custom_id
+        .strip_prefix("ask_cancel_confirm:")
+        .map(|s| s.to_string())
+}
+
+/// Parses `ask_cancel_abort:{request_id}` confirm-no button custom_id.
+pub fn parse_question_cancel_abort_id(custom_id: &str) -> Option<String> {
+    custom_id
+        .strip_prefix("ask_cancel_abort:")
+        .map(|s| s.to_string())
+}
+
 /// Resolves an option label from the original input, question index, and option index.
 pub fn resolve_option_label(input: &Value, question_index: usize, option_index: usize) -> String {
     let question = extract_question_at(input, question_index);
@@ -234,12 +267,46 @@ pub async fn disable_question_components(
     lang: Lang,
 ) -> Result<(), PidoryError> {
     let label = format!("-# ✅ {} {}", lang.question_answered(), answer);
+    disable_question_components_with_label(ctx, channel_id, message_id, &label).await
+}
+
+/// Disables question components with a caller-supplied label string.
+/// Used by cancel flow to display `lang.question_canceled_label()`.
+pub async fn disable_question_components_with_label(
+    ctx: &Context,
+    channel_id: ChannelId,
+    message_id: MessageId,
+    label: &str,
+) -> Result<(), PidoryError> {
     let edit = EditMessage::new().content(label).components(vec![]);
     channel_id
         .edit_message(ctx, message_id, edit)
         .await
         .map_err(|e| PidoryError::Discord(Box::new(e)))?;
     Ok(())
+}
+
+/// Builds an ephemeral confirmation message for the cancel flow.
+///
+/// Contains two buttons in one row:
+/// - `ask_cancel_confirm:{rid}` (Danger) — confirm cancel
+/// - `ask_cancel_abort:{rid}` (Secondary) — go back
+pub fn create_cancel_confirm_message(
+    sub_request_id: &str,
+    lang: Lang,
+) -> CreateInteractionResponseMessage {
+    let rid = truncate_request_id(sub_request_id);
+    let confirm_btn = CreateButton::new(format!("ask_cancel_confirm:{}", rid))
+        .label(lang.question_cancel_confirm_yes())
+        .style(ButtonStyle::Danger);
+    let abort_btn = CreateButton::new(format!("ask_cancel_abort:{}", rid))
+        .label(lang.question_cancel_confirm_no())
+        .style(ButtonStyle::Secondary);
+    let row = CreateActionRow::Buttons(vec![confirm_btn, abort_btn]);
+    CreateInteractionResponseMessage::new()
+        .content(lang.question_cancel_confirm_prompt())
+        .components(vec![row])
+        .ephemeral(true)
 }
 
 #[cfg(test)]
@@ -475,5 +542,219 @@ mod tests {
         assert!(format!("ask_text:{}", rid).len() <= 100);
         assert!(format!("ask_sel:{}", rid).len() <= 100);
         assert!(format!("ask_modal:{}", rid).len() <= 100);
+    }
+
+    // ── ask_text button presence ────────────────────────────────────────────
+
+    #[test]
+    fn create_question_message_includes_text_button_with_buttons() {
+        // 3 options → Buttons branch (2-5 options)
+        let input = serde_json::json!({
+            "questions": [{
+                "question": "Pick one?",
+                "options": [
+                    {"label": "Alpha"},
+                    {"label": "Beta"},
+                    {"label": "Gamma"}
+                ]
+            }]
+        });
+        let msg = create_question_message_for_index(&input, 0, "req-btn", UserId::new(1), Lang::En);
+        let json = serde_json::to_value(&msg).unwrap();
+        let components = json["components"].as_array().cloned().unwrap_or_default();
+        let count = components.iter().fold(0usize, |acc, row| {
+            let items = row["components"].as_array().cloned().unwrap_or_default();
+            acc + items.iter().filter(|item| {
+                item["custom_id"]
+                    .as_str()
+                    .map(|cid| cid.starts_with("ask_text:"))
+                    .unwrap_or(false)
+            }).count()
+        });
+        assert_eq!(count, 1, "expected exactly 1 ask_text: button in components");
+    }
+
+    #[test]
+    fn create_question_message_includes_text_button_with_select() {
+        // 10 options → SelectMenu branch (6-25 options)
+        let options: Vec<serde_json::Value> = (0..10)
+            .map(|i| serde_json::json!({"label": format!("Option {}", i)}))
+            .collect();
+        let input = serde_json::json!({
+            "questions": [{"question": "Choose?", "options": options}]
+        });
+        let msg =
+            create_question_message_for_index(&input, 0, "req-sel", UserId::new(2), Lang::En);
+        let json = serde_json::to_value(&msg).unwrap();
+        let components = json["components"].as_array().cloned().unwrap_or_default();
+        let count = components.iter().fold(0usize, |acc, row| {
+            let items = row["components"].as_array().cloned().unwrap_or_default();
+            acc + items.iter().filter(|item| {
+                item["custom_id"]
+                    .as_str()
+                    .map(|cid| cid.starts_with("ask_text:"))
+                    .unwrap_or(false)
+            }).count()
+        });
+        assert_eq!(count, 1, "expected exactly 1 ask_text: button alongside select menu");
+    }
+
+    #[test]
+    fn create_question_message_includes_text_button_with_no_options() {
+        // 0 options → free text button only
+        let input = serde_json::json!({
+            "questions": [{"question": "Anything to say?"}]
+        });
+        let msg =
+            create_question_message_for_index(&input, 0, "req-none", UserId::new(3), Lang::En);
+        let json = serde_json::to_value(&msg).unwrap();
+        let components = json["components"].as_array().cloned().unwrap_or_default();
+        assert!(!components.is_empty(), "components must not be empty when no options given");
+        let count = components.iter().fold(0usize, |acc, row| {
+            let items = row["components"].as_array().cloned().unwrap_or_default();
+            acc + items.iter().filter(|item| {
+                item["custom_id"]
+                    .as_str()
+                    .map(|cid| cid.starts_with("ask_text:"))
+                    .unwrap_or(false)
+            }).count()
+        });
+        assert_eq!(count, 1, "expected exactly 1 ask_text: button when no options present");
+    }
+
+    // ── cancel button presence ──────────────────────────────────────────────
+
+    #[test]
+    fn create_question_message_includes_cancel_button_with_buttons() {
+        // 3 options → Buttons branch; cancel button must also appear exactly once
+        let input = serde_json::json!({
+            "questions": [{
+                "question": "Pick one?",
+                "options": [
+                    {"label": "Alpha"},
+                    {"label": "Beta"},
+                    {"label": "Gamma"}
+                ]
+            }]
+        });
+        let msg =
+            create_question_message_for_index(&input, 0, "req-btn", UserId::new(1), Lang::En);
+        let json = serde_json::to_value(&msg).unwrap();
+        let components = json["components"].as_array().cloned().unwrap_or_default();
+        let count = components.iter().fold(0usize, |acc, row| {
+            let items = row["components"].as_array().cloned().unwrap_or_default();
+            acc + items
+                .iter()
+                .filter(|item| {
+                    item["custom_id"]
+                        .as_str()
+                        .map(|cid| cid.starts_with("ask_cancel:"))
+                        .unwrap_or(false)
+                })
+                .count()
+        });
+        assert_eq!(count, 1, "expected exactly 1 ask_cancel: button");
+    }
+
+    #[test]
+    fn create_question_message_includes_cancel_button_with_select() {
+        // 10 options → SelectMenu branch; cancel button must appear alongside select menu
+        let options: Vec<serde_json::Value> = (0..10)
+            .map(|i| serde_json::json!({"label": format!("Option {}", i)}))
+            .collect();
+        let input = serde_json::json!({
+            "questions": [{"question": "Choose?", "options": options}]
+        });
+        let msg =
+            create_question_message_for_index(&input, 0, "req-sel", UserId::new(2), Lang::En);
+        let json = serde_json::to_value(&msg).unwrap();
+        let components = json["components"].as_array().cloned().unwrap_or_default();
+        let count = components.iter().fold(0usize, |acc, row| {
+            let items = row["components"].as_array().cloned().unwrap_or_default();
+            acc + items
+                .iter()
+                .filter(|item| {
+                    item["custom_id"]
+                        .as_str()
+                        .map(|cid| cid.starts_with("ask_cancel:"))
+                        .unwrap_or(false)
+                })
+                .count()
+        });
+        assert_eq!(count, 1, "expected exactly 1 ask_cancel: button alongside select menu");
+    }
+
+    #[test]
+    fn create_question_message_includes_cancel_button_with_no_options() {
+        // 0 options → free text button + cancel button; at least 2 ActionRows
+        let input = serde_json::json!({
+            "questions": [{"question": "Anything to say?"}]
+        });
+        let msg =
+            create_question_message_for_index(&input, 0, "req-none", UserId::new(3), Lang::En);
+        let json = serde_json::to_value(&msg).unwrap();
+        let components = json["components"].as_array().cloned().unwrap_or_default();
+        assert!(
+            components.len() >= 2,
+            "expected at least 2 ActionRows (free text + cancel), got {}",
+            components.len()
+        );
+        let count = components.iter().fold(0usize, |acc, row| {
+            let items = row["components"].as_array().cloned().unwrap_or_default();
+            acc + items
+                .iter()
+                .filter(|item| {
+                    item["custom_id"]
+                        .as_str()
+                        .map(|cid| cid.starts_with("ask_cancel:"))
+                        .unwrap_or(false)
+                })
+                .count()
+        });
+        assert_eq!(count, 1, "expected exactly 1 ask_cancel: button when no options present");
+    }
+
+    // ── cancel button parsing ───────────────────────────────────────────────
+
+    #[test]
+    fn parse_question_cancel_button_valid() {
+        let rid = parse_question_cancel_button_id("ask_cancel:req-1").unwrap();
+        assert_eq!(rid, "req-1");
+    }
+
+    #[test]
+    fn parse_question_cancel_button_rejects_confirm_prefix() {
+        // "ask_cancel_confirm:" must NOT be matched by parse_question_cancel_button_id
+        assert!(
+            parse_question_cancel_button_id("ask_cancel_confirm:req-1").is_none(),
+            "ask_cancel_confirm: should not match ask_cancel: parser"
+        );
+    }
+
+    #[test]
+    fn parse_question_cancel_button_rejects_abort_prefix() {
+        // "ask_cancel_abort:" must NOT be matched by parse_question_cancel_button_id
+        assert!(
+            parse_question_cancel_button_id("ask_cancel_abort:req-1").is_none(),
+            "ask_cancel_abort: should not match ask_cancel: parser"
+        );
+    }
+
+    #[test]
+    fn cancel_custom_ids_within_100_chars() {
+        // Longest prefix is "ask_cancel_confirm:" (19 chars) + 80-char rid = 99 chars ≤ 100
+        let rid = "a".repeat(80);
+        assert!(
+            format!("ask_cancel:{}", rid).len() <= 100,
+            "ask_cancel: + 80-char rid must be within 100 chars"
+        );
+        assert!(
+            format!("ask_cancel_confirm:{}", rid).len() <= 100,
+            "ask_cancel_confirm: + 80-char rid must be within 100 chars"
+        );
+        assert!(
+            format!("ask_cancel_abort:{}", rid).len() <= 100,
+            "ask_cancel_abort: + 80-char rid must be within 100 chars"
+        );
     }
 }
