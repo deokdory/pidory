@@ -63,6 +63,7 @@ pub struct Data {
     pub turn_participants: Arc<Mutex<HashMap<String, HashSet<serenity::UserId>>>>,
     pub todo_trackers: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<handler::todo_tracker::TodoTracker>>>>>,
     pub skill_descriptions: HashMap<String, String>,
+    pub agent_descriptions: HashMap<String, String>,
     /// thread_id → 마지막으로 사용된 tool name
     pub last_tool_name: Arc<Mutex<HashMap<String, String>>>,
     /// thread_id → 마지막 kick 시각
@@ -247,6 +248,7 @@ async fn main() -> Result<(), PidoryError> {
                 let turn_initiators: Arc<Mutex<HashMap<String, serenity::UserId>>> = Arc::new(Mutex::new(HashMap::new()));
                 let turn_participants: Arc<Mutex<HashMap<String, HashSet<serenity::UserId>>>> = Arc::new(Mutex::new(HashMap::new()));
                 let skill_descriptions = load_skill_descriptions();
+                let agent_descriptions = commands::agent::load_global_agent_descriptions();
 
                 // watch channel: event handler → background task로 fresh Context 전달
                 // shard reconnect 후에도 최신 ShardMessenger 사용 가능
@@ -439,6 +441,7 @@ async fn main() -> Result<(), PidoryError> {
                     turn_participants,
                     todo_trackers: Arc::new(Mutex::new(HashMap::<String, Arc<tokio::sync::Mutex<handler::todo_tracker::TodoTracker>>>::new())),
                     skill_descriptions,
+                    agent_descriptions,
                     last_tool_name,
                     kick_cooldowns,
                     kick_pending,

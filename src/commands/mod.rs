@@ -1,3 +1,4 @@
+pub mod agent;
 pub mod branch;
 pub mod model;
 pub mod recall;
@@ -22,6 +23,7 @@ pub fn all_commands() -> Vec<poise::Command<Data, Error>> {
         session::clear(),
         session::new(),
         skill::skill(),
+        agent::agent(),
         model::model(),
         recall::recall(),
         branch::branch(),
