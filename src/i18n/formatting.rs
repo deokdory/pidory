@@ -112,4 +112,39 @@ impl Lang {
             Lang::En => "Answered:",
         }
     }
+
+    pub fn question_cancel(&self) -> &'static str {
+        match self {
+            Lang::Ko => "취소",
+            Lang::En => "Cancel",
+        }
+    }
+
+    pub fn question_cancel_confirm_prompt(&self) -> &'static str {
+        match self {
+            Lang::Ko => "답변 없이 취소하시겠습니까? Claude는 응답 없이 다음 단계로 진행해요.",
+            Lang::En => "Cancel without answering? Claude will proceed to the next step without a response.",
+        }
+    }
+
+    pub fn question_cancel_confirm_yes(&self) -> &'static str {
+        match self {
+            Lang::Ko => "네, 취소함",
+            Lang::En => "Yes, cancel",
+        }
+    }
+
+    pub fn question_cancel_confirm_no(&self) -> &'static str {
+        match self {
+            Lang::Ko => "아니요",
+            Lang::En => "No",
+        }
+    }
+
+    pub fn question_canceled_label(&self) -> &'static str {
+        match self {
+            Lang::Ko => "✋ 취소됨",
+            Lang::En => "✋ Canceled",
+        }
+    }
 }
