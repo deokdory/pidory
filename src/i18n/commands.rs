@@ -491,6 +491,34 @@ impl Lang {
         }
     }
 
+    // ── Commands: agent ──
+
+    pub fn agent_autocomplete_more(&self, count: usize) -> String {
+        match self {
+            Lang::Ko => format!(
+                "\u{22ef} 외 {}개 (클릭하지 마시고 이름을 입력해서 필터링해 주세요)",
+                count
+            ),
+            Lang::En => format!(
+                "\u{22ef} {} more (please type the name to filter instead of clicking)",
+                count
+            ),
+        }
+    }
+
+    pub fn agent_not_found(&self, name: &str) -> String {
+        match self {
+            Lang::Ko => format!(
+                "❌ '{}' 에이전트를 목록에서 찾지 못했습니다.\n- 이름 철자를 확인해 주세요\n- 또는 강제 실행하려면 `force:true`를 추가해 주세요",
+                name
+            ),
+            Lang::En => format!(
+                "❌ Agent '{}' was not found in the list.\n- Please verify the spelling\n- Or add `force:true` to execute anyway",
+                name
+            ),
+        }
+    }
+
     // ── Commands: update ──
 
     pub fn update_in_progress(&self) -> &'static str {
