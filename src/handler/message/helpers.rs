@@ -1,7 +1,9 @@
 use crate::i18n::Lang;
 
 fn escape_xml(s: &str) -> String {
-    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
 }
 
 pub(crate) fn format_cli_command(command: &str, args: Option<&str>) -> String {
@@ -17,13 +19,26 @@ pub(crate) fn format_cli_command(command: &str, args: Option<&str>) -> String {
 }
 
 pub(crate) fn shorten_model_name(model: &str) -> String {
-    let base = model.split('@').next().unwrap_or(model);
-    match base {
-        s if s.starts_with("claude-opus") => "opus".into(),
-        s if s.starts_with("claude-sonnet") => "sonnet".into(),
-        s if s.starts_with("claude-haiku") => "haiku".into(),
-        other => other.to_string(),
+    let without_at = model.split('@').next().unwrap_or(model);
+    let without_bracket = match without_at.find('[') {
+        Some(i) => &without_at[..i],
+        None => without_at,
+    };
+    let stripped = without_bracket
+        .strip_prefix("claude-")
+        .unwrap_or(without_bracket);
+    let parts: Vec<&str> = stripped.split('-').collect();
+    if parts.len() >= 3 {
+        let family = parts[0];
+        let major = parts[1];
+        let minor = parts[2];
+        let is_known_family = matches!(family, "opus" | "sonnet" | "haiku");
+        let is_numeric = |s: &str| !s.is_empty() && s.chars().all(|c| c.is_ascii_digit());
+        if is_known_family && is_numeric(major) && is_numeric(minor) {
+            return format!("{} {}.{}", family, major, minor);
+        }
     }
+    model.to_string()
 }
 
 pub(crate) fn format_ctx_suffix(input_tokens: u64, context_window: u64) -> String {
@@ -108,6 +123,42 @@ mod tests {
     #[test]
     fn parse_compact_regular_message() {
         assert_eq!(parse_compact_command("hello"), None);
+    }
+
+    #[test]
+    fn shorten_opus_4_7() {
+        assert_eq!(shorten_model_name("claude-opus-4-7"), "opus 4.7");
+    }
+
+    #[test]
+    fn shorten_opus_4_6() {
+        assert_eq!(shorten_model_name("claude-opus-4-6"), "opus 4.6");
+    }
+
+    #[test]
+    fn shorten_opus_with_1m_suffix() {
+        assert_eq!(shorten_model_name("claude-opus-4-6[1m]"), "opus 4.6");
+    }
+
+    #[test]
+    fn shorten_sonnet_4_6() {
+        assert_eq!(shorten_model_name("claude-sonnet-4-6"), "sonnet 4.6");
+    }
+
+    #[test]
+    fn shorten_haiku_with_date_suffix() {
+        assert_eq!(shorten_model_name("claude-haiku-4-5-20251001"), "haiku 4.5");
+    }
+
+    #[test]
+    fn shorten_with_at_date() {
+        assert_eq!(shorten_model_name("claude-opus-4-6@20260101"), "opus 4.6");
+    }
+
+    #[test]
+    fn shorten_unknown_format() {
+        assert_eq!(shorten_model_name("opus"), "opus");
+        assert_eq!(shorten_model_name("custom-model"), "custom-model");
     }
 }
 
