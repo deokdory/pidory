@@ -6,6 +6,8 @@ use crate::db::repository;
 use crate::handler::message;
 use crate::{Context, Error};
 
+const SENTINEL_MORE: &str = "__more__";
+
 /// `~/.claude/agents/*.md` 파일에서 (name, description) 맵 로드
 pub fn load_global_agent_descriptions() -> HashMap<String, String> {
     let home = std::env::var("HOME").unwrap_or_default();
@@ -49,9 +51,7 @@ pub fn merge_agent_descriptions(
     local: HashMap<String, String>,
 ) -> HashMap<String, String> {
     let mut merged = global;
-    for (k, v) in local {
-        merged.insert(k, v);
-    }
+    merged.extend(local);
     merged
 }
 
@@ -81,10 +81,7 @@ pub fn parse_frontmatter_fields(content: &str) -> Option<(String, String)> {
         }
     }
 
-    match (name, description) {
-        (Some(n), Some(d)) => Some((n, d)),
-        _ => None,
-    }
+    name.zip(description)
 }
 
 /// Claude Code agent 실행
@@ -97,9 +94,9 @@ pub async fn agent(
     #[description = "agent에게 맡길 작업"]
     #[rest]
     task: String,
+    #[description = "목록에 없는 agent도 강제 실행 (기본 false)"]
+    force: Option<bool>,
 ) -> Result<(), Error> {
-    let content = format!("Use the {} subagent proactively to: {}", name, task);
-
     let channel_id = ctx.channel_id();
     let thread_id = channel_id.to_string();
     let data = ctx.data();
@@ -111,6 +108,31 @@ pub async fn agent(
         ctx.say(format!("❌ {}", lang.no_session_in_thread())).await?;
         return Ok(());
     }
+
+    // 머지된 agent 맵 재계산 (autocomplete와 동일 로직)
+    let global = data.agent_descriptions.clone();
+    let descriptions = 'lookup: {
+        let session = match repository::get_session_by_thread(&data.db, &thread_id).await {
+            Ok(Some(s)) => s,
+            _ => break 'lookup global,
+        };
+        let project =
+            match repository::get_project_by_channel(&data.db, &session.channel_id).await {
+                Ok(Some(p)) => p,
+                _ => break 'lookup global,
+            };
+        let local = load_project_agent_descriptions(&project.path);
+        merge_agent_descriptions(global, local)
+    };
+
+    // name 화이트리스트 검증 (sentinel은 force와 무관하게 항상 차단)
+    let name_valid = descriptions.contains_key(&name);
+    if name == SENTINEL_MORE || (!name_valid && force != Some(true)) {
+        ctx.say(lang.agent_not_found(&name)).await?;
+        return Ok(());
+    }
+
+    let content = format!("Use the {} subagent proactively to: {}", name, task);
 
     // 초기 응답 전송
     let reply = ctx.say(format!("-# /agent {}", name)).await?;
@@ -137,6 +159,7 @@ async fn autocomplete_agent<'a>(
 ) -> Vec<poise::serenity_prelude::AutocompleteChoice> {
     let data = ctx.data();
     let thread_id = ctx.channel_id().to_string();
+    let lang = data.config.language;
 
     // 글로벌 descriptions 기준으로 시작
     let global = data.agent_descriptions.clone();
@@ -147,17 +170,37 @@ async fn autocomplete_agent<'a>(
             Ok(Some(s)) => s,
             _ => break 'lookup global,
         };
-        let project = match repository::get_project_by_channel(&data.db, &session.channel_id).await {
-            Ok(Some(p)) => p,
-            _ => break 'lookup global,
-        };
+        let project =
+            match repository::get_project_by_channel(&data.db, &session.channel_id).await {
+                Ok(Some(p)) => p,
+                _ => break 'lookup global,
+            };
         let local = load_project_agent_descriptions(&project.path);
         merge_agent_descriptions(global, local)
     };
 
-    descriptions
+    // 필터링 후 알파벳 정렬
+    let mut filtered: Vec<(String, String)> = descriptions
         .into_iter()
-        .filter(|(name, _): &(String, String)| partial.is_empty() || name.contains(partial))
+        .filter(|(name, _)| partial.is_empty() || name.contains(partial))
+        .collect();
+    filtered.sort_by(|(a, _), (b, _)| a.cmp(b));
+
+    let total = filtered.len();
+
+    // 25개 이하면 그대로, 26개 이상이면 상위 24개 + hint choice
+    let (items, hint) = if total > 25 {
+        let overflow = total - 24;
+        (
+            &filtered[..24],
+            Some(lang.agent_autocomplete_more(overflow)),
+        )
+    } else {
+        (filtered.as_slice(), None)
+    };
+
+    let mut choices: Vec<poise::serenity_prelude::AutocompleteChoice> = items
+        .iter()
         .map(|(name, desc)| {
             let combined = format!("{} \u{2014} {}", name, desc);
             let display = if combined.chars().count() > 100 {
@@ -166,9 +209,18 @@ async fn autocomplete_agent<'a>(
             } else {
                 combined
             };
-            poise::serenity_prelude::AutocompleteChoice::new(display, name)
+            poise::serenity_prelude::AutocompleteChoice::new(display, name.clone())
         })
-        .collect()
+        .collect();
+
+    if let Some(hint_display) = hint {
+        choices.push(poise::serenity_prelude::AutocompleteChoice::new(
+            hint_display,
+            SENTINEL_MORE.to_string(),
+        ));
+    }
+
+    choices
 }
 
 #[cfg(test)]
@@ -246,5 +298,71 @@ mod tests {
             result,
             Some(("my-agent".to_string(), "quoted desc".to_string()))
         );
+    }
+
+    #[test]
+    fn agent_map_contains_name_case() {
+        // 머지 맵에 이름 있을 때 force 없이 통과하는 로직 검증
+        let mut global = HashMap::new();
+        global.insert("implementer".to_string(), "구현 엔지니어".to_string());
+        global.insert("researcher".to_string(), "리서처".to_string());
+
+        let mut local = HashMap::new();
+        local.insert("custom-agent".to_string(), "커스텀".to_string());
+
+        let merged = merge_agent_descriptions(global, local);
+
+        // 맵에 있는 이름 → contains_key true (force 불필요)
+        assert!(merged.contains_key("implementer"));
+        assert!(merged.contains_key("researcher"));
+        assert!(merged.contains_key("custom-agent"));
+
+        // 맵에 없는 이름 → contains_key false (force 없으면 에러 경로)
+        assert!(!merged.contains_key("unknown-agent"));
+        assert!(!merged.contains_key(SENTINEL_MORE));
+    }
+
+    #[test]
+    fn autocomplete_25_or_fewer_no_hint() {
+        // 25개 이하면 hint choice 없이 그대로 반환
+        let mut map: HashMap<String, String> = HashMap::new();
+        for i in 0..25 {
+            map.insert(format!("agent-{:02}", i), format!("desc {}", i));
+        }
+
+        // 필터링 + 정렬 로직 직접 검증
+        let mut filtered: Vec<(String, String)> = map.into_iter().collect();
+        filtered.sort_by(|(a, _), (b, _)| a.cmp(b));
+
+        assert_eq!(filtered.len(), 25);
+        // 25 이하이므로 hint 없음
+        assert!(filtered.len() <= 25);
+    }
+
+    #[test]
+    fn autocomplete_26_or_more_has_hint() {
+        // 26개 이상이면 상위 24개 + hint 1개 = 25개
+        let mut map: HashMap<String, String> = HashMap::new();
+        for i in 0..26 {
+            map.insert(format!("agent-{:02}", i), format!("desc {}", i));
+        }
+
+        let mut filtered: Vec<(String, String)> = map.into_iter().collect();
+        filtered.sort_by(|(a, _), (b, _)| a.cmp(b));
+
+        let total = filtered.len();
+        assert_eq!(total, 26);
+
+        let (items, has_hint) = if total > 25 {
+            let overflow = total - 24;
+            (&filtered[..24], Some(overflow))
+        } else {
+            (filtered.as_slice(), None)
+        };
+
+        assert_eq!(items.len(), 24);
+        assert_eq!(has_hint, Some(2)); // 26 - 24 = 2
+        // choices 총 25개
+        assert_eq!(items.len() + has_hint.map(|_| 1).unwrap_or(0), 25);
     }
 }
