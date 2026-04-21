@@ -38,7 +38,7 @@ pub(crate) fn shorten_model_name(model: &str) -> String {
             return format!("{} {}.{}", family, major, minor);
         }
     }
-    model.to_string()
+    without_bracket.to_string()
 }
 
 pub(crate) fn format_ctx_suffix(input_tokens: u64, context_window: u64) -> String {
@@ -159,6 +159,16 @@ mod tests {
     fn shorten_unknown_format() {
         assert_eq!(shorten_model_name("opus"), "opus");
         assert_eq!(shorten_model_name("custom-model"), "custom-model");
+    }
+
+    #[test]
+    fn shorten_unknown_with_at_suffix() {
+        assert_eq!(shorten_model_name("custom-model@20260101"), "custom-model");
+    }
+
+    #[test]
+    fn shorten_unknown_with_bracket_suffix() {
+        assert_eq!(shorten_model_name("claude-sonnet-4[1m]"), "claude-sonnet-4");
     }
 }
 
