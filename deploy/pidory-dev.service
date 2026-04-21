@@ -13,6 +13,7 @@ RestartSec=10
 
 # Config — dev
 Environment=PIDORY_CONFIG=__PROJECT_DIR__/config.dev.toml
+Environment=HOME=__HOME_DIR__
 Environment=RUST_LOG=info
 
 EnvironmentFile=-__PROJECT_DIR__/config.dev.env
