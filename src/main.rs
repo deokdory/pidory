@@ -22,6 +22,7 @@ use tracing_subscriber::{EnvFilter, fmt};
 
 use config::Config;
 use error::PidoryError;
+use handler::dispatch_locks::ThreadDispatchLocks;
 use subprocess::permission::PermissionDecision;
 use subprocess::session_manager::SessionManager;
 
@@ -61,6 +62,7 @@ pub struct Data {
     pub archived_threads: Arc<Mutex<HashSet<String>>>,
     pub turn_initiators: Arc<Mutex<HashMap<String, serenity::UserId>>>,
     pub turn_participants: Arc<Mutex<HashMap<String, HashSet<serenity::UserId>>>>,
+    pub dispatch_locks: Arc<ThreadDispatchLocks>,
     pub todo_trackers: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<handler::todo_tracker::TodoTracker>>>>>,
     pub skill_descriptions: HashMap<String, String>,
     pub agent_descriptions: HashMap<String, String>,
@@ -324,6 +326,7 @@ async fn main() -> Result<(), PidoryError> {
                 let kick_pending: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
                 let needs_context = Arc::new(Mutex::new(HashSet::new()));
                 let next_step_buttons: Arc<Mutex<HashMap<String, serenity::MessageId>>> = Arc::new(Mutex::new(HashMap::new()));
+                let dispatch_locks: Arc<ThreadDispatchLocks> = Arc::new(ThreadDispatchLocks::new());
 
                 // Idle session TTL sweep
                 {
@@ -339,6 +342,7 @@ async fn main() -> Result<(), PidoryError> {
                     let kick_cooldowns = Arc::clone(&kick_cooldowns);
                     let kick_pending = Arc::clone(&kick_pending);
                     let next_step_buttons = Arc::clone(&next_step_buttons);
+                    let dispatch_locks = Arc::clone(&dispatch_locks);
                     let db_clone = db.clone();
                     let mut ctx_rx = ctx_tx.subscribe();
                     tokio::spawn(async move {
@@ -362,6 +366,7 @@ async fn main() -> Result<(), PidoryError> {
                                         kick_cooldowns.lock().await.remove(tid);
                                         kick_pending.lock().await.remove(tid);
                                         next_step_buttons.lock().await.remove(tid);
+                                        dispatch_locks.remove(tid).await;
                                         if let Err(e) = db::repository::update_session_status(&db_clone, tid, "idle").await {
                                             tracing::warn!("Failed to update session status for TTL sweep thread {}: {}", tid, e);
                                         }
@@ -439,6 +444,7 @@ async fn main() -> Result<(), PidoryError> {
                     archived_threads: Arc::new(Mutex::new(HashSet::new())),
                     turn_initiators,
                     turn_participants,
+                    dispatch_locks,
                     todo_trackers: Arc::new(Mutex::new(HashMap::<String, Arc<tokio::sync::Mutex<handler::todo_tracker::TodoTracker>>>::new())),
                     skill_descriptions,
                     agent_descriptions,
