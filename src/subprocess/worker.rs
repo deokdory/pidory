@@ -359,18 +359,7 @@ impl SessionWorker {
             thread_id
         );
         if let Some(mut inner) = sessions.lock().await.remove(thread_id) {
-            inner.permission_handler.abort();
-            match inner.child.try_wait() {
-                Ok(Some(_status)) => {
-                    // Already exited, no kill needed
-                }
-                _ => {
-                    // Still running or error checking — kill it
-                    if let Err(e) = inner.child.kill().await {
-                        tracing::warn!("Failed to kill child process for thread {}: {}", thread_id, e);
-                    }
-                }
-            }
+            super::session_manager::kill_with_timeout(&mut inner.child).await;
         }
     }
 }
