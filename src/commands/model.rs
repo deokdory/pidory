@@ -1,13 +1,39 @@
 use crate::db::repository;
 use crate::{Context, Error};
 
+/// (autocomplete label, CLI model ID). label은 `shorten_model_name()` 출력과 일치.
+const VERSIONED_MODELS: &[(&str, &str)] = &[
+    ("opus 4.7", "claude-opus-4-7"),
+    ("opus 4.6", "claude-opus-4-6"),
+    ("sonnet 4.6", "claude-sonnet-4-6"),
+    ("haiku 4.5", "claude-haiku-4-5"),
+];
+
+const SHORT_ALIASES: &[&str] = &["opus", "sonnet", "haiku"];
+
 fn validate_model_name(name: &str) -> Option<String> {
-    let normalized = name.to_lowercase();
-    match normalized.as_str() {
-        "opus" | "sonnet" | "haiku" => Some(normalized),
-        s if s.strip_prefix("claude-").is_some_and(|rest| !rest.is_empty()) => Some(normalized),
-        _ => None,
+    let normalized = name.trim().to_lowercase();
+    if normalized.is_empty() {
+        return None;
     }
+    // 1) short alias
+    if SHORT_ALIASES.iter().any(|s| *s == normalized) {
+        return Some(normalized);
+    }
+    // 2) versioned label (opus 4.7 등) → CLI ID
+    for (label, cli_id) in VERSIONED_MODELS {
+        if *label == normalized {
+            return Some((*cli_id).to_string());
+        }
+    }
+    // 3) claude-* full ID (기존 동작)
+    if normalized
+        .strip_prefix("claude-")
+        .is_some_and(|rest| !rest.is_empty())
+    {
+        return Some(normalized);
+    }
+    None
 }
 
 /// 현재 세션의 모델을 변경합니다
@@ -116,6 +142,23 @@ pub async fn model(
     Ok(())
 }
 
+async fn autocomplete_model(
+    _ctx: Context<'_>,
+    partial: &str,
+) -> Vec<poise::serenity_prelude::AutocompleteChoice> {
+    let needle = partial.to_ascii_lowercase();
+    let candidates: Vec<&str> = SHORT_ALIASES
+        .iter()
+        .copied()
+        .chain(VERSIONED_MODELS.iter().map(|(label, _)| *label))
+        .collect();
+    candidates
+        .into_iter()
+        .filter(|label| needle.is_empty() || label.to_ascii_lowercase().contains(&needle))
+        .map(|label| poise::serenity_prelude::AutocompleteChoice::new(label, label))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -178,16 +221,66 @@ mod tests {
         assert_eq!(validate_model_name("claude-"), None);
         assert_eq!(validate_model_name("CLAUDE-"), None);
     }
-}
 
-async fn autocomplete_model(
-    _ctx: Context<'_>,
-    partial: &str,
-) -> Vec<poise::serenity_prelude::AutocompleteChoice> {
-    let models = ["opus", "sonnet", "haiku"];
-    models
-        .iter()
-        .filter(|m| partial.is_empty() || m.contains(partial))
-        .map(|m| poise::serenity_prelude::AutocompleteChoice::new(*m, *m))
-        .collect()
+    #[test]
+    fn validate_versioned_opus_4_7() {
+        assert_eq!(
+            validate_model_name("opus 4.7"),
+            Some("claude-opus-4-7".to_string())
+        );
+    }
+
+    #[test]
+    fn validate_versioned_case_insensitive() {
+        assert_eq!(
+            validate_model_name("OPUS 4.7"),
+            Some("claude-opus-4-7".to_string())
+        );
+        assert_eq!(
+            validate_model_name("Opus 4.7"),
+            Some("claude-opus-4-7".to_string())
+        );
+    }
+
+    #[test]
+    fn validate_versioned_opus_4_6() {
+        assert_eq!(
+            validate_model_name("opus 4.6"),
+            Some("claude-opus-4-6".to_string())
+        );
+    }
+
+    #[test]
+    fn validate_versioned_sonnet_4_6() {
+        assert_eq!(
+            validate_model_name("sonnet 4.6"),
+            Some("claude-sonnet-4-6".to_string())
+        );
+    }
+
+    #[test]
+    fn validate_versioned_haiku_4_5() {
+        assert_eq!(
+            validate_model_name("haiku 4.5"),
+            Some("claude-haiku-4-5".to_string())
+        );
+    }
+
+    #[test]
+    fn validate_versioned_unknown_version_rejected() {
+        assert_eq!(validate_model_name("opus 9.9"), None);
+    }
+
+    #[test]
+    fn validate_versioned_invalid_format_rejected() {
+        assert_eq!(validate_model_name("opus 4"), None);
+        assert_eq!(validate_model_name("opus 4.x"), None);
+    }
+
+    #[test]
+    fn round_trip_versioned_to_cli_and_back() {
+        use crate::handler::message::shorten_model_name;
+        let cli_id = validate_model_name("opus 4.7").expect("should validate");
+        assert_eq!(shorten_model_name(&cli_id), "opus 4.7");
+    }
 }
