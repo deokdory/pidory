@@ -15,14 +15,22 @@ use tokio::sync::Mutex;
 ///
 /// - `get_or_create` always returns the **same** `Arc<Mutex<()>>` for a
 ///   given `thread_id` as long as the entry lives in the map.
-/// - After `remove`, a subsequent `get_or_create` for the same
-///   `thread_id` allocates a **new** `Mutex`.  Any holder of the old
-///   `Arc` is unaffected (the `Arc` keeps the allocation alive until the
-///   last reference drops).
-/// - Callers must ensure that `remove` is not called while a concurrent
-///   `get_or_create` for the same key is in flight.  In practice this is
-///   guaranteed by `cleanup_session_state` running after the worker task
-///   has finished.
+/// - `remove` is **cooperative** — it only drops the map entry when no
+///   other task holds or is waiting on the inner mutex (checked via
+///   `Arc::strong_count == 1`).  If there are active holders/waiters,
+///   the entry is preserved and the next cleanup cycle retries.  This
+///   prevents the following teardown race:
+///   1. Task A holds the per-thread guard while dispatching.
+///   2. Cleanup fires and would otherwise evict the entry.
+///   3. Task B starts a new dispatch for the same thread, calls
+///      `get_or_create`, and receives a **fresh** mutex.  A and B would
+///      then run concurrently against the same thread, reopening the
+///      very race this type exists to prevent.
+/// - Because `remove` holds the outer `Mutex<HashMap>`, the
+///   `strong_count` check is atomic with the subsequent `HashMap::remove`.
+/// - Entries are not leaked: TTL sweep, LRU eviction, and
+///   `cleanup_session_state` each re-invoke `remove`, so once all holders
+///   drop their `Arc` the entry is reclaimed on a later cleanup tick.
 pub struct ThreadDispatchLocks {
     inner: Mutex<HashMap<String, Arc<Mutex<()>>>>,
 }
@@ -47,14 +55,26 @@ impl ThreadDispatchLocks {
             .clone()
     }
 
-    /// Removes the dispatch lock entry for `thread_id`.
+    /// Cooperatively removes the dispatch lock entry for `thread_id`.
     ///
-    /// If a caller currently holds the inner `Mutex<()>` guard, the
-    /// removal does **not** affect them — the `Arc` reference they hold
-    /// keeps the allocation alive.  Any subsequent `get_or_create` call
-    /// for the same `thread_id` will produce a fresh, independent mutex.
+    /// The entry is only dropped when the map's `Arc` is the **only**
+    /// reference (`strong_count == 1`).  If other tasks still hold the
+    /// `Arc` — either because they are inside a guard or waiting on
+    /// `.lock()` — the entry is left in place so all current and future
+    /// dispatchers on this thread continue to serialize on the **same**
+    /// mutex.  A later cleanup cycle (TTL sweep, LRU eviction, next
+    /// `cleanup_session_state`) will retry and eventually reclaim the
+    /// slot once all holders drop their `Arc`.
     pub async fn remove(&self, thread_id: &str) {
-        self.inner.lock().await.remove(thread_id);
+        let mut map = self.inner.lock().await;
+        // Hold the outer Mutex<HashMap> for the whole check-and-remove — this
+        // is atomic with concurrent `get_or_create` calls on the same key.
+        // `Arc::strong_count == 1` means the map holds the only reference.
+        if let Some(arc) = map.get(thread_id) {
+            if Arc::strong_count(arc) == 1 {
+                map.remove(thread_id);
+            }
+        }
     }
 
     /// Returns the number of entries currently in the map.
@@ -244,38 +264,44 @@ mod tests {
         assert_eq!(locks.len().await, 0);
     }
 
-    /// `remove` while another task holds the guard must not panic or
-    /// deadlock.  The holder should complete normally because the `Arc`
-    /// keeps the mutex alive.
+    /// `remove` while another task holds the `Arc` must be cooperative —
+    /// the entry is preserved so concurrent dispatchers keep serializing
+    /// on the **same** mutex.  After the holder drops the `Arc`, a later
+    /// `remove` reclaims the slot.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn remove_with_active_guard() {
+    async fn remove_cooperative_with_active_holder() {
         let locks = Arc::new(ThreadDispatchLocks::new());
 
-        // Acquire the lock and hold it for 100 ms.
+        // Holder keeps an Arc clone + the guard.
         let arc = locks.get_or_create("thread-z").await;
-        let guard_future = arc.lock();
-
-        let guard = guard_future.await;
+        let guard = arc.lock().await;
 
         let locks_clone = locks.clone();
         let remover = tokio::spawn(async move {
-            // Remove the entry while the guard is held in the outer task.
             locks_clone.remove("thread-z").await;
         });
 
-        // Removal must complete without deadlocking.
+        // Removal must not deadlock, even when skipped.
         remover.await.unwrap();
 
-        // The map entry is gone.
+        // Cooperative remove: entry is preserved because the holder still owns `arc`.
+        assert_eq!(locks.len().await, 1);
+
+        // Same mutex is returned — dispatchers keep serializing.
+        let arc_same = locks.get_or_create("thread-z").await;
+        assert!(Arc::ptr_eq(&arc, &arc_same));
+
+        drop(guard);
+        drop(arc);
+        drop(arc_same);
+
+        // Now only the map holds the Arc. remove should succeed.
+        locks.remove("thread-z").await;
         assert_eq!(locks.len().await, 0);
 
-        // The holder can still use the guard normally.
-        tokio::time::sleep(Duration::from_millis(10)).await;
-        drop(guard);
-
-        // A new get_or_create produces a fresh, independent entry.
-        let arc2 = locks.get_or_create("thread-z").await;
-        assert!(!Arc::ptr_eq(&arc, &arc2));
+        // A fresh get_or_create allocates a brand new mutex.
+        let arc_new = locks.get_or_create("thread-z").await;
         assert_eq!(locks.len().await, 1);
+        drop(arc_new);
     }
 }
