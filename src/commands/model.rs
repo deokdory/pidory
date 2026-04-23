@@ -155,6 +155,7 @@ async fn autocomplete_model(
     candidates
         .into_iter()
         .filter(|label| needle.is_empty() || label.to_ascii_lowercase().contains(&needle))
+        .take(25) // Discord slash-command autocomplete 최대 25개 제한
         .map(|label| poise::serenity_prelude::AutocompleteChoice::new(label, label))
         .collect()
 }
@@ -282,5 +283,12 @@ mod tests {
         use crate::handler::message::shorten_model_name;
         let cli_id = validate_model_name("opus 4.7").expect("should validate");
         assert_eq!(shorten_model_name(&cli_id), "opus 4.7");
+    }
+
+    #[test]
+    fn autocomplete_candidates_within_discord_limit() {
+        // Discord slash-command autocomplete는 최대 25개까지만 받음.
+        // 테이블 확장 시 컴파일 타임에 한계 초과를 감지하도록 보장.
+        assert!(SHORT_ALIASES.len() + VERSIONED_MODELS.len() <= 25);
     }
 }
