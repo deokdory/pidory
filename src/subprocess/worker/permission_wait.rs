@@ -80,7 +80,7 @@ async fn write_permission_response(
 
 /// 동시 pending control_request 의 상한. 초과 시 auto-deny.
 // permission_tx buffer 와 동기 (session_manager.rs).
-pub(super) const MAX_PENDING_CR: usize = 32;
+const MAX_PENDING_CR: usize = 32;
 
 /// 새 복수형 wait_for_permissions() 의 반환 타입.
 #[derive(Debug)]
