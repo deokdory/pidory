@@ -45,8 +45,7 @@ pub(super) struct SessionInner {
     pub(super) child: Child,
     queue_tx: mpsc::Sender<QueuedMessage>,
     queue_size: Arc<AtomicUsize>,
-    worker_task: JoinHandle<()>,
-    pub(super) permission_handler: JoinHandle<()>,
+    supervisor_task: JoinHandle<()>,
     _permission_tx: mpsc::Sender<PermissionRequest>,
     interrupt_tx: mpsc::Sender<()>,
     last_activity: Arc<StdMutex<Instant>>,
@@ -103,7 +102,11 @@ impl SessionManager {
         pending_question_groups: Arc<tokio::sync::Mutex<HashMap<String, crate::PendingQuestionGroup>>>,
         owner_id: u64,
         todo_trackers: Arc<tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<crate::handler::todo_tracker::TodoTracker>>>>>,
+        mut cleanup_handles: crate::subprocess::supervisor::SessionCleanupHandles,
+        notification_channel: Option<poise::serenity_prelude::ChannelId>,
     ) -> Result<SessionCreateResult, PidoryError> {
+        // pending_recalls는 SessionManager 소유 — 호출자 placeholder를 실제 Arc로 덮어쓴다.
+        cleanup_handles.pending_recalls = Arc::clone(&self.pending_recalls);
         let mut sessions = self.sessions.lock().await;
 
         if sessions.contains_key(thread_id) {
@@ -115,13 +118,12 @@ impl SessionManager {
             if let Some(evict_tid) = Self::find_evict_target(&sessions) {
                 tracing::info!(thread_id = %evict_tid, "Evicting idle session (LRU)");
                 if let Some(mut inner) = sessions.remove(&evict_tid) {
-                    inner.permission_handler.abort();
-                    inner.worker_task.abort();
-                    let _ = inner.child.kill().await;
+                    inner.supervisor_task.abort();
+                    self.pending_recalls.lock().await.retain(|_, (tid, _)| tid != &evict_tid);
+                    evicted_thread_id = Some(evict_tid);
+                    let _ = self.session_count_tx.send(sessions.len());
+                    kill_with_timeout(&mut inner.child).await;
                 }
-                self.pending_recalls.lock().await.retain(|_, (tid, _)| tid != &evict_tid);
-                evicted_thread_id = Some(evict_tid);
-                let _ = self.session_count_tx.send(sessions.len());
             } else {
                 return Err(PidoryError::Subprocess(
                     format!("all {} sessions are busy", self.max_sessions)
@@ -181,21 +183,10 @@ impl SessionManager {
         let has_active_bg_tasks = Arc::new(AtomicBool::new(false));
         let is_turn_active = Arc::new(AtomicBool::new(false));
 
-        let permission_handler = tokio::spawn(crate::handler::permission_ui::run_permission_handler(
-            permission_rx,
-            ctx.clone(),
-            channel_id,
-            pending_permissions.clone(),
-            pending_question_groups.clone(),
-            owner_id,
-            thread_id.to_string(),
-            lang,
-        ));
-
         // Combined worker task: reads queue, writes stdin, reads stdout until result, streams events
         let timeout_secs = self.config.subprocess_timeout_secs;
         let sessions_clone = Arc::clone(&self.sessions);
-        let worker_task = tokio::spawn(super::worker::SessionWorker::new(
+        let worker_fut = super::worker::SessionWorker::new(
             stdin,
             BufReader::new(stdout),
             queue_rx,
@@ -208,16 +199,38 @@ impl SessionManager {
             Arc::clone(&is_turn_active),
             thread_id.to_string(),
             channel_id,
-            ctx,
-            db,
+            ctx.clone(),
+            db.clone(),
             timeout_secs,
             lang,
             owner_id,
             Arc::clone(&self.pending_recalls),
             self.ratelimit_tx.clone(),
             todo_trackers,
-        ).run());
+        ).run();
 
+        let permission_fut = crate::handler::permission_ui::run_permission_handler(
+            permission_rx,
+            ctx.clone(),
+            channel_id,
+            pending_permissions.clone(),
+            pending_question_groups.clone(),
+            owner_id,
+            thread_id.to_string(),
+            lang,
+        );
+
+        let supervisor_task = tokio::spawn(super::supervisor::run_supervisor(
+            thread_id.to_string(),
+            worker_fut,
+            permission_fut,
+            Arc::clone(&self.sessions),
+            cleanup_handles,
+            db.clone(),
+            ctx.clone(),
+            notification_channel,
+            self.session_count_tx.clone(),
+        ));
 
         sessions.insert(
             thread_id.to_string(),
@@ -225,8 +238,7 @@ impl SessionManager {
                 child,
                 queue_tx,
                 queue_size,
-                worker_task,
-                permission_handler,
+                supervisor_task,
                 _permission_tx: permission_tx,
                 interrupt_tx,
                 last_activity,
@@ -300,19 +312,17 @@ impl SessionManager {
             PidoryError::NotFound(format!("no active session for thread_id: {}", thread_id))
         })?;
 
-        inner.permission_handler.abort();
-        inner.worker_task.abort();
+        inner.supervisor_task.abort();
 
         // 해당 session의 pending_recalls 엔트리 정리
         self.pending_recalls.lock().await.retain(|_, (tid, _)| tid != thread_id);
 
         let _ = self.session_count_tx.send(sessions.len());
 
-        inner
-            .child
-            .kill()
-            .await
-            .map_err(|e| PidoryError::Subprocess(format!("kill failed: {}", e)))?;
+        // lock을 kill 전에 drop — deadlock 방지
+        drop(sessions);
+
+        kill_with_timeout(&mut inner.child).await;
 
         Ok(())
     }
@@ -375,21 +385,38 @@ impl SessionManager {
             .map(|(tid, _)| tid.clone())
             .collect();
 
-        let mut evicted = Vec::new();
-        for tid in targets {
+        // lock 보유 중 child.kill 금지. lock 해제 후 kill.
+        let mut to_kill: Vec<SessionInner> = Vec::new();
+        for tid in &targets {
             tracing::info!(thread_id = %tid, "Sweeping idle session (TTL expired)");
-            if let Some(mut inner) = sessions.remove(&tid) {
-                inner.permission_handler.abort();
-                inner.worker_task.abort();
-                let _ = inner.child.kill().await;
+            if let Some(inner) = sessions.remove(tid) {
+                inner.supervisor_task.abort();
+                to_kill.push(inner);
             }
-            evicted.push(tid);
         }
+        let evicted: Vec<String> = targets;
+
         if !evicted.is_empty() {
             self.pending_recalls.lock().await.retain(|_, (tid, _)| !evicted.contains(tid));
             let _ = self.session_count_tx.send(sessions.len());
         }
+
+        // lock 해제 후 kill
+        drop(sessions);
+        for mut inner in to_kill {
+            kill_with_timeout(&mut inner.child).await;
+        }
+
         evicted
+    }
+}
+
+pub(super) async fn kill_with_timeout(child: &mut Child) {
+    use tokio::time::{timeout, Duration};
+    match timeout(Duration::from_secs(3), child.kill()).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => tracing::warn!(error = %e, "child.kill returned error (probably already exited)"),
+        Err(_) => tracing::warn!("child.kill timed out after 3s; leaving process to be reaped by init"),
     }
 }
 
@@ -742,5 +769,77 @@ mod tests {
             },
         )];
         assert!(!has_slot_mock(&sessions, 1));
+    }
+
+    // ---------- supervisor::trigger_cleanup_core tests ----------
+
+    async fn make_dummy_session_inner() -> super::SessionInner {
+        use std::process::Stdio;
+        use std::sync::atomic::{AtomicBool, AtomicUsize};
+        use std::sync::Arc;
+        use tokio::sync::mpsc;
+
+        let child = tokio::process::Command::new("cat")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn dummy cat");
+
+        let (queue_tx, _queue_rx) = mpsc::channel(5);
+        let (permission_tx, _permission_rx) = mpsc::channel(32);
+        let (interrupt_tx, _interrupt_rx) = mpsc::channel(1);
+
+        let supervisor_task = tokio::spawn(async {});
+
+        super::SessionInner {
+            child,
+            queue_tx,
+            queue_size: Arc::new(AtomicUsize::new(0)),
+            supervisor_task,
+            _permission_tx: permission_tx,
+            interrupt_tx,
+            last_activity: Arc::new(std::sync::Mutex::new(Instant::now())),
+            has_active_bg_tasks: Arc::new(AtomicBool::new(false)),
+            is_turn_active: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    #[tokio::test]
+    async fn trigger_cleanup_core_removes_present_session() {
+        use std::collections::HashMap;
+        use std::sync::Arc;
+        use tokio::sync::Mutex as TokioMutex;
+
+        let sessions: Arc<TokioMutex<HashMap<String, super::SessionInner>>> =
+            Arc::new(TokioMutex::new(HashMap::new()));
+
+        let inner = make_dummy_session_inner().await;
+        sessions.lock().await.insert("tid1".to_string(), inner);
+
+        let removed =
+            crate::subprocess::supervisor::trigger_cleanup_core(&sessions, "tid1").await;
+        assert!(removed.is_some(), "expected Some when session present");
+        assert!(
+            sessions.lock().await.get("tid1").is_none(),
+            "session should be removed from HashMap"
+        );
+    }
+
+    #[tokio::test]
+    async fn trigger_cleanup_core_returns_none_when_absent() {
+        use std::collections::HashMap;
+        use std::sync::Arc;
+        use tokio::sync::Mutex as TokioMutex;
+
+        let sessions: Arc<TokioMutex<HashMap<String, super::SessionInner>>> =
+            Arc::new(TokioMutex::new(HashMap::new()));
+
+        let removed =
+            crate::subprocess::supervisor::trigger_cleanup_core(&sessions, "nonexistent").await;
+        assert!(
+            removed.is_none(),
+            "expected None for absent tid (idempotency)"
+        );
     }
 }

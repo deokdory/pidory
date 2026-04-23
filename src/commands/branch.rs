@@ -151,6 +151,8 @@ pub async fn branch(
             data.pending_question_groups.clone(),
             data.config.discord.owner_id,
             data.todo_trackers.clone(),
+            crate::subprocess::supervisor::SessionCleanupHandles::from_data(data),
+            data.config.discord.notification_channel_id.map(poise::serenity_prelude::ChannelId::new),
         )
         .await
     {
@@ -319,6 +321,8 @@ pub async fn branch(
             data.pending_question_groups.clone(),
             data.config.discord.owner_id,
             data.todo_trackers.clone(),
+            crate::subprocess::supervisor::SessionCleanupHandles::from_data(data),
+            data.config.discord.notification_channel_id.map(poise::serenity_prelude::ChannelId::new),
         )
         .await
     {

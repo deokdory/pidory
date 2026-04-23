@@ -1,0 +1,202 @@
+use std::collections::{HashMap, HashSet};
+use std::future::Future;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+
+use poise::serenity_prelude::{ChannelId, Context, MessageId, UserId};
+use sqlx::SqlitePool;
+use tokio::sync::{Mutex, watch};
+use tokio::task::JoinSet;
+use tracing::{Instrument, info_span};
+
+use crate::PendingPermission;
+use crate::PendingQuestionGroup;
+use crate::handler::reset_ui::PendingReset;
+use crate::handler::todo_tracker::TodoTracker;
+
+use super::session_manager::SessionInner;
+
+/// `(thread_id, cancel_flag)` 쌍을 값으로 갖는 recall 대기 맵 타입.
+pub type PendingRecallMap = Arc<Mutex<HashMap<MessageId, (String, Arc<AtomicBool>)>>>;
+
+/// 13개 맵의 Arc clone을 담는 경량 구조체. Data struct 전체 참조를 피한다.
+#[derive(Clone)]
+pub struct SessionCleanupHandles {
+    pub pending_permissions: Arc<Mutex<HashMap<String, PendingPermission>>>,
+    pub pending_question_groups: Arc<Mutex<HashMap<String, PendingQuestionGroup>>>,
+    pub pending_resets: Arc<Mutex<HashMap<String, PendingReset>>>,
+    pub session_skills: Arc<Mutex<HashMap<String, Vec<String>>>>,
+    pub needs_context: Arc<Mutex<HashSet<String>>>,
+    pub turn_initiators: Arc<Mutex<HashMap<String, UserId>>>,
+    pub turn_participants: Arc<Mutex<HashMap<String, HashSet<UserId>>>>,
+    pub last_tool_name: Arc<Mutex<HashMap<String, String>>>,
+    pub kick_cooldowns: Arc<Mutex<HashMap<String, std::time::Instant>>>,
+    pub kick_pending: Arc<Mutex<HashSet<String>>>,
+    pub next_step_buttons: Arc<Mutex<HashMap<String, MessageId>>>,
+    pub todo_trackers: Arc<Mutex<HashMap<String, Arc<Mutex<TodoTracker>>>>>,
+    pub pending_recalls: PendingRecallMap,
+}
+
+impl SessionCleanupHandles {
+    pub fn from_data(data: &crate::Data) -> Self {
+        // pending_recalls는 placeholder. SessionManager::get_or_create가 실제 Arc로 덮어쓴다.
+        let placeholder = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+        Self::from_parts(data, placeholder)
+    }
+
+    pub fn from_parts(
+        data: &crate::Data,
+        pending_recalls: PendingRecallMap,
+    ) -> Self {
+        Self {
+            pending_permissions: Arc::clone(&data.pending_permissions),
+            pending_question_groups: Arc::clone(&data.pending_question_groups),
+            pending_resets: Arc::clone(&data.pending_resets),
+            session_skills: Arc::clone(&data.session_skills),
+            needs_context: Arc::clone(&data.needs_context),
+            turn_initiators: Arc::clone(&data.turn_initiators),
+            turn_participants: Arc::clone(&data.turn_participants),
+            last_tool_name: Arc::clone(&data.last_tool_name),
+            kick_cooldowns: Arc::clone(&data.kick_cooldowns),
+            kick_pending: Arc::clone(&data.kick_pending),
+            next_step_buttons: Arc::clone(&data.next_step_buttons),
+            todo_trackers: Arc::clone(&data.todo_trackers),
+            pending_recalls,
+        }
+    }
+
+    #[cfg(test)]
+    pub fn empty_for_test() -> Self {
+        use std::collections::{HashMap, HashSet};
+        Self {
+            pending_permissions: Arc::new(Mutex::new(HashMap::new())),
+            pending_question_groups: Arc::new(Mutex::new(HashMap::new())),
+            pending_resets: Arc::new(Mutex::new(HashMap::new())),
+            session_skills: Arc::new(Mutex::new(HashMap::new())),
+            needs_context: Arc::new(Mutex::new(HashSet::new())),
+            turn_initiators: Arc::new(Mutex::new(HashMap::new())),
+            turn_participants: Arc::new(Mutex::new(HashMap::new())),
+            last_tool_name: Arc::new(Mutex::new(HashMap::new())),
+            kick_cooldowns: Arc::new(Mutex::new(HashMap::new())),
+            kick_pending: Arc::new(Mutex::new(HashSet::new())),
+            next_step_buttons: Arc::new(Mutex::new(HashMap::new())),
+            todo_trackers: Arc::new(Mutex::new(HashMap::new())),
+            pending_recalls: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+}
+
+/// core: DB/Discord 없이 테스트 가능한 분리된 정리 로직.
+/// sessions HashMap에서 tid를 remove한다. 이미 None이면 다른 정리 경로가 처리했으므로 None 반환.
+/// 반환된 SessionInner의 child는 호출자가 kill_with_timeout 처리.
+pub(super) async fn trigger_cleanup_core(
+    sessions: &Arc<Mutex<HashMap<String, SessionInner>>>,
+    thread_id: &str,
+) -> Option<SessionInner> {
+    let mut ss = sessions.lock().await;
+    ss.remove(thread_id)
+    // lock 자동 drop (함수 종료).
+}
+
+/// 완전 wrapper: panic/cancel 감지, core 호출, child kill timeout, DB/Discord 알림, 13개 맵 정리.
+/// NOTE: child.kill은 lock 해제 후 호출 — lock은 trigger_cleanup_core 내부에서 이미 drop됨.
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn run_supervisor(
+    thread_id: String,
+    worker_fut: impl Future<Output = ()> + Send + 'static,
+    permission_fut: impl Future<Output = ()> + Send + 'static,
+    sessions: Arc<Mutex<HashMap<String, SessionInner>>>,
+    handles: SessionCleanupHandles,
+    db: SqlitePool,
+    ctx: Context,
+    notification_channel: Option<ChannelId>,
+    session_count_tx: watch::Sender<usize>,
+) {
+    let mut js: JoinSet<()> = JoinSet::new();
+    js.spawn(worker_fut.instrument(info_span!("worker", thread_id = %thread_id)));
+    js.spawn(permission_fut.instrument(info_span!("permission", thread_id = %thread_id)));
+
+    while let Some(res) = js.join_next().await {
+        match res {
+            Err(e) if e.is_panic() => {
+                tracing::error!(thread_id = %thread_id, error = %e, "session task panicked — triggering cleanup");
+                do_cleanup(
+                    &thread_id,
+                    &sessions,
+                    &handles,
+                    &db,
+                    &ctx,
+                    notification_channel,
+                    &session_count_tx,
+                ).await;
+                break;
+            }
+            Err(e) if e.is_cancelled() => {
+                tracing::debug!(thread_id = %thread_id, "session task cancelled (normal abort path)");
+                // JoinSet 내 다른 task도 곧 취소될 것. 반복 계속해서 다음 결과 소비.
+            }
+            Ok(()) => {
+                tracing::debug!(thread_id = %thread_id, "session task ended normally");
+                // 하나 정상 종료 → 나머지는 곧 자연 종료. 특별한 정리 불필요.
+            }
+            Err(e) => {
+                tracing::warn!(thread_id = %thread_id, error = %e, "session task join error (neither panic nor cancelled)");
+            }
+        }
+    }
+    // JoinSet drop 시 나머지 task abort.
+}
+
+async fn do_cleanup(
+    thread_id: &str,
+    sessions: &Arc<Mutex<HashMap<String, SessionInner>>>,
+    handles: &SessionCleanupHandles,
+    db: &SqlitePool,
+    ctx: &Context,
+    notification_channel: Option<ChannelId>,
+    session_count_tx: &watch::Sender<usize>,
+) {
+    // 1. sessions에서 remove (idempotency — None이면 이미 처리됨)
+    let removed = trigger_cleanup_core(sessions, thread_id).await;
+    let Some(mut inner) = removed else {
+        tracing::debug!(thread_id = %thread_id, "session already removed by another path — cleanup skipped");
+        return;
+    };
+
+    // session_count 업데이트
+    let new_len = sessions.lock().await.len();
+    let _ = session_count_tx.send(new_len);
+
+    // pending_recalls도 정리 (이 세션이 소유했던 항목만)
+    handles
+        .pending_recalls
+        .lock()
+        .await
+        .retain(|_, (tid, _)| tid != thread_id);
+
+    // 2. child kill with timeout
+    super::session_manager::kill_with_timeout(&mut inner.child).await;
+
+    // 3. DB status update → error
+    if let Err(e) = sqlx::query!(
+        "UPDATE sessions SET status = 'error' WHERE thread_id = ?",
+        thread_id
+    )
+    .execute(db)
+    .await
+    {
+        tracing::warn!(thread_id = %thread_id, error = %e, "failed to update session status to error");
+    }
+
+    // 4. 13개 맵 정리 (handler::cleanup)
+    crate::handler::cleanup::cleanup_session_state_from_handles(handles, thread_id, ctx).await;
+
+    // 5. Discord 알림 (optional)
+    if let Some(channel) = notification_channel
+        && let Err(e) = channel
+            .say(ctx, format!("⚠️ 세션 `{}`이 예기치 않게 종료됐어. 정리 완료.", thread_id))
+            .await
+    {
+        tracing::warn!(thread_id = %thread_id, error = %e, "failed to send session panic notification");
+    }
+}
