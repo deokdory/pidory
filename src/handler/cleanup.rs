@@ -27,6 +27,7 @@ pub async fn cleanup_session_state(data: &Data, thread_id: &str, ctx: &Context) 
     data.last_tool_name.lock().await.remove(thread_id);
     data.kick_cooldowns.lock().await.remove(thread_id);
     data.kick_pending.lock().await.remove(thread_id);
+    data.dispatch_locks.remove(thread_id).await;
     let tracker = data.todo_trackers.lock().await.remove(thread_id);
     if let Some(tracker) = tracker {
         tracker.lock().await.cleanup(ctx).await;
