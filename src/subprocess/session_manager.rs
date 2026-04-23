@@ -220,8 +220,13 @@ impl SessionManager {
             lang,
         );
 
+        // ready 채널: supervisor가 sessions.insert 완료 후에 task를 관찰하도록 보장.
+        // 순서: spawn → insert → ready_tx.send(()) — supervisor는 ready_rx.await 후 진행.
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<()>();
+
         let supervisor_task = tokio::spawn(super::supervisor::run_supervisor(
             thread_id.to_string(),
+            ready_rx,
             worker_fut,
             permission_fut,
             Arc::clone(&self.sessions),
@@ -246,6 +251,10 @@ impl SessionManager {
                 is_turn_active,
             },
         );
+
+        // insert 완료 후 supervisor 해제 — 이 시점부터 supervisor가 panic 감지 시
+        // sessions에서 session을 찾을 수 있음이 보장된다.
+        let _ = ready_tx.send(());
 
         let _ = self.session_count_tx.send(sessions.len());
 
@@ -306,6 +315,11 @@ impl SessionManager {
         }
     }
 
+    /// Kills and removes a session from the manager.
+    ///
+    /// Returns `Err(PidoryError::NotFound)` when no session exists for `thread_id`.
+    /// Returns `Ok(())` even if the child process kill fails or times out — such
+    /// failures are logged as warnings via `kill_with_timeout` but do not propagate.
     pub async fn kill_session(&self, thread_id: &str) -> Result<(), PidoryError> {
         let mut sessions = self.sessions.lock().await;
         let mut inner = sessions.remove(thread_id).ok_or_else(|| {
@@ -394,10 +408,9 @@ impl SessionManager {
                 to_kill.push(inner);
             }
         }
-        let evicted: Vec<String> = targets;
 
-        if !evicted.is_empty() {
-            self.pending_recalls.lock().await.retain(|_, (tid, _)| !evicted.contains(tid));
+        if !targets.is_empty() {
+            self.pending_recalls.lock().await.retain(|_, (tid, _)| !targets.contains(tid));
             let _ = self.session_count_tx.send(sessions.len());
         }
 
@@ -407,16 +420,25 @@ impl SessionManager {
             kill_with_timeout(&mut inner.child).await;
         }
 
-        evicted
+        targets
     }
 }
 
 pub(super) async fn kill_with_timeout(child: &mut Child) {
     use tokio::time::{timeout, Duration};
+
+    // 1) kill 시도 (이미 죽었으면 Err — OK, 무시)
     match timeout(Duration::from_secs(3), child.kill()).await {
         Ok(Ok(())) => {}
         Ok(Err(e)) => tracing::warn!(error = %e, "child.kill returned error (probably already exited)"),
-        Err(_) => tracing::warn!("child.kill timed out after 3s; leaving process to be reaped by init"),
+        Err(_) => tracing::warn!("child.kill timed out after 3s; continuing to wait"),
+    }
+
+    // 2) wait으로 reap 확실히 (zombie 방지). cat 등 짧은 프로세스는 stdin close 시 자연 종료 — 금방 반환.
+    match timeout(Duration::from_secs(3), child.wait()).await {
+        Ok(Ok(status)) => tracing::debug!(?status, "child reaped"),
+        Ok(Err(e)) => tracing::warn!(error = %e, "child.wait returned error"),
+        Err(_) => tracing::warn!("child.wait timed out after 3s; leaving unreaped"),
     }
 }
 
@@ -817,7 +839,7 @@ mod tests {
         let inner = make_dummy_session_inner().await;
         sessions.lock().await.insert("tid1".to_string(), inner);
 
-        let removed =
+        let (removed, _len) =
             crate::subprocess::supervisor::trigger_cleanup_core(&sessions, "tid1").await;
         assert!(removed.is_some(), "expected Some when session present");
         assert!(
@@ -835,7 +857,7 @@ mod tests {
         let sessions: Arc<TokioMutex<HashMap<String, super::SessionInner>>> =
             Arc::new(TokioMutex::new(HashMap::new()));
 
-        let removed =
+        let (removed, _) =
             crate::subprocess::supervisor::trigger_cleanup_core(&sessions, "nonexistent").await;
         assert!(
             removed.is_none(),

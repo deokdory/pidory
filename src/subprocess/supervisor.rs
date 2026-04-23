@@ -19,7 +19,7 @@ use super::session_manager::SessionInner;
 /// `(thread_id, cancel_flag)` 쌍을 값으로 갖는 recall 대기 맵 타입.
 pub type PendingRecallMap = Arc<Mutex<HashMap<MessageId, (String, Arc<AtomicBool>)>>>;
 
-/// 13개 맵의 Arc clone을 담는 경량 구조체. Data struct 전체 참조를 피한다.
+/// 14개 맵의 Arc clone을 담는 경량 구조체. Data struct 전체 참조를 피한다.
 #[derive(Clone)]
 pub struct SessionCleanupHandles {
     pub pending_permissions: Arc<Mutex<HashMap<String, PendingPermission>>>,
@@ -35,6 +35,7 @@ pub struct SessionCleanupHandles {
     pub next_step_buttons: Arc<Mutex<HashMap<String, MessageId>>>,
     pub todo_trackers: Arc<Mutex<HashMap<String, Arc<Mutex<TodoTracker>>>>>,
     pub pending_recalls: PendingRecallMap,
+    pub dispatch_locks: Arc<crate::handler::dispatch_locks::ThreadDispatchLocks>,
 }
 
 impl SessionCleanupHandles {
@@ -62,6 +63,7 @@ impl SessionCleanupHandles {
             next_step_buttons: Arc::clone(&data.next_step_buttons),
             todo_trackers: Arc::clone(&data.todo_trackers),
             pending_recalls,
+            dispatch_locks: Arc::clone(&data.dispatch_locks),
         }
     }
 
@@ -82,6 +84,7 @@ impl SessionCleanupHandles {
             next_step_buttons: Arc::new(Mutex::new(HashMap::new())),
             todo_trackers: Arc::new(Mutex::new(HashMap::new())),
             pending_recalls: Arc::new(Mutex::new(HashMap::new())),
+            dispatch_locks: Arc::new(crate::handler::dispatch_locks::ThreadDispatchLocks::new()),
         }
     }
 }
@@ -89,20 +92,29 @@ impl SessionCleanupHandles {
 /// core: DB/Discord 없이 테스트 가능한 분리된 정리 로직.
 /// sessions HashMap에서 tid를 remove한다. 이미 None이면 다른 정리 경로가 처리했으므로 None 반환.
 /// 반환된 SessionInner의 child는 호출자가 kill_with_timeout 처리.
+/// 두 번째 반환값은 remove 후 남은 세션 수 — 추가 lock 없이 session_count_tx 업데이트 가능.
 pub(super) async fn trigger_cleanup_core(
     sessions: &Arc<Mutex<HashMap<String, SessionInner>>>,
     thread_id: &str,
-) -> Option<SessionInner> {
+) -> (Option<SessionInner>, usize) {
     let mut ss = sessions.lock().await;
-    ss.remove(thread_id)
+    let removed = ss.remove(thread_id);
+    let len = ss.len();
+    (removed, len)
     // lock 자동 drop (함수 종료).
 }
 
 /// 완전 wrapper: panic/cancel 감지, core 호출, child kill timeout, DB/Discord 알림, 13개 맵 정리.
 /// NOTE: child.kill은 lock 해제 후 호출 — lock은 trigger_cleanup_core 내부에서 이미 drop됨.
+///
+/// `ready_rx`: get_or_create가 sessions.insert 완료 후 send하는 oneshot 채널.
+/// supervisor는 이 신호를 받은 뒤에 worker/permission task를 관찰하기 시작한다.
+/// sender가 drop(즉 get_or_create 실패 경로)되어도 Err를 무시하고 계속 진행한다 —
+/// 어느 쪽이든 session이 맵에 없으면 do_cleanup이 early-exit하므로 안전하다.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn run_supervisor(
     thread_id: String,
+    ready_rx: tokio::sync::oneshot::Receiver<()>,
     worker_fut: impl Future<Output = ()> + Send + 'static,
     permission_fut: impl Future<Output = ()> + Send + 'static,
     sessions: Arc<Mutex<HashMap<String, SessionInner>>>,
@@ -112,6 +124,11 @@ pub(super) async fn run_supervisor(
     notification_channel: Option<ChannelId>,
     session_count_tx: watch::Sender<usize>,
 ) {
+    // sessions.insert가 완료될 때까지 대기 (spawn-before-insert race 방지).
+    // sender drop(실패 경로) 시 Err → 무시하고 계속 진행. session이 맵에 없으면
+    // do_cleanup이 early-exit하므로 어느 쪽이든 안전하다.
+    let _ = ready_rx.await;
+
     let mut js: JoinSet<()> = JoinSet::new();
     js.spawn(worker_fut.instrument(info_span!("worker", thread_id = %thread_id)));
     js.spawn(permission_fut.instrument(info_span!("permission", thread_id = %thread_id)));
@@ -120,6 +137,10 @@ pub(super) async fn run_supervisor(
         match res {
             Err(e) if e.is_panic() => {
                 tracing::error!(thread_id = %thread_id, error = %e, "session task panicked — triggering cleanup");
+                // sibling task들을 먼저 abort + drain — cleanup 중 state 재생성 방지.
+                // abort된 task는 Err(cancelled)를 빠르게 반환하므로 무한 대기 없음.
+                js.abort_all();
+                while js.join_next().await.is_some() {}
                 do_cleanup(
                     &thread_id,
                     &sessions,
@@ -157,14 +178,13 @@ async fn do_cleanup(
     session_count_tx: &watch::Sender<usize>,
 ) {
     // 1. sessions에서 remove (idempotency — None이면 이미 처리됨)
-    let removed = trigger_cleanup_core(sessions, thread_id).await;
+    let (removed, new_len) = trigger_cleanup_core(sessions, thread_id).await;
     let Some(mut inner) = removed else {
         tracing::debug!(thread_id = %thread_id, "session already removed by another path — cleanup skipped");
         return;
     };
 
-    // session_count 업데이트
-    let new_len = sessions.lock().await.len();
+    // session_count 업데이트 (trigger_cleanup_core에서 lock 안에 계산 — 추가 lock 불필요)
     let _ = session_count_tx.send(new_len);
 
     // pending_recalls도 정리 (이 세션이 소유했던 항목만)

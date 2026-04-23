@@ -76,6 +76,7 @@ pub async fn cleanup_session_state_from_handles(
     handles.last_tool_name.lock().await.remove(thread_id);
     handles.kick_cooldowns.lock().await.remove(thread_id);
     handles.kick_pending.lock().await.remove(thread_id);
+    handles.dispatch_locks.remove(thread_id).await;
     let tracker = handles.todo_trackers.lock().await.remove(thread_id);
     if let Some(tracker) = tracker {
         tracker.lock().await.cleanup(ctx).await;
