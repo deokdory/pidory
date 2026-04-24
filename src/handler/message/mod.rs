@@ -1,6 +1,7 @@
 mod interaction;
 mod event_processor;
 mod helpers;
+pub(crate) mod interaction_kind;
 
 pub use event_processor::process_turn_events;
 pub(crate) use helpers::format_cli_command;

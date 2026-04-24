@@ -194,17 +194,6 @@ pub fn create_next_step_components(skills: &[String], thread_id: &str) -> Vec<Cr
     vec![CreateActionRow::Buttons(buttons)]
 }
 
-/// Parses custom_id in the format `nxt:{thread_id}:{skill}`.
-/// Returns `(thread_id, skill_name)` or `None` if the format does not match.
-pub fn parse_next_step_custom_id(custom_id: &str) -> Option<(String, String)> {
-    let rest = custom_id.strip_prefix("nxt:")?;
-    let (thread_part, skill_name) = rest.rsplit_once(':')?;
-    if skill_name.is_empty() {
-        return None;
-    }
-    Some((thread_part.to_string(), skill_name.to_string()))
-}
-
 /// Removes buttons from an existing Discord message by replacing components with an empty list.
 pub async fn disable_next_step_buttons(
     ctx: &Context,
@@ -343,47 +332,6 @@ mod tests {
         assert_eq!(result, vec!["verify"]);
     }
 
-    // ─── parse_next_step_custom_id ───────────────────────────────────────────
-
-    #[test]
-    fn parse_next_step_valid() {
-        let result = parse_next_step_custom_id("nxt:1234567890:session-commit");
-        assert_eq!(
-            result,
-            Some(("1234567890".to_string(), "session-commit".to_string()))
-        );
-    }
-
-    #[test]
-    fn parse_next_step_wrong_prefix() {
-        let result = parse_next_step_custom_id("perm:123:allow");
-        assert_eq!(result, None);
-    }
-
-    #[test]
-    fn parse_next_step_no_second_separator() {
-        // Only one colon after "nxt:" — rsplit_once(':') still finds it, but there's no thread_id
-        // "nxt:no-separator" strips to "no-separator", rsplit_once finds no ':', returns None
-        let result = parse_next_step_custom_id("nxt:no-separator");
-        assert_eq!(result, None);
-    }
-
-    #[test]
-    fn parse_next_step_empty_skill() {
-        let result = parse_next_step_custom_id("nxt:123:");
-        assert_eq!(result, None);
-    }
-
-    #[test]
-    fn parse_next_step_multiple_colons_uses_last() {
-        // thread_id may contain colons (e.g. IPv6-like), rsplit_once splits on the last ':'
-        let result = parse_next_step_custom_id("nxt:abc:def:craft");
-        assert_eq!(
-            result,
-            Some(("abc:def".to_string(), "craft".to_string()))
-        );
-    }
-
     // ─── create_next_step_components ────────────────────────────────────────
 
     #[test]
@@ -423,13 +371,6 @@ mod tests {
         assert_eq!(result.len(), 1);
         if let CreateActionRow::Buttons(buttons) = &result[0] {
             assert_eq!(buttons.len(), 1);
-            // Verify the round-trip: parse what we created
-            let custom_id_str = format!("nxt:{}:{}", "42", "session-commit");
-            let parsed = parse_next_step_custom_id(&custom_id_str);
-            assert_eq!(
-                parsed,
-                Some(("42".to_string(), "session-commit".to_string()))
-            );
         } else {
             panic!("expected Buttons action row");
         }

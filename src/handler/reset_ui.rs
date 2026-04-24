@@ -3,6 +3,7 @@ use poise::serenity_prelude::{
     MessageId, UserId,
 };
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResetAction {
     Confirm,
     Cancel,
@@ -35,19 +36,6 @@ pub fn create_reset_confirm_message(content: &str, thread_id: &str) -> CreateMes
         .components(vec![row])
 }
 
-/// Parses custom_id in the format `reset:{thread_id}:{action}`.
-/// Returns `(thread_id, ResetAction)` or `None` if the format does not match.
-pub fn parse_reset_custom_id(custom_id: &str) -> Option<(String, ResetAction)> {
-    let stripped = custom_id.strip_prefix("reset:")?;
-    let (thread_id, action) = stripped.rsplit_once(':')?;
-    let reset_action = match action {
-        "confirm" => ResetAction::Confirm,
-        "cancel" => ResetAction::Cancel,
-        _ => return None,
-    };
-    Some((thread_id.to_string(), reset_action))
-}
-
 pub async fn disable_reset_buttons(
     ctx: &Context,
     channel_id: ChannelId,
@@ -67,41 +55,3 @@ pub async fn disable_reset_buttons(
     Ok(())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn parse_confirm() {
-        let (tid, action) = parse_reset_custom_id("reset:123:confirm").unwrap();
-        assert_eq!(tid, "123");
-        assert!(matches!(action, ResetAction::Confirm));
-    }
-
-    #[test]
-    fn parse_cancel() {
-        let (tid, action) = parse_reset_custom_id("reset:123:cancel").unwrap();
-        assert_eq!(tid, "123");
-        assert!(matches!(action, ResetAction::Cancel));
-    }
-
-    #[test]
-    fn parse_wrong_prefix() {
-        assert!(parse_reset_custom_id("perm:abc:allow").is_none());
-    }
-
-    #[test]
-    fn parse_unknown_action() {
-        assert!(parse_reset_custom_id("reset:123:deny").is_none());
-    }
-
-    #[test]
-    fn parse_empty_string() {
-        assert!(parse_reset_custom_id("").is_none());
-    }
-
-    #[test]
-    fn parse_no_action() {
-        assert!(parse_reset_custom_id("reset:123").is_none());
-    }
-}
