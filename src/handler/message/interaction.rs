@@ -188,10 +188,10 @@ async fn handle_permission(
     action: PermissionAction,
 ) -> Result<(), PidoryError> {
     let lang = data.config.language;
-    let action_str = match action {
-        PermissionAction::Allow => "allow",
-        PermissionAction::Always => "always",
-        PermissionAction::Deny => "deny",
+    let (decision, action_str) = match action {
+        PermissionAction::Allow => (PermissionDecision::Allow, "allow"),
+        PermissionAction::Always => (PermissionDecision::AlwaysAllow, "always"),
+        PermissionAction::Deny => (PermissionDecision::Deny, "deny"),
     };
     let Some(_triggered_by) = verify_component_auth(component, ctx, data, &request_id, lang).await
     else {
@@ -207,12 +207,6 @@ async fn handle_permission(
         )
         .await
         .ok();
-    let decision = match action_str {
-        "allow" => PermissionDecision::Allow,
-        "always" => PermissionDecision::AlwaysAllow,
-        "deny" => PermissionDecision::Deny,
-        _ => return Ok(()),
-    };
     let pending = data.pending_permissions.lock().await.remove(&request_id);
     if let Some(p) = pending {
         let tool_name = p.tool_name.clone();
@@ -472,6 +466,95 @@ async fn handle_question_cancel(
     Ok(())
 }
 
+async fn handle_reset_confirm(
+    ctx: &Context,
+    component: &poise::serenity_prelude::ComponentInteraction,
+    data: &Data,
+    thread_id: &str,
+    channel_id: poise::serenity_prelude::ChannelId,
+    lang: crate::i18n::Lang,
+) -> Result<(), PidoryError> {
+    let pending = data.pending_resets.lock().await.remove(thread_id);
+    let Some(pending) = pending else {
+        component
+            .create_followup(
+                ctx,
+                poise::serenity_prelude::CreateInteractionResponseFollowup::new()
+                    .content(lang.session_reset_expired())
+                    .ephemeral(true),
+            )
+            .await
+            .ok();
+        reset_ui::disable_reset_buttons(
+            ctx,
+            channel_id,
+            component.message.id,
+            reset_ui::ResetOutcome::Expired,
+        )
+        .await
+        .ok();
+        return Ok(());
+    };
+    let _ = data.sessions.interrupt_session(thread_id).await;
+    match data.sessions.kill_session(thread_id).await {
+        Ok(()) | Err(PidoryError::NotFound(_)) => {}
+        Err(e) => {
+            channel_id
+                .say(ctx, format!("❌ {}", lang.error_with(&e)))
+                .await
+                .ok();
+            return Ok(());
+        }
+    }
+    cleanup_session_state(data, thread_id, ctx).await;
+    let _ = repository::delete_session(&data.db, thread_id).await;
+    reset_ui::disable_reset_buttons(
+        ctx,
+        channel_id,
+        pending.message_id,
+        reset_ui::ResetOutcome::Confirmed,
+    )
+    .await
+    .ok();
+    channel_id
+        .say(ctx, format!("-# ♻️ {}", lang.session_reset()))
+        .await
+        .ok();
+    Ok(())
+}
+
+async fn handle_reset_cancel(
+    ctx: &Context,
+    component: &poise::serenity_prelude::ComponentInteraction,
+    data: &Data,
+    thread_id: &str,
+    channel_id: poise::serenity_prelude::ChannelId,
+    lang: crate::i18n::Lang,
+) -> Result<(), PidoryError> {
+    let pending = data.pending_resets.lock().await.remove(thread_id);
+    let Some(pending) = pending else {
+        component
+            .create_followup(
+                ctx,
+                poise::serenity_prelude::CreateInteractionResponseFollowup::new()
+                    .content(lang.session_reset_expired())
+                    .ephemeral(true),
+            )
+            .await
+            .ok();
+        return Ok(());
+    };
+    reset_ui::disable_reset_buttons(
+        ctx,
+        channel_id,
+        pending.message_id,
+        reset_ui::ResetOutcome::Cancelled,
+    )
+    .await
+    .ok();
+    Ok(())
+}
+
 async fn handle_reset(
     ctx: &Context,
     component: &poise::serenity_prelude::ComponentInteraction,
@@ -511,75 +594,10 @@ async fn handle_reset(
         .ok();
     match reset_action {
         reset_ui::ResetAction::Confirm => {
-            let pending = data.pending_resets.lock().await.remove(&thread_id);
-            let Some(pending) = pending else {
-                component
-                    .create_followup(
-                        ctx,
-                        poise::serenity_prelude::CreateInteractionResponseFollowup::new()
-                            .content(lang.session_reset_expired())
-                            .ephemeral(true),
-                    )
-                    .await
-                    .ok();
-                reset_ui::disable_reset_buttons(
-                    ctx,
-                    channel_id,
-                    component.message.id,
-                    reset_ui::ResetOutcome::Expired,
-                )
-                .await
-                .ok();
-                return Ok(());
-            };
-            let _ = data.sessions.interrupt_session(&thread_id).await;
-            match data.sessions.kill_session(&thread_id).await {
-                Ok(()) | Err(PidoryError::NotFound(_)) => {}
-                Err(e) => {
-                    channel_id
-                        .say(ctx, format!("❌ {}", lang.error_with(&e)))
-                        .await
-                        .ok();
-                    return Ok(());
-                }
-            }
-            cleanup_session_state(data, &thread_id, ctx).await;
-            let _ = repository::delete_session(&data.db, &thread_id).await;
-            reset_ui::disable_reset_buttons(
-                ctx,
-                channel_id,
-                pending.message_id,
-                reset_ui::ResetOutcome::Confirmed,
-            )
-            .await
-            .ok();
-            channel_id
-                .say(ctx, format!("-# ♻️ {}", lang.session_reset()))
-                .await
-                .ok();
+            handle_reset_confirm(ctx, component, data, &thread_id, channel_id, lang).await?;
         }
         reset_ui::ResetAction::Cancel => {
-            let pending = data.pending_resets.lock().await.remove(&thread_id);
-            let Some(pending) = pending else {
-                component
-                    .create_followup(
-                        ctx,
-                        poise::serenity_prelude::CreateInteractionResponseFollowup::new()
-                            .content(lang.session_reset_expired())
-                            .ephemeral(true),
-                    )
-                    .await
-                    .ok();
-                return Ok(());
-            };
-            reset_ui::disable_reset_buttons(
-                ctx,
-                channel_id,
-                pending.message_id,
-                reset_ui::ResetOutcome::Cancelled,
-            )
-            .await
-            .ok();
+            handle_reset_cancel(ctx, component, data, &thread_id, channel_id, lang).await?;
         }
     }
     Ok(())

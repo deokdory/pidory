@@ -118,6 +118,9 @@ impl InteractionKind {
             })
         } else if let Some(rest) = s.strip_prefix("reset:") {
             let (thread_id, action_str) = rest.rsplit_once(':')?;
+            if thread_id.is_empty() {
+                return None;
+            }
             let action = match action_str {
                 "confirm" => ResetAction::Confirm,
                 "cancel" => ResetAction::Cancel,
@@ -132,7 +135,7 @@ impl InteractionKind {
             // rsplit_once is correct here: skill cannot contain colons by convention,
             // and thread_id is always a numeric snowflake.
             let (thread_id, skill) = rest.rsplit_once(':')?;
-            if skill.is_empty() {
+            if thread_id.is_empty() || skill.is_empty() {
                 return None;
             }
             Some(Self::NextStep {
@@ -342,5 +345,15 @@ mod tests {
     #[test]
     fn invalid_reset_action_returns_none() {
         assert_eq!(InteractionKind::from_custom_id("reset:tid:bogus"), None);
+    }
+
+    #[test]
+    fn empty_thread_id_reset_returns_none() {
+        assert_eq!(InteractionKind::from_custom_id("reset::confirm"), None);
+    }
+
+    #[test]
+    fn empty_thread_id_nxt_returns_none() {
+        assert_eq!(InteractionKind::from_custom_id("nxt::skill"), None);
     }
 }
