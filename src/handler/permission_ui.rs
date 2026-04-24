@@ -134,14 +134,6 @@ pub async fn disable_permission_buttons(
     Ok(())
 }
 
-/// Parses custom_id in the format `perm:{request_id}:{action}`.
-/// Returns `(request_id, action)` or `None` if the format does not match.
-pub fn parse_permission_custom_id(custom_id: &str) -> Option<(String, String)> {
-    let stripped = custom_id.strip_prefix("perm:")?;
-    let (request_id, action) = stripped.rsplit_once(':')?;
-    Some((request_id.to_string(), action.to_string()))
-}
-
 #[allow(clippy::too_many_arguments)]
 pub async fn run_permission_handler(
     mut permission_rx: mpsc::Receiver<PermissionRequest>,
@@ -343,37 +335,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parse_valid_custom_id() {
-        let (rid, action) =
-            parse_permission_custom_id("perm:e5c3058b-6794-4a0d-b445-7729855cb810:allow").unwrap();
-        assert_eq!(rid, "e5c3058b-6794-4a0d-b445-7729855cb810");
-        assert_eq!(action, "allow");
-    }
-
-    #[test]
-    fn parse_always_action() {
-        let (rid, action) = parse_permission_custom_id("perm:some-id:always").unwrap();
-        assert_eq!(rid, "some-id");
-        assert_eq!(action, "always");
-    }
-
-    #[test]
-    fn parse_deny_action() {
-        let (_, action) = parse_permission_custom_id("perm:abc:deny").unwrap();
-        assert_eq!(action, "deny");
-    }
-
-    #[test]
-    fn parse_invalid_prefix() {
-        assert!(parse_permission_custom_id("other:abc:allow").is_none());
-    }
-
-    #[test]
-    fn parse_no_action() {
-        assert!(parse_permission_custom_id("perm:abc").is_none());
-    }
-
-    #[test]
     fn format_bash_summary() {
         let input = serde_json::json!({"command": "ls -la"});
         let result = format_tool_input_summary("Bash", &input);
@@ -468,34 +429,6 @@ mod tests {
         let input = serde_json::json!({});
         let result = format_tool_input_summary("Bash", &input);
         assert!(result.contains("```"));
-    }
-
-    // ── parse_permission_custom_id: edge cases ────────────────────────────────
-
-    #[test]
-    fn parse_colon_in_request_id() {
-        // rsplit_once(':') means the last ':' is the separator — so colons inside
-        // the request_id are preserved in the first part.
-        let (rid, action) = parse_permission_custom_id("perm:a:b:allow").unwrap();
-        assert_eq!(rid, "a:b");
-        assert_eq!(action, "allow");
-    }
-
-    #[test]
-    fn parse_empty_string() {
-        assert!(parse_permission_custom_id("").is_none());
-    }
-
-    #[test]
-    fn parse_perm_prefix_only() {
-        assert!(parse_permission_custom_id("perm:").is_none());
-    }
-
-    #[test]
-    fn parse_action_preserved_case() {
-        let (_, action) = parse_permission_custom_id("perm:id:Allow").unwrap();
-        // Action is returned as-is, case sensitive
-        assert_eq!(action, "Allow");
     }
 
     // ── dismiss_pending_by_tool ───────────────────────────────────────────────
