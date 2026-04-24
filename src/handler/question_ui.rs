@@ -203,49 +203,9 @@ fn truncate_request_id(request_id: &str) -> &str {
     }
 }
 
-/// Parses `ask:{request_id}:{option_index}` button custom_id.
-pub fn parse_question_button_id(custom_id: &str) -> Option<(String, usize)> {
-    let stripped = custom_id.strip_prefix("ask:")?;
-    let (request_id, index_str) = stripped.rsplit_once(':')?;
-    let index: usize = index_str.parse().ok()?;
-    Some((request_id.to_string(), index))
-}
-
-/// Parses `ask_text:{request_id}` free-text button custom_id.
-pub fn parse_question_text_button_id(custom_id: &str) -> Option<String> {
-    custom_id.strip_prefix("ask_text:").map(|s| s.to_string())
-}
-
-/// Parses `ask_sel:{request_id}` select menu custom_id.
-pub fn parse_question_select_id(custom_id: &str) -> Option<String> {
-    custom_id.strip_prefix("ask_sel:").map(|s| s.to_string())
-}
-
 /// Parses `ask_modal:{request_id}` modal custom_id.
 pub fn parse_question_modal_id(custom_id: &str) -> Option<String> {
     custom_id.strip_prefix("ask_modal:").map(|s| s.to_string())
-}
-
-/// Parses `ask_cancel:{request_id}` cancel button custom_id.
-///
-/// Safe vs `ask_cancel_confirm:` / `ask_cancel_abort:` because those have `_` right
-/// after `ask_cancel`, not `:` — `strip_prefix("ask_cancel:")` cannot match them.
-pub fn parse_question_cancel_button_id(custom_id: &str) -> Option<String> {
-    custom_id.strip_prefix("ask_cancel:").map(|s| s.to_string())
-}
-
-/// Parses `ask_cancel_confirm:{request_id}` confirm-yes button custom_id.
-pub fn parse_question_cancel_confirm_id(custom_id: &str) -> Option<String> {
-    custom_id
-        .strip_prefix("ask_cancel_confirm:")
-        .map(|s| s.to_string())
-}
-
-/// Parses `ask_cancel_abort:{request_id}` confirm-no button custom_id.
-pub fn parse_question_cancel_abort_id(custom_id: &str) -> Option<String> {
-    custom_id
-        .strip_prefix("ask_cancel_abort:")
-        .map(|s| s.to_string())
 }
 
 /// Resolves an option label from the original input, question index, and option index.
@@ -369,53 +329,6 @@ mod tests {
     }
 
     // ── parsing ─────────────────────────────────────────────────────────────
-
-    #[test]
-    fn parse_question_button_valid() {
-        let (rid, idx) = parse_question_button_id("ask:abc-123:2").unwrap();
-        assert_eq!(rid, "abc-123");
-        assert_eq!(idx, 2);
-    }
-
-    #[test]
-    fn parse_question_button_with_sub_id() {
-        let (rid, idx) = parse_question_button_id("ask:req-1__q0:3").unwrap();
-        assert_eq!(rid, "req-1__q0");
-        assert_eq!(idx, 3);
-    }
-
-    #[test]
-    fn parse_question_button_invalid_prefix() {
-        assert!(parse_question_button_id("perm:abc:0").is_none());
-    }
-
-    #[test]
-    fn parse_question_button_invalid_index() {
-        assert!(parse_question_button_id("ask:abc:notnum").is_none());
-    }
-
-    #[test]
-    fn parse_question_text_button_valid() {
-        let rid = parse_question_text_button_id("ask_text:req-123").unwrap();
-        assert_eq!(rid, "req-123");
-    }
-
-    #[test]
-    fn parse_question_text_button_with_sub_id() {
-        let rid = parse_question_text_button_id("ask_text:req-123__q1").unwrap();
-        assert_eq!(rid, "req-123__q1");
-    }
-
-    #[test]
-    fn parse_question_text_button_invalid() {
-        assert!(parse_question_text_button_id("ask:abc:0").is_none());
-    }
-
-    #[test]
-    fn parse_question_select_valid() {
-        let rid = parse_question_select_id("ask_sel:req-456").unwrap();
-        assert_eq!(rid, "req-456");
-    }
 
     #[test]
     fn parse_question_modal_valid() {
@@ -714,31 +627,7 @@ mod tests {
         assert_eq!(count, 1, "expected exactly 1 ask_cancel: button when no options present");
     }
 
-    // ── cancel button parsing ───────────────────────────────────────────────
-
-    #[test]
-    fn parse_question_cancel_button_valid() {
-        let rid = parse_question_cancel_button_id("ask_cancel:req-1").unwrap();
-        assert_eq!(rid, "req-1");
-    }
-
-    #[test]
-    fn parse_question_cancel_button_rejects_confirm_prefix() {
-        // "ask_cancel_confirm:" must NOT be matched by parse_question_cancel_button_id
-        assert!(
-            parse_question_cancel_button_id("ask_cancel_confirm:req-1").is_none(),
-            "ask_cancel_confirm: should not match ask_cancel: parser"
-        );
-    }
-
-    #[test]
-    fn parse_question_cancel_button_rejects_abort_prefix() {
-        // "ask_cancel_abort:" must NOT be matched by parse_question_cancel_button_id
-        assert!(
-            parse_question_cancel_button_id("ask_cancel_abort:req-1").is_none(),
-            "ask_cancel_abort: should not match ask_cancel: parser"
-        );
-    }
+    // ── cancel custom_id length ─────────────────────────────────────────────
 
     #[test]
     fn cancel_custom_ids_within_100_chars() {

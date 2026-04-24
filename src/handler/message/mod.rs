@@ -1,6 +1,7 @@
 mod interaction;
 mod event_processor;
 mod helpers;
+pub(crate) mod interaction_kind;
 
 pub use event_processor::process_turn_events;
 pub(crate) use helpers::format_cli_command;
@@ -203,6 +204,8 @@ async fn handle_message(
             data.pending_question_groups.clone(),
             data.config.discord.owner_id,
             data.todo_trackers.clone(),
+            crate::subprocess::supervisor::SessionCleanupHandles::from_data(data),
+            data.config.discord.notification_channel_id.map(poise::serenity_prelude::ChannelId::new),
         )
         .await
     {
@@ -223,6 +226,7 @@ async fn handle_message(
                 data.last_tool_name.lock().await.remove(&evicted_tid);
                 data.kick_cooldowns.lock().await.remove(&evicted_tid);
                 data.kick_pending.lock().await.remove(&evicted_tid);
+                data.dispatch_locks.remove(&evicted_tid).await;
                 if let Err(e) = repository::update_session_status(db, &evicted_tid, "idle").await {
                     tracing::warn!("Failed to update session status for evicted thread {}: {}", evicted_tid, e);
                 }
@@ -243,6 +247,11 @@ async fn handle_message(
             return Ok(());
         }
     }
+
+    // per-thread dispatch 직렬화 lock 획득
+    // try_acquire_session 이전에 획득해야 primary/mid-turn 분기 역전 레이스를 방지함 (#258)
+    let _dispatch_lock_arc = data.dispatch_locks.get_or_create(&thread_id).await;
+    let _dispatch_guard = _dispatch_lock_arc.lock().await;
 
     let compact_args = helpers::parse_compact_command(&new_message.content);
     let is_cli_command = compact_args.is_some();
@@ -401,6 +410,10 @@ async fn handle_message(
         data.needs_context.lock().await.insert(thread_id.clone());
     }
 
+    // send_message 완료 후 dispatch lock 해제.
+    // process_turn_events는 턴 완료까지 await하므로 반드시 lock 밖에서 실행.
+    drop(_dispatch_guard);
+
     let todo_tracker = {
         let mut map = data.todo_trackers.lock().await;
         map.entry(thread_id.clone())
@@ -444,6 +457,10 @@ pub async fn execute_in_session(
     triggered_by: UserId,
 ) -> Result<(), PidoryError> {
     let db = &data.db;
+
+    // per-thread dispatch 직렬화 lock 획득 (try_acquire_session 이전) (#258)
+    let _dispatch_lock_arc = data.dispatch_locks.get_or_create(thread_id).await;
+    let _dispatch_guard = _dispatch_lock_arc.lock().await;
 
     let compact_args = helpers::parse_compact_command(content);
     let is_cli_command = compact_args.is_some();
@@ -529,6 +546,10 @@ pub async fn execute_in_session(
     if is_cli_command {
         data.needs_context.lock().await.insert(thread_id.to_string());
     }
+
+    // send_message 완료 후 dispatch lock 해제.
+    // process_turn_events는 턴 완료까지 await하므로 반드시 lock 밖에서 실행.
+    drop(_dispatch_guard);
 
     let thread_id_string = thread_id.to_string();
     let todo_tracker = {

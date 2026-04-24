@@ -5,7 +5,8 @@ use poise::serenity_prelude::{Context, UserId};
 use crate::Data;
 use crate::db::repository;
 use crate::error::PidoryError;
-use crate::handler::{cleanup::cleanup_session_state, next_step_ui, permission_ui, question_ui, reset_ui};
+use crate::handler::message::interaction_kind::{CancelStage, InteractionKind, PermissionAction};
+use crate::handler::{cleanup::cleanup_session_state, permission_ui, question_ui, reset_ui};
 use crate::i18n::Lang;
 use crate::subprocess::permission::PermissionDecision;
 
@@ -46,7 +47,7 @@ pub(super) async fn verify_component_auth(
 
 /// Cancels a question (single or multi-question group) by sending Deny to Claude
 /// and disabling all related Discord messages.
-pub(super) async fn handle_question_cancel(
+pub(super) async fn cancel_question(
     data: &Data,
     ctx: &Context,
     request_id: &str,
@@ -73,8 +74,12 @@ pub(super) async fn handle_question_cancel(
             drop(perms);
             for mid in to_disable {
                 let _ = question_ui::disable_question_components_with_label(
-                    ctx, channel_id, mid, canceled_label,
-                ).await;
+                    ctx,
+                    channel_id,
+                    mid,
+                    canceled_label,
+                )
+                .await;
             }
         }
     } else {
@@ -83,8 +88,12 @@ pub(super) async fn handle_question_cancel(
         if let Some(p) = pending {
             let _ = p.response_tx.send(PermissionDecision::Deny);
             let _ = question_ui::disable_question_components_with_label(
-                ctx, channel_id, p.message_id, canceled_label,
-            ).await;
+                ctx,
+                channel_id,
+                p.message_id,
+                canceled_label,
+            )
+            .await;
         }
     }
 }
@@ -111,7 +120,9 @@ pub(super) async fn handle_question_answer(
             group.answers.insert(key, answer);
             if group.answers.len() >= group.total {
                 let group = groups.remove(&group_id).unwrap();
-                let _ = group.response_tx.send(PermissionDecision::Answer(group.answers));
+                let _ = group
+                    .response_tx
+                    .send(PermissionDecision::Answer(group.answers));
             }
         } else {
             tracing::warn!("PendingQuestionGroup not found for group_id={}", group_id);
@@ -141,478 +152,528 @@ pub(super) async fn handle_interaction(
         _ => return Ok(()),
     };
 
+    let kind = InteractionKind::from_custom_id(&component.data.custom_id);
+
+    match kind {
+        Some(InteractionKind::Permission { request_id, action }) => {
+            handle_permission(ctx, component, data, request_id, action).await
+        }
+        Some(InteractionKind::QuestionOption { request_id, index }) => {
+            handle_question_option(ctx, component, data, request_id, index).await
+        }
+        Some(InteractionKind::QuestionText { request_id }) => {
+            handle_question_text(ctx, component, data, request_id).await
+        }
+        Some(InteractionKind::QuestionSelect { request_id }) => {
+            handle_question_select(ctx, component, data, request_id).await
+        }
+        Some(InteractionKind::QuestionCancel { request_id, stage }) => {
+            handle_question_cancel(ctx, component, data, request_id, stage).await
+        }
+        Some(InteractionKind::Reset { thread_id, action }) => {
+            handle_reset(ctx, component, data, thread_id, action).await
+        }
+        Some(InteractionKind::NextStep { thread_id, skill }) => {
+            handle_next_step(ctx, component, data, thread_id, skill).await
+        }
+        None => Ok(()),
+    }
+}
+
+async fn handle_permission(
+    ctx: &Context,
+    component: &poise::serenity_prelude::ComponentInteraction,
+    data: &Data,
+    request_id: String,
+    action: PermissionAction,
+) -> Result<(), PidoryError> {
+    let lang = data.config.language;
+    let (decision, action_str) = match action {
+        PermissionAction::Allow => (PermissionDecision::Allow, "allow"),
+        PermissionAction::Always => (PermissionDecision::AlwaysAllow, "always"),
+        PermissionAction::Deny => (PermissionDecision::Deny, "deny"),
+    };
+    let Some(_triggered_by) = verify_component_auth(component, ctx, data, &request_id, lang).await
+    else {
+        return Ok(());
+    };
+    tracing::info!(request_id = %request_id, action = %action_str, "permission button clicked");
+    component
+        .create_response(
+            ctx,
+            poise::serenity_prelude::CreateInteractionResponse::UpdateMessage(
+                poise::serenity_prelude::CreateInteractionResponseMessage::new(),
+            ),
+        )
+        .await
+        .ok();
+    let pending = data.pending_permissions.lock().await.remove(&request_id);
+    if let Some(p) = pending {
+        let tool_name = p.tool_name.clone();
+        let thread_id = p.thread_id.clone();
+        let message_id = p.message_id;
+        let _ = p.response_tx.send(decision);
+        permission_ui::disable_permission_buttons(
+            ctx,
+            component.channel_id,
+            message_id,
+            action_str,
+            &tool_name,
+            lang,
+        )
+        .await
+        .ok();
+        if action_str == "always" {
+            let dismissed = permission_ui::dismiss_pending_by_tool(
+                &data.pending_permissions,
+                &thread_id,
+                &tool_name,
+                PermissionDecision::Allow,
+                &request_id,
+            )
+            .await;
+            for d in &dismissed {
+                permission_ui::disable_permission_buttons(
+                    ctx,
+                    component.channel_id,
+                    d.message_id,
+                    "always",
+                    &tool_name,
+                    lang,
+                )
+                .await
+                .ok();
+                tracing::info!(
+                    thread_id = %d.thread_id,
+                    request_id = %d.request_id,
+                    tool_name = %tool_name,
+                    "permission auto-dismissed by always_allow chain"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn handle_question_option(
+    ctx: &Context,
+    component: &poise::serenity_prelude::ComponentInteraction,
+    data: &Data,
+    request_id: String,
+    option_index: usize,
+) -> Result<(), PidoryError> {
     let lang = data.config.language;
 
-    // Try permission button first
-    if let Some((request_id, action)) =
-        permission_ui::parse_permission_custom_id(&component.data.custom_id)
-    {
-        let Some(_triggered_by) = verify_component_auth(component, ctx, data, &request_id, lang).await else {
-            return Ok(());
-        };
-
-        tracing::info!(request_id = %request_id, action = %action, "permission button clicked");
-
-        // interaction defer — 메시지 업데이트로 응답 (3초 제약)
-        component
-            .create_response(
-                ctx,
-                poise::serenity_prelude::CreateInteractionResponse::UpdateMessage(
-                    poise::serenity_prelude::CreateInteractionResponseMessage::new(),
-                ),
-            )
-            .await
-            .ok();
-
-        let decision = match action.as_str() {
-            "allow" => PermissionDecision::Allow,
-            "always" => PermissionDecision::AlwaysAllow,
-            "deny" => PermissionDecision::Deny,
-            _ => return Ok(()),
-        };
-
-        // pending_permissions에서 꺼내서 oneshot 전송
-        let pending = data
-            .pending_permissions
-            .lock()
-            .await
-            .remove(&request_id);
-
-        if let Some(p) = pending {
-            let tool_name = p.tool_name.clone();
-            let thread_id = p.thread_id.clone();
-            let message_id = p.message_id;
-            // decision 전송 (실패해도 무시)
-            let _ = p.response_tx.send(decision);
-
-            // 버튼 disable
-            permission_ui::disable_permission_buttons(
-                ctx,
-                component.channel_id,
-                message_id,
-                &action,
-                &tool_name,
-                lang,
-            )
-            .await
-            .ok();
-
-            // "always" 클릭 시 같은 thread + tool_name 의 대기 중인 다른 permission 도 자동 dismiss
-            if action == "always" {
-                let dismissed = permission_ui::dismiss_pending_by_tool(
-                    &data.pending_permissions,
-                    &thread_id,
-                    &tool_name,
-                    PermissionDecision::Allow,
-                    &request_id,
-                )
-                .await;
-
-                for d in &dismissed {
-                    permission_ui::disable_permission_buttons(
-                        ctx,
-                        component.channel_id,
-                        d.message_id,
-                        "always",
-                        &tool_name,
-                        lang,
-                    )
-                    .await
-                    .ok();
-                    tracing::info!(
-                        thread_id = %d.thread_id,
-                        request_id = %d.request_id,
-                        tool_name = %tool_name,
-                        "permission auto-dismissed by always_allow chain"
-                    );
-                }
-            }
-        }
-
+    let Some(_triggered_by) = verify_component_auth(component, ctx, data, &request_id, lang).await
+    else {
         return Ok(());
-    }
+    };
 
-    // Try question option button: ask:{request_id}:{index}
-    if let Some((request_id, option_index)) =
-        question_ui::parse_question_button_id(&component.data.custom_id)
-    {
-        let Some(_triggered_by) = verify_component_auth(component, ctx, data, &request_id, lang).await else {
-            return Ok(());
-        };
-
-        component
-            .create_response(
-                ctx,
-                poise::serenity_prelude::CreateInteractionResponse::UpdateMessage(
-                    poise::serenity_prelude::CreateInteractionResponseMessage::new(),
-                ),
-            )
-            .await
-            .ok();
-
-        let pending = data.pending_permissions.lock().await.remove(&request_id);
-        if let Some(p) = pending {
-            let message_id = p.message_id;
-            let question_index = question_ui::parse_sub_request_id(&request_id)
-                .map(|(_, idx)| idx)
-                .unwrap_or(0);
-            let input = p.input.unwrap_or_default();
-            let label = question_ui::resolve_option_label(
-                &input,
-                question_index,
-                option_index,
-            );
-            handle_question_answer(data, &request_id, label.clone(), question_index, p.response_tx).await;
-            question_ui::disable_question_components(
-                ctx,
-                component.channel_id,
-                message_id,
-                &label,
-                lang,
-            )
-            .await
-            .ok();
-        }
-
-        return Ok(());
-    }
-
-    // Try question free-text button: ask_text:{request_id}
-    if let Some(request_id) =
-        question_ui::parse_question_text_button_id(&component.data.custom_id)
-    {
-        let Some(_triggered_by) = verify_component_auth(component, ctx, data, &request_id, lang).await else {
-            return Ok(());
-        };
-
-        // Respond with modal (do NOT defer with UpdateMessage)
-        component
-            .create_response(
-                ctx,
-                poise::serenity_prelude::CreateInteractionResponse::Modal(
-                    question_ui::create_question_modal(&request_id, lang),
-                ),
-            )
-            .await
-            .ok();
-
-        return Ok(());
-    }
-
-    // Try question cancel button: ask_cancel:{request_id}
-    // Opens an ephemeral confirm/abort dialog without modifying the original message.
-    if let Some(request_id) =
-        question_ui::parse_question_cancel_button_id(&component.data.custom_id)
-    {
-        let Some(_triggered_by) = verify_component_auth(component, ctx, data, &request_id, lang).await else {
-            return Ok(());
-        };
-
-        component
-            .create_response(
-                ctx,
-                poise::serenity_prelude::CreateInteractionResponse::Message(
-                    question_ui::create_cancel_confirm_message(&request_id, lang),
-                ),
-            )
-            .await
-            .ok();
-
-        return Ok(());
-    }
-
-    // Try question cancel confirm button: ask_cancel_confirm:{request_id}
-    // Updates the ephemeral message and sends Deny to Claude.
-    if let Some(request_id) =
-        question_ui::parse_question_cancel_confirm_id(&component.data.custom_id)
-    {
-        let Some(_triggered_by) = verify_component_auth(component, ctx, data, &request_id, lang).await else {
-            return Ok(());
-        };
-
-        // Update ephemeral message to show cancellation
-        component
-            .create_response(
-                ctx,
-                poise::serenity_prelude::CreateInteractionResponse::UpdateMessage(
-                    poise::serenity_prelude::CreateInteractionResponseMessage::new()
-                        .content(format!("-# {}", lang.question_canceled_label()))
-                        .components(vec![]),
-                ),
-            )
-            .await
-            .ok();
-
-        handle_question_cancel(data, ctx, &request_id, component.channel_id, lang).await;
-        return Ok(());
-    }
-
-    // Try question cancel abort button: ask_cancel_abort:{request_id}
-    // The ephemeral confirm message is only visible to the clicker, so no auth check is
-    // strictly necessary. We still parse the id for correctness but skip verify_component_auth.
-    if let Some(_request_id) =
-        question_ui::parse_question_cancel_abort_id(&component.data.custom_id)
-    {
-        // Collapse the ephemeral confirm dialog back to a neutral indicator.
-        component
-            .create_response(
-                ctx,
-                poise::serenity_prelude::CreateInteractionResponse::UpdateMessage(
-                    poise::serenity_prelude::CreateInteractionResponseMessage::new()
-                        .content("-# ↩️")
-                        .components(vec![]),
-                ),
-            )
-            .await
-            .ok();
-
-        return Ok(());
-    }
-
-    // Try question select menu: ask_sel:{request_id}
-    if let Some(request_id) = question_ui::parse_question_select_id(&component.data.custom_id) {
-        let Some(_triggered_by) = verify_component_auth(component, ctx, data, &request_id, lang).await else {
-            return Ok(());
-        };
-
-        component
-            .create_response(
-                ctx,
-                poise::serenity_prelude::CreateInteractionResponse::UpdateMessage(
-                    poise::serenity_prelude::CreateInteractionResponseMessage::new(),
-                ),
-            )
-            .await
-            .ok();
-
-        let selected_index: usize = match &component.data.kind {
-            poise::serenity_prelude::ComponentInteractionDataKind::StringSelect { values } => {
-                values.first().and_then(|v| v.parse().ok()).unwrap_or(0)
-            }
-            _ => 0,
-        };
-
-        let pending = data.pending_permissions.lock().await.remove(&request_id);
-        if let Some(p) = pending {
-            let message_id = p.message_id;
-            let question_index = question_ui::parse_sub_request_id(&request_id)
-                .map(|(_, idx)| idx)
-                .unwrap_or(0);
-            let input = p.input.unwrap_or_default();
-            let label = question_ui::resolve_option_label(
-                &input,
-                question_index,
-                selected_index,
-            );
-            handle_question_answer(data, &request_id, label.clone(), question_index, p.response_tx).await;
-            question_ui::disable_question_components(
-                ctx,
-                component.channel_id,
-                message_id,
-                &label,
-                lang,
-            )
-            .await
-            .ok();
-        }
-
-        return Ok(());
-    }
-
-    // Try reset confirm/cancel button: reset:{thread_id}:{action}
-    if let Some((thread_id, reset_action)) =
-        reset_ui::parse_reset_custom_id(&component.data.custom_id)
-    {
-        let channel_id = component.channel_id;
-
-        // Authorization: only the requester (or owner) may act
-        let requested_by = {
-            let pending = data.pending_resets.lock().await;
-            pending.get(&thread_id).map(|p| p.requested_by)
-        };
-
-        if let Some(requested_by) = requested_by {
-            let is_owner = component.user.id == UserId::new(data.config.discord.owner_id);
-            if component.user.id != requested_by && !is_owner {
-                component
-                    .create_response(
-                        ctx,
-                        poise::serenity_prelude::CreateInteractionResponse::Message(
-                            poise::serenity_prelude::CreateInteractionResponseMessage::new()
-                                .content(format!("❌ {}", lang.no_permission()))
-                                .ephemeral(true),
-                        ),
-                    )
-                    .await
-                    .ok();
-                return Ok(());
-            }
-        }
-
-        // Defer the interaction so the button click is acknowledged
-        component
-            .create_response(
-                ctx,
-                poise::serenity_prelude::CreateInteractionResponse::Acknowledge,
-            )
-            .await
-            .ok();
-
-        match reset_action {
-            reset_ui::ResetAction::Confirm => {
-                // Remove from pending — if gone, it expired
-                let pending = data.pending_resets.lock().await.remove(&thread_id);
-                let Some(pending) = pending else {
-                    component
-                        .create_followup(
-                            ctx,
-                            poise::serenity_prelude::CreateInteractionResponseFollowup::new()
-                                .content(lang.session_reset_expired())
-                                .ephemeral(true),
-                        )
-                        .await
-                        .ok();
-                    reset_ui::disable_reset_buttons(
-                        ctx,
-                        channel_id,
-                        // We don't have message_id anymore; best-effort, ignore error
-                        component.message.id,
-                        reset_ui::ResetOutcome::Expired,
-                    )
-                    .await
-                    .ok();
-                    return Ok(());
-                };
-
-                // Interrupt the session (ignore failure — may already be idle)
-                let _ = data.sessions.interrupt_session(&thread_id).await;
-
-                // Kill the session
-                match data.sessions.kill_session(&thread_id).await {
-                    Ok(()) | Err(PidoryError::NotFound(_)) => {}
-                    Err(e) => {
-                        channel_id
-                            .say(ctx, format!("❌ {}", lang.error_with(&e)))
-                            .await
-                            .ok();
-                        return Ok(());
-                    }
-                }
-
-                // Clean up in-memory maps
-                cleanup_session_state(data, &thread_id, ctx).await;
-
-                // Remove from DB (best-effort)
-                let _ = repository::delete_session(&data.db, &thread_id).await;
-
-                // Disable the confirm/cancel buttons and post result message
-                reset_ui::disable_reset_buttons(
-                    ctx,
-                    channel_id,
-                    pending.message_id,
-                    reset_ui::ResetOutcome::Confirmed,
-                )
-                .await
-                .ok();
-
-                channel_id
-                    .say(ctx, format!("-# ♻️ {}", lang.session_reset()))
-                    .await
-                    .ok();
-            }
-            reset_ui::ResetAction::Cancel => {
-                let pending = data.pending_resets.lock().await.remove(&thread_id);
-                let Some(pending) = pending else {
-                    component
-                        .create_followup(
-                            ctx,
-                            poise::serenity_prelude::CreateInteractionResponseFollowup::new()
-                                .content(lang.session_reset_expired())
-                                .ephemeral(true),
-                        )
-                        .await
-                        .ok();
-                    return Ok(());
-                };
-
-                reset_ui::disable_reset_buttons(
-                    ctx,
-                    channel_id,
-                    pending.message_id,
-                    reset_ui::ResetOutcome::Cancelled,
-                )
-                .await
-                .ok();
-            }
-        }
-
-        return Ok(());
-    }
-
-    // Try next-step skill button: nxt:{thread_id}:{skill_name}
-    if let Some((thread_id, skill_name)) =
-        next_step_ui::parse_next_step_custom_id(&component.data.custom_id)
-    {
-        component
-            .create_response(
-                ctx,
-                poise::serenity_prelude::CreateInteractionResponse::UpdateMessage(
-                    poise::serenity_prelude::CreateInteractionResponseMessage::new()
-                        .components(vec![]),
-                ),
-            )
-            .await
-            .ok();
-
-        let is_owner = component.user.id == UserId::new(data.config.discord.owner_id);
-        if !is_owner {
-            component
-                .create_followup(
-                    ctx,
-                    poise::serenity_prelude::CreateInteractionResponseFollowup::new()
-                        .content(format!("❌ {}", lang.no_permission()))
-                        .ephemeral(true),
-                )
-                .await
-                .ok();
-            return Ok(());
-        }
-
-        if data.next_step_buttons.lock().await.remove(&thread_id).is_none() {
-            return Ok(());
-        }
-
-        let channel_id = component.channel_id;
-        let msg_id = component.message.id;
-
-        if !data.sessions.session_exists(&thread_id).await {
-            component
-                .create_followup(
-                    ctx,
-                    poise::serenity_prelude::CreateInteractionResponseFollowup::new()
-                        .content(format!("❌ {}", lang.no_session_in_thread()))
-                        .ephemeral(true),
-                )
-                .await
-                .ok();
-            return Ok(());
-        }
-
-        let cli_command = super::helpers::format_cli_command("skill", Some(&skill_name));
-        super::execute_in_session(
+    component
+        .create_response(
             ctx,
-            data,
-            &thread_id,
-            channel_id,
-            msg_id,
-            &cli_command,
-            component.user.id,
+            poise::serenity_prelude::CreateInteractionResponse::UpdateMessage(
+                poise::serenity_prelude::CreateInteractionResponseMessage::new(),
+            ),
         )
         .await
         .ok();
 
+    let pending = data.pending_permissions.lock().await.remove(&request_id);
+    if let Some(p) = pending {
+        let message_id = p.message_id;
+        let question_index = question_ui::parse_sub_request_id(&request_id)
+            .map(|(_, idx)| idx)
+            .unwrap_or(0);
+        let input = p.input.unwrap_or_default();
+        let label = question_ui::resolve_option_label(&input, question_index, option_index);
+        handle_question_answer(
+            data,
+            &request_id,
+            label.clone(),
+            question_index,
+            p.response_tx,
+        )
+        .await;
+        question_ui::disable_question_components(
+            ctx,
+            component.channel_id,
+            message_id,
+            &label,
+            lang,
+        )
+        .await
+        .ok();
+    }
+
+    Ok(())
+}
+
+async fn handle_question_text(
+    ctx: &Context,
+    component: &poise::serenity_prelude::ComponentInteraction,
+    data: &Data,
+    request_id: String,
+) -> Result<(), PidoryError> {
+    let lang = data.config.language;
+
+    let Some(_triggered_by) = verify_component_auth(component, ctx, data, &request_id, lang).await
+    else {
+        return Ok(());
+    };
+
+    // Respond with modal (do NOT defer with UpdateMessage)
+    component
+        .create_response(
+            ctx,
+            poise::serenity_prelude::CreateInteractionResponse::Modal(
+                question_ui::create_question_modal(&request_id, lang),
+            ),
+        )
+        .await
+        .ok();
+
+    Ok(())
+}
+
+async fn handle_question_select(
+    ctx: &Context,
+    component: &poise::serenity_prelude::ComponentInteraction,
+    data: &Data,
+    request_id: String,
+) -> Result<(), PidoryError> {
+    let lang = data.config.language;
+
+    let Some(_triggered_by) = verify_component_auth(component, ctx, data, &request_id, lang).await
+    else {
+        return Ok(());
+    };
+
+    component
+        .create_response(
+            ctx,
+            poise::serenity_prelude::CreateInteractionResponse::UpdateMessage(
+                poise::serenity_prelude::CreateInteractionResponseMessage::new(),
+            ),
+        )
+        .await
+        .ok();
+
+    let selected_index: usize = match &component.data.kind {
+        poise::serenity_prelude::ComponentInteractionDataKind::StringSelect { values } => {
+            values.first().and_then(|v| v.parse().ok()).unwrap_or(0)
+        }
+        _ => 0,
+    };
+
+    let pending = data.pending_permissions.lock().await.remove(&request_id);
+    if let Some(p) = pending {
+        let message_id = p.message_id;
+        let question_index = question_ui::parse_sub_request_id(&request_id)
+            .map(|(_, idx)| idx)
+            .unwrap_or(0);
+        let input = p.input.unwrap_or_default();
+        let label = question_ui::resolve_option_label(&input, question_index, selected_index);
+        handle_question_answer(
+            data,
+            &request_id,
+            label.clone(),
+            question_index,
+            p.response_tx,
+        )
+        .await;
+        question_ui::disable_question_components(
+            ctx,
+            component.channel_id,
+            message_id,
+            &label,
+            lang,
+        )
+        .await
+        .ok();
+    }
+
+    Ok(())
+}
+
+async fn handle_question_cancel(
+    ctx: &Context,
+    component: &poise::serenity_prelude::ComponentInteraction,
+    data: &Data,
+    request_id: String,
+    stage: CancelStage,
+) -> Result<(), PidoryError> {
+    let lang = data.config.language;
+
+    match stage {
+        CancelStage::Ask => {
+            let Some(_triggered_by) =
+                verify_component_auth(component, ctx, data, &request_id, lang).await
+            else {
+                return Ok(());
+            };
+
+            component
+                .create_response(
+                    ctx,
+                    poise::serenity_prelude::CreateInteractionResponse::Message(
+                        question_ui::create_cancel_confirm_message(&request_id, lang),
+                    ),
+                )
+                .await
+                .ok();
+        }
+        CancelStage::Confirm => {
+            let Some(_triggered_by) =
+                verify_component_auth(component, ctx, data, &request_id, lang).await
+            else {
+                return Ok(());
+            };
+
+            // Update ephemeral message to show cancellation
+            component
+                .create_response(
+                    ctx,
+                    poise::serenity_prelude::CreateInteractionResponse::UpdateMessage(
+                        poise::serenity_prelude::CreateInteractionResponseMessage::new()
+                            .content(format!("-# {}", lang.question_canceled_label()))
+                            .components(vec![]),
+                    ),
+                )
+                .await
+                .ok();
+
+            cancel_question(data, ctx, &request_id, component.channel_id, lang).await;
+        }
+        CancelStage::Abort => {
+            // The ephemeral confirm message is only visible to the clicker, so no auth check is
+            // strictly necessary. We still parse the id for correctness but skip verify_component_auth.
+            // Collapse the ephemeral confirm dialog back to a neutral indicator.
+            component
+                .create_response(
+                    ctx,
+                    poise::serenity_prelude::CreateInteractionResponse::UpdateMessage(
+                        poise::serenity_prelude::CreateInteractionResponseMessage::new()
+                            .content("-# ↩️")
+                            .components(vec![]),
+                    ),
+                )
+                .await
+                .ok();
+        }
+    }
+
+    Ok(())
+}
+
+async fn handle_reset_confirm(
+    ctx: &Context,
+    component: &poise::serenity_prelude::ComponentInteraction,
+    data: &Data,
+    thread_id: &str,
+    channel_id: poise::serenity_prelude::ChannelId,
+    lang: crate::i18n::Lang,
+) -> Result<(), PidoryError> {
+    let pending = data.pending_resets.lock().await.remove(thread_id);
+    let Some(pending) = pending else {
+        component
+            .create_followup(
+                ctx,
+                poise::serenity_prelude::CreateInteractionResponseFollowup::new()
+                    .content(lang.session_reset_expired())
+                    .ephemeral(true),
+            )
+            .await
+            .ok();
+        reset_ui::disable_reset_buttons(
+            ctx,
+            channel_id,
+            component.message.id,
+            reset_ui::ResetOutcome::Expired,
+        )
+        .await
+        .ok();
+        return Ok(());
+    };
+    let _ = data.sessions.interrupt_session(thread_id).await;
+    match data.sessions.kill_session(thread_id).await {
+        Ok(()) | Err(PidoryError::NotFound(_)) => {}
+        Err(e) => {
+            channel_id
+                .say(ctx, format!("❌ {}", lang.error_with(&e)))
+                .await
+                .ok();
+            return Ok(());
+        }
+    }
+    cleanup_session_state(data, thread_id, ctx).await;
+    let _ = repository::delete_session(&data.db, thread_id).await;
+    reset_ui::disable_reset_buttons(
+        ctx,
+        channel_id,
+        pending.message_id,
+        reset_ui::ResetOutcome::Confirmed,
+    )
+    .await
+    .ok();
+    channel_id
+        .say(ctx, format!("-# ♻️ {}", lang.session_reset()))
+        .await
+        .ok();
+    Ok(())
+}
+
+async fn handle_reset_cancel(
+    ctx: &Context,
+    component: &poise::serenity_prelude::ComponentInteraction,
+    data: &Data,
+    thread_id: &str,
+    channel_id: poise::serenity_prelude::ChannelId,
+    lang: crate::i18n::Lang,
+) -> Result<(), PidoryError> {
+    let pending = data.pending_resets.lock().await.remove(thread_id);
+    let Some(pending) = pending else {
+        component
+            .create_followup(
+                ctx,
+                poise::serenity_prelude::CreateInteractionResponseFollowup::new()
+                    .content(lang.session_reset_expired())
+                    .ephemeral(true),
+            )
+            .await
+            .ok();
+        return Ok(());
+    };
+    reset_ui::disable_reset_buttons(
+        ctx,
+        channel_id,
+        pending.message_id,
+        reset_ui::ResetOutcome::Cancelled,
+    )
+    .await
+    .ok();
+    Ok(())
+}
+
+async fn handle_reset(
+    ctx: &Context,
+    component: &poise::serenity_prelude::ComponentInteraction,
+    data: &Data,
+    thread_id: String,
+    reset_action: reset_ui::ResetAction,
+) -> Result<(), PidoryError> {
+    let lang = data.config.language;
+    let channel_id = component.channel_id;
+    let requested_by = {
+        let pending = data.pending_resets.lock().await;
+        pending.get(&thread_id).map(|p| p.requested_by)
+    };
+    if let Some(requested_by) = requested_by {
+        let is_owner = component.user.id == UserId::new(data.config.discord.owner_id);
+        if component.user.id != requested_by && !is_owner {
+            component
+                .create_response(
+                    ctx,
+                    poise::serenity_prelude::CreateInteractionResponse::Message(
+                        poise::serenity_prelude::CreateInteractionResponseMessage::new()
+                            .content(format!("❌ {}", lang.no_permission()))
+                            .ephemeral(true),
+                    ),
+                )
+                .await
+                .ok();
+            return Ok(());
+        }
+    }
+    component
+        .create_response(
+            ctx,
+            poise::serenity_prelude::CreateInteractionResponse::Acknowledge,
+        )
+        .await
+        .ok();
+    match reset_action {
+        reset_ui::ResetAction::Confirm => {
+            handle_reset_confirm(ctx, component, data, &thread_id, channel_id, lang).await?;
+        }
+        reset_ui::ResetAction::Cancel => {
+            handle_reset_cancel(ctx, component, data, &thread_id, channel_id, lang).await?;
+        }
+    }
+    Ok(())
+}
+
+async fn handle_next_step(
+    ctx: &Context,
+    component: &poise::serenity_prelude::ComponentInteraction,
+    data: &Data,
+    thread_id: String,
+    skill_name: String,
+) -> Result<(), PidoryError> {
+    let lang = data.config.language;
+
+    component
+        .create_response(
+            ctx,
+            poise::serenity_prelude::CreateInteractionResponse::UpdateMessage(
+                poise::serenity_prelude::CreateInteractionResponseMessage::new().components(vec![]),
+            ),
+        )
+        .await
+        .ok();
+
+    let is_owner = component.user.id == UserId::new(data.config.discord.owner_id);
+    if !is_owner {
+        component
+            .create_followup(
+                ctx,
+                poise::serenity_prelude::CreateInteractionResponseFollowup::new()
+                    .content(format!("❌ {}", lang.no_permission()))
+                    .ephemeral(true),
+            )
+            .await
+            .ok();
         return Ok(());
     }
+
+    if data
+        .next_step_buttons
+        .lock()
+        .await
+        .remove(&thread_id)
+        .is_none()
+    {
+        return Ok(());
+    }
+
+    let channel_id = component.channel_id;
+    let msg_id = component.message.id;
+
+    if !data.sessions.session_exists(&thread_id).await {
+        component
+            .create_followup(
+                ctx,
+                poise::serenity_prelude::CreateInteractionResponseFollowup::new()
+                    .content(format!("❌ {}", lang.no_session_in_thread()))
+                    .ephemeral(true),
+            )
+            .await
+            .ok();
+        return Ok(());
+    }
+
+    let cli_command = super::helpers::format_cli_command("skill", Some(&skill_name));
+    super::execute_in_session(
+        ctx,
+        data,
+        &thread_id,
+        channel_id,
+        msg_id,
+        &cli_command,
+        component.user.id,
+    )
+    .await
+    .ok();
 
     Ok(())
 }
@@ -686,16 +747,17 @@ pub(super) async fn handle_modal_interaction(
         let question_index = question_ui::parse_sub_request_id(&request_id)
             .map(|(_, idx)| idx)
             .unwrap_or(0);
-        handle_question_answer(data, &request_id, answer.clone(), question_index, p.response_tx).await;
-        question_ui::disable_question_components(
-            ctx,
-            modal.channel_id,
-            message_id,
-            &answer,
-            lang,
+        handle_question_answer(
+            data,
+            &request_id,
+            answer.clone(),
+            question_index,
+            p.response_tx,
         )
-        .await
-        .ok();
+        .await;
+        question_ui::disable_question_components(ctx, modal.channel_id, message_id, &answer, lang)
+            .await
+            .ok();
     }
 
     Ok(())

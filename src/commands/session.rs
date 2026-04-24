@@ -470,6 +470,7 @@ pub async fn kick(
     let needs_context = Arc::clone(&data.needs_context);
     let todo_trackers = Arc::clone(&data.todo_trackers);
     let next_step_buttons = Arc::clone(&data.next_step_buttons);
+    let dispatch_locks = Arc::clone(&data.dispatch_locks);
     let author_id = ctx.author().id;
     let mut ctx_rx = data.ctx_watch.subscribe();
 
@@ -497,6 +498,12 @@ pub async fn kick(
                             .await;
                         return;
                     }
+
+                    // per-thread dispatch 직렬화 lock 획득
+                    // try_acquire_session 이전에 획득해야 다른 진입점(handle_message 등)과의
+                    // primary/mid-turn 분기 역전 레이스를 방지함 (#258)
+                    let _dispatch_lock_arc = dispatch_locks.get_or_create(&thread_id).await;
+                    let _dispatch_guard = _dispatch_lock_arc.lock().await;
 
                     let acquired = match repository::try_acquire_session(&db, &thread_id).await {
                         Ok(a) => a,
@@ -555,6 +562,10 @@ pub async fn kick(
                         let _ = repository::update_session_status(&db, &thread_id, "error").await;
                         return;
                     }
+
+                    // send_message 완료 후 dispatch lock 해제.
+                    // process_turn_events는 턴 완료까지 await하므로 반드시 lock 밖에서 실행.
+                    drop(_dispatch_guard);
 
                     let todo_tracker = {
                         let mut map = todo_trackers.lock().await;
