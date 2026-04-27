@@ -208,7 +208,6 @@ async fn handle_message(
             data.pending_permissions.clone(),
             data.pending_question_groups.clone(),
             data.config.discord.owner_id,
-            data.todo_trackers.clone(),
             crate::subprocess::supervisor::SessionCleanupHandles::from_data(data),
             data.config.discord.notification_channel_id.map(poise::serenity_prelude::ChannelId::new),
         )
@@ -402,15 +401,6 @@ async fn handle_message(
     // process_turn_events는 턴 완료까지 await하므로 반드시 lock 밖에서 실행.
     drop(_dispatch_guard);
 
-    let todo_tracker = {
-        let mut map = data.todo_trackers.lock().await;
-        map.entry(thread_id.clone())
-            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(
-                crate::handler::todo_tracker::TodoTracker::new(channel_id)
-            )))
-            .clone()
-    };
-
     process_turn_events(
         ctx,
         event_rx,
@@ -423,7 +413,6 @@ async fn handle_message(
         lang,
         data.config.discord.owner_id,
         data.session_states.clone(),
-        todo_tracker.clone(),
     )
     .await;
 
@@ -538,14 +527,6 @@ pub async fn execute_in_session(
     drop(_dispatch_guard);
 
     let thread_id_string = thread_id.to_string();
-    let todo_tracker = {
-        let mut map = data.todo_trackers.lock().await;
-        map.entry(thread_id_string.clone())
-            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(
-                crate::handler::todo_tracker::TodoTracker::new(channel_id)
-            )))
-            .clone()
-    };
 
     process_turn_events(
         ctx,
@@ -559,13 +540,18 @@ pub async fn execute_in_session(
         data.config.language,
         data.config.discord.owner_id,
         data.session_states.clone(),
-        todo_tracker.clone(),
     )
     .await;
 
     if is_cli_command {
-        todo_tracker.lock().await.cleanup(ctx).await;
-        data.todo_trackers.lock().await.remove(&thread_id_string);
+        // take/put 패턴: 짧은 락에서 tracker take → 락 밖에서 cleanup
+        let tracker = {
+            let mut guard = data.session_states.lock().await;
+            guard.get_mut(&thread_id_string).and_then(|s| s.todo_tracker.take())
+        };
+        if let Some(mut tracker) = tracker {
+            tracker.cleanup(ctx).await;
+        }
     }
 
     Ok(())

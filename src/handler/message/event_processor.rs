@@ -38,6 +38,7 @@ use crate::db::repository;
 use crate::handler::{emoji, file_attach, formatter, next_step_ui};
 use crate::handler::emoji::ReactionStatus;
 use crate::handler::message::helpers::shorten_model_name;
+use crate::handler::session_state::SessionState;
 use crate::handler::status::ProgressIndicator;
 use crate::i18n::Lang;
 use crate::subprocess::parser::{ContentBlock, StreamEvent};
@@ -52,7 +53,7 @@ async fn send_summary_with_buttons(
     summary: &str,
     thread_id: &str,
     events: &[StreamEvent],
-    session_states: &Arc<tokio::sync::Mutex<HashMap<String, crate::handler::session_state::SessionState>>>,
+    session_states: &Arc<tokio::sync::Mutex<HashMap<String, SessionState>>>,
 ) {
     let skills_for_thread = session_states.lock().await
         .get(thread_id).map(|s| s.skills.clone()).unwrap_or_default();
@@ -103,9 +104,8 @@ pub(super) async fn send_event_to_discord(
     used_skills: &mut Vec<String>,
     max_chunk_length: usize,
     lang: Lang,
-    session_states: &std::sync::Arc<tokio::sync::Mutex<HashMap<String, crate::handler::session_state::SessionState>>>,
+    session_states: &Arc<tokio::sync::Mutex<HashMap<String, SessionState>>>,
     thread_id: &str,
-    todo_tracker: Arc<tokio::sync::Mutex<crate::handler::todo_tracker::TodoTracker>>,
 ) {
     match event {
         StreamEvent::Assistant { content, .. } => {
@@ -144,7 +144,27 @@ pub(super) async fn send_event_to_discord(
                             session_states.lock().await.entry(thread_id.to_string()).or_default().last_tool_name = Some(name.clone());
                         }
                         if name == "TodoWrite" {
-                            todo_tracker.lock().await.update(ctx, input).await;
+                            // take/put 패턴: 짧은 락에서 ownership 이동 → 락 밖에서 Discord HTTP → 짧은 락에서 돌려놓기
+                            let mut tracker = {
+                                let mut guard = session_states.lock().await;
+                                let st = guard.entry(thread_id.to_string()).or_default();
+                                st.take_todo_tracker(channel_id)
+                            };
+                            // 락 밖에서 Discord HTTP 호출
+                            tracker.update(ctx, input).await;
+                            // 짧은 락에서 archived 체크 후 put 또는 cleanup
+                            let mut guard = session_states.lock().await;
+                            if let Some(st) = guard.get_mut(thread_id) {
+                                if !st.archived {
+                                    st.put_todo_tracker(tracker);
+                                } else {
+                                    drop(guard);
+                                    tracker.cleanup(ctx).await;
+                                }
+                            } else {
+                                drop(guard);
+                                tracker.cleanup(ctx).await;
+                            }
                         } else {
                             let formatted = formatter::format_tool_use(name, input);
                             let chunks = formatter::split_message(&formatted, max_chunk_length);
@@ -192,8 +212,7 @@ pub async fn process_turn_events(
     max_chunks: usize,
     lang: Lang,
     owner_id: u64,
-    session_states: std::sync::Arc<tokio::sync::Mutex<HashMap<String, crate::handler::session_state::SessionState>>>,
-    todo_tracker: Arc<tokio::sync::Mutex<crate::handler::todo_tracker::TodoTracker>>,
+    session_states: Arc<tokio::sync::Mutex<HashMap<String, SessionState>>>,
 ) {
     // 0. 이전 턴의 next-step 버튼 비활성화
     if let Some(prev_msg_id) = session_states.lock().await.get_mut(thread_id).and_then(|s| s.next_step_button.take()) {
@@ -263,7 +282,7 @@ pub async fn process_turn_events(
     if !fast_complete {
         // 버퍼링된 이벤트 먼저 전송
         for event in &events {
-            send_event_to_discord(ctx, channel_id, event, &mut tool_use_names, &mut used_tools, &mut used_skills, max_chunk_length, lang, &session_states, thread_id, todo_tracker.clone()).await;
+            send_event_to_discord(ctx, channel_id, event, &mut tool_use_names, &mut used_tools, &mut used_skills, max_chunk_length, lang, &session_states, thread_id).await;
         }
 
         // Progress indicator 초기화
@@ -307,7 +326,7 @@ pub async fn process_turn_events(
                             typing_paused.store(progress.is_active(), Ordering::Relaxed);
 
                             // 기존 이벤트 처리
-                            send_event_to_discord(ctx, channel_id, &stream_event, &mut tool_use_names, &mut used_tools, &mut used_skills, max_chunk_length, lang, &session_states, thread_id, todo_tracker.clone()).await;
+                            send_event_to_discord(ctx, channel_id, &stream_event, &mut tool_use_names, &mut used_tools, &mut used_skills, max_chunk_length, lang, &session_states, thread_id).await;
 
                             if stream_event.is_result() {
                                 got_result = true;
@@ -333,7 +352,27 @@ pub async fn process_turn_events(
 
         // Turn 종료 시 cleanup
         progress.cleanup(ctx).await;
-        todo_tracker.lock().await.flush(ctx).await;
+        // streaming end flush: take/put 패턴
+        {
+            let mut tracker = {
+                let mut guard = session_states.lock().await;
+                let st = guard.entry(thread_id.to_string()).or_default();
+                st.take_todo_tracker(channel_id)
+            };
+            tracker.flush(ctx).await;
+            let mut guard = session_states.lock().await;
+            if let Some(st) = guard.get_mut(thread_id) {
+                if !st.archived {
+                    st.put_todo_tracker(tracker);
+                } else {
+                    drop(guard);
+                    tracker.cleanup(ctx).await;
+                }
+            } else {
+                drop(guard);
+                tracker.cleanup(ctx).await;
+            }
+        }
     }
 
     // 5. typing indicator 취소
@@ -512,9 +551,13 @@ pub async fn process_turn_events(
 
     // 8. fast-complete path: 기존 format_response + send_response (한 메시지)
     if fast_complete {
-        // fast_complete path에서도 TodoWrite 처리
+        // fast_complete path에서도 TodoWrite 처리 — 락 보유 0: 루프 전 take, 루프 후 flush → put
         {
-            let mut tracker = todo_tracker.lock().await;
+            let mut tracker = {
+                let mut guard = session_states.lock().await;
+                let st = guard.entry(thread_id.to_string()).or_default();
+                st.take_todo_tracker(channel_id)
+            };
             for event in &events {
                 if let StreamEvent::Assistant { content, .. } = event {
                     for block in content {
@@ -527,6 +570,19 @@ pub async fn process_turn_events(
                 }
             }
             tracker.flush(ctx).await;
+            // put (archived 변화 시 폐기)
+            let mut guard = session_states.lock().await;
+            if let Some(st) = guard.get_mut(thread_id) {
+                if !st.archived {
+                    st.put_todo_tracker(tracker);
+                } else {
+                    drop(guard);
+                    tracker.cleanup(ctx).await;
+                }
+            } else {
+                drop(guard);
+                tracker.cleanup(ctx).await;
+            }
         }
 
         let (response, file_paths) = formatter::format_response(&events, lang);

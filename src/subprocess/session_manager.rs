@@ -101,7 +101,6 @@ impl SessionManager {
         pending_permissions: Arc<tokio::sync::Mutex<HashMap<String, PendingPermission>>>,
         pending_question_groups: Arc<tokio::sync::Mutex<HashMap<String, crate::PendingQuestionGroup>>>,
         owner_id: u64,
-        todo_trackers: Arc<tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<crate::handler::todo_tracker::TodoTracker>>>>>,
         mut cleanup_handles: crate::subprocess::supervisor::SessionCleanupHandles,
         notification_channel: Option<poise::serenity_prelude::ChannelId>,
     ) -> Result<SessionCreateResult, PidoryError> {
@@ -206,7 +205,7 @@ impl SessionManager {
             owner_id,
             Arc::clone(&self.pending_recalls),
             self.ratelimit_tx.clone(),
-            todo_trackers,
+            Arc::clone(&cleanup_handles.session_states),
         ).run();
 
         let permission_fut = crate::handler::permission_ui::run_permission_handler(

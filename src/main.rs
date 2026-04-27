@@ -60,7 +60,6 @@ pub struct Data {
     pub pending_question_groups: Arc<Mutex<HashMap<String, PendingQuestionGroup>>>,
     pub pending_resets: Arc<Mutex<HashMap<String, handler::reset_ui::PendingReset>>>,
     pub dispatch_locks: Arc<ThreadDispatchLocks>,
-    pub todo_trackers: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<handler::todo_tracker::TodoTracker>>>>>,
     pub session_states: Arc<Mutex<HashMap<String, SessionState>>>,
     pub skill_descriptions: HashMap<String, String>,
     pub agent_descriptions: HashMap<String, String>,
@@ -310,7 +309,6 @@ async fn main() -> Result<(), PidoryError> {
 
                 let session_states: Arc<Mutex<HashMap<String, SessionState>>> = Arc::new(Mutex::new(HashMap::new()));
                 let dispatch_locks: Arc<ThreadDispatchLocks> = Arc::new(ThreadDispatchLocks::new());
-                let todo_trackers: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<handler::todo_tracker::TodoTracker>>>>> = Arc::new(Mutex::new(HashMap::new()));
 
                 // Idle session TTL sweep
                 {
@@ -327,7 +325,6 @@ async fn main() -> Result<(), PidoryError> {
                         pending_question_groups: Arc::clone(&pending_question_groups),
                         pending_resets: Arc::clone(&pending_resets),
                         session_states: Arc::clone(&session_states),
-                        todo_trackers: Arc::clone(&todo_trackers),
                         pending_recalls: placeholder_recalls,
                         dispatch_locks: Arc::clone(&dispatch_locks),
                     };
@@ -415,7 +412,6 @@ async fn main() -> Result<(), PidoryError> {
                     pending_question_groups,
                     pending_resets,
                     dispatch_locks,
-                    todo_trackers,
                     session_states,
                     skill_descriptions,
                     agent_descriptions,

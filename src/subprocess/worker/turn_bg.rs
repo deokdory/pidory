@@ -7,11 +7,12 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use poise::serenity_prelude::{ChannelId, Context, MessageId, UserId};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{ChildStdin, ChildStdout};
-use tokio::sync::mpsc;
+use tokio::sync::{Mutex, mpsc};
 
 use crate::db::repository;
 use crate::handler::formatter;
 use crate::handler::message::{shorten_model_name, format_ctx_suffix};
+use crate::handler::session_state::SessionState;
 use crate::i18n::Lang;
 use crate::ratelimit::RateLimitInfo;
 use super::super::background::BackgroundTaskTracker;
@@ -36,7 +37,7 @@ pub(super) async fn handle_bg_turn(
     queue_size: &Arc<AtomicUsize>,
     pending_recalls: &Arc<tokio::sync::Mutex<HashMap<MessageId, (String, Arc<AtomicBool>)>>>,
     ratelimit_tx: &tokio::sync::watch::Sender<RateLimitInfo>,
-    todo_trackers: &Arc<tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<crate::handler::todo_tracker::TodoTracker>>>>>,
+    session_states: &Arc<Mutex<HashMap<String, SessionState>>>,
     thread_id: &str,
     channel_id: &ChannelId,
     ctx: &Context,
@@ -96,10 +97,28 @@ pub(super) async fn handle_bg_turn(
                                     format!("\n-# Skills: {}", used_skills.iter().map(|s| formatter::inline_code(s)).collect::<Vec<_>>().join(", "))
                                 };
                                 let summary = format!("-# {} {}\n{}{}{}", icon, mention, stats_line, tools_line, skills_line);
-                                // bg turn 종료 — pending TodoWrite flush
-                                let tracker = todo_trackers.lock().await.get(thread_id).cloned();
-                                if let Some(tracker) = tracker {
-                                    tracker.lock().await.flush(ctx).await;
+                                // bg turn 종료 — pending TodoWrite flush (take/put 패턴)
+                                let todo_tracker = {
+                                    let mut guard = session_states.lock().await;
+                                    guard.get_mut(thread_id).and_then(|s| s.todo_tracker.take())
+                                };
+                                if let Some(mut todo_tracker) = todo_tracker {
+                                    todo_tracker.flush(ctx).await;
+                                    // 짧은 락: archived 체크 후 put 또는 cleanup
+                                    let mut guard = session_states.lock().await;
+                                    if let Some(st) = guard.get_mut(thread_id) {
+                                        if !st.archived {
+                                            st.put_todo_tracker(todo_tracker);
+                                        } else {
+                                            drop(guard);
+                                            todo_tracker.cleanup(ctx).await;
+                                        }
+                                    } else {
+                                        drop(guard);
+                                        todo_tracker.cleanup(ctx).await;
+                                    }
+                                } else {
+                                    tracing::warn!("bg flush: tracker already taken (race with primary turn)");
                                 }
                                 if is_error && !is_interrupted {
                                     let error_msg = errors.join(", ");
@@ -134,15 +153,26 @@ pub(super) async fn handle_bg_turn(
                                                 used_tools.push(name.clone());
                                             }
                                             if name == "TodoWrite" {
-                                                let tracker = {
-                                                    let mut map = todo_trackers.lock().await;
-                                                    map.entry(thread_id.to_string())
-                                                        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(
-                                                            crate::handler::todo_tracker::TodoTracker::new(*channel_id)
-                                                        )))
-                                                        .clone()
+                                                // take/put 패턴 — lazy-init: take_todo_tracker가 None이면 새로 생성
+                                                let mut todo_tracker = {
+                                                    let mut guard = session_states.lock().await;
+                                                    guard.get_mut(thread_id)
+                                                        .map(|s| s.take_todo_tracker(*channel_id))
+                                                        .unwrap_or_else(|| crate::handler::todo_tracker::TodoTracker::new(*channel_id))
                                                 };
-                                                tracker.lock().await.update(ctx, input).await;
+                                                todo_tracker.update(ctx, input).await;
+                                                let mut guard = session_states.lock().await;
+                                                if let Some(st) = guard.get_mut(thread_id) {
+                                                    if !st.archived {
+                                                        st.put_todo_tracker(todo_tracker);
+                                                    } else {
+                                                        drop(guard);
+                                                        todo_tracker.cleanup(ctx).await;
+                                                    }
+                                                } else {
+                                                    drop(guard);
+                                                    todo_tracker.cleanup(ctx).await;
+                                                }
                                             } else {
                                                 let formatted = formatter::format_tool_use(name, input);
                                                 let bg_text = lang.bg_notification(&formatted);

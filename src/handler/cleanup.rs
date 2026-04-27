@@ -31,10 +31,19 @@ pub async fn cleanup_session_state(data: &Data, thread_id: &str, ctx: &Context) 
         .lock()
         .await
         .retain(|_, r| r.thread_id != thread_id);
+    let (mut tracker, archived) = {
+        let mut guard = data.session_states.lock().await;
+        match guard.get_mut(thread_id) {
+            Some(state) => (state.todo_tracker.take(), state.archived),
+            None => (None, false),
+        }
+    };
+    if let Some(ref mut t) = tracker {
+        t.cleanup(ctx).await;
+    }
     {
         let mut guard = data.session_states.lock().await;
-        let was_archived = guard.get(thread_id).is_some_and(|s| s.archived);
-        if was_archived {
+        if archived {
             guard.insert(
                 thread_id.to_string(),
                 crate::handler::session_state::SessionState {
@@ -47,10 +56,6 @@ pub async fn cleanup_session_state(data: &Data, thread_id: &str, ctx: &Context) 
         }
     }
     data.dispatch_locks.remove(thread_id).await;
-    let tracker = data.todo_trackers.lock().await.remove(thread_id);
-    if let Some(tracker) = tracker {
-        tracker.lock().await.cleanup(ctx).await;
-    }
 
     // Leave the thread — the member list now signals session liveness
     if let Ok(id) = thread_id.parse::<u64>() {
@@ -94,10 +99,19 @@ pub async fn cleanup_session_state_from_handles(
         .lock()
         .await
         .retain(|_, r| r.thread_id != thread_id);
+    let (mut tracker, archived) = {
+        let mut guard = handles.session_states.lock().await;
+        match guard.get_mut(thread_id) {
+            Some(state) => (state.todo_tracker.take(), state.archived),
+            None => (None, false),
+        }
+    };
+    if let Some(ref mut t) = tracker {
+        t.cleanup(ctx).await;
+    }
     {
         let mut guard = handles.session_states.lock().await;
-        let was_archived = guard.get(thread_id).is_some_and(|s| s.archived);
-        if was_archived {
+        if archived {
             guard.insert(
                 thread_id.to_string(),
                 crate::handler::session_state::SessionState {
@@ -110,10 +124,6 @@ pub async fn cleanup_session_state_from_handles(
         }
     }
     handles.dispatch_locks.remove(thread_id).await;
-    let tracker = handles.todo_trackers.lock().await.remove(thread_id);
-    if let Some(tracker) = tracker {
-        tracker.lock().await.cleanup(ctx).await;
-    }
 
     // Leave the thread — the member list now signals session liveness
     if let Ok(id) = thread_id.parse::<u64>() {

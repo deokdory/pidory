@@ -13,7 +13,6 @@ use crate::PendingPermission;
 use crate::PendingQuestionGroup;
 use crate::handler::reset_ui::PendingReset;
 use crate::handler::session_state::SessionState;
-use crate::handler::todo_tracker::TodoTracker;
 
 use super::session_manager::SessionInner;
 
@@ -28,7 +27,6 @@ pub struct SessionCleanupHandles {
     pub pending_question_groups: Arc<Mutex<HashMap<String, PendingQuestionGroup>>>,
     pub pending_resets: Arc<Mutex<HashMap<String, PendingReset>>>,
     pub session_states: Arc<Mutex<HashMap<String, SessionState>>>,
-    pub todo_trackers: Arc<Mutex<HashMap<String, Arc<Mutex<TodoTracker>>>>>,
     pub pending_recalls: PendingRecallMap,
     pub dispatch_locks: Arc<crate::handler::dispatch_locks::ThreadDispatchLocks>,
 }
@@ -49,7 +47,6 @@ impl SessionCleanupHandles {
             pending_question_groups: Arc::clone(&data.pending_question_groups),
             pending_resets: Arc::clone(&data.pending_resets),
             session_states: Arc::clone(&data.session_states),
-            todo_trackers: Arc::clone(&data.todo_trackers),
             pending_recalls,
             dispatch_locks: Arc::clone(&data.dispatch_locks),
         }
@@ -63,7 +60,6 @@ impl SessionCleanupHandles {
             pending_question_groups: Arc::new(Mutex::new(HashMap::new())),
             pending_resets: Arc::new(Mutex::new(HashMap::new())),
             session_states: Arc::new(Mutex::new(HashMap::new())),
-            todo_trackers: Arc::new(Mutex::new(HashMap::new())),
             pending_recalls: Arc::new(Mutex::new(HashMap::new())),
             dispatch_locks: Arc::new(crate::handler::dispatch_locks::ThreadDispatchLocks::new()),
         }

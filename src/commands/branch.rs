@@ -151,7 +151,6 @@ pub async fn branch(
             data.pending_permissions.clone(),
             data.pending_question_groups.clone(),
             data.config.discord.owner_id,
-            data.todo_trackers.clone(),
             crate::subprocess::supervisor::SessionCleanupHandles::from_data(data),
             data.config.discord.notification_channel_id.map(poise::serenity_prelude::ChannelId::new),
         )
@@ -321,7 +320,6 @@ pub async fn branch(
             data.pending_permissions.clone(),
             data.pending_question_groups.clone(),
             data.config.discord.owner_id,
-            data.todo_trackers.clone(),
             crate::subprocess::supervisor::SessionCleanupHandles::from_data(data),
             data.config.discord.notification_channel_id.map(poise::serenity_prelude::ChannelId::new),
         )
@@ -455,7 +453,7 @@ async fn cleanup_orphaned_thread(
         tracing::debug!("cleanup: kill_session {}: {} (may not exist yet)", thread_id, e);
     }
 
-    // 2. 인메모리 tracking 정리 (pending_*, dispatch_locks, todo_trackers, leave_thread 포함)
+    // 2. 인메모리 tracking 정리 (pending_*, session_states, dispatch_locks 포함)
     crate::handler::cleanup::cleanup_session_state(data, thread_id, serenity_ctx).await;
 
     // 3. DB 세션 삭제
