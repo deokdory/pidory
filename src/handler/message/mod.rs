@@ -58,8 +58,8 @@ async fn handle_thread_closed(ctx: &Context, data: &Data, thread_id: &str) -> Re
         return Ok(());
     }
 
-    if data.turn_participants.lock().await.contains_key(thread_id) {
-        data.archived_threads.lock().await.insert(thread_id.to_string());
+    if data.session_states.lock().await.get(thread_id).is_some_and(|s| !s.turn_participants.is_empty()) {
+        data.session_states.lock().await.entry(thread_id.to_string()).or_default().archived = true;
     }
 
     if let Err(e) = data.sessions.kill_session(thread_id).await {
@@ -216,25 +216,9 @@ async fn handle_message(
                 "Session get_or_create completed"
             );
             if let Some(evicted_tid) = result.evicted_thread_id {
-                data.pending_permissions.lock().await.retain(|_, p| p.thread_id != evicted_tid);
-                data.pending_question_groups.lock().await.retain(|_, g| g.thread_id != evicted_tid);
-                data.session_skills.lock().await.remove(&evicted_tid);
-                data.next_step_buttons.lock().await.remove(&evicted_tid);
-                data.needs_context.lock().await.remove(&evicted_tid);
-                data.turn_initiators.lock().await.remove(&evicted_tid);
-                data.turn_participants.lock().await.remove(&evicted_tid);
-                data.last_tool_name.lock().await.remove(&evicted_tid);
-                data.kick_cooldowns.lock().await.remove(&evicted_tid);
-                data.kick_pending.lock().await.remove(&evicted_tid);
-                data.dispatch_locks.remove(&evicted_tid).await;
+                cleanup_session_state(data, &evicted_tid, ctx).await;
                 if let Err(e) = repository::update_session_status(db, &evicted_tid, "idle").await {
                     tracing::warn!("Failed to update session status for evicted thread {}: {}", evicted_tid, e);
-                }
-                if let Ok(id) = evicted_tid.parse::<u64>() {
-                    ChannelId::new(id)
-                        .leave_thread(ctx)
-                        .await
-                        .ok();
                 }
             }
         }
@@ -292,14 +276,15 @@ async fn handle_message(
             Ok(()) => {
                 // CLI 커맨드가 성공적으로 큐잉된 후에만 flag 세팅
                 if is_cli_command {
-                    data.needs_context.lock().await.insert(thread_id.clone());
+                    data.session_states.lock().await.entry(thread_id.clone()).or_default().needs_context = true;
                 }
                 // mid-turn inject 사용자를 participants에 추가
-                data.turn_participants
+                data.session_states
                     .lock()
                     .await
                     .entry(thread_id.clone())
                     .or_default()
+                    .turn_participants
                     .insert(new_message.author.id);
                 let _ = channel_id
                     .create_reaction(
@@ -338,23 +323,21 @@ async fn handle_message(
     let content = if let Some(args) = compact_args {
         helpers::format_cli_command("compact", args)
     } else {
-        let had_needs_context = data.needs_context.lock().await.remove(&thread_id);
+        let had_needs_context = data.session_states.lock().await
+            .get_mut(&thread_id)
+            .map(|s| std::mem::replace(&mut s.needs_context, false))
+            .unwrap_or(false);
         helpers::build_context_content(&new_message.content, is_new_session, had_needs_context, &guild_channel.name, lang)
     };
 
-    // turn 시작: 이 turn 의 triggering user 를 기록 (permission 위임용)
-    data.turn_initiators
-        .lock()
-        .await
-        .insert(thread_id.clone(), new_message.author.id);
-
-    // turn_participants 초기화: 새 turn 시작 시 author 만 포함
-    data.turn_participants
-        .lock()
-        .await
-        .insert(thread_id.clone(), std::collections::HashSet::from([new_message.author.id]));
-
-    data.last_tool_name.lock().await.remove(&thread_id);
+    // turn 시작: turn_initiator 기록 + turn_participants 초기화 (author만 포함)
+    {
+        let mut guard = data.session_states.lock().await;
+        let s = guard.entry(thread_id.clone()).or_default();
+        s.turn_initiator = Some(new_message.author.id);
+        s.turn_participants = std::collections::HashSet::from([new_message.author.id]);
+        s.last_tool_name = None;
+    }
 
     // 첨부파일 있으면 ⏬ reaction 먼저
     if !new_message.attachments.is_empty() {
@@ -407,7 +390,7 @@ async fn handle_message(
 
     // CLI 커맨드가 성공적으로 전송된 후에만 flag 세팅
     if is_cli_command {
-        data.needs_context.lock().await.insert(thread_id.clone());
+        data.session_states.lock().await.entry(thread_id.clone()).or_default().needs_context = true;
     }
 
     // send_message 완료 후 dispatch lock 해제.
@@ -432,15 +415,10 @@ async fn handle_message(
         db,
         data.config.response.max_chunk_length,
         data.config.response.max_chunks,
-        data.session_skills.clone(),
         lang,
         data.config.discord.owner_id,
-        data.turn_participants.clone(),
-        data.archived_threads.clone(),
-        data.last_tool_name.clone(),
-        data.kick_pending.clone(),
+        data.session_states.clone(),
         todo_tracker.clone(),
-        data.next_step_buttons.clone(),
     )
     .await;
 
@@ -486,22 +464,25 @@ pub async fn execute_in_session(
         };
         data.sessions.send_message(thread_id, msg).await?;
         if is_cli_command {
-            data.needs_context.lock().await.insert(thread_id.to_string());
+            data.session_states.lock().await.entry(thread_id.to_string()).or_default().needs_context = true;
         }
         // mid-turn inject 사용자를 participants에 추가
-        data.turn_participants
+        data.session_states
             .lock()
             .await
             .entry(thread_id.to_string())
             .or_default()
+            .turn_participants
             .insert(triggered_by);
         return Ok(());
     }
 
     // 직접 실행
     // stale needs_context 정리 (CLI 커맨드가 아닌 경우에만 — CLI 커맨드는 send 후 insert)
-    if !is_cli_command {
-        data.needs_context.lock().await.remove(thread_id);
+    if !is_cli_command
+        && let Some(s) = data.session_states.lock().await.get_mut(thread_id)
+    {
+        s.needs_context = false;
     }
 
     let effective_content = if let Some(args) = compact_args {
@@ -527,12 +508,12 @@ pub async fn execute_in_session(
     };
 
     // turn_participants 초기화 (skill 직접 실행 경로)
-    data.turn_participants
-        .lock()
-        .await
-        .insert(thread_id.to_string(), std::collections::HashSet::from([triggered_by]));
-
-    data.last_tool_name.lock().await.remove(thread_id);
+    {
+        let mut guard = data.session_states.lock().await;
+        let s = guard.entry(thread_id.to_string()).or_default();
+        s.turn_participants = std::collections::HashSet::from([triggered_by]);
+        s.last_tool_name = None;
+    }
 
     if let Err(e) = data.sessions.send_message(thread_id, msg).await {
         error!("Failed to send message to session {}: {}", thread_id, e);
@@ -544,7 +525,7 @@ pub async fn execute_in_session(
     }
 
     if is_cli_command {
-        data.needs_context.lock().await.insert(thread_id.to_string());
+        data.session_states.lock().await.entry(thread_id.to_string()).or_default().needs_context = true;
     }
 
     // send_message 완료 후 dispatch lock 해제.
@@ -570,15 +551,10 @@ pub async fn execute_in_session(
         db,
         data.config.response.max_chunk_length,
         data.config.response.max_chunks,
-        data.session_skills.clone(),
         data.config.language,
         data.config.discord.owner_id,
-        data.turn_participants.clone(),
-        data.archived_threads.clone(),
-        data.last_tool_name.clone(),
-        data.kick_pending.clone(),
+        data.session_states.clone(),
         todo_tracker.clone(),
-        data.next_step_buttons.clone(),
     )
     .await;
 

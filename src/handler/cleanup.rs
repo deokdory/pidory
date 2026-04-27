@@ -7,9 +7,11 @@ use crate::subprocess::supervisor::SessionCleanupHandles;
 ///
 /// Does NOT kill the subprocess (caller is responsible) and does NOT touch the DB.
 /// `kill_session` failure should be ignored by the caller — the process may have already exited.
+///
+/// # Lock ordering
+/// When holding both `Data.sessions` and `Data.session_states` locks, always acquire
+/// `sessions` first, then `session_states`. Reverse order risks deadlock.
 pub async fn cleanup_session_state(data: &Data, thread_id: &str, ctx: &Context) {
-    data.session_skills.lock().await.remove(thread_id);
-    data.next_step_buttons.lock().await.remove(thread_id);
     data.pending_permissions
         .lock()
         .await
@@ -22,12 +24,7 @@ pub async fn cleanup_session_state(data: &Data, thread_id: &str, ctx: &Context) 
         .lock()
         .await
         .retain(|_, r| r.thread_id != thread_id);
-    data.needs_context.lock().await.remove(thread_id);
-    data.turn_initiators.lock().await.remove(thread_id);
-    data.turn_participants.lock().await.remove(thread_id);
-    data.last_tool_name.lock().await.remove(thread_id);
-    data.kick_cooldowns.lock().await.remove(thread_id);
-    data.kick_pending.lock().await.remove(thread_id);
+    data.session_states.lock().await.remove(thread_id);
     data.dispatch_locks.remove(thread_id).await;
     let tracker = data.todo_trackers.lock().await.remove(thread_id);
     if let Some(tracker) = tracker {
@@ -48,13 +45,15 @@ pub async fn cleanup_session_state(data: &Data, thread_id: &str, ctx: &Context) 
 /// Called by the supervisor when a worker panics and `Data` is not directly available.
 /// Does NOT kill the subprocess and does NOT touch the DB.
 /// `pending_recalls` is NOT cleaned up here — it is handled separately by the supervisor.
+///
+/// # Lock ordering
+/// When holding both `Data.sessions` and `Data.session_states` locks, always acquire
+/// `sessions` first, then `session_states`. Reverse order risks deadlock.
 pub async fn cleanup_session_state_from_handles(
     handles: &SessionCleanupHandles,
     thread_id: &str,
     ctx: &Context,
 ) {
-    handles.session_skills.lock().await.remove(thread_id);
-    handles.next_step_buttons.lock().await.remove(thread_id);
     handles
         .pending_permissions
         .lock()
@@ -70,12 +69,7 @@ pub async fn cleanup_session_state_from_handles(
         .lock()
         .await
         .retain(|_, r| r.thread_id != thread_id);
-    handles.needs_context.lock().await.remove(thread_id);
-    handles.turn_initiators.lock().await.remove(thread_id);
-    handles.turn_participants.lock().await.remove(thread_id);
-    handles.last_tool_name.lock().await.remove(thread_id);
-    handles.kick_cooldowns.lock().await.remove(thread_id);
-    handles.kick_pending.lock().await.remove(thread_id);
+    handles.session_states.lock().await.remove(thread_id);
     handles.dispatch_locks.remove(thread_id).await;
     let tracker = handles.todo_trackers.lock().await.remove(thread_id);
     if let Some(tracker) = tracker {

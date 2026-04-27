@@ -1,9 +1,9 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
-use poise::serenity_prelude::{ChannelId, Context, MessageId, UserId};
+use poise::serenity_prelude::{ChannelId, Context, MessageId};
 use sqlx::SqlitePool;
 use tokio::sync::{Mutex, watch};
 use tokio::task::JoinSet;
@@ -12,6 +12,7 @@ use tracing::{Instrument, info_span};
 use crate::PendingPermission;
 use crate::PendingQuestionGroup;
 use crate::handler::reset_ui::PendingReset;
+use crate::handler::session_state::SessionState;
 use crate::handler::todo_tracker::TodoTracker;
 
 use super::session_manager::SessionInner;
@@ -19,20 +20,14 @@ use super::session_manager::SessionInner;
 /// `(thread_id, cancel_flag)` 쌍을 값으로 갖는 recall 대기 맵 타입.
 pub type PendingRecallMap = Arc<Mutex<HashMap<MessageId, (String, Arc<AtomicBool>)>>>;
 
-/// 14개 맵의 Arc clone을 담는 경량 구조체. Data struct 전체 참조를 피한다.
+/// 7개 핸들의 Arc clone을 담는 경량 구조체. Data struct 전체 참조를 피한다.
+/// (#266 Stage 1) thread_id 키 9개 맵을 SessionState 단일 핸들로 통합 후 슬림화됨.
 #[derive(Clone)]
 pub struct SessionCleanupHandles {
     pub pending_permissions: Arc<Mutex<HashMap<String, PendingPermission>>>,
     pub pending_question_groups: Arc<Mutex<HashMap<String, PendingQuestionGroup>>>,
     pub pending_resets: Arc<Mutex<HashMap<String, PendingReset>>>,
-    pub session_skills: Arc<Mutex<HashMap<String, Vec<String>>>>,
-    pub needs_context: Arc<Mutex<HashSet<String>>>,
-    pub turn_initiators: Arc<Mutex<HashMap<String, UserId>>>,
-    pub turn_participants: Arc<Mutex<HashMap<String, HashSet<UserId>>>>,
-    pub last_tool_name: Arc<Mutex<HashMap<String, String>>>,
-    pub kick_cooldowns: Arc<Mutex<HashMap<String, std::time::Instant>>>,
-    pub kick_pending: Arc<Mutex<HashSet<String>>>,
-    pub next_step_buttons: Arc<Mutex<HashMap<String, MessageId>>>,
+    pub session_states: Arc<Mutex<HashMap<String, SessionState>>>,
     pub todo_trackers: Arc<Mutex<HashMap<String, Arc<Mutex<TodoTracker>>>>>,
     pub pending_recalls: PendingRecallMap,
     pub dispatch_locks: Arc<crate::handler::dispatch_locks::ThreadDispatchLocks>,
@@ -53,14 +48,7 @@ impl SessionCleanupHandles {
             pending_permissions: Arc::clone(&data.pending_permissions),
             pending_question_groups: Arc::clone(&data.pending_question_groups),
             pending_resets: Arc::clone(&data.pending_resets),
-            session_skills: Arc::clone(&data.session_skills),
-            needs_context: Arc::clone(&data.needs_context),
-            turn_initiators: Arc::clone(&data.turn_initiators),
-            turn_participants: Arc::clone(&data.turn_participants),
-            last_tool_name: Arc::clone(&data.last_tool_name),
-            kick_cooldowns: Arc::clone(&data.kick_cooldowns),
-            kick_pending: Arc::clone(&data.kick_pending),
-            next_step_buttons: Arc::clone(&data.next_step_buttons),
+            session_states: Arc::clone(&data.session_states),
             todo_trackers: Arc::clone(&data.todo_trackers),
             pending_recalls,
             dispatch_locks: Arc::clone(&data.dispatch_locks),
@@ -69,19 +57,12 @@ impl SessionCleanupHandles {
 
     #[cfg(test)]
     pub fn empty_for_test() -> Self {
-        use std::collections::{HashMap, HashSet};
+        use std::collections::HashMap;
         Self {
             pending_permissions: Arc::new(Mutex::new(HashMap::new())),
             pending_question_groups: Arc::new(Mutex::new(HashMap::new())),
             pending_resets: Arc::new(Mutex::new(HashMap::new())),
-            session_skills: Arc::new(Mutex::new(HashMap::new())),
-            needs_context: Arc::new(Mutex::new(HashSet::new())),
-            turn_initiators: Arc::new(Mutex::new(HashMap::new())),
-            turn_participants: Arc::new(Mutex::new(HashMap::new())),
-            last_tool_name: Arc::new(Mutex::new(HashMap::new())),
-            kick_cooldowns: Arc::new(Mutex::new(HashMap::new())),
-            kick_pending: Arc::new(Mutex::new(HashSet::new())),
-            next_step_buttons: Arc::new(Mutex::new(HashMap::new())),
+            session_states: Arc::new(Mutex::new(HashMap::new())),
             todo_trackers: Arc::new(Mutex::new(HashMap::new())),
             pending_recalls: Arc::new(Mutex::new(HashMap::new())),
             dispatch_locks: Arc::new(crate::handler::dispatch_locks::ThreadDispatchLocks::new()),
