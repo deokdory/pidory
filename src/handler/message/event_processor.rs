@@ -38,7 +38,7 @@ use crate::db::repository;
 use crate::handler::{emoji, file_attach, formatter, next_step_ui};
 use crate::handler::emoji::ReactionStatus;
 use crate::handler::message::helpers::shorten_model_name;
-use crate::handler::session_state::SessionState;
+use crate::handler::session_state::{SessionState, try_acquire_todo_tracker, release_todo_tracker};
 use crate::handler::status::ProgressIndicator;
 use crate::i18n::Lang;
 use crate::subprocess::parser::{ContentBlock, StreamEvent};
@@ -144,26 +144,10 @@ pub(super) async fn send_event_to_discord(
                             session_states.lock().await.entry(thread_id.to_string()).or_default().last_tool_name = Some(name.clone());
                         }
                         if name == "TodoWrite" {
-                            // take/put 패턴: 짧은 락에서 ownership 이동 → 락 밖에서 Discord HTTP → 짧은 락에서 돌려놓기
-                            let mut tracker = {
-                                let mut guard = session_states.lock().await;
-                                let st = guard.entry(thread_id.to_string()).or_default();
-                                st.take_todo_tracker(channel_id)
-                            };
-                            // 락 밖에서 Discord HTTP 호출
-                            tracker.update(ctx, input).await;
-                            // 짧은 락에서 archived 체크 후 put 또는 cleanup
-                            let mut guard = session_states.lock().await;
-                            if let Some(st) = guard.get_mut(thread_id) {
-                                if !st.archived {
-                                    st.put_todo_tracker(tracker);
-                                } else {
-                                    drop(guard);
-                                    tracker.cleanup(ctx).await;
-                                }
-                            } else {
-                                drop(guard);
-                                tracker.cleanup(ctx).await;
+                            // try_acquire가 None이면: 세션이 cleanup됐거나 다른 path가 take 중. 둘 다 silent skip.
+                            if let Some(mut tracker) = try_acquire_todo_tracker(session_states, thread_id, channel_id).await {
+                                tracker.update(ctx, input).await;
+                                release_todo_tracker(session_states, thread_id, tracker, ctx).await;
                             }
                         } else {
                             let formatted = formatter::format_tool_use(name, input);
@@ -352,26 +336,10 @@ pub async fn process_turn_events(
 
         // Turn 종료 시 cleanup
         progress.cleanup(ctx).await;
-        // streaming end flush: take/put 패턴
-        {
-            let mut tracker = {
-                let mut guard = session_states.lock().await;
-                let st = guard.entry(thread_id.to_string()).or_default();
-                st.take_todo_tracker(channel_id)
-            };
+        // streaming end flush
+        if let Some(mut tracker) = try_acquire_todo_tracker(&session_states, thread_id, channel_id).await {
             tracker.flush(ctx).await;
-            let mut guard = session_states.lock().await;
-            if let Some(st) = guard.get_mut(thread_id) {
-                if !st.archived {
-                    st.put_todo_tracker(tracker);
-                } else {
-                    drop(guard);
-                    tracker.cleanup(ctx).await;
-                }
-            } else {
-                drop(guard);
-                tracker.cleanup(ctx).await;
-            }
+            release_todo_tracker(&session_states, thread_id, tracker, ctx).await;
         }
     }
 
@@ -551,13 +519,8 @@ pub async fn process_turn_events(
 
     // 8. fast-complete path: 기존 format_response + send_response (한 메시지)
     if fast_complete {
-        // fast_complete path에서도 TodoWrite 처리 — 락 보유 0: 루프 전 take, 루프 후 flush → put
-        {
-            let mut tracker = {
-                let mut guard = session_states.lock().await;
-                let st = guard.entry(thread_id.to_string()).or_default();
-                st.take_todo_tracker(channel_id)
-            };
+        // fast_complete path TodoWrite 처리
+        if let Some(mut tracker) = try_acquire_todo_tracker(&session_states, thread_id, channel_id).await {
             for event in &events {
                 if let StreamEvent::Assistant { content, .. } = event {
                     for block in content {
@@ -570,19 +533,7 @@ pub async fn process_turn_events(
                 }
             }
             tracker.flush(ctx).await;
-            // put (archived 변화 시 폐기)
-            let mut guard = session_states.lock().await;
-            if let Some(st) = guard.get_mut(thread_id) {
-                if !st.archived {
-                    st.put_todo_tracker(tracker);
-                } else {
-                    drop(guard);
-                    tracker.cleanup(ctx).await;
-                }
-            } else {
-                drop(guard);
-                tracker.cleanup(ctx).await;
-            }
+            release_todo_tracker(&session_states, thread_id, tracker, ctx).await;
         }
 
         let (response, file_paths) = formatter::format_response(&events, lang);

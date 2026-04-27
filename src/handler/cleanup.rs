@@ -31,18 +31,13 @@ pub async fn cleanup_session_state(data: &Data, thread_id: &str, ctx: &Context) 
         .lock()
         .await
         .retain(|_, r| r.thread_id != thread_id);
-    let (mut tracker, archived) = {
+    let tracker = {
         let mut guard = data.session_states.lock().await;
-        match guard.get_mut(thread_id) {
-            Some(state) => (state.todo_tracker.take(), state.archived),
+        let (t, archived) = match guard.get_mut(thread_id) {
+            Some(state) => (state.take_present_todo_tracker(), state.archived),
             None => (None, false),
-        }
-    };
-    if let Some(ref mut t) = tracker {
-        t.cleanup(ctx).await;
-    }
-    {
-        let mut guard = data.session_states.lock().await;
+        };
+        // 단일 락 transaction에서 archived 결정 완료 — await 너머로 archived 스냅샷 안 보냄
         if archived {
             guard.insert(
                 thread_id.to_string(),
@@ -54,6 +49,11 @@ pub async fn cleanup_session_state(data: &Data, thread_id: &str, ctx: &Context) 
         } else {
             guard.remove(thread_id);
         }
+        t
+    };
+    // 락 밖에서 cleanup
+    if let Some(mut t) = tracker {
+        t.cleanup(ctx).await;
     }
     data.dispatch_locks.remove(thread_id).await;
 
@@ -99,18 +99,13 @@ pub async fn cleanup_session_state_from_handles(
         .lock()
         .await
         .retain(|_, r| r.thread_id != thread_id);
-    let (mut tracker, archived) = {
+    let tracker = {
         let mut guard = handles.session_states.lock().await;
-        match guard.get_mut(thread_id) {
-            Some(state) => (state.todo_tracker.take(), state.archived),
+        let (t, archived) = match guard.get_mut(thread_id) {
+            Some(state) => (state.take_present_todo_tracker(), state.archived),
             None => (None, false),
-        }
-    };
-    if let Some(ref mut t) = tracker {
-        t.cleanup(ctx).await;
-    }
-    {
-        let mut guard = handles.session_states.lock().await;
+        };
+        // 단일 락 transaction에서 archived 결정 완료 — await 너머로 archived 스냅샷 안 보냄
         if archived {
             guard.insert(
                 thread_id.to_string(),
@@ -122,6 +117,11 @@ pub async fn cleanup_session_state_from_handles(
         } else {
             guard.remove(thread_id);
         }
+        t
+    };
+    // 락 밖에서 cleanup
+    if let Some(mut t) = tracker {
+        t.cleanup(ctx).await;
     }
     handles.dispatch_locks.remove(thread_id).await;
 

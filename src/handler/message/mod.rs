@@ -544,10 +544,10 @@ pub async fn execute_in_session(
     .await;
 
     if is_cli_command {
-        // take/put 패턴: 짧은 락에서 tracker take → 락 밖에서 cleanup
+        // cli 명령 종료 시 tracker 폐기 (Present일 때만 take, CheckedOut이면 그쪽이 cleanup 책임)
         let tracker = {
             let mut guard = data.session_states.lock().await;
-            guard.get_mut(&thread_id_string).and_then(|s| s.todo_tracker.take())
+            guard.get_mut(&thread_id_string).and_then(|s| s.take_present_todo_tracker())
         };
         if let Some(mut tracker) = tracker {
             tracker.cleanup(ctx).await;

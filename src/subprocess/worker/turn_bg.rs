@@ -12,7 +12,7 @@ use tokio::sync::{Mutex, mpsc};
 use crate::db::repository;
 use crate::handler::formatter;
 use crate::handler::message::{shorten_model_name, format_ctx_suffix};
-use crate::handler::session_state::SessionState;
+use crate::handler::session_state::{SessionState, try_acquire_todo_tracker, release_todo_tracker};
 use crate::i18n::Lang;
 use crate::ratelimit::RateLimitInfo;
 use super::super::background::BackgroundTaskTracker;
@@ -97,28 +97,12 @@ pub(super) async fn handle_bg_turn(
                                     format!("\n-# Skills: {}", used_skills.iter().map(|s| formatter::inline_code(s)).collect::<Vec<_>>().join(", "))
                                 };
                                 let summary = format!("-# {} {}\n{}{}{}", icon, mention, stats_line, tools_line, skills_line);
-                                // bg turn 종료 — pending TodoWrite flush (take/put 패턴)
-                                let todo_tracker = {
-                                    let mut guard = session_states.lock().await;
-                                    guard.get_mut(thread_id).and_then(|s| s.todo_tracker.take())
-                                };
-                                if let Some(mut todo_tracker) = todo_tracker {
+                                // bg turn 종료 — pending TodoWrite flush
+                                if let Some(mut todo_tracker) = try_acquire_todo_tracker(session_states, thread_id, *channel_id).await {
                                     todo_tracker.flush(ctx).await;
-                                    // 짧은 락: archived 체크 후 put 또는 cleanup
-                                    let mut guard = session_states.lock().await;
-                                    if let Some(st) = guard.get_mut(thread_id) {
-                                        if !st.archived {
-                                            st.put_todo_tracker(todo_tracker);
-                                        } else {
-                                            drop(guard);
-                                            todo_tracker.cleanup(ctx).await;
-                                        }
-                                    } else {
-                                        drop(guard);
-                                        todo_tracker.cleanup(ctx).await;
-                                    }
+                                    release_todo_tracker(session_states, thread_id, todo_tracker, ctx).await;
                                 } else {
-                                    tracing::warn!("bg flush: tracker already taken (race with primary turn)");
+                                    tracing::warn!("bg flush: tracker unavailable (race with primary turn or session gone)");
                                 }
                                 if is_error && !is_interrupted {
                                     let error_msg = errors.join(", ");
@@ -153,25 +137,12 @@ pub(super) async fn handle_bg_turn(
                                                 used_tools.push(name.clone());
                                             }
                                             if name == "TodoWrite" {
-                                                // take/put 패턴 — lazy-init: take_todo_tracker가 None이면 새로 생성
-                                                let mut todo_tracker = {
-                                                    let mut guard = session_states.lock().await;
-                                                    guard.get_mut(thread_id)
-                                                        .map(|s| s.take_todo_tracker(*channel_id))
-                                                        .unwrap_or_else(|| crate::handler::todo_tracker::TodoTracker::new(*channel_id))
-                                                };
-                                                todo_tracker.update(ctx, input).await;
-                                                let mut guard = session_states.lock().await;
-                                                if let Some(st) = guard.get_mut(thread_id) {
-                                                    if !st.archived {
-                                                        st.put_todo_tracker(todo_tracker);
-                                                    } else {
-                                                        drop(guard);
-                                                        todo_tracker.cleanup(ctx).await;
-                                                    }
+                                                // try_acquire가 None이면 silent skip + warn (primary와 race 또는 cleanup된 세션)
+                                                if let Some(mut todo_tracker) = try_acquire_todo_tracker(session_states, thread_id, *channel_id).await {
+                                                    todo_tracker.update(ctx, input).await;
+                                                    release_todo_tracker(session_states, thread_id, todo_tracker, ctx).await;
                                                 } else {
-                                                    drop(guard);
-                                                    todo_tracker.cleanup(ctx).await;
+                                                    tracing::warn!("bg TodoWrite: tracker unavailable (race with primary turn or session gone)");
                                                 }
                                             } else {
                                                 let formatted = formatter::format_tool_use(name, input);
