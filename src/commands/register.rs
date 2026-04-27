@@ -217,15 +217,12 @@ pub async fn unregister(ctx: Context<'_>) -> Result<(), Error> {
         if let Err(e) = ctx.data().sessions.kill_session(&session.thread_id).await {
             tracing::warn!(thread_id = %session.thread_id, "Failed to kill session during unregister: {}", e);
         }
-        ctx.data().pending_permissions.lock().await.retain(|_, p| p.thread_id != session.thread_id);
-        if let Some(s) = ctx.data().session_states.lock().await.get_mut(&session.thread_id) {
-            s.skills.clear();
-            s.needs_context = false;
-            s.turn_initiator = None;
-            s.turn_participants.clear();
-            s.next_step_button = None;
-            s.last_tool_name = None;
-        }
+        crate::handler::cleanup::cleanup_session_state(
+            ctx.data(),
+            &session.thread_id,
+            ctx.serenity_context(),
+        )
+        .await;
     }
     repository::delete_sessions_by_channel(&ctx.data().db, &channel_id).await?;
 

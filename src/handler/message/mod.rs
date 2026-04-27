@@ -58,8 +58,13 @@ async fn handle_thread_closed(ctx: &Context, data: &Data, thread_id: &str) -> Re
         return Ok(());
     }
 
-    if data.session_states.lock().await.get(thread_id).is_some_and(|s| !s.turn_participants.is_empty()) {
-        data.session_states.lock().await.entry(thread_id.to_string()).or_default().archived = true;
+    {
+        let mut guard = data.session_states.lock().await;
+        if let Some(s) = guard.get_mut(thread_id)
+            && !s.turn_participants.is_empty()
+        {
+            s.archived = true;
+        }
     }
 
     if let Err(e) = data.sessions.kill_session(thread_id).await {

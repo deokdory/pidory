@@ -3,10 +3,36 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use poise::serenity_prelude::{ChannelId, Context, CreateMessage, MessageFlags, MessageId};
+use poise::serenity_prelude::{ChannelId, Context, CreateMessage, MessageFlags, MessageId, UserId};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::error;
+
+/// turn_participants를 mention 문자열로 직렬화한다.
+/// lock guard 안에서 `format!`/`Vec` 할당이 누적되지 않도록 UserId만 lock 안에서 추출하고
+/// 문자열 빌드는 lock 밖에서 수행한다.
+async fn build_mentions(
+    session_states: &Arc<tokio::sync::Mutex<HashMap<String, crate::handler::session_state::SessionState>>>,
+    thread_id: &str,
+    owner_id: u64,
+) -> String {
+    let participants: Vec<UserId> = {
+        let guard = session_states.lock().await;
+        guard
+            .get(thread_id)
+            .map(|s| s.turn_participants.iter().copied().collect())
+            .unwrap_or_default()
+    };
+    if participants.is_empty() {
+        format!("<@{}>", owner_id)
+    } else {
+        participants
+            .iter()
+            .map(|uid| format!("<@{}>", uid))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+}
 
 use crate::db::repository;
 use crate::handler::{emoji, file_attach, formatter, next_step_ui};
@@ -353,10 +379,17 @@ pub async fn process_turn_events(
         s.kick_pending = false;
     }
 
-    let was_archived = session_states.lock().await
-        .get_mut(thread_id)
-        .map(|s| std::mem::replace(&mut s.archived, false))
-        .unwrap_or(false);
+    // archived tombstone consume + leftover entry 정리.
+    // cleanup_session_state가 archived=true인 entry를 reset해서 보존했으므로,
+    // 여기서 archived를 소비하는 동시에 entry 자체도 제거해 leak 방지.
+    let was_archived = {
+        let mut guard = session_states.lock().await;
+        let was = guard.get(thread_id).is_some_and(|s| s.archived);
+        if was {
+            guard.remove(thread_id);
+        }
+        was
+    };
     if was_archived {
         tracing::info!(thread_id, "Turn ended silently — thread archived");
         return;
@@ -411,14 +444,7 @@ pub async fn process_turn_events(
         if let Err(e) = repository::update_session_status(db, thread_id, "error").await {
             tracing::warn!("Failed to update session status for thread {}: {}", thread_id, e);
         }
-        let mentions = {
-            let guard = session_states.lock().await;
-            guard.get(thread_id)
-                .map(|s| &s.turn_participants)
-                .filter(|set| !set.is_empty())
-                .map(|set| set.iter().map(|uid| format!("<@{}>", uid)).collect::<Vec<_>>().join(" "))
-                .unwrap_or_else(|| format!("<@{}>", owner_id))
-        };
+        let mentions = build_mentions(&session_states, thread_id, owner_id).await;
         if let Some(error_text) = error_msgs.first()
             && let Err(e) = channel_id.say(ctx, &format!("-# ❌ {} {}", error_text, mentions)).await
         {
@@ -431,14 +457,7 @@ pub async fn process_turn_events(
         if let Err(e) = repository::update_session_status(db, thread_id, "error").await {
             tracing::warn!("Failed to update session status for thread {}: {}", thread_id, e);
         }
-        let mentions = {
-            let guard = session_states.lock().await;
-            guard.get(thread_id)
-                .map(|s| &s.turn_participants)
-                .filter(|set| !set.is_empty())
-                .map(|set| set.iter().map(|uid| format!("<@{}>", uid)).collect::<Vec<_>>().join(" "))
-                .unwrap_or_else(|| format!("<@{}>", owner_id))
-        };
+        let mentions = build_mentions(&session_states, thread_id, owner_id).await;
         if let Err(e) = channel_id.say(ctx, &format!("-# ❌ {} {}", lang.process_abnormal_exit(), mentions)).await {
             tracing::warn!(%channel_id, "Failed to send process exit notification: {}", e);
         }
@@ -458,14 +477,7 @@ pub async fn process_turn_events(
         let cost = formatter::format_cost(total_cost_usd);
         let tokens = formatter::format_tokens(input_tokens, output_tokens);
         let ctx_suffix = format_ctx_suffix(total_input_tokens, context_window);
-        let mentions = {
-            let guard = session_states.lock().await;
-            guard.get(thread_id)
-                .map(|s| &s.turn_participants)
-                .filter(|set| !set.is_empty())
-                .map(|set| set.iter().map(|uid| format!("<@{}>", uid)).collect::<Vec<_>>().join(" "))
-                .unwrap_or_else(|| format!("<@{}>", owner_id))
-        };
+        let mentions = build_mentions(&session_states, thread_id, owner_id).await;
         let model_part = if turn_model.is_empty() { String::new() } else { format!("**{}**", turn_model) };
         let stats_line = format!("-# {} · {} · {} · {}{}", model_part, duration, cost, tokens, ctx_suffix);
         let tools_line = if used_tools.is_empty() {
