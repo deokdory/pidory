@@ -637,10 +637,11 @@ async fn handle_next_step(
     }
 
     if data
-        .next_step_buttons
+        .session_states
         .lock()
         .await
-        .remove(&thread_id)
+        .get_mut(&thread_id)
+        .and_then(|s| s.next_step_button.take())
         .is_none()
     {
         return Ok(());

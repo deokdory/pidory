@@ -116,11 +116,11 @@ async fn autocomplete_skill<'a>(
     let thread_id = ctx.channel_id().to_string();
     let skills = ctx
         .data()
-        .session_skills
+        .session_states
         .lock()
         .await
         .get(&thread_id)
-        .cloned()
+        .map(|s| s.skills.clone())
         .unwrap_or_default();
 
     let descriptions = &ctx.data().skill_descriptions;
