@@ -218,6 +218,18 @@ pub fn resolve_option_label(input: &Value, question_index: usize, option_index: 
         .unwrap_or_else(|| option_index.to_string())
 }
 
+/// Resolves the question text at `question_index`. This text is used as the
+/// answer key in the `control_response.updatedInput.answers` map sent to
+/// Claude CLI — the CLI's AskUserQuestion tool looks up answers by the exact
+/// `question.question` string (Claude CLI ≥ 2.1.121).
+pub fn resolve_question_text(input: &Value, question_index: usize) -> String {
+    extract_question_at(input, question_index)
+        .get("question")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string()
+}
+
 /// Disables question components after an answer is selected.
 pub async fn disable_question_components(
     ctx: &Context,
@@ -360,6 +372,38 @@ mod tests {
         });
         assert_eq!(resolve_option_label(&input, 1, 0), "Y");
         assert_eq!(resolve_option_label(&input, 1, 1), "Z");
+    }
+
+    // ── resolve_question_text ───────────────────────────────────────────────
+
+    #[test]
+    fn resolve_question_text_single() {
+        let input = serde_json::json!({"questions": [{"question": "What's your favorite color?"}]});
+        assert_eq!(resolve_question_text(&input, 0), "What's your favorite color?");
+    }
+
+    #[test]
+    fn resolve_question_text_multi() {
+        let input = serde_json::json!({
+            "questions": [
+                {"question": "Q0?"},
+                {"question": "Q1?"}
+            ]
+        });
+        assert_eq!(resolve_question_text(&input, 0), "Q0?");
+        assert_eq!(resolve_question_text(&input, 1), "Q1?");
+    }
+
+    #[test]
+    fn resolve_question_text_out_of_bounds() {
+        let input = serde_json::json!({"questions": [{"question": "Q0?"}]});
+        assert_eq!(resolve_question_text(&input, 5), "");
+    }
+
+    #[test]
+    fn resolve_question_text_empty_input() {
+        let input = serde_json::json!({});
+        assert_eq!(resolve_question_text(&input, 0), "");
     }
 
     #[test]

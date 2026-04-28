@@ -105,32 +105,36 @@ mod ask_answer_tests {
     use super::*;
     use std::collections::HashMap;
 
+    // Claude CLI ≥ 2.1.121 looks up answers by `question.question` (the question
+    // text), so the keys passed in here must be the question texts — not synthetic
+    // `q_0`/`q_1` indices. See #273.
+
     #[test]
-    fn build_control_response_ask_answer_sets_q0() {
+    fn build_control_response_ask_answer_sets_question_text_key() {
         let input = serde_json::json!({"questions": [{"question": "pick?"}]});
-        let answers = HashMap::from([("q_0".to_string(), "Blue".to_string())]);
+        let answers = HashMap::from([("pick?".to_string(), "Blue".to_string())]);
         let out = build_control_response_ask_answer("req-1", &input, &answers);
         let v: serde_json::Value = serde_json::from_str(out.trim()).expect("valid JSON");
-        assert_eq!(v["response"]["response"]["updatedInput"]["answers"]["q_0"], "Blue");
+        assert_eq!(v["response"]["response"]["updatedInput"]["answers"]["pick?"], "Blue");
     }
 
     #[test]
     fn build_control_response_ask_answer_multiple_questions() {
         let input = serde_json::json!({"questions": [{"question": "q1?"}, {"question": "q2?"}]});
         let answers = HashMap::from([
-            ("q_0".to_string(), "A".to_string()),
-            ("q_1".to_string(), "B".to_string()),
+            ("q1?".to_string(), "A".to_string()),
+            ("q2?".to_string(), "B".to_string()),
         ]);
         let out = build_control_response_ask_answer("req-m", &input, &answers);
         let v: serde_json::Value = serde_json::from_str(out.trim()).expect("valid JSON");
-        assert_eq!(v["response"]["response"]["updatedInput"]["answers"]["q_0"], "A");
-        assert_eq!(v["response"]["response"]["updatedInput"]["answers"]["q_1"], "B");
+        assert_eq!(v["response"]["response"]["updatedInput"]["answers"]["q1?"], "A");
+        assert_eq!(v["response"]["response"]["updatedInput"]["answers"]["q2?"], "B");
     }
 
     #[test]
     fn build_control_response_ask_answer_preserves_original_fields() {
         let input = serde_json::json!({"questions": [{"question": "pick?"}], "extra": 42});
-        let answers = HashMap::from([("q_0".to_string(), "Red".to_string())]);
+        let answers = HashMap::from([("pick?".to_string(), "Red".to_string())]);
         let out = build_control_response_ask_answer("req-2", &input, &answers);
         let v: serde_json::Value = serde_json::from_str(out.trim()).expect("valid JSON");
         assert_eq!(v["response"]["response"]["updatedInput"]["extra"], 42);
@@ -140,7 +144,7 @@ mod ask_answer_tests {
     #[test]
     fn build_control_response_ask_answer_ends_with_newline() {
         let input = serde_json::json!({});
-        let answers = HashMap::from([("q_0".to_string(), "test".to_string())]);
+        let answers = HashMap::from([("question text".to_string(), "test".to_string())]);
         let out = build_control_response_ask_answer("req-3", &input, &answers);
         assert!(out.ends_with('\n'));
     }
