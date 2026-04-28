@@ -1,0 +1,18 @@
+Ok(
+    RateLimit {
+        status: "allowed_warning",
+        resets_at: Some(
+            1776042000,
+        ),
+        session_id: "abc",
+        rate_limit_type: Some(
+            "seven_day",
+        ),
+        utilization: Some(
+            0.57,
+        ),
+        is_using_overage: Some(
+            false,
+        ),
+    },
+)

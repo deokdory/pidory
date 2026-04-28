@@ -1,462 +1,247 @@
 use serde_json::Value;
 
+use super::raw::{
+    RawCompactBoundary, RawContentBlock, RawControlRequest, RawInit, RawRateLimit,
+    RawResult, RawStreamEvent, RawSystemEvent, RawTaskNotification, RawTaskProgress,
+    RawTaskStarted, RawUser, RawUserContent,
+};
 use super::types::{ContentBlock, StreamEvent, ToolResult};
 
+/// Convert a raw content block to a `ContentBlock`, returning `None` for
+/// unknown variants. Baseline `parse_line` had `_ => {}` to silently skip
+/// unknown block types, so a single unknown block must not break the whole
+/// Assistant event.
+fn content_block_from(raw: RawContentBlock) -> Option<ContentBlock> {
+    match raw {
+        RawContentBlock::Text { text } => Some(ContentBlock::Text(text)),
+        RawContentBlock::Thinking { thinking } => Some(ContentBlock::Thinking(thinking)),
+        RawContentBlock::ToolUse { id, name, input } => {
+            Some(ContentBlock::ToolUse { id, name, input })
+        }
+        RawContentBlock::Unknown => None,
+    }
+}
+
+/// Extract UserReplay text: first Text variant in message.content.
+/// Matches parse_line behaviour (find_map → first Text, not concat).
+fn extract_user_replay_text(content: &[RawUserContent]) -> String {
+    content
+        .iter()
+        .find_map(|c| match c {
+            RawUserContent::Text { text } => Some(text.clone()),
+            _ => None,
+        })
+        .unwrap_or_default()
+}
+
+impl From<RawInit> for StreamEvent {
+    fn from(init: RawInit) -> Self {
+        StreamEvent::Init {
+            session_id: init.session_id,
+            cwd: init.cwd,
+            tools: init.tools,
+            model: init.model,
+            skills: init.skills,
+        }
+    }
+}
+
+impl From<RawTaskStarted> for StreamEvent {
+    fn from(t: RawTaskStarted) -> Self {
+        StreamEvent::TaskStarted {
+            task_id: t.task_id,
+            tool_use_id: t.tool_use_id,
+            description: t.description,
+            task_type: t.task_type,
+            session_id: t.session_id,
+        }
+    }
+}
+
+impl From<RawTaskProgress> for StreamEvent {
+    fn from(t: RawTaskProgress) -> Self {
+        StreamEvent::TaskProgress {
+            task_id: t.task_id,
+            tool_use_id: t.tool_use_id,
+            description: t.description,
+            last_tool_name: t.last_tool_name,
+            session_id: t.session_id,
+        }
+    }
+}
+
+impl From<RawTaskNotification> for StreamEvent {
+    fn from(t: RawTaskNotification) -> Self {
+        StreamEvent::TaskNotification {
+            task_id: t.task_id,
+            tool_use_id: t.tool_use_id,
+            status: t.status,
+            summary: t.summary,
+            output_file: t.output_file,
+            session_id: t.session_id,
+        }
+    }
+}
+
+impl From<RawCompactBoundary> for StreamEvent {
+    fn from(cb: RawCompactBoundary) -> Self {
+        let (pre_tokens, trigger) = match cb.compact_metadata {
+            Some(m) => (m.pre_tokens, m.trigger),
+            None => (None, None),
+        };
+        StreamEvent::CompactBoundary {
+            pre_tokens,
+            trigger,
+            session_id: cb.session_id,
+        }
+    }
+}
+
+impl From<RawSystemEvent> for StreamEvent {
+    fn from(sys: RawSystemEvent) -> Self {
+        match sys {
+            RawSystemEvent::Init(init) => StreamEvent::from(init),
+            RawSystemEvent::TaskStarted(t) => StreamEvent::from(t),
+            RawSystemEvent::TaskProgress(t) => StreamEvent::from(t),
+            RawSystemEvent::TaskNotification(t) => StreamEvent::from(t),
+            RawSystemEvent::CompactBoundary(cb) => StreamEvent::from(cb),
+        }
+    }
+}
+
+impl From<RawRateLimit> for StreamEvent {
+    fn from(r: RawRateLimit) -> Self {
+        let info = r.rate_limit_info.unwrap_or_default();
+        StreamEvent::RateLimit {
+            status: info.status,
+            resets_at: info.resets_at,
+            session_id: r.session_id,
+            rate_limit_type: info.rate_limit_type,
+            utilization: info.utilization,
+            is_using_overage: info.is_using_overage,
+        }
+    }
+}
+
+impl From<RawResult> for StreamEvent {
+    fn from(res: RawResult) -> Self {
+        let usage = res.usage.unwrap_or_default();
+        let total_input_tokens = usage
+            .input_tokens
+            .saturating_add(usage.cache_creation_input_tokens)
+            .saturating_add(usage.cache_read_input_tokens);
+        let context_window = res
+            .model_usage
+            .as_ref()
+            .and_then(|m| m.values().map(|mu| mu.context_window).max())
+            .unwrap_or(0);
+        StreamEvent::Result {
+            subtype: res.subtype,
+            session_id: res.session_id,
+            is_error: res.is_error,
+            result: res.result,
+            errors: res.errors,
+            duration_ms: res.duration_ms,
+            total_cost_usd: res.total_cost_usd,
+            num_turns: res.num_turns,
+            input_tokens: usage.input_tokens,
+            output_tokens: usage.output_tokens,
+            context_window,
+            total_input_tokens,
+        }
+    }
+}
+
+impl From<RawControlRequest> for StreamEvent {
+    fn from(cr: RawControlRequest) -> Self {
+        StreamEvent::ControlRequest {
+            request_id: cr.request_id,
+            tool_name: cr.request.tool_name,
+            tool_use_id: cr.request.tool_use_id,
+            input: cr.request.input,
+            decision_reason: cr.request.decision_reason,
+        }
+    }
+}
+
+impl From<RawUser> for StreamEvent {
+    fn from(u: RawUser) -> Self {
+        if u.is_replay {
+            let content = extract_user_replay_text(&u.message.content);
+            StreamEvent::UserReplay {
+                content,
+                session_id: u.session_id,
+                timestamp: u.timestamp,
+            }
+        } else {
+            let tool_results = u
+                .message
+                .content
+                .into_iter()
+                .filter_map(|c| match c {
+                    RawUserContent::ToolResult {
+                        tool_use_id,
+                        content,
+                        is_error,
+                    } => Some(ToolResult {
+                        tool_use_id,
+                        content,
+                        is_error,
+                    }),
+                    RawUserContent::Text { .. } | RawUserContent::Unknown => None,
+                })
+                .collect();
+            StreamEvent::User {
+                tool_results,
+                session_id: u.session_id,
+            }
+        }
+    }
+}
+
+impl From<RawStreamEvent> for StreamEvent {
+    fn from(raw: RawStreamEvent) -> Self {
+        match raw {
+            RawStreamEvent::System(sys) => StreamEvent::from(sys),
+            RawStreamEvent::Assistant(a) => {
+                let content = a
+                    .message
+                    .content
+                    .into_iter()
+                    .filter_map(content_block_from)
+                    .collect();
+                StreamEvent::Assistant {
+                    content,
+                    session_id: a.session_id,
+                }
+            }
+            RawStreamEvent::User(u) => StreamEvent::from(u),
+            RawStreamEvent::RateLimitEvent(r) => StreamEvent::from(r),
+            RawStreamEvent::Result(res) => StreamEvent::from(res),
+            RawStreamEvent::ControlRequest(cr) => StreamEvent::from(cr),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+
 pub fn parse_line(line: &str) -> Result<StreamEvent, serde_json::Error> {
-    if line.trim().is_empty() {
-        return Ok(StreamEvent::Unknown {
-            raw: Value::Null,
-        });
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return Ok(StreamEvent::Unknown { raw: Value::Null });
     }
 
-    let v: Value = serde_json::from_str(line)?;
+    // Parse to Value once. Used for the rate_limit raw-JSON debug log
+    // (preserved from baseline parse.rs:306) and for the Unknown fallback path.
+    let v: Value = serde_json::from_str(trimmed)?;
 
-    let event_type = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
+    if v.get("type").and_then(|t| t.as_str()) == Some("rate_limit_event") {
+        tracing::info!("rate_limit_event raw JSON: {}", line);
+    }
 
-    match event_type {
-        "system" => {
-            let subtype = v.get("subtype").and_then(|s| s.as_str()).unwrap_or("");
-            if subtype == "init" {
-                let session_id = v
-                    .get("session_id")
-                    .and_then(|s| s.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                let cwd = v
-                    .get("cwd")
-                    .and_then(|s| s.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                let tools = v
-                    .get("tools")
-                    .and_then(|t| t.as_array())
-                    .map(|arr| {
-                        arr.iter()
-                            .filter_map(|t| t.as_str().map(|s| s.to_string()))
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                let model = v
-                    .get("model")
-                    .and_then(|s| s.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                let skills = v
-                    .get("skills")
-                    .and_then(|s| s.as_array())
-                    .map(|arr| arr.iter().filter_map(|s| s.as_str().map(|s| s.to_string())).collect())
-                    .unwrap_or_default();
-                Ok(StreamEvent::Init {
-                    session_id,
-                    cwd,
-                    tools,
-                    model,
-                    skills,
-                })
-            } else if subtype == "task_started" {
-                let task_id = v
-                    .get("task_id")
-                    .and_then(|s| s.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                let tool_use_id = v
-                    .get("tool_use_id")
-                    .and_then(|s| s.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                let description = v
-                    .get("description")
-                    .and_then(|s| s.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                let task_type = v
-                    .get("task_type")
-                    .and_then(|s| s.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                let session_id = v
-                    .get("session_id")
-                    .and_then(|s| s.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                Ok(StreamEvent::TaskStarted {
-                    task_id,
-                    tool_use_id,
-                    description,
-                    task_type,
-                    session_id,
-                })
-            } else if subtype == "task_progress" {
-                let task_id = v
-                    .get("task_id")
-                    .and_then(|s| s.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                let tool_use_id = v
-                    .get("tool_use_id")
-                    .and_then(|s| s.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                let description = v
-                    .get("description")
-                    .and_then(|s| s.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                let last_tool_name = v
-                    .get("last_tool_name")
-                    .and_then(|s| s.as_str())
-                    .map(|s| s.to_string());
-                let session_id = v
-                    .get("session_id")
-                    .and_then(|s| s.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                Ok(StreamEvent::TaskProgress {
-                    task_id,
-                    tool_use_id,
-                    description,
-                    last_tool_name,
-                    session_id,
-                })
-            } else if subtype == "task_notification" {
-                let task_id = v
-                    .get("task_id")
-                    .and_then(|s| s.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                let tool_use_id = v
-                    .get("tool_use_id")
-                    .and_then(|s| s.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                let status = v
-                    .get("status")
-                    .and_then(|s| s.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                let summary = v
-                    .get("summary")
-                    .and_then(|s| s.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                let output_file = v
-                    .get("output_file")
-                    .and_then(|s| s.as_str())
-                    .map(|s| s.to_string());
-                let session_id = v
-                    .get("session_id")
-                    .and_then(|s| s.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                Ok(StreamEvent::TaskNotification {
-                    task_id,
-                    tool_use_id,
-                    status,
-                    summary,
-                    output_file,
-                    session_id,
-                })
-            } else if subtype == "compact_boundary" {
-                let session_id = v
-                    .get("session_id")
-                    .and_then(|s| s.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                let compact_metadata = v.get("compact_metadata");
-                let pre_tokens = compact_metadata
-                    .and_then(|m| m.get("pre_tokens"))
-                    .and_then(|t| t.as_u64());
-                let trigger = compact_metadata
-                    .and_then(|m| m.get("trigger"))
-                    .and_then(|t| t.as_str())
-                    .map(|s| s.to_string());
-                Ok(StreamEvent::CompactBoundary {
-                    pre_tokens,
-                    trigger,
-                    session_id,
-                })
-            } else {
-                Ok(StreamEvent::Unknown { raw: v })
-            }
-        }
-        "assistant" => {
-            let session_id = v
-                .get("session_id")
-                .and_then(|s| s.as_str())
-                .unwrap_or("")
-                .to_string();
-            let content_arr = v
-                .get("message")
-                .and_then(|m| m.get("content"))
-                .and_then(|c| c.as_array());
-            let mut content = Vec::new();
-            if let Some(arr) = content_arr {
-                for block in arr {
-                    let block_type = block.get("type").and_then(|t| t.as_str()).unwrap_or("");
-                    match block_type {
-                        "text" => {
-                            let text = block
-                                .get("text")
-                                .and_then(|t| t.as_str())
-                                .unwrap_or("")
-                                .to_string();
-                            content.push(ContentBlock::Text(text));
-                        }
-                        "thinking" => {
-                            let thinking = block
-                                .get("thinking")
-                                .and_then(|t| t.as_str())
-                                .unwrap_or("")
-                                .to_string();
-                            content.push(ContentBlock::Thinking(thinking));
-                        }
-                        "tool_use" => {
-                            let id = block
-                                .get("id")
-                                .and_then(|t| t.as_str())
-                                .unwrap_or("")
-                                .to_string();
-                            let name = block
-                                .get("name")
-                                .and_then(|t| t.as_str())
-                                .unwrap_or("")
-                                .to_string();
-                            let input = block.get("input").cloned().unwrap_or(Value::Null);
-                            content.push(ContentBlock::ToolUse { id, name, input });
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            Ok(StreamEvent::Assistant { content, session_id })
-        }
-        "user" => {
-            let session_id = v
-                .get("session_id")
-                .and_then(|s| s.as_str())
-                .unwrap_or("")
-                .to_string();
-
-            let is_replay = v.get("isReplay").and_then(|r| r.as_bool()).unwrap_or(false);
-
-            if is_replay {
-                let text = v
-                    .get("message")
-                    .and_then(|m| m.get("content"))
-                    .and_then(|c| c.as_array())
-                    .and_then(|arr| {
-                        arr.iter().find_map(|b| {
-                            if b.get("type").and_then(|t| t.as_str()) == Some("text") {
-                                b.get("text").and_then(|t| t.as_str()).map(|s| s.to_string())
-                            } else {
-                                None
-                            }
-                        })
-                    })
-                    .unwrap_or_default();
-                let timestamp = v
-                    .get("timestamp")
-                    .and_then(|t| t.as_str())
-                    .map(|s| s.to_string());
-                Ok(StreamEvent::UserReplay {
-                    content: text,
-                    session_id,
-                    timestamp,
-                })
-            } else {
-                let content_arr = v
-                    .get("message")
-                    .and_then(|m| m.get("content"))
-                    .and_then(|c| c.as_array());
-                let mut tool_results = Vec::new();
-                if let Some(arr) = content_arr {
-                    for block in arr {
-                        let block_type =
-                            block.get("type").and_then(|t| t.as_str()).unwrap_or("");
-                        if block_type == "tool_result" {
-                            let tool_use_id = block
-                                .get("tool_use_id")
-                                .and_then(|t| t.as_str())
-                                .unwrap_or("")
-                                .to_string();
-                            let content_str = block
-                                .get("content")
-                                .and_then(|c| c.as_str())
-                                .unwrap_or("")
-                                .to_string();
-                            let is_error = block
-                                .get("is_error")
-                                .and_then(|e| e.as_bool())
-                                .unwrap_or(false);
-                            tool_results.push(ToolResult {
-                                tool_use_id,
-                                content: content_str,
-                                is_error,
-                            });
-                        }
-                    }
-                }
-                Ok(StreamEvent::User {
-                    tool_results,
-                    session_id,
-                })
-            }
-        }
-        "rate_limit_event" => {
-            tracing::info!("rate_limit_event raw JSON: {}", line);
-            let session_id = v
-                .get("session_id")
-                .and_then(|s| s.as_str())
-                .unwrap_or("")
-                .to_string();
-            let rate_limit_info = v.get("rate_limit_info");
-            let status = rate_limit_info
-                .and_then(|r| r.get("status"))
-                .and_then(|s| s.as_str())
-                .unwrap_or("")
-                .to_string();
-            let resets_at = rate_limit_info
-                .and_then(|r| r.get("resetsAt"))
-                .and_then(|r| r.as_u64());
-            let rate_limit_type = rate_limit_info
-                .and_then(|r| r.get("rateLimitType"))
-                .and_then(|s| s.as_str())
-                .map(|s| s.to_string());
-            let utilization = rate_limit_info
-                .and_then(|r| r.get("utilization"))
-                .and_then(|u| u.as_f64());
-            let is_using_overage = rate_limit_info
-                .and_then(|r| r.get("isUsingOverage"))
-                .and_then(|b| b.as_bool());
-            Ok(StreamEvent::RateLimit {
-                status,
-                resets_at,
-                session_id,
-                rate_limit_type,
-                utilization,
-                is_using_overage,
-            })
-        }
-        "result" => {
-            let session_id = v
-                .get("session_id")
-                .and_then(|s| s.as_str())
-                .unwrap_or("")
-                .to_string();
-            let subtype = v
-                .get("subtype")
-                .and_then(|s| s.as_str())
-                .unwrap_or("")
-                .to_string();
-            let is_error = v
-                .get("is_error")
-                .and_then(|e| e.as_bool())
-                .unwrap_or(false);
-            let result = v
-                .get("result")
-                .and_then(|r| r.as_str())
-                .map(|s| s.to_string());
-            let errors = v
-                .get("errors")
-                .and_then(|e| e.as_array())
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|e| e.as_str().map(|s| s.to_string()))
-                        .collect()
-                })
-                .unwrap_or_default();
-            let duration_ms = v
-                .get("duration_ms")
-                .and_then(|d| d.as_u64())
-                .unwrap_or(0);
-            let total_cost_usd = v
-                .get("total_cost_usd")
-                .and_then(|c| c.as_f64())
-                .unwrap_or(0.0);
-            let num_turns = v
-                .get("num_turns")
-                .and_then(|n| n.as_u64())
-                .unwrap_or(0) as u32;
-            let usage = v.get("usage");
-            let input_tokens = usage
-                .and_then(|u| u.get("input_tokens"))
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0);
-            let output_tokens = usage
-                .and_then(|u| u.get("output_tokens"))
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0);
-            let main_model = v.get("modelUsage")
-                .and_then(|m| m.as_object())
-                .and_then(|obj| {
-                    obj.values().max_by_key(|model| {
-                        model.get("contextWindow").and_then(|v| v.as_u64()).unwrap_or(0)
-                    })
-                });
-            let context_window = main_model
-                .and_then(|model| model.get("contextWindow"))
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0);
-            let cache_creation_input_tokens = usage
-                .and_then(|u| u.get("cache_creation_input_tokens"))
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0);
-            let cache_read_input_tokens = usage
-                .and_then(|u| u.get("cache_read_input_tokens"))
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0);
-            let total_input_tokens = input_tokens
-                .saturating_add(cache_creation_input_tokens)
-                .saturating_add(cache_read_input_tokens);
-            Ok(StreamEvent::Result {
-                subtype,
-                session_id,
-                is_error,
-                result,
-                errors,
-                duration_ms,
-                total_cost_usd,
-                num_turns,
-                input_tokens,
-                output_tokens,
-                context_window,
-                total_input_tokens,
-            })
-        }
-        "control_request" => {
-            let request_id = v
-                .get("request_id")
-                .and_then(|s| s.as_str())
-                .unwrap_or("")
-                .to_string();
-            let request = v.get("request");
-            let tool_name = request
-                .and_then(|r| r.get("tool_name"))
-                .and_then(|s| s.as_str())
-                .unwrap_or("")
-                .to_string();
-            let tool_use_id = request
-                .and_then(|r| r.get("tool_use_id"))
-                .and_then(|s| s.as_str())
-                .unwrap_or("")
-                .to_string();
-            let input = request
-                .and_then(|r| r.get("input"))
-                .cloned()
-                .unwrap_or(Value::Null);
-            let decision_reason = request
-                .and_then(|r| r.get("decision_reason"))
-                .and_then(|s| s.as_str())
-                .map(|s| s.to_string());
-            Ok(StreamEvent::ControlRequest {
-                request_id,
-                tool_name,
-                tool_use_id,
-                input,
-                decision_reason,
-            })
-        }
-        _ => Ok(StreamEvent::Unknown { raw: v }),
+    match serde_json::from_value::<RawStreamEvent>(v.clone()) {
+        Ok(raw) => Ok(StreamEvent::from(raw)),
+        Err(_) => Ok(StreamEvent::Unknown { raw: v }),
     }
 }
 

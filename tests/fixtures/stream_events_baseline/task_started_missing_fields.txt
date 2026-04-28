@@ -1,0 +1,9 @@
+Ok(
+    TaskStarted {
+        task_id: "t1",
+        tool_use_id: "",
+        description: "",
+        task_type: "",
+        session_id: "s1",
+    },
+)

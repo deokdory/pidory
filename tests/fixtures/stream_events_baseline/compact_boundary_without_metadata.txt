@@ -1,0 +1,7 @@
+Ok(
+    CompactBoundary {
+        pre_tokens: None,
+        trigger: None,
+        session_id: "abc",
+    },
+)

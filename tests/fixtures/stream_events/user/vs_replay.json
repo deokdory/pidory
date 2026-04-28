@@ -1,0 +1,1 @@
+{"type":"user","session_id":"abc","message":{"content":[{"type":"tool_result","tool_use_id":"t1","content":"hello","is_error":false}]}}
