@@ -41,8 +41,8 @@ pub(crate) fn shorten_model_name(model: &str) -> String {
     without_bracket.to_string()
 }
 
-pub(crate) fn format_ctx_suffix(input_tokens: u64, context_window: u64) -> String {
-    if context_window == 0 {
+pub(crate) fn format_ctx_suffix(input_tokens: u64, context_window: u64, show: bool) -> String {
+    if !show || context_window == 0 {
         return String::new();
     }
     let pct = (input_tokens as f64 / context_window as f64 * 100.0).min(100.0) as u8;

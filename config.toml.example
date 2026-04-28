@@ -29,3 +29,6 @@ max_chunks = 10               # 초과 시 파일 첨부
 # max_file_size_mb = 25         # 파일 1개 최대 크기 (MB) [기본: 25 / Nitro: 500 / Nitro Basic: 50]
 # max_aggregate_size_mb = 50    # 메시지당 첨부파일 총 크기 합계 (MB) [기본: 50]
 # download_timeout_secs = 30    # 다운로드 타임아웃 (초) [기본: 30 / 대용량(500MB)은 300 이상 권장]
+
+# [footer]
+# show_context_percent = false  # 턴 완료 footer에 ctx 사용률(%) 표시 (default: false)

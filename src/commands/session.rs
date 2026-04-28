@@ -584,6 +584,7 @@ pub async fn kick(
                         config.response.max_chunks,
                         config.language,
                         config.discord.owner_id,
+                        config.footer.show_context_percent,
                         session_states.clone(),
                     )
                     .await;

@@ -412,6 +412,7 @@ async fn handle_message(
         data.config.response.max_chunks,
         lang,
         data.config.discord.owner_id,
+        data.config.footer.show_context_percent,
         data.session_states.clone(),
     )
     .await;
@@ -539,6 +540,7 @@ pub async fn execute_in_session(
         data.config.response.max_chunks,
         data.config.language,
         data.config.discord.owner_id,
+        data.config.footer.show_context_percent,
         data.session_states.clone(),
     )
     .await;
@@ -612,11 +614,13 @@ mod tests {
 
     #[test]
     fn test_format_ctx_suffix() {
-        assert_eq!(format_ctx_suffix(26150, 1000000), " · ctx:2%");
-        assert_eq!(format_ctx_suffix(420000, 1000000), " · ctx:42%");
-        assert_eq!(format_ctx_suffix(0, 0), "");
-        assert_eq!(format_ctx_suffix(100, 0), "");
-        assert_eq!(format_ctx_suffix(1000000, 1000000), " · ctx:100%");
+        assert_eq!(format_ctx_suffix(26150, 1000000, true), " · ctx:2%");
+        assert_eq!(format_ctx_suffix(420000, 1000000, true), " · ctx:42%");
+        assert_eq!(format_ctx_suffix(0, 0, true), "");
+        assert_eq!(format_ctx_suffix(100, 0, true), "");
+        assert_eq!(format_ctx_suffix(1000000, 1000000, true), " · ctx:100%");
+        assert_eq!(format_ctx_suffix(26150, 1000000, false), "");
+        assert_eq!(format_ctx_suffix(420000, 1000000, false), "");
     }
 
     #[test]
