@@ -1,0 +1,12 @@
+Ok(
+    TaskNotification {
+        task_id: "buyj7z5o7",
+        tool_use_id: "toolu_012daJxCZsawPJKJYF6WxmtC",
+        status: "completed",
+        summary: "Background command completed (exit code 0)",
+        output_file: Some(
+            "/tmp/claude-1000/tasks/buyj7z5o7.output",
+        ),
+        session_id: "40746b0a-41c2-4f62-9ea6-d683612ad9ae",
+    },
+)

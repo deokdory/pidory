@@ -1,0 +1,3 @@
+Err(
+    Error("expected ident", line: 1, column: 2),
+)

@@ -1,0 +1,11 @@
+Ok(
+    Init {
+        session_id: "abc",
+        cwd: "/tmp",
+        tools: [
+            "Bash",
+        ],
+        model: "opus",
+        skills: [],
+    },
+)

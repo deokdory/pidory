@@ -1,0 +1,14 @@
+Ok(
+    ControlRequest {
+        request_id: "e5c3058b-6794-4a0d-b445-7729855cb810",
+        tool_name: "Write",
+        tool_use_id: "toolu_01BKN27SrcApvHEMYi7A1ik4",
+        input: Object {
+            "content": String("hello"),
+            "file_path": String("/tmp/test.txt"),
+        },
+        decision_reason: Some(
+            "Path is outside allowed working directories",
+        ),
+    },
+)

@@ -1,0 +1,10 @@
+Ok(
+    Assistant {
+        content: [
+            Text(
+                "Hello!",
+            ),
+        ],
+        session_id: "abc",
+    },
+)

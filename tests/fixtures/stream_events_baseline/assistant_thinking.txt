@@ -1,0 +1,10 @@
+Ok(
+    Assistant {
+        content: [
+            Thinking(
+                "let me think...",
+            ),
+        ],
+        session_id: "abc",
+    },
+)

@@ -1,0 +1,10 @@
+Ok(
+    Assistant {
+        content: [
+            Text(
+                "After image",
+            ),
+        ],
+        session_id: "abc",
+    },
+)

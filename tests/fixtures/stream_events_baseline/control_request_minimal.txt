@@ -1,0 +1,11 @@
+Ok(
+    ControlRequest {
+        request_id: "abc",
+        tool_name: "Bash",
+        tool_use_id: "t1",
+        input: Object {
+            "command": String("ls"),
+        },
+        decision_reason: None,
+    },
+)

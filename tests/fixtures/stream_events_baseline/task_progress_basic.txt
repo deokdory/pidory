@@ -1,0 +1,11 @@
+Ok(
+    TaskProgress {
+        task_id: "a7ca5a342d867c971",
+        tool_use_id: "toolu_01CWFNoUWUwyfyMqVJ42F96Z",
+        description: "Reading /etc/hostname",
+        last_tool_name: Some(
+            "Read",
+        ),
+        session_id: "a352a7c9-4254-465e-b444-b804c6099892",
+    },
+)

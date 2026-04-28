@@ -1,0 +1,12 @@
+Ok(
+    RateLimit {
+        status: "allowed",
+        resets_at: Some(
+            12345,
+        ),
+        session_id: "abc",
+        rate_limit_type: None,
+        utilization: None,
+        is_using_overage: None,
+    },
+)
