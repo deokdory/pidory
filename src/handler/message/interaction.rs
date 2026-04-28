@@ -103,21 +103,25 @@ pub(super) async fn cancel_question(
 /// For single questions, the caller has already removed the PendingPermission and passes
 /// its `response_tx` directly. For multi-question groups, the answer is stored in the
 /// PendingQuestionGroup; when all answers are collected, the group's `response_tx` fires.
+///
+/// `question_text` is used as the key in the `answers` map — Claude CLI's
+/// AskUserQuestion tool (≥ 2.1.121) looks up answers by the exact `question.question`
+/// string when rendering the tool result, so a mismatched key (`q_0`/`q_1`) yielded
+/// `"User has answered your questions:"` with no answers visible to the agent.
 pub(super) async fn handle_question_answer(
     data: &Data,
     request_id: &str,
     answer: String,
-    question_index: usize,
+    question_text: String,
     response_tx: tokio::sync::oneshot::Sender<PermissionDecision>,
 ) {
-    if let Some((group_id, q_idx)) = question_ui::parse_sub_request_id(request_id) {
+    if let Some((group_id, _q_idx)) = question_ui::parse_sub_request_id(request_id) {
         // Multi-question group member — store answer in group
         // The caller's response_tx is a dummy; drop it and use the group's instead.
         drop(response_tx);
         let mut groups = data.pending_question_groups.lock().await;
         if let Some(group) = groups.get_mut(&group_id) {
-            let key = format!("q_{}", q_idx);
-            group.answers.insert(key, answer);
+            group.answers.insert(question_text, answer);
             if group.answers.len() >= group.total {
                 let group = groups.remove(&group_id).unwrap();
                 let _ = group
@@ -129,7 +133,7 @@ pub(super) async fn handle_question_answer(
         }
     } else {
         // Single question — send directly via the caller's response_tx
-        let answers = HashMap::from([(format!("q_{}", question_index), answer)]);
+        let answers = HashMap::from([(question_text, answer)]);
         let _ = response_tx.send(PermissionDecision::Answer(answers));
     }
 }
@@ -287,11 +291,12 @@ async fn handle_question_option(
             .unwrap_or(0);
         let input = p.input.unwrap_or_default();
         let label = question_ui::resolve_option_label(&input, question_index, option_index);
+        let question_text = question_ui::resolve_question_text(&input, question_index);
         handle_question_answer(
             data,
             &request_id,
             label.clone(),
-            question_index,
+            question_text,
             p.response_tx,
         )
         .await;
@@ -374,11 +379,12 @@ async fn handle_question_select(
             .unwrap_or(0);
         let input = p.input.unwrap_or_default();
         let label = question_ui::resolve_option_label(&input, question_index, selected_index);
+        let question_text = question_ui::resolve_question_text(&input, question_index);
         handle_question_answer(
             data,
             &request_id,
             label.clone(),
-            question_index,
+            question_text,
             p.response_tx,
         )
         .await;
@@ -748,11 +754,13 @@ pub(super) async fn handle_modal_interaction(
         let question_index = question_ui::parse_sub_request_id(&request_id)
             .map(|(_, idx)| idx)
             .unwrap_or(0);
+        let input = p.input.unwrap_or_default();
+        let question_text = question_ui::resolve_question_text(&input, question_index);
         handle_question_answer(
             data,
             &request_id,
             answer.clone(),
-            question_index,
+            question_text,
             p.response_tx,
         )
         .await;
