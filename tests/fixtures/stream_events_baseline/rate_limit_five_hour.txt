@@ -1,0 +1,18 @@
+Ok(
+    RateLimit {
+        status: "allowed",
+        resets_at: Some(
+            12345,
+        ),
+        session_id: "abc",
+        rate_limit_type: Some(
+            "five_hour",
+        ),
+        utilization: Some(
+            0.24,
+        ),
+        is_using_overage: Some(
+            false,
+        ),
+    },
+)

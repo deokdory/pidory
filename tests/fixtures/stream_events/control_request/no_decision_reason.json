@@ -1,0 +1,1 @@
+{"type":"control_request","request_id":"abc","request":{"subtype":"can_use_tool","tool_name":"Read","input":{"file_path":"/tmp/f"},"tool_use_id":"t1"}}

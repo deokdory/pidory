@@ -1,0 +1,1 @@
+{"type":"assistant","session_id":"abc","message":{"content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"echo hi"}}]}}

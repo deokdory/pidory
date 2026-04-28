@@ -1,0 +1,16 @@
+Ok(
+    Result {
+        subtype: "success",
+        session_id: "abc",
+        is_error: false,
+        result: None,
+        errors: [],
+        duration_ms: 5000,
+        total_cost_usd: 1.0,
+        num_turns: 3,
+        input_tokens: 17,
+        output_tokens: 5067,
+        context_window: 1000000,
+        total_input_tokens: 1931086,
+    },
+)
