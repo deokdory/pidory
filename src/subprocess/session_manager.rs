@@ -12,7 +12,7 @@ use tokio::task::JoinHandle;
 
 use std::process::Stdio;
 
-use crate::config::ClaudeConfig;
+use crate::config::{ClaudeConfig, FooterConfig};
 use crate::error::PidoryError;
 use crate::i18n::Lang;
 use crate::ratelimit::RateLimitInfo;
@@ -63,6 +63,7 @@ pub struct SessionInfo {
 pub struct SessionManager {
     sessions: Arc<Mutex<HashMap<String, SessionInner>>>,
     config: Arc<ClaudeConfig>,
+    footer: FooterConfig,
     max_sessions: usize,
     pending_recalls: Arc<tokio::sync::Mutex<HashMap<MessageId, (String, Arc<AtomicBool>)>>>,
     ratelimit_tx: tokio::sync::watch::Sender<RateLimitInfo>,
@@ -72,6 +73,7 @@ pub struct SessionManager {
 impl SessionManager {
     pub fn new(
         config: Arc<ClaudeConfig>,
+        footer: FooterConfig,
         max_sessions: usize,
         ratelimit_tx: tokio::sync::watch::Sender<RateLimitInfo>,
         session_count_tx: tokio::sync::watch::Sender<usize>,
@@ -79,6 +81,7 @@ impl SessionManager {
         Self {
             sessions: Arc::new(Mutex::new(HashMap::new())),
             config,
+            footer,
             max_sessions,
             pending_recalls: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             ratelimit_tx,
@@ -203,6 +206,7 @@ impl SessionManager {
             timeout_secs,
             lang,
             owner_id,
+            self.footer.show_context_percent,
             Arc::clone(&self.pending_recalls),
             self.ratelimit_tx.clone(),
             Arc::clone(&cleanup_handles.session_states),

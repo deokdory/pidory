@@ -4,6 +4,12 @@ use std::fs;
 use crate::error::PidoryError;
 use crate::i18n::Lang;
 
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct FooterConfig {
+    #[serde(default)]
+    pub show_context_percent: bool,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct Config {
     #[serde(default)]
@@ -17,6 +23,8 @@ pub struct Config {
     pub release: ReleaseConfig,
     #[serde(default)]
     pub attachment: AttachmentConfig,
+    #[serde(default)]
+    pub footer: FooterConfig,
 }
 
 #[derive(Debug, Deserialize)]
@@ -290,6 +298,7 @@ binary_path = "claude"
         assert_eq!(config.attachment.download_timeout_secs, 30);
         assert!(config.discord.project_roots.is_empty());
         assert!(config.discord.default_category_id.is_none());
+        assert!(!config.footer.show_context_percent);
     }
 
     #[test]
@@ -606,5 +615,40 @@ binary_path = "claude"
     fn normalize_root_slash_preserved() {
         let result = normalize_project_roots(&["/".to_string()]).unwrap();
         assert_eq!(result, vec!["/"]);
+    }
+
+    #[test]
+    fn parse_config_without_footer_defaults_off() {
+        let toml_str = r#"
+[discord]
+guild_id = 123
+owner_id = 456
+
+[claude]
+binary_path = "claude"
+
+[response]
+"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert!(!config.footer.show_context_percent);
+    }
+
+    #[test]
+    fn parse_config_with_footer_show_context_percent_true() {
+        let toml_str = r#"
+[discord]
+guild_id = 123
+owner_id = 456
+
+[claude]
+binary_path = "claude"
+
+[response]
+
+[footer]
+show_context_percent = true
+"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert!(config.footer.show_context_percent);
     }
 }

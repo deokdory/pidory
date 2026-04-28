@@ -60,6 +60,7 @@ pub(super) struct SessionWorker {
     db: sqlx::SqlitePool,
     timeout_secs: u64,
     lang: Lang,
+    show_context_percent: bool,
 }
 
 impl SessionWorker {
@@ -82,6 +83,7 @@ impl SessionWorker {
         timeout_secs: u64,
         lang: Lang,
         owner_id: u64,
+        show_context_percent: bool,
         pending_recalls: Arc<tokio::sync::Mutex<HashMap<MessageId, (String, Arc<AtomicBool>)>>>,
         ratelimit_tx: tokio::sync::watch::Sender<RateLimitInfo>,
         session_states: Arc<Mutex<HashMap<String, SessionState>>>,
@@ -110,6 +112,7 @@ impl SessionWorker {
             db,
             timeout_secs,
             lang,
+            show_context_percent,
         }
     }
 
@@ -138,6 +141,7 @@ impl SessionWorker {
             ref db,
             timeout_secs,
             lang,
+            show_context_percent,
             ..
         } = self;
 
@@ -164,6 +168,7 @@ impl SessionWorker {
                 ctx,
                 db,
                 lang,
+                show_context_percent,
                 &mut model_name,
             ).await;
 
