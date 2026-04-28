@@ -222,12 +222,23 @@ pub fn resolve_option_label(input: &Value, question_index: usize, option_index: 
 /// answer key in the `control_response.updatedInput.answers` map sent to
 /// Claude CLI — the CLI's AskUserQuestion tool looks up answers by the exact
 /// `question.question` string (Claude CLI ≥ 2.1.121).
+///
+/// Returns `""` when the question is missing/out-of-bounds/non-string. The
+/// fallback would otherwise be silent — log a warning so an upstream malformed
+/// payload (or a Claude CLI rendering change) is visible in journalctl.
 pub fn resolve_question_text(input: &Value, question_index: usize) -> String {
-    extract_question_at(input, question_index)
-        .get("question")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string()
+    let question = extract_question_at(input, question_index);
+    match question.get("question").and_then(|v| v.as_str()) {
+        Some(s) => s.to_string(),
+        None => {
+            tracing::warn!(
+                "AskUserQuestion question text missing — falling back to empty key (question_index={}, has_questions={})",
+                question_index,
+                input.get("questions").is_some()
+            );
+            String::new()
+        }
+    }
 }
 
 /// Disables question components after an answer is selected.
