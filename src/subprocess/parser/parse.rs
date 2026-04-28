@@ -7,13 +7,18 @@ use super::raw::{
 };
 use super::types::{ContentBlock, StreamEvent, ToolResult};
 
-impl From<RawContentBlock> for ContentBlock {
-    fn from(raw: RawContentBlock) -> Self {
-        match raw {
-            RawContentBlock::Text { text } => ContentBlock::Text(text),
-            RawContentBlock::Thinking { thinking } => ContentBlock::Thinking(thinking),
-            RawContentBlock::ToolUse { id, name, input } => ContentBlock::ToolUse { id, name, input },
+/// Convert a raw content block to a `ContentBlock`, returning `None` for
+/// unknown variants. Baseline `parse_line` had `_ => {}` to silently skip
+/// unknown block types, so a single unknown block must not break the whole
+/// Assistant event.
+fn content_block_from(raw: RawContentBlock) -> Option<ContentBlock> {
+    match raw {
+        RawContentBlock::Text { text } => Some(ContentBlock::Text(text)),
+        RawContentBlock::Thinking { thinking } => Some(ContentBlock::Thinking(thinking)),
+        RawContentBlock::ToolUse { id, name, input } => {
+            Some(ContentBlock::ToolUse { id, name, input })
         }
+        RawContentBlock::Unknown => None,
     }
 }
 
@@ -183,7 +188,7 @@ impl From<RawUser> for StreamEvent {
                         content,
                         is_error,
                     }),
-                    RawUserContent::Text { .. } => None,
+                    RawUserContent::Text { .. } | RawUserContent::Unknown => None,
                 })
                 .collect();
             StreamEvent::User {
@@ -203,7 +208,7 @@ impl From<RawStreamEvent> for StreamEvent {
                     .message
                     .content
                     .into_iter()
-                    .map(ContentBlock::from)
+                    .filter_map(content_block_from)
                     .collect();
                 StreamEvent::Assistant {
                     content,
@@ -225,12 +230,18 @@ pub fn parse_line(line: &str) -> Result<StreamEvent, serde_json::Error> {
     if trimmed.is_empty() {
         return Ok(StreamEvent::Unknown { raw: Value::Null });
     }
-    match serde_json::from_str::<RawStreamEvent>(trimmed) {
+
+    // Parse to Value once. Used for the rate_limit raw-JSON debug log
+    // (preserved from baseline parse.rs:306) and for the Unknown fallback path.
+    let v: Value = serde_json::from_str(trimmed)?;
+
+    if v.get("type").and_then(|t| t.as_str()) == Some("rate_limit_event") {
+        tracing::info!("rate_limit_event raw JSON: {}", line);
+    }
+
+    match serde_json::from_value::<RawStreamEvent>(v.clone()) {
         Ok(raw) => Ok(StreamEvent::from(raw)),
-        Err(_) => {
-            let v: Value = serde_json::from_str(trimmed)?;
-            Ok(StreamEvent::Unknown { raw: v })
-        }
+        Err(_) => Ok(StreamEvent::Unknown { raw: v }),
     }
 }
 

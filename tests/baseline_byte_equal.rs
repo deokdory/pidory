@@ -380,3 +380,65 @@ fn edge_malformed() {
         "edge_malformed",
     );
 }
+
+// ============================================================
+// silent-default fallback regression gates
+//
+// Anti-regression for review #274 [w1]-[w6]: a single unknown content block
+// or wrong-shape Optional field must NOT collapse the whole event into Unknown.
+// ============================================================
+
+#[test]
+fn assistant_unknown_block_mixed() {
+    // Unknown content block (image) is silently skipped; remaining text survives.
+    // Without [w1]/[w3] fix: whole Assistant event would fall to Unknown.
+    check(
+        include_str!("fixtures/stream_events/assistant/unknown_block_mixed.json"),
+        include_str!("fixtures/stream_events_baseline/assistant_unknown_block_mixed.txt"),
+        "assistant_unknown_block_mixed",
+    );
+}
+
+#[test]
+fn assistant_missing_message() {
+    // Missing `message` field → empty content vec, not Unknown.
+    // Without [w3] fix: whole Assistant event would fall to Unknown.
+    check(
+        include_str!("fixtures/stream_events/assistant/missing_message.json"),
+        include_str!("fixtures/stream_events_baseline/assistant_missing_message.txt"),
+        "assistant_missing_message",
+    );
+}
+
+#[test]
+fn user_unknown_content_mixed() {
+    // Unknown user content block is silently skipped; tool_result survives.
+    // Without [w2]/[w4] fix: whole User event would fall to Unknown.
+    check(
+        include_str!("fixtures/stream_events/user/unknown_content_mixed.json"),
+        include_str!("fixtures/stream_events_baseline/user_unknown_content_mixed.txt"),
+        "user_unknown_content_mixed",
+    );
+}
+
+#[test]
+fn control_request_missing_request() {
+    // Missing `request` field → ControlRequest with empty inner, not Unknown.
+    // Without [w5] fix: permission flow would silently break.
+    check(
+        include_str!("fixtures/stream_events/control_request/missing_request.json"),
+        include_str!("fixtures/stream_events_baseline/control_request_missing_request.txt"),
+        "control_request_missing_request",
+    );
+}
+
+#[test]
+fn rate_limit_wrong_shape_optional() {
+    // Wrong-shape Optional fields (resetsAt as string, etc.) silently become None.
+    // Without [w6] fix: whole RateLimit event would fall to Unknown.
+    check(
+        include_str!("fixtures/stream_events/rate_limit/wrong_shape_optional.json"),
+        include_str!("fixtures/stream_events_baseline/rate_limit_wrong_shape_optional.txt"),
+        "rate_limit_wrong_shape_optional",
+    );
+}

@@ -1,0 +1,9 @@
+Ok(
+    ControlRequest {
+        request_id: "abc",
+        tool_name: "",
+        tool_use_id: "",
+        input: Null,
+        decision_reason: None,
+    },
+)

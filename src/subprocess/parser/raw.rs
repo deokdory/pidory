@@ -56,6 +56,41 @@ where D: Deserializer<'de> {
     })
 }
 
+// Optional lenient deserializers — wrong-shape JSON returns None instead of error.
+// Mirrors original parse_line's `.and_then(|x| x.as_<t>())` silent-fallback pattern.
+
+pub(super) fn deserialize_optional_u64_lenient<'de, D>(deserializer: D) -> Result<Option<u64>, D::Error>
+where D: Deserializer<'de> {
+    Ok(match Value::deserialize(deserializer)? {
+        Value::Number(n) => n.as_u64(),
+        _ => None,
+    })
+}
+
+pub(super) fn deserialize_optional_f64_lenient<'de, D>(deserializer: D) -> Result<Option<f64>, D::Error>
+where D: Deserializer<'de> {
+    Ok(match Value::deserialize(deserializer)? {
+        Value::Number(n) => n.as_f64(),
+        _ => None,
+    })
+}
+
+pub(super) fn deserialize_optional_bool_lenient<'de, D>(deserializer: D) -> Result<Option<bool>, D::Error>
+where D: Deserializer<'de> {
+    Ok(match Value::deserialize(deserializer)? {
+        Value::Bool(b) => Some(b),
+        _ => None,
+    })
+}
+
+pub(super) fn deserialize_optional_string_lenient<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where D: Deserializer<'de> {
+    Ok(match Value::deserialize(deserializer)? {
+        Value::String(s) => Some(s),
+        _ => None,
+    })
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub(super) enum RawStreamEvent {
@@ -96,10 +131,13 @@ pub(super) struct RawInit {
 pub(super) struct RawAssistant {
     #[serde(default, deserialize_with = "deserialize_string_lenient")]
     pub(super) session_id: String,
+    // baseline parse_line treated missing `message` as empty content vec;
+    // keep that behaviour by defaulting the whole sub-struct.
+    #[serde(default)]
     pub(super) message: RawAssistantMessage,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 pub(super) struct RawAssistantMessage {
     #[serde(default)]
     pub(super) content: Vec<RawContentBlock>,
@@ -124,20 +162,26 @@ pub(super) enum RawContentBlock {
         #[serde(default)]
         input: Value,
     },
+    // Catch-all — baseline `_ => {}` silently skipped unknown content block types.
+    // Without this variant a single unknown block breaks the whole Assistant event.
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Debug, Deserialize)]
 pub(super) struct RawUser {
     #[serde(default, deserialize_with = "deserialize_string_lenient")]
     pub(super) session_id: String,
+    // missing `message` → empty content vec (baseline silent-default).
+    #[serde(default)]
     pub(super) message: RawUserMessage,
     #[serde(default, rename = "isReplay", deserialize_with = "deserialize_bool_lenient")]
     pub(super) is_replay: bool,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_optional_string_lenient")]
     pub(super) timestamp: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 pub(super) struct RawUserMessage {
     #[serde(default)]
     pub(super) content: Vec<RawUserContent>,
@@ -158,6 +202,9 @@ pub(super) enum RawUserContent {
         #[serde(default, deserialize_with = "deserialize_string_lenient")]
         text: String,
     },
+    // Catch-all — baseline silently skipped unknown user content block types.
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Debug, Deserialize)]
@@ -172,13 +219,15 @@ pub(super) struct RawRateLimit {
 pub(super) struct RawRateLimitInfo {
     #[serde(default, deserialize_with = "deserialize_string_lenient")]
     pub(super) status: String,
-    #[serde(rename = "resetsAt", default)]
+    // Optional fields with lenient deserializers — baseline used `.and_then(|x| x.as_u64())`
+    // so wrong-shape JSON (e.g. resetsAt as string) silently became None.
+    #[serde(rename = "resetsAt", default, deserialize_with = "deserialize_optional_u64_lenient")]
     pub(super) resets_at: Option<u64>,
-    #[serde(rename = "rateLimitType", default)]
+    #[serde(rename = "rateLimitType", default, deserialize_with = "deserialize_optional_string_lenient")]
     pub(super) rate_limit_type: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_optional_f64_lenient")]
     pub(super) utilization: Option<f64>,
-    #[serde(rename = "isUsingOverage", default)]
+    #[serde(rename = "isUsingOverage", default, deserialize_with = "deserialize_optional_bool_lenient")]
     pub(super) is_using_overage: Option<bool>,
 }
 
@@ -228,10 +277,12 @@ pub(super) struct RawModelUsage {
 pub(super) struct RawControlRequest {
     #[serde(default, deserialize_with = "deserialize_string_lenient")]
     pub(super) request_id: String,
+    // missing `request` → empty inner (baseline `let request = v.get("request"); request.and_then(...)`).
+    #[serde(default)]
     pub(super) request: RawControlRequestInner,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 pub(super) struct RawControlRequestInner {
     #[serde(default, deserialize_with = "deserialize_string_lenient")]
     pub(super) tool_name: String,
@@ -239,7 +290,7 @@ pub(super) struct RawControlRequestInner {
     pub(super) tool_use_id: String,
     #[serde(default)]
     pub(super) input: Value,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_optional_string_lenient")]
     pub(super) decision_reason: Option<String>,
 }
 
