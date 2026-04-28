@@ -1,0 +1,15 @@
+Ok(
+    Init {
+        session_id: "abc-123",
+        cwd: "/tmp",
+        tools: [
+            "Bash",
+            "Read",
+        ],
+        model: "claude-opus-4-6",
+        skills: [
+            "craft",
+            "verify",
+        ],
+    },
+)

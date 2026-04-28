@@ -1,3 +1,5 @@
+#![warn(clippy::await_holding_lock)]
+
 mod commands;
 mod config;
 mod db;
@@ -10,7 +12,6 @@ mod subprocess;
 mod update;
 
 use std::collections::{HashMap, HashSet};
-use std::time::Instant;
 use commands::skill::load_skill_descriptions;
 use std::sync::Arc;
 
@@ -23,6 +24,7 @@ use tracing_subscriber::{EnvFilter, fmt};
 use config::Config;
 use error::PidoryError;
 use handler::dispatch_locks::ThreadDispatchLocks;
+use handler::session_state::SessionState;
 use subprocess::permission::PermissionDecision;
 use subprocess::session_manager::SessionManager;
 
@@ -41,10 +43,18 @@ pub struct PendingPermission {
 /// Tracks a multi-question AskUserQuestion group.
 /// Each sub-question gets its own PendingPermission keyed by `{request_id}__q{idx}`.
 /// When all answers are collected, the combined answer is sent via `response_tx`.
+///
+/// `answered` tracks which sub-question indices have been answered. We can't use
+/// `answers.len() == total` for completion because `answers` is keyed by question
+/// text (Claude CLI ≥ 2.1.121 looks up answers by `question.question`). If two
+/// questions share the same text — or `resolve_question_text` falls back to `""`
+/// — the second insert overwrites the first, and `len()` would never reach `total`.
+/// `answered` is keyed by sub-question index so it's collision-free. See PR #275.
 pub struct PendingQuestionGroup {
     pub response_tx: oneshot::Sender<PermissionDecision>,
     pub input: serde_json::Value,
     pub answers: HashMap<String, String>,
+    pub answered: HashSet<usize>,
     pub total: usize,
     pub thread_id: String,
     pub triggered_by: serenity::UserId,
@@ -57,23 +67,10 @@ pub struct Data {
     pub pending_permissions: Arc<Mutex<HashMap<String, PendingPermission>>>,
     pub pending_question_groups: Arc<Mutex<HashMap<String, PendingQuestionGroup>>>,
     pub pending_resets: Arc<Mutex<HashMap<String, handler::reset_ui::PendingReset>>>,
-    pub session_skills: Arc<Mutex<HashMap<String, Vec<String>>>>,
-    pub needs_context: Arc<Mutex<HashSet<String>>>,
-    pub archived_threads: Arc<Mutex<HashSet<String>>>,
-    pub turn_initiators: Arc<Mutex<HashMap<String, serenity::UserId>>>,
-    pub turn_participants: Arc<Mutex<HashMap<String, HashSet<serenity::UserId>>>>,
     pub dispatch_locks: Arc<ThreadDispatchLocks>,
-    pub todo_trackers: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<handler::todo_tracker::TodoTracker>>>>>,
+    pub session_states: Arc<Mutex<HashMap<String, SessionState>>>,
     pub skill_descriptions: HashMap<String, String>,
     pub agent_descriptions: HashMap<String, String>,
-    /// thread_id → 마지막으로 사용된 tool name
-    pub last_tool_name: Arc<Mutex<HashMap<String, String>>>,
-    /// thread_id → 마지막 kick 시각
-    pub kick_cooldowns: Arc<Mutex<HashMap<String, Instant>>>,
-    /// kick 후 interrupt 대기 중인 thread_id 집합 (자연 완료 시 제거됨)
-    pub kick_pending: Arc<Mutex<HashSet<String>>>,
-    /// thread_id → next-step 버튼이 붙은 메시지 ID (다음 턴 시 비활성화용)
-    pub next_step_buttons: Arc<Mutex<HashMap<String, serenity::MessageId>>>,
     /// Event handler가 fresh Context를 background task에 전달하는 채널.
     /// Shard reconnect 후에도 최신 ShardMessenger를 사용할 수 있게 해준다.
     pub ctx_watch: watch::Sender<serenity::Context>,
@@ -238,6 +235,7 @@ async fn main() -> Result<(), PidoryError> {
 
                 let sessions = Arc::new(SessionManager::new(
                     Arc::new(config.claude.clone()),
+                    config.footer.clone(),
                     config.claude.max_sessions,
                     ratelimit_tx.clone(),
                     session_count_tx.clone(),
@@ -246,9 +244,6 @@ async fn main() -> Result<(), PidoryError> {
                 let pending_permissions: Arc<Mutex<HashMap<String, PendingPermission>>> = Arc::new(Mutex::new(HashMap::new()));
                 let pending_question_groups: Arc<Mutex<HashMap<String, PendingQuestionGroup>>> = Arc::new(Mutex::new(HashMap::new()));
                 let pending_resets: Arc<Mutex<HashMap<String, handler::reset_ui::PendingReset>>> = Arc::new(Mutex::new(HashMap::new()));
-                let session_skills = Arc::new(Mutex::new(HashMap::new()));
-                let turn_initiators: Arc<Mutex<HashMap<String, serenity::UserId>>> = Arc::new(Mutex::new(HashMap::new()));
-                let turn_participants: Arc<Mutex<HashMap<String, HashSet<serenity::UserId>>>> = Arc::new(Mutex::new(HashMap::new()));
                 let skill_descriptions = load_skill_descriptions();
                 let agent_descriptions = commands::agent::load_global_agent_descriptions();
 
@@ -321,30 +316,27 @@ async fn main() -> Result<(), PidoryError> {
                     }
                 }
 
-                let last_tool_name: Arc<Mutex<HashMap<String, String>>> = Arc::new(Mutex::new(HashMap::new()));
-                let kick_cooldowns: Arc<Mutex<HashMap<String, Instant>>> = Arc::new(Mutex::new(HashMap::new()));
-                let kick_pending: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
-                let needs_context = Arc::new(Mutex::new(HashSet::new()));
-                let next_step_buttons: Arc<Mutex<HashMap<String, serenity::MessageId>>> = Arc::new(Mutex::new(HashMap::new()));
+                let session_states: Arc<Mutex<HashMap<String, SessionState>>> = Arc::new(Mutex::new(HashMap::new()));
                 let dispatch_locks: Arc<ThreadDispatchLocks> = Arc::new(ThreadDispatchLocks::new());
 
                 // Idle session TTL sweep
                 {
                     let sessions = Arc::clone(&sessions);
                     let idle_timeout = std::time::Duration::from_secs(config.claude.idle_timeout_secs);
-                    let pending_permissions = Arc::clone(&pending_permissions);
-                    let pending_question_groups = Arc::clone(&pending_question_groups);
-                    let session_skills = Arc::clone(&session_skills);
-                    let needs_context = Arc::clone(&needs_context);
-                    let turn_initiators = Arc::clone(&turn_initiators);
-                    let turn_participants = Arc::clone(&turn_participants);
-                    let last_tool_name = Arc::clone(&last_tool_name);
-                    let kick_cooldowns = Arc::clone(&kick_cooldowns);
-                    let kick_pending = Arc::clone(&kick_pending);
-                    let next_step_buttons = Arc::clone(&next_step_buttons);
-                    let dispatch_locks = Arc::clone(&dispatch_locks);
                     let db_clone = db.clone();
                     let mut ctx_rx = ctx_tx.subscribe();
+                    // pending_recalls placeholder — TTL sweep은 recall 없음
+                    let placeholder_recalls = Arc::new(tokio::sync::Mutex::new(
+                        std::collections::HashMap::<serenity::MessageId, (String, Arc<std::sync::atomic::AtomicBool>)>::new(),
+                    ));
+                    let cleanup_handles = subprocess::supervisor::SessionCleanupHandles {
+                        pending_permissions: Arc::clone(&pending_permissions),
+                        pending_question_groups: Arc::clone(&pending_question_groups),
+                        pending_resets: Arc::clone(&pending_resets),
+                        session_states: Arc::clone(&session_states),
+                        pending_recalls: placeholder_recalls,
+                        dispatch_locks: Arc::clone(&dispatch_locks),
+                    };
                     tokio::spawn(async move {
                         let mut interval = tokio::time::interval(std::time::Duration::from_secs(300));
                         loop {
@@ -356,26 +348,15 @@ async fn main() -> Result<(), PidoryError> {
                                     }
                                     tracing::info!("TTL sweep: evicted {} sessions", evicted.len());
                                     for tid in &evicted {
-                                        pending_permissions.lock().await.retain(|_, p| p.thread_id != *tid);
-                                        pending_question_groups.lock().await.retain(|_, g| g.thread_id != *tid);
-                                        session_skills.lock().await.remove(tid);
-                                        needs_context.lock().await.remove(tid);
-                                        turn_initiators.lock().await.remove(tid);
-                                        turn_participants.lock().await.remove(tid);
-                                        last_tool_name.lock().await.remove(tid);
-                                        kick_cooldowns.lock().await.remove(tid);
-                                        kick_pending.lock().await.remove(tid);
-                                        next_step_buttons.lock().await.remove(tid);
-                                        dispatch_locks.remove(tid).await;
+                                        let ctx = ctx_rx.borrow().clone();
+                                        crate::handler::cleanup::cleanup_session_state_from_handles(
+                                            &cleanup_handles,
+                                            tid,
+                                            &ctx,
+                                        )
+                                        .await;
                                         if let Err(e) = db::repository::update_session_status(&db_clone, tid, "idle").await {
                                             tracing::warn!("Failed to update session status for TTL sweep thread {}: {}", tid, e);
-                                        }
-                                        if let Ok(channel_id) = tid.parse::<u64>() {
-                                            let ctx = ctx_rx.borrow().clone();
-                                            poise::serenity_prelude::ChannelId::new(channel_id)
-                                                .leave_thread(&ctx)
-                                                .await
-                                                .ok();
                                         }
                                     }
                                 }
@@ -439,19 +420,10 @@ async fn main() -> Result<(), PidoryError> {
                     pending_permissions,
                     pending_question_groups,
                     pending_resets,
-                    session_skills,
-                    needs_context,
-                    archived_threads: Arc::new(Mutex::new(HashSet::new())),
-                    turn_initiators,
-                    turn_participants,
                     dispatch_locks,
-                    todo_trackers: Arc::new(Mutex::new(HashMap::<String, Arc<tokio::sync::Mutex<handler::todo_tracker::TodoTracker>>>::new())),
+                    session_states,
                     skill_descriptions,
                     agent_descriptions,
-                    last_tool_name,
-                    kick_cooldowns,
-                    kick_pending,
-                    next_step_buttons,
                     ctx_watch: ctx_tx,
                 })
             })

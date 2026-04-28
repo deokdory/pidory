@@ -7,9 +7,10 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use poise::serenity_prelude::{ChannelId, Context, MessageId, UserId};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{ChildStdin, ChildStdout};
-use tokio::sync::mpsc;
+use tokio::sync::{Mutex, mpsc};
 
 use crate::db::repository;
+use crate::handler::session_state::SessionState;
 use crate::i18n::Lang;
 use crate::ratelimit::RateLimitInfo;
 use super::super::background::BackgroundTaskTracker;
@@ -43,12 +44,13 @@ pub(super) async fn handle_between_turns_event(
     has_bg_tasks: &Arc<AtomicBool>,
     pending_recalls: &Arc<tokio::sync::Mutex<HashMap<MessageId, (String, Arc<AtomicBool>)>>>,
     ratelimit_tx: &tokio::sync::watch::Sender<RateLimitInfo>,
-    todo_trackers: &Arc<tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<crate::handler::todo_tracker::TodoTracker>>>>>,
+    session_states: &Arc<Mutex<HashMap<String, SessionState>>>,
     thread_id: &str,
     channel_id: &ChannelId,
     ctx: &Context,
     db: &sqlx::SqlitePool,
     lang: Lang,
+    show_context_percent: bool,
     model_name: &mut String,
 ) -> BetweenTurnsAction {
     line.clear();
@@ -111,12 +113,13 @@ pub(super) async fn handle_between_turns_event(
                                 queue_size,
                                 pending_recalls,
                                 ratelimit_tx,
-                                todo_trackers,
+                                session_states,
                                 thread_id,
                                 channel_id,
                                 ctx,
                                 db,
                                 lang,
+                                show_context_percent,
                                 model_name,
                             ).await;
 

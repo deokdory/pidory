@@ -7,11 +7,12 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use poise::serenity_prelude::{ChannelId, Context, MessageId, UserId};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{ChildStdin, ChildStdout};
-use tokio::sync::mpsc;
+use tokio::sync::{Mutex, mpsc};
 
 use crate::db::repository;
 use crate::handler::formatter;
 use crate::handler::message::{shorten_model_name, format_ctx_suffix};
+use crate::handler::session_state::{SessionState, try_acquire_todo_tracker, release_todo_tracker};
 use crate::i18n::Lang;
 use crate::ratelimit::RateLimitInfo;
 use super::super::background::BackgroundTaskTracker;
@@ -36,12 +37,13 @@ pub(super) async fn handle_bg_turn(
     queue_size: &Arc<AtomicUsize>,
     pending_recalls: &Arc<tokio::sync::Mutex<HashMap<MessageId, (String, Arc<AtomicBool>)>>>,
     ratelimit_tx: &tokio::sync::watch::Sender<RateLimitInfo>,
-    todo_trackers: &Arc<tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<crate::handler::todo_tracker::TodoTracker>>>>>,
+    session_states: &Arc<Mutex<HashMap<String, SessionState>>>,
     thread_id: &str,
     channel_id: &ChannelId,
     ctx: &Context,
     db: &sqlx::SqlitePool,
     lang: Lang,
+    show_context_percent: bool,
     model_name: &mut String,
 ) {
     let mut used_tools: Vec<String> = Vec::new();
@@ -67,7 +69,7 @@ pub(super) async fn handle_bg_turn(
                                 let duration = formatter::format_duration(duration_ms);
                                 let cost = formatter::format_cost(total_cost_usd);
                                 let tokens = formatter::format_tokens(input_tokens, output_tokens);
-                                let ctx_suffix = format_ctx_suffix(total_input_tokens, context_window);
+                                let ctx_suffix = format_ctx_suffix(total_input_tokens, context_window, show_context_percent);
                                 let model_short = if model_name.is_empty() {
                                     String::new()
                                 } else {
@@ -97,9 +99,11 @@ pub(super) async fn handle_bg_turn(
                                 };
                                 let summary = format!("-# {} {}\n{}{}{}", icon, mention, stats_line, tools_line, skills_line);
                                 // bg turn 종료 — pending TodoWrite flush
-                                let tracker = todo_trackers.lock().await.get(thread_id).cloned();
-                                if let Some(tracker) = tracker {
-                                    tracker.lock().await.flush(ctx).await;
+                                if let Some(mut todo_tracker) = try_acquire_todo_tracker(session_states, thread_id, *channel_id).await {
+                                    todo_tracker.flush(ctx).await;
+                                    release_todo_tracker(session_states, thread_id, todo_tracker, ctx).await;
+                                } else {
+                                    tracing::warn!("bg flush: tracker unavailable (race with primary turn or session gone)");
                                 }
                                 if is_error && !is_interrupted {
                                     let error_msg = errors.join(", ");
@@ -134,15 +138,13 @@ pub(super) async fn handle_bg_turn(
                                                 used_tools.push(name.clone());
                                             }
                                             if name == "TodoWrite" {
-                                                let tracker = {
-                                                    let mut map = todo_trackers.lock().await;
-                                                    map.entry(thread_id.to_string())
-                                                        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(
-                                                            crate::handler::todo_tracker::TodoTracker::new(*channel_id)
-                                                        )))
-                                                        .clone()
-                                                };
-                                                tracker.lock().await.update(ctx, input).await;
+                                                // try_acquire가 None이면 silent skip + warn (primary와 race 또는 cleanup된 세션)
+                                                if let Some(mut todo_tracker) = try_acquire_todo_tracker(session_states, thread_id, *channel_id).await {
+                                                    todo_tracker.update(ctx, input).await;
+                                                    release_todo_tracker(session_states, thread_id, todo_tracker, ctx).await;
+                                                } else {
+                                                    tracing::warn!("bg TodoWrite: tracker unavailable (race with primary turn or session gone)");
+                                                }
                                             } else {
                                                 let formatted = formatter::format_tool_use(name, input);
                                                 let bg_text = lang.bg_notification(&formatted);

@@ -1,0 +1,9 @@
+Ok(
+    TaskStarted {
+        task_id: "a7ca5a342d867c971",
+        tool_use_id: "toolu_01CWFNoUWUwyfyMqVJ42F96Z",
+        description: "Read /etc/hostname content",
+        task_type: "local_agent",
+        session_id: "a352a7c9-4254-465e-b444-b804c6099892",
+    },
+)

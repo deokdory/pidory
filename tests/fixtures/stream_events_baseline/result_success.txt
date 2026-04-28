@@ -1,0 +1,18 @@
+Ok(
+    Result {
+        subtype: "success",
+        session_id: "abc",
+        is_error: false,
+        result: Some(
+            "done",
+        ),
+        errors: [],
+        duration_ms: 1000,
+        total_cost_usd: 0.05,
+        num_turns: 1,
+        input_tokens: 0,
+        output_tokens: 0,
+        context_window: 0,
+        total_input_tokens: 0,
+    },
+)
