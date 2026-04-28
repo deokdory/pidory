@@ -1,6 +1,7 @@
 mod types;
 mod parse;
 mod control_response;
+mod raw;
 
 pub use types::*;
 pub use parse::parse_line;

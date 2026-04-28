@@ -180,7 +180,7 @@ pub async fn sleep(ctx: Context<'_>) -> Result<(), Error> {
     }
 
     // 2. 권한 체크: 세션 시작자 또는 owner만 허용
-    let triggered_by = data.turn_initiators.lock().await.get(&thread_id).copied();
+    let triggered_by = data.session_states.lock().await.get(&thread_id).and_then(|s| s.turn_initiator);
     let is_owner = ctx.author().id == serenity::UserId::new(data.config.discord.owner_id);
 
     let allowed = match triggered_by {
@@ -248,7 +248,7 @@ async fn clear_impl(ctx: Context<'_>) -> Result<(), Error> {
     }
 
     // 2. 권한 체크: 세션 시작자 또는 owner만 허용
-    let triggered_by = data.turn_initiators.lock().await.get(&thread_id).copied();
+    let triggered_by = data.session_states.lock().await.get(&thread_id).and_then(|s| s.turn_initiator);
     let is_owner = ctx.author().id == serenity::UserId::new(data.config.discord.owner_id);
 
     let allowed = match triggered_by {
@@ -269,8 +269,8 @@ async fn clear_impl(ctx: Context<'_>) -> Result<(), Error> {
     // 3. defer (kill은 ~1s+ 소요)
     ctx.defer().await?;
 
-    // 4. archived_threads 먼저 등록 (kill 전, mid-turn stale output 억제)
-    data.archived_threads.lock().await.insert(thread_id.clone());
+    // 4. archived 먼저 등록 (kill 전, mid-turn stale output 억제)
+    data.session_states.lock().await.entry(thread_id.clone()).or_default().archived = true;
 
     // 5. kill_session (결과 무시)
     let _ = data.sessions.kill_session(&thread_id).await;
@@ -314,7 +314,7 @@ pub async fn stop(ctx: Context<'_>) -> Result<(), Error> {
     }
 
     // triggered_by 체크: 세션을 시작한 사람만 중단 가능 (owner 는 fallback)
-    let triggered_by = data.turn_initiators.lock().await.get(&thread_id).copied();
+    let triggered_by = data.session_states.lock().await.get(&thread_id).and_then(|s| s.turn_initiator);
     let is_owner = ctx.author().id == serenity::UserId::new(data.config.discord.owner_id);
 
     let allowed = match triggered_by {
@@ -362,19 +362,21 @@ pub async fn kick(
     }
 
     // 2. cooldown 체크 (5초)
-    {
-        let cooldowns = data.kick_cooldowns.lock().await;
-        if let Some(last_kick) = cooldowns.get(&thread_id)
-            && last_kick.elapsed() < Duration::from_secs(5)
-        {
-            ctx.send(
-                poise::CreateReply::default()
-                    .content(format!("❌ {}", lang.kick_cooldown()))
-                    .ephemeral(true),
-            )
-            .await?;
-            return Ok(());
-        }
+    let kick_blocked = {
+        let states = data.session_states.lock().await;
+        states
+            .get(&thread_id)
+            .and_then(|s| s.kick_cooldown)
+            .is_some_and(|t| t.elapsed() < Duration::from_secs(5))
+    };
+    if kick_blocked {
+        ctx.send(
+            poise::CreateReply::default()
+                .content(format!("❌ {}", lang.kick_cooldown()))
+                .ephemeral(true),
+        )
+        .await?;
+        return Ok(());
     }
 
     // 3. 활성 턴 체크
@@ -398,7 +400,7 @@ pub async fn kick(
     }
 
     // 4. 권한 체크
-    let triggered_by = data.turn_initiators.lock().await.get(&thread_id).copied();
+    let triggered_by = data.session_states.lock().await.get(&thread_id).and_then(|s| s.turn_initiator);
     let is_owner = ctx.author().id == serenity::UserId::new(data.config.discord.owner_id);
 
     let allowed = match triggered_by {
@@ -418,28 +420,32 @@ pub async fn kick(
 
     // 5. last_tool_name 조회
     let last_tool = data
-        .last_tool_name
+        .session_states
         .lock()
         .await
         .get(&thread_id)
-        .cloned()
+        .and_then(|s| s.last_tool_name.clone())
         .unwrap_or_else(|| lang.none_placeholder().to_string());
 
     // 6. kick_pending 등록 (process_turn_events에서 자연 완료 시 제거됨)
-    data.kick_pending.lock().await.insert(thread_id.clone());
+    data.session_states.lock().await.entry(thread_id.clone()).or_default().kick_pending = true;
 
     // 7. interrupt_session() 호출
     if let Err(e) = data.sessions.interrupt_session(&thread_id).await {
-        data.kick_pending.lock().await.remove(&thread_id);
+        if let Some(s) = data.session_states.lock().await.get_mut(&thread_id) {
+            s.kick_pending = false;
+        }
         ctx.say(format!("❌ {}", lang.interrupt_failed(&e))).await?;
         return Ok(());
     }
 
     // cooldown 기록
-    data.kick_cooldowns
+    data.session_states
         .lock()
         .await
-        .insert(thread_id.clone(), std::time::Instant::now());
+        .entry(thread_id.clone())
+        .or_default()
+        .kick_cooldown = Some(std::time::Instant::now());
 
     // 8. Discord 확인 메시지 전송
     let reply = ctx
@@ -461,15 +467,7 @@ pub async fn kick(
     let sessions = Arc::clone(&data.sessions);
     let db = data.db.clone();
     let config = Arc::clone(&data.config);
-    let session_skills = Arc::clone(&data.session_skills);
-    let turn_participants = Arc::clone(&data.turn_participants);
-    let last_tool_name = Arc::clone(&data.last_tool_name);
-    let archived_threads = Arc::clone(&data.archived_threads);
-    let kick_pending = Arc::clone(&data.kick_pending);
-    let turn_initiators = Arc::clone(&data.turn_initiators);
-    let needs_context = Arc::clone(&data.needs_context);
-    let todo_trackers = Arc::clone(&data.todo_trackers);
-    let next_step_buttons = Arc::clone(&data.next_step_buttons);
+    let session_states = Arc::clone(&data.session_states);
     let dispatch_locks = Arc::clone(&data.dispatch_locks);
     let author_id = ctx.author().id;
     let mut ctx_rx = data.ctx_watch.subscribe();
@@ -480,7 +478,13 @@ pub async fn kick(
             match repository::get_session_by_thread(&db, &thread_id).await {
                 Ok(Some(session)) if session.status == "idle" || session.status == "error" => {
                     // W1: kick_pending 확인 — 자연 완료 시 process_turn_events가 제거함
-                    if !kick_pending.lock().await.remove(&thread_id) {
+                    let was_pending = session_states
+                        .lock()
+                        .await
+                        .get_mut(&thread_id)
+                        .map(|s| std::mem::replace(&mut s.kick_pending, false))
+                        .unwrap_or(false);
+                    if !was_pending {
                         ctx_rx.mark_changed();
                         let serenity_ctx = ctx_rx.borrow_and_update().clone();
                         let _ = channel_id
@@ -526,9 +530,10 @@ pub async fn kick(
                     ctx_rx.mark_changed();
                     let serenity_ctx = ctx_rx.borrow_and_update().clone();
 
-                    needs_context.lock().await.remove(&thread_id);
-                    // S1: stale tool name 방지
-                    last_tool_name.lock().await.remove(&thread_id);
+                    if let Some(s) = session_states.lock().await.get_mut(&thread_id) {
+                        s.needs_context = false;
+                        s.last_tool_name = None; // S1: stale tool name 방지
+                    }
 
                     crate::handler::emoji::set_reaction(
                         &serenity_ctx,
@@ -551,11 +556,12 @@ pub async fn kick(
                         reply_context: None,
                     };
 
-                    turn_participants
-                        .lock()
-                        .await
-                        .insert(thread_id.clone(), std::collections::HashSet::from([author_id]));
-                    turn_initiators.lock().await.insert(thread_id.clone(), author_id);
+                    {
+                        let mut guard = session_states.lock().await;
+                        let s = guard.entry(thread_id.clone()).or_default();
+                        s.turn_participants = std::collections::HashSet::from([author_id]);
+                        s.turn_initiator = Some(author_id);
+                    }
 
                     if let Err(e) = sessions.send_message(&thread_id, msg).await {
                         tracing::error!("kick: send_message failed: {}", e);
@@ -567,15 +573,6 @@ pub async fn kick(
                     // process_turn_events는 턴 완료까지 await하므로 반드시 lock 밖에서 실행.
                     drop(_dispatch_guard);
 
-                    let todo_tracker = {
-                        let mut map = todo_trackers.lock().await;
-                        map.entry(thread_id.clone())
-                            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(
-                                crate::handler::todo_tracker::TodoTracker::new(channel_id)
-                            )))
-                            .clone()
-                    };
-
                     process_turn_events(
                         &serenity_ctx,
                         event_rx,
@@ -585,15 +582,10 @@ pub async fn kick(
                         &db,
                         config.response.max_chunk_length,
                         config.response.max_chunks,
-                        session_skills.clone(),
                         config.language,
                         config.discord.owner_id,
-                        turn_participants.clone(),
-                        archived_threads.clone(),
-                        last_tool_name.clone(),
-                        kick_pending.clone(),
-                        todo_tracker.clone(),
-                        next_step_buttons.clone(),
+                        config.footer.show_context_percent,
+                        session_states.clone(),
                     )
                     .await;
 
@@ -605,7 +597,9 @@ pub async fn kick(
         }
 
         // 타임아웃 — kick_pending 정리
-        kick_pending.lock().await.remove(&thread_id);
+        if let Some(s) = session_states.lock().await.get_mut(&thread_id) {
+            s.kick_pending = false;
+        }
         ctx_rx.mark_changed();
         let serenity_ctx = ctx_rx.borrow_and_update().clone();
         let _ = channel_id

@@ -9,6 +9,7 @@ use crate::{Context, Data, Error};
 use crate::db::repository;
 use crate::error::PidoryError;
 use crate::handler::formatter;
+use crate::handler::session_state::SessionState;
 use crate::subprocess::parser::{ContentBlock, StreamEvent};
 use crate::subprocess::session_manager::QueuedMessage;
 
@@ -150,7 +151,6 @@ pub async fn branch(
             data.pending_permissions.clone(),
             data.pending_question_groups.clone(),
             data.config.discord.owner_id,
-            data.todo_trackers.clone(),
             crate::subprocess::supervisor::SessionCleanupHandles::from_data(data),
             data.config.discord.notification_channel_id.map(poise::serenity_prelude::ChannelId::new),
         )
@@ -320,7 +320,6 @@ pub async fn branch(
             data.pending_permissions.clone(),
             data.pending_question_groups.clone(),
             data.config.discord.owner_id,
-            data.todo_trackers.clone(),
             crate::subprocess::supervisor::SessionCleanupHandles::from_data(data),
             data.config.discord.notification_channel_id.map(poise::serenity_prelude::ChannelId::new),
         )
@@ -415,7 +414,7 @@ pub async fn branch(
         new_event_rx,
         &new_thread_id,
         db,
-        data.session_skills.clone(),
+        data.session_states.clone(),
         drain_timeout,
     )
     .await
@@ -454,9 +453,8 @@ async fn cleanup_orphaned_thread(
         tracing::debug!("cleanup: kill_session {}: {} (may not exist yet)", thread_id, e);
     }
 
-    // 2. 인메모리 tracking 정리
-    data.turn_initiators.lock().await.remove(thread_id);
-    data.turn_participants.lock().await.remove(thread_id);
+    // 2. 인메모리 tracking 정리 (pending_*, session_states, dispatch_locks 포함)
+    crate::handler::cleanup::cleanup_session_state(data, thread_id, serenity_ctx).await;
 
     // 3. DB 세션 삭제
     if let Err(e) = repository::delete_session(&data.db, thread_id).await {
@@ -480,7 +478,7 @@ async fn drain_initial_turn(
     mut event_rx: mpsc::Receiver<StreamEvent>,
     thread_id: &str,
     db: &sqlx::SqlitePool,
-    session_skills: Arc<tokio::sync::Mutex<std::collections::HashMap<String, Vec<String>>>>,
+    session_states: Arc<tokio::sync::Mutex<std::collections::HashMap<String, SessionState>>>,
     timeout_secs: u64,
 ) -> Result<(), PidoryError> {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
@@ -491,7 +489,7 @@ async fn drain_initial_turn(
                 match event {
                     Some(StreamEvent::Init { skills, .. }) => {
                         if !skills.is_empty() {
-                            session_skills.lock().await.insert(thread_id.to_string(), skills.clone());
+                            session_states.lock().await.entry(thread_id.to_string()).or_default().skills = skills.clone();
                         }
                     }
                     Some(StreamEvent::Result { session_id, is_error, .. }) => {

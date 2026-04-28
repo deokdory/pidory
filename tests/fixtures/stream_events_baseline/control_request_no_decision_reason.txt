@@ -1,0 +1,11 @@
+Ok(
+    ControlRequest {
+        request_id: "abc",
+        tool_name: "Read",
+        tool_use_id: "t1",
+        input: Object {
+            "file_path": String("/tmp/f"),
+        },
+        decision_reason: None,
+    },
+)

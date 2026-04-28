@@ -8,10 +8,37 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::error;
 
+/// turn_participants를 mention 문자열로 직렬화한다.
+/// lock guard 안에서 `format!`/`Vec` 할당이 누적되지 않도록 UserId만 lock 안에서 추출하고
+/// 문자열 빌드는 lock 밖에서 수행한다.
+async fn build_mentions(
+    session_states: &Arc<tokio::sync::Mutex<HashMap<String, crate::handler::session_state::SessionState>>>,
+    thread_id: &str,
+    owner_id: u64,
+) -> String {
+    let participants: Vec<UserId> = {
+        let guard = session_states.lock().await;
+        guard
+            .get(thread_id)
+            .map(|s| s.turn_participants.iter().copied().collect())
+            .unwrap_or_default()
+    };
+    if participants.is_empty() {
+        format!("<@{}>", owner_id)
+    } else {
+        participants
+            .iter()
+            .map(|uid| format!("<@{}>", uid))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+}
+
 use crate::db::repository;
 use crate::handler::{emoji, file_attach, formatter, next_step_ui};
 use crate::handler::emoji::ReactionStatus;
 use crate::handler::message::helpers::shorten_model_name;
+use crate::handler::session_state::{SessionState, try_acquire_todo_tracker, release_todo_tracker};
 use crate::handler::status::ProgressIndicator;
 use crate::i18n::Lang;
 use crate::subprocess::parser::{ContentBlock, StreamEvent};
@@ -26,11 +53,10 @@ async fn send_summary_with_buttons(
     summary: &str,
     thread_id: &str,
     events: &[StreamEvent],
-    session_skills: &Arc<tokio::sync::Mutex<HashMap<String, Vec<String>>>>,
-    next_step_buttons: &Arc<tokio::sync::Mutex<HashMap<String, MessageId>>>,
+    session_states: &Arc<tokio::sync::Mutex<HashMap<String, SessionState>>>,
 ) {
-    let skills_for_thread = session_skills.lock().await
-        .get(thread_id).cloned().unwrap_or_default();
+    let skills_for_thread = session_states.lock().await
+        .get(thread_id).map(|s| s.skills.clone()).unwrap_or_default();
     let next_steps = next_step_ui::extract_next_steps(events, &skills_for_thread);
     let components = next_step_ui::create_next_step_components(&next_steps, thread_id);
     if components.is_empty() {
@@ -40,7 +66,7 @@ async fn send_summary_with_buttons(
     } else {
         match channel_id.send_message(ctx, CreateMessage::new().content(summary).components(components)).await {
             Ok(msg) => {
-                next_step_buttons.lock().await.insert(thread_id.to_string(), msg.id);
+                session_states.lock().await.entry(thread_id.to_string()).or_default().next_step_button = Some(msg.id);
             }
             Err(e) => {
                 tracing::warn!(%channel_id, "Failed to send turn summary with buttons: {}", e);
@@ -78,9 +104,8 @@ pub(super) async fn send_event_to_discord(
     used_skills: &mut Vec<String>,
     max_chunk_length: usize,
     lang: Lang,
-    last_tool_name: &std::sync::Arc<tokio::sync::Mutex<HashMap<String, String>>>,
+    session_states: &Arc<tokio::sync::Mutex<HashMap<String, SessionState>>>,
     thread_id: &str,
-    todo_tracker: Arc<tokio::sync::Mutex<crate::handler::todo_tracker::TodoTracker>>,
 ) {
     match event {
         StreamEvent::Assistant { content, .. } => {
@@ -116,15 +141,14 @@ pub(super) async fn send_event_to_discord(
                             used_tools.push(name.clone());
                         }
                         {
-                            let mut map = last_tool_name.lock().await;
-                            if let Some(existing) = map.get_mut(thread_id) {
-                                existing.clone_from(name);
-                            } else {
-                                map.insert(thread_id.to_string(), name.clone());
-                            }
+                            session_states.lock().await.entry(thread_id.to_string()).or_default().last_tool_name = Some(name.clone());
                         }
                         if name == "TodoWrite" {
-                            todo_tracker.lock().await.update(ctx, input).await;
+                            // try_acquire가 None이면: 세션이 cleanup됐거나 다른 path가 take 중. 둘 다 silent skip.
+                            if let Some(mut tracker) = try_acquire_todo_tracker(session_states, thread_id, channel_id).await {
+                                tracker.update(ctx, input).await;
+                                release_todo_tracker(session_states, thread_id, tracker, ctx).await;
+                            }
                         } else {
                             let formatted = formatter::format_tool_use(name, input);
                             let chunks = formatter::split_message(&formatted, max_chunk_length);
@@ -170,18 +194,13 @@ pub async fn process_turn_events(
     db: &sqlx::SqlitePool,
     max_chunk_length: usize,
     max_chunks: usize,
-    session_skills: std::sync::Arc<tokio::sync::Mutex<HashMap<String, Vec<String>>>>,
     lang: Lang,
     owner_id: u64,
-    turn_participants: std::sync::Arc<tokio::sync::Mutex<HashMap<String, std::collections::HashSet<UserId>>>>,
-    archived_threads: std::sync::Arc<tokio::sync::Mutex<std::collections::HashSet<String>>>,
-    last_tool_name: std::sync::Arc<tokio::sync::Mutex<HashMap<String, String>>>,
-    kick_pending: std::sync::Arc<tokio::sync::Mutex<std::collections::HashSet<String>>>,
-    todo_tracker: Arc<tokio::sync::Mutex<crate::handler::todo_tracker::TodoTracker>>,
-    next_step_buttons: Arc<tokio::sync::Mutex<HashMap<String, MessageId>>>,
+    show_context_percent: bool,
+    session_states: Arc<tokio::sync::Mutex<HashMap<String, SessionState>>>,
 ) {
     // 0. 이전 턴의 next-step 버튼 비활성화
-    if let Some(prev_msg_id) = next_step_buttons.lock().await.remove(thread_id) {
+    if let Some(prev_msg_id) = session_states.lock().await.get_mut(thread_id).and_then(|s| s.next_step_button.take()) {
         next_step_ui::disable_next_step_buttons(ctx, channel_id, prev_msg_id)
             .await
             .ok();
@@ -248,7 +267,7 @@ pub async fn process_turn_events(
     if !fast_complete {
         // 버퍼링된 이벤트 먼저 전송
         for event in &events {
-            send_event_to_discord(ctx, channel_id, event, &mut tool_use_names, &mut used_tools, &mut used_skills, max_chunk_length, lang, &last_tool_name, thread_id, todo_tracker.clone()).await;
+            send_event_to_discord(ctx, channel_id, event, &mut tool_use_names, &mut used_tools, &mut used_skills, max_chunk_length, lang, &session_states, thread_id).await;
         }
 
         // Progress indicator 초기화
@@ -292,7 +311,7 @@ pub async fn process_turn_events(
                             typing_paused.store(progress.is_active(), Ordering::Relaxed);
 
                             // 기존 이벤트 처리
-                            send_event_to_discord(ctx, channel_id, &stream_event, &mut tool_use_names, &mut used_tools, &mut used_skills, max_chunk_length, lang, &last_tool_name, thread_id, todo_tracker.clone()).await;
+                            send_event_to_discord(ctx, channel_id, &stream_event, &mut tool_use_names, &mut used_tools, &mut used_skills, max_chunk_length, lang, &session_states, thread_id).await;
 
                             if stream_event.is_result() {
                                 got_result = true;
@@ -318,7 +337,11 @@ pub async fn process_turn_events(
 
         // Turn 종료 시 cleanup
         progress.cleanup(ctx).await;
-        todo_tracker.lock().await.flush(ctx).await;
+        // streaming end flush
+        if let Some(mut tracker) = try_acquire_todo_tracker(&session_states, thread_id, channel_id).await {
+            tracker.flush(ctx).await;
+            release_todo_tracker(&session_states, thread_id, tracker, ctx).await;
+        }
     }
 
     // 5. typing indicator 취소
@@ -340,7 +363,7 @@ pub async fn process_turn_events(
     for event in &events {
         if let StreamEvent::Init { skills, model, .. } = event {
             if !skills.is_empty() {
-                session_skills.lock().await.insert(thread_id.to_string(), skills.clone());
+                session_states.lock().await.entry(thread_id.to_string()).or_default().skills = skills.clone();
             }
             let _ = repository::update_session_model(db, thread_id, model).await;
             turn_model = shorten_model_name(model);
@@ -358,11 +381,24 @@ pub async fn process_turn_events(
         }
     });
 
-    if !is_interrupted {
-        kick_pending.lock().await.remove(thread_id);
+    if !is_interrupted
+        && let Some(s) = session_states.lock().await.get_mut(thread_id)
+    {
+        s.kick_pending = false;
     }
 
-    if archived_threads.lock().await.remove(thread_id) {
+    // archived tombstone consume + leftover entry 정리.
+    // cleanup_session_state가 archived=true인 entry를 reset해서 보존했으므로,
+    // 여기서 archived를 소비하는 동시에 entry 자체도 제거해 leak 방지.
+    let was_archived = {
+        let mut guard = session_states.lock().await;
+        let was = guard.get(thread_id).is_some_and(|s| s.archived);
+        if was {
+            guard.remove(thread_id);
+        }
+        was
+    };
+    if was_archived {
         tracing::info!(thread_id, "Turn ended silently — thread archived");
         return;
     }
@@ -416,13 +452,7 @@ pub async fn process_turn_events(
         if let Err(e) = repository::update_session_status(db, thread_id, "error").await {
             tracing::warn!("Failed to update session status for thread {}: {}", thread_id, e);
         }
-        let mentions = {
-            let parts = turn_participants.lock().await;
-            parts.get(thread_id)
-                .filter(|set| !set.is_empty())
-                .map(|set| set.iter().map(|uid| format!("<@{}>", uid)).collect::<Vec<_>>().join(" "))
-                .unwrap_or_else(|| format!("<@{}>", owner_id))
-        };
+        let mentions = build_mentions(&session_states, thread_id, owner_id).await;
         if let Some(error_text) = error_msgs.first()
             && let Err(e) = channel_id.say(ctx, &format!("-# ❌ {} {}", error_text, mentions)).await
         {
@@ -435,13 +465,7 @@ pub async fn process_turn_events(
         if let Err(e) = repository::update_session_status(db, thread_id, "error").await {
             tracing::warn!("Failed to update session status for thread {}: {}", thread_id, e);
         }
-        let mentions = {
-            let parts = turn_participants.lock().await;
-            parts.get(thread_id)
-                .filter(|set| !set.is_empty())
-                .map(|set| set.iter().map(|uid| format!("<@{}>", uid)).collect::<Vec<_>>().join(" "))
-                .unwrap_or_else(|| format!("<@{}>", owner_id))
-        };
+        let mentions = build_mentions(&session_states, thread_id, owner_id).await;
         if let Err(e) = channel_id.say(ctx, &format!("-# ❌ {} {}", lang.process_abnormal_exit(), mentions)).await {
             tracing::warn!(%channel_id, "Failed to send process exit notification: {}", e);
         }
@@ -460,14 +484,8 @@ pub async fn process_turn_events(
         let duration = formatter::format_duration(duration_ms);
         let cost = formatter::format_cost(total_cost_usd);
         let tokens = formatter::format_tokens(input_tokens, output_tokens);
-        let ctx_suffix = format_ctx_suffix(total_input_tokens, context_window);
-        let mentions = {
-            let parts = turn_participants.lock().await;
-            parts.get(thread_id)
-                .filter(|set| !set.is_empty())
-                .map(|set| set.iter().map(|uid| format!("<@{}>", uid)).collect::<Vec<_>>().join(" "))
-                .unwrap_or_else(|| format!("<@{}>", owner_id))
-        };
+        let ctx_suffix = format_ctx_suffix(total_input_tokens, context_window, show_context_percent);
+        let mentions = build_mentions(&session_states, thread_id, owner_id).await;
         let model_part = if turn_model.is_empty() { String::new() } else { format!("**{}**", turn_model) };
         let stats_line = format!("-# {} · {} · {} · {}{}", model_part, duration, cost, tokens, ctx_suffix);
         let tools_line = if used_tools.is_empty() {
@@ -488,7 +506,7 @@ pub async fn process_turn_events(
         }
         send_summary_with_buttons(
             ctx, channel_id, &summary, thread_id, &events,
-            &session_skills, &next_step_buttons,
+            &session_states,
         ).await;
 
         emoji::set_reaction(ctx, channel_id, msg_id, ReactionStatus::Done)
@@ -502,9 +520,8 @@ pub async fn process_turn_events(
 
     // 8. fast-complete path: 기존 format_response + send_response (한 메시지)
     if fast_complete {
-        // fast_complete path에서도 TodoWrite 처리
-        {
-            let mut tracker = todo_tracker.lock().await;
+        // fast_complete path TodoWrite 처리
+        if let Some(mut tracker) = try_acquire_todo_tracker(&session_states, thread_id, channel_id).await {
             for event in &events {
                 if let StreamEvent::Assistant { content, .. } = event {
                     for block in content {
@@ -517,6 +534,7 @@ pub async fn process_turn_events(
                 }
             }
             tracker.flush(ctx).await;
+            release_todo_tracker(&session_states, thread_id, tracker, ctx).await;
         }
 
         let (response, file_paths) = formatter::format_response(&events, lang);
@@ -542,8 +560,9 @@ pub async fn process_turn_events(
         // 완료 알림 (mention)
         if !is_interrupted {
             let mentions = {
-                let parts = turn_participants.lock().await;
-                parts.get(thread_id)
+                let guard = session_states.lock().await;
+                guard.get(thread_id)
+                    .map(|s| &s.turn_participants)
                     .filter(|set| !set.is_empty())
                     .map(|set| set.iter().map(|uid| format!("<@{}>", uid)).collect::<Vec<_>>().join(" "))
                     .unwrap_or_else(|| format!("<@{}>", owner_id))
@@ -563,13 +582,13 @@ pub async fn process_turn_events(
                 let duration = formatter::format_duration(duration_ms);
                 let cost = formatter::format_cost(total_cost_usd);
                 let tokens = formatter::format_tokens(input_tokens, output_tokens);
-                let ctx_suffix = format_ctx_suffix(total_input_tokens, context_window);
+                let ctx_suffix = format_ctx_suffix(total_input_tokens, context_window, show_context_percent);
                 let model_part = if turn_model.is_empty() { String::new() } else { format!("**{}**", turn_model) };
                 let stats_line = format!("-# {} · {} · {} · {}{}", model_part, duration, cost, tokens, ctx_suffix);
                 let fast_summary = format!("-# ✅ {}\n{}", mentions, stats_line);
                 send_summary_with_buttons(
                     ctx, channel_id, &fast_summary, thread_id, &events,
-                    &session_skills, &next_step_buttons,
+                    &session_states,
                 ).await;
             }
         }

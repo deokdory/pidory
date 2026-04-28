@@ -1,0 +1,10 @@
+Ok(
+    TaskNotification {
+        task_id: "bf2vp1kx2",
+        tool_use_id: "",
+        status: "failed",
+        summary: "Background command failed with exit code 1",
+        output_file: None,
+        session_id: "sess-xyz",
+    },
+)

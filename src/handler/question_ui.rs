@@ -218,6 +218,29 @@ pub fn resolve_option_label(input: &Value, question_index: usize, option_index: 
         .unwrap_or_else(|| option_index.to_string())
 }
 
+/// Resolves the question text at `question_index`. This text is used as the
+/// answer key in the `control_response.updatedInput.answers` map sent to
+/// Claude CLI — the CLI's AskUserQuestion tool looks up answers by the exact
+/// `question.question` string (Claude CLI ≥ 2.1.121).
+///
+/// Returns `""` when the question is missing/out-of-bounds/non-string. The
+/// fallback would otherwise be silent — log a warning so an upstream malformed
+/// payload (or a Claude CLI rendering change) is visible in journalctl.
+pub fn resolve_question_text(input: &Value, question_index: usize) -> String {
+    let question = extract_question_at(input, question_index);
+    match question.get("question").and_then(|v| v.as_str()) {
+        Some(s) => s.to_string(),
+        None => {
+            tracing::warn!(
+                "AskUserQuestion question text missing — falling back to empty key (question_index={}, has_questions={})",
+                question_index,
+                input.get("questions").is_some()
+            );
+            String::new()
+        }
+    }
+}
+
 /// Disables question components after an answer is selected.
 pub async fn disable_question_components(
     ctx: &Context,
@@ -360,6 +383,38 @@ mod tests {
         });
         assert_eq!(resolve_option_label(&input, 1, 0), "Y");
         assert_eq!(resolve_option_label(&input, 1, 1), "Z");
+    }
+
+    // ── resolve_question_text ───────────────────────────────────────────────
+
+    #[test]
+    fn resolve_question_text_single() {
+        let input = serde_json::json!({"questions": [{"question": "What's your favorite color?"}]});
+        assert_eq!(resolve_question_text(&input, 0), "What's your favorite color?");
+    }
+
+    #[test]
+    fn resolve_question_text_multi() {
+        let input = serde_json::json!({
+            "questions": [
+                {"question": "Q0?"},
+                {"question": "Q1?"}
+            ]
+        });
+        assert_eq!(resolve_question_text(&input, 0), "Q0?");
+        assert_eq!(resolve_question_text(&input, 1), "Q1?");
+    }
+
+    #[test]
+    fn resolve_question_text_out_of_bounds() {
+        let input = serde_json::json!({"questions": [{"question": "Q0?"}]});
+        assert_eq!(resolve_question_text(&input, 5), "");
+    }
+
+    #[test]
+    fn resolve_question_text_empty_input() {
+        let input = serde_json::json!({});
+        assert_eq!(resolve_question_text(&input, 0), "");
     }
 
     #[test]

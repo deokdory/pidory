@@ -9,6 +9,7 @@ use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::process::{ChildStdin, ChildStdout};
 use tokio::sync::{Mutex, mpsc};
 
+use crate::handler::session_state::SessionState;
 use crate::i18n::Lang;
 use crate::ratelimit::RateLimitInfo;
 use super::background::BackgroundTaskTracker;
@@ -51,7 +52,7 @@ pub(super) struct SessionWorker {
     is_turn_active: Arc<AtomicBool>,
     pending_recalls: Arc<tokio::sync::Mutex<HashMap<MessageId, (String, Arc<AtomicBool>)>>>,
     ratelimit_tx: tokio::sync::watch::Sender<RateLimitInfo>,
-    todo_trackers: Arc<tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<crate::handler::todo_tracker::TodoTracker>>>>>,
+    session_states: Arc<Mutex<HashMap<String, SessionState>>>,
     // Config/Context
     thread_id: String,
     channel_id: ChannelId,
@@ -59,6 +60,7 @@ pub(super) struct SessionWorker {
     db: sqlx::SqlitePool,
     timeout_secs: u64,
     lang: Lang,
+    show_context_percent: bool,
 }
 
 impl SessionWorker {
@@ -81,9 +83,10 @@ impl SessionWorker {
         timeout_secs: u64,
         lang: Lang,
         owner_id: u64,
+        show_context_percent: bool,
         pending_recalls: Arc<tokio::sync::Mutex<HashMap<MessageId, (String, Arc<AtomicBool>)>>>,
         ratelimit_tx: tokio::sync::watch::Sender<RateLimitInfo>,
-        todo_trackers: Arc<tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<crate::handler::todo_tracker::TodoTracker>>>>>,
+        session_states: Arc<Mutex<HashMap<String, SessionState>>>,
     ) -> Self {
         Self {
             stdin,
@@ -102,13 +105,14 @@ impl SessionWorker {
             is_turn_active,
             pending_recalls,
             ratelimit_tx,
-            todo_trackers,
+            session_states,
             thread_id,
             channel_id,
             ctx,
             db,
             timeout_secs,
             lang,
+            show_context_percent,
         }
     }
 
@@ -130,13 +134,14 @@ impl SessionWorker {
             ref is_turn_active,
             ref pending_recalls,
             ref ratelimit_tx,
-            ref todo_trackers,
+            ref session_states,
             ref thread_id,
             ref channel_id,
             ref ctx,
             ref db,
             timeout_secs,
             lang,
+            show_context_percent,
             ..
         } = self;
 
@@ -157,12 +162,13 @@ impl SessionWorker {
                 has_bg_tasks,
                 pending_recalls,
                 ratelimit_tx,
-                todo_trackers,
+                session_states,
                 thread_id,
                 channel_id,
                 ctx,
                 db,
                 lang,
+                show_context_percent,
                 &mut model_name,
             ).await;
 

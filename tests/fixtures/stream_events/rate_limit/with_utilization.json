@@ -1,0 +1,1 @@
+{"type":"rate_limit_event","session_id":"abc","rate_limit_info":{"status":"allowed_warning","resetsAt":1776042000,"rateLimitType":"seven_day","utilization":0.57,"isUsingOverage":false}}
