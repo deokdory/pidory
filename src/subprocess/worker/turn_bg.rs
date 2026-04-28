@@ -43,6 +43,7 @@ pub(super) async fn handle_bg_turn(
     ctx: &Context,
     db: &sqlx::SqlitePool,
     lang: Lang,
+    show_context_percent: bool,
     model_name: &mut String,
 ) {
     let mut used_tools: Vec<String> = Vec::new();
@@ -68,7 +69,7 @@ pub(super) async fn handle_bg_turn(
                                 let duration = formatter::format_duration(duration_ms);
                                 let cost = formatter::format_cost(total_cost_usd);
                                 let tokens = formatter::format_tokens(input_tokens, output_tokens);
-                                let ctx_suffix = format_ctx_suffix(total_input_tokens, context_window);
+                                let ctx_suffix = format_ctx_suffix(total_input_tokens, context_window, show_context_percent);
                                 let model_short = if model_name.is_empty() {
                                     String::new()
                                 } else {

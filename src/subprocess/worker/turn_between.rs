@@ -50,6 +50,7 @@ pub(super) async fn handle_between_turns_event(
     ctx: &Context,
     db: &sqlx::SqlitePool,
     lang: Lang,
+    show_context_percent: bool,
     model_name: &mut String,
 ) -> BetweenTurnsAction {
     line.clear();
@@ -118,6 +119,7 @@ pub(super) async fn handle_between_turns_event(
                                 ctx,
                                 db,
                                 lang,
+                                show_context_percent,
                                 model_name,
                             ).await;
 

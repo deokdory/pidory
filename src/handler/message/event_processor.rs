@@ -196,6 +196,7 @@ pub async fn process_turn_events(
     max_chunks: usize,
     lang: Lang,
     owner_id: u64,
+    show_context_percent: bool,
     session_states: Arc<tokio::sync::Mutex<HashMap<String, SessionState>>>,
 ) {
     // 0. 이전 턴의 next-step 버튼 비활성화
@@ -483,7 +484,7 @@ pub async fn process_turn_events(
         let duration = formatter::format_duration(duration_ms);
         let cost = formatter::format_cost(total_cost_usd);
         let tokens = formatter::format_tokens(input_tokens, output_tokens);
-        let ctx_suffix = format_ctx_suffix(total_input_tokens, context_window);
+        let ctx_suffix = format_ctx_suffix(total_input_tokens, context_window, show_context_percent);
         let mentions = build_mentions(&session_states, thread_id, owner_id).await;
         let model_part = if turn_model.is_empty() { String::new() } else { format!("**{}**", turn_model) };
         let stats_line = format!("-# {} · {} · {} · {}{}", model_part, duration, cost, tokens, ctx_suffix);
@@ -581,7 +582,7 @@ pub async fn process_turn_events(
                 let duration = formatter::format_duration(duration_ms);
                 let cost = formatter::format_cost(total_cost_usd);
                 let tokens = formatter::format_tokens(input_tokens, output_tokens);
-                let ctx_suffix = format_ctx_suffix(total_input_tokens, context_window);
+                let ctx_suffix = format_ctx_suffix(total_input_tokens, context_window, show_context_percent);
                 let model_part = if turn_model.is_empty() { String::new() } else { format!("**{}**", turn_model) };
                 let stats_line = format!("-# {} · {} · {} · {}{}", model_part, duration, cost, tokens, ctx_suffix);
                 let fast_summary = format!("-# ✅ {}\n{}", mentions, stats_line);
