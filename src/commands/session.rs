@@ -468,7 +468,6 @@ pub async fn kick(
     let db = data.db.clone();
     let config = Arc::clone(&data.config);
     let session_states = Arc::clone(&data.session_states);
-    let todo_trackers = Arc::clone(&data.todo_trackers);
     let dispatch_locks = Arc::clone(&data.dispatch_locks);
     let author_id = ctx.author().id;
     let mut ctx_rx = data.ctx_watch.subscribe();
@@ -574,15 +573,6 @@ pub async fn kick(
                     // process_turn_events는 턴 완료까지 await하므로 반드시 lock 밖에서 실행.
                     drop(_dispatch_guard);
 
-                    let todo_tracker = {
-                        let mut map = todo_trackers.lock().await;
-                        map.entry(thread_id.clone())
-                            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(
-                                crate::handler::todo_tracker::TodoTracker::new(channel_id)
-                            )))
-                            .clone()
-                    };
-
                     process_turn_events(
                         &serenity_ctx,
                         event_rx,
@@ -595,7 +585,6 @@ pub async fn kick(
                         config.language,
                         config.discord.owner_id,
                         session_states.clone(),
-                        todo_tracker.clone(),
                     )
                     .await;
 
