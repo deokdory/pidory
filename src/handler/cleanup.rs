@@ -31,10 +31,14 @@ pub async fn cleanup_session_state(data: &Data, thread_id: &str, ctx: &Context) 
         .lock()
         .await
         .retain(|_, r| r.thread_id != thread_id);
-    {
+    let tracker = {
         let mut guard = data.session_states.lock().await;
-        let was_archived = guard.get(thread_id).is_some_and(|s| s.archived);
-        if was_archived {
+        let (t, archived) = match guard.get_mut(thread_id) {
+            Some(state) => (state.take_present_todo_tracker(), state.archived),
+            None => (None, false),
+        };
+        // 단일 락 transaction에서 archived 결정 완료 — await 너머로 archived 스냅샷 안 보냄
+        if archived {
             guard.insert(
                 thread_id.to_string(),
                 crate::handler::session_state::SessionState {
@@ -45,12 +49,13 @@ pub async fn cleanup_session_state(data: &Data, thread_id: &str, ctx: &Context) 
         } else {
             guard.remove(thread_id);
         }
+        t
+    };
+    // 락 밖에서 cleanup
+    if let Some(mut t) = tracker {
+        t.cleanup(ctx).await;
     }
     data.dispatch_locks.remove(thread_id).await;
-    let tracker = data.todo_trackers.lock().await.remove(thread_id);
-    if let Some(tracker) = tracker {
-        tracker.lock().await.cleanup(ctx).await;
-    }
 
     // Leave the thread — the member list now signals session liveness
     if let Ok(id) = thread_id.parse::<u64>() {
@@ -94,10 +99,14 @@ pub async fn cleanup_session_state_from_handles(
         .lock()
         .await
         .retain(|_, r| r.thread_id != thread_id);
-    {
+    let tracker = {
         let mut guard = handles.session_states.lock().await;
-        let was_archived = guard.get(thread_id).is_some_and(|s| s.archived);
-        if was_archived {
+        let (t, archived) = match guard.get_mut(thread_id) {
+            Some(state) => (state.take_present_todo_tracker(), state.archived),
+            None => (None, false),
+        };
+        // 단일 락 transaction에서 archived 결정 완료 — await 너머로 archived 스냅샷 안 보냄
+        if archived {
             guard.insert(
                 thread_id.to_string(),
                 crate::handler::session_state::SessionState {
@@ -108,12 +117,13 @@ pub async fn cleanup_session_state_from_handles(
         } else {
             guard.remove(thread_id);
         }
+        t
+    };
+    // 락 밖에서 cleanup
+    if let Some(mut t) = tracker {
+        t.cleanup(ctx).await;
     }
     handles.dispatch_locks.remove(thread_id).await;
-    let tracker = handles.todo_trackers.lock().await.remove(thread_id);
-    if let Some(tracker) = tracker {
-        tracker.lock().await.cleanup(ctx).await;
-    }
 
     // Leave the thread — the member list now signals session liveness
     if let Ok(id) = thread_id.parse::<u64>() {
