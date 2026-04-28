@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use poise::serenity_prelude::{
@@ -186,6 +186,7 @@ pub async fn run_permission_handler(
                     response_tx: perm_req.response_tx,
                     input: perm_req.input.clone(),
                     answers: HashMap::new(),
+                    answered: HashSet::new(),
                     total: count,
                     thread_id: thread_id.clone(),
                     triggered_by,

@@ -43,10 +43,18 @@ pub struct PendingPermission {
 /// Tracks a multi-question AskUserQuestion group.
 /// Each sub-question gets its own PendingPermission keyed by `{request_id}__q{idx}`.
 /// When all answers are collected, the combined answer is sent via `response_tx`.
+///
+/// `answered` tracks which sub-question indices have been answered. We can't use
+/// `answers.len() == total` for completion because `answers` is keyed by question
+/// text (Claude CLI ≥ 2.1.121 looks up answers by `question.question`). If two
+/// questions share the same text — or `resolve_question_text` falls back to `""`
+/// — the second insert overwrites the first, and `len()` would never reach `total`.
+/// `answered` is keyed by sub-question index so it's collision-free. See PR #275.
 pub struct PendingQuestionGroup {
     pub response_tx: oneshot::Sender<PermissionDecision>,
     pub input: serde_json::Value,
     pub answers: HashMap<String, String>,
+    pub answered: HashSet<usize>,
     pub total: usize,
     pub thread_id: String,
     pub triggered_by: serenity::UserId,

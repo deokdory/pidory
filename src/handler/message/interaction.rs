@@ -2,6 +2,7 @@ use std::collections::HashMap;
 
 use poise::serenity_prelude::{Context, UserId};
 
+use crate::PendingQuestionGroup;
 use crate::Data;
 use crate::db::repository;
 use crate::error::PidoryError;
@@ -108,6 +109,12 @@ pub(super) async fn cancel_question(
 /// AskUserQuestion tool (≥ 2.1.121) looks up answers by the exact `question.question`
 /// string when rendering the tool result, so a mismatched key (`q_0`/`q_1`) yielded
 /// `"User has answered your questions:"` with no answers visible to the agent.
+///
+/// Completion is tracked via `group.answered` (a `HashSet<usize>` keyed by sub-question
+/// index), not `group.answers.len()`. The `answers` map is keyed by question text and
+/// would silently collide if Claude sent two questions with identical text — or if
+/// `resolve_question_text` fell back to `""` for malformed input — leaving the group
+/// stuck even after the user answered every question. See PR #275 follow-up.
 pub(super) async fn handle_question_answer(
     data: &Data,
     request_id: &str,
@@ -115,14 +122,14 @@ pub(super) async fn handle_question_answer(
     question_text: String,
     response_tx: tokio::sync::oneshot::Sender<PermissionDecision>,
 ) {
-    if let Some((group_id, _q_idx)) = question_ui::parse_sub_request_id(request_id) {
+    if let Some((group_id, q_idx)) = question_ui::parse_sub_request_id(request_id) {
         // Multi-question group member — store answer in group
         // The caller's response_tx is a dummy; drop it and use the group's instead.
         drop(response_tx);
         let mut groups = data.pending_question_groups.lock().await;
         if let Some(group) = groups.get_mut(&group_id) {
-            group.answers.insert(question_text, answer);
-            if group.answers.len() >= group.total {
+            let complete = record_group_answer(group, q_idx, question_text, answer);
+            if complete {
                 let group = groups.remove(&group_id).unwrap();
                 let _ = group
                     .response_tx
@@ -136,6 +143,31 @@ pub(super) async fn handle_question_answer(
         let answers = HashMap::from([(question_text, answer)]);
         let _ = response_tx.send(PermissionDecision::Answer(answers));
     }
+}
+
+/// Records a single sub-question answer in a multi-question group. Returns
+/// `true` when the group is complete (all sub-question indices answered).
+///
+/// Completion uses the index-keyed `answered` set, not `answers.len()`, because
+/// the `answers` map is keyed by question text — duplicate texts (or empty
+/// fallback keys from `resolve_question_text`) silently collapse, which would
+/// leave the group permanently un-complete if `len()` were the gate.
+pub(super) fn record_group_answer(
+    group: &mut PendingQuestionGroup,
+    q_idx: usize,
+    question_text: String,
+    answer: String,
+) -> bool {
+    if !question_text.is_empty() && group.answers.contains_key(&question_text) {
+        tracing::warn!(
+            "AskUserQuestion duplicate question text overwriting prior answer (q_idx={}, key={:?})",
+            q_idx,
+            question_text
+        );
+    }
+    group.answers.insert(question_text, answer);
+    group.answered.insert(q_idx);
+    group.answered.len() >= group.total
 }
 
 pub(super) async fn handle_interaction(
@@ -770,4 +802,74 @@ pub(super) async fn handle_modal_interaction(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use poise::serenity_prelude::UserId;
+    use std::collections::{HashMap, HashSet};
+    use tokio::sync::oneshot;
+
+    fn make_group(total: usize) -> PendingQuestionGroup {
+        let (tx, _rx) = oneshot::channel::<PermissionDecision>();
+        PendingQuestionGroup {
+            response_tx: tx,
+            input: serde_json::json!({}),
+            answers: HashMap::new(),
+            answered: HashSet::new(),
+            total,
+            thread_id: "thread".to_string(),
+            triggered_by: UserId::new(1),
+        }
+    }
+
+    #[test]
+    fn record_group_answer_completes_with_unique_texts() {
+        let mut g = make_group(2);
+        assert!(!record_group_answer(&mut g, 0, "Q0?".into(), "A".into()));
+        assert!(record_group_answer(&mut g, 1, "Q1?".into(), "B".into()));
+        assert_eq!(g.answers.len(), 2);
+        assert_eq!(g.answered.len(), 2);
+    }
+
+    /// Regression: prior to this fix, completion used `answers.len()`, so two
+    /// questions with identical text (LLM happens to phrase them the same)
+    /// would collide on insert and the group would never complete — the
+    /// Discord turn would hang until the user clicked Cancel or killed the
+    /// session. With `answered` (index-keyed) as the gate, completion fires
+    /// correctly even though the answers map collapsed to a single entry.
+    #[test]
+    fn record_group_answer_completes_even_with_duplicate_texts() {
+        let mut g = make_group(2);
+        assert!(!record_group_answer(&mut g, 0, "Same?".into(), "A".into()));
+        assert!(record_group_answer(&mut g, 1, "Same?".into(), "B".into()));
+        assert_eq!(g.answers.len(), 1, "duplicate text collapses to one entry (last write wins)");
+        assert_eq!(g.answered.len(), 2, "completion counter still accurate");
+    }
+
+    /// Regression: if `resolve_question_text` falls back to `""` for malformed
+    /// input (out-of-bounds index, missing `question` field), every sub-question
+    /// would share the empty key and collide. Same hang as the duplicate-text
+    /// case. Verify the `answered` set still tracks completion correctly.
+    #[test]
+    fn record_group_answer_completes_even_with_empty_fallback_keys() {
+        let mut g = make_group(3);
+        assert!(!record_group_answer(&mut g, 0, "".into(), "A".into()));
+        assert!(!record_group_answer(&mut g, 1, "".into(), "B".into()));
+        assert!(record_group_answer(&mut g, 2, "".into(), "C".into()));
+        assert_eq!(g.answers.len(), 1);
+        assert_eq!(g.answered.len(), 3);
+    }
+
+    #[test]
+    fn record_group_answer_idempotent_on_same_index() {
+        // Defensive: Discord disables the buttons after a click, but if two
+        // events for the same index somehow arrive, the index set should not
+        // double-count.
+        let mut g = make_group(2);
+        assert!(!record_group_answer(&mut g, 0, "Q?".into(), "A1".into()));
+        assert!(!record_group_answer(&mut g, 0, "Q?".into(), "A2".into()));
+        assert_eq!(g.answered.len(), 1);
+    }
 }
