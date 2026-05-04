@@ -1,13 +1,22 @@
 use std::collections::HashMap;
 
-use poise::serenity_prelude::{Context, UserId};
+use poise::serenity_prelude::{
+    Context, CreateInteractionResponse, CreateInteractionResponseMessage, UserId,
+};
 
 use crate::PendingQuestionGroup;
 use crate::Data;
+use crate::claude_settings::rule::{RuleKind, Scope, build_rule_text, default_scope, scope_to_path};
+use crate::claude_settings::{self, ClaudeSettingsError, MergeOutcome};
 use crate::db::repository;
 use crate::error::PidoryError;
-use crate::handler::message::interaction_kind::{CancelStage, InteractionKind, PermissionAction};
-use crate::handler::{cleanup::cleanup_session_state, permission_ui, question_ui, reset_ui};
+use crate::handler::discord_notifier::DiscordNotifier;
+use crate::handler::message::interaction_kind::{CancelStage, InteractionKind};
+use crate::handler::permission_ui::{
+    DisableReason, PermAction, build_permission_message_parts, disable_permission_buttons,
+    dismiss_pending_by_tool,
+};
+use crate::handler::{cleanup::cleanup_session_state, question_ui, reset_ui};
 use crate::i18n::Lang;
 use crate::subprocess::permission::PermissionDecision;
 
@@ -221,74 +230,348 @@ async fn handle_permission(
     component: &poise::serenity_prelude::ComponentInteraction,
     data: &Data,
     request_id: String,
-    action: PermissionAction,
+    perm_action: PermAction,
 ) -> Result<(), PidoryError> {
     let lang = data.config.language;
-    let (decision, action_str) = match action {
-        PermissionAction::Allow => (PermissionDecision::Allow, "allow"),
-        PermissionAction::Always => (PermissionDecision::AlwaysAllow, "always"),
-        PermissionAction::Deny => (PermissionDecision::Deny, "deny"),
-    };
-    let Some(_triggered_by) = verify_component_auth(component, ctx, data, &request_id, lang).await
+    let channel_id = component.channel_id;
+
+    // Auth check — must happen before defer to send ephemeral on failure.
+    let Some(_triggered_by) =
+        verify_component_auth(component, ctx, data, &request_id, lang).await
     else {
         return Ok(());
     };
-    tracing::info!(request_id = %request_id, action = %action_str, "permission button clicked");
+
+    // ScopeToggle 은 별도 분기로 처리. UpdateMessage 로 한 번에 메시지 갱신
+    // (Acknowledge + edit_message 2-call 보다 안전하고 race-free, review #297 w3).
+    if matches!(perm_action, PermAction::ScopeToggle) {
+        return handle_scope_toggle(ctx, component, data, &request_id, lang).await;
+    }
+
+    // serenity::Acknowledge = Discord type 6 (DEFERRED_UPDATE_MESSAGE) — component
+    // interaction 의 정석. 사용자에게 loading state 안 보이고 이후 edit_message
+    // 로 메시지 갱신.
     component
-        .create_response(
-            ctx,
-            poise::serenity_prelude::CreateInteractionResponse::UpdateMessage(
-                poise::serenity_prelude::CreateInteractionResponseMessage::new(),
-            ),
-        )
+        .create_response(ctx, CreateInteractionResponse::Acknowledge)
         .await
         .ok();
-    let pending = data.pending_permissions.lock().await.remove(&request_id);
-    if let Some(p) = pending {
-        let tool_name = p.tool_name.clone();
-        let thread_id = p.thread_id.clone();
-        let message_id = p.message_id;
-        let _ = p.response_tx.send(decision);
-        permission_ui::disable_permission_buttons(
-            ctx,
-            component.channel_id,
-            message_id,
-            action_str,
-            &tool_name,
-            lang,
-        )
-        .await
-        .ok();
-        if action_str == "always" {
-            let dismissed = permission_ui::dismiss_pending_by_tool(
-                &data.pending_permissions,
-                &thread_id,
-                &tool_name,
-                PermissionDecision::Allow,
-                &request_id,
-            )
-            .await;
-            for d in &dismissed {
-                permission_ui::disable_permission_buttons(
+
+    match perm_action {
+        PermAction::Once => {
+            let pending = data.pending_permissions.lock().await.remove(&request_id);
+            if let Some(p) = pending {
+                let tool_name = p.tool_name.clone();
+                let message_id = p.message_id;
+                tracing::info!(request_id = %request_id, action = "once", "permission button clicked");
+                let _ = p.response_tx.send(PermissionDecision::Allow);
+                let _ = disable_permission_buttons(
                     ctx,
-                    component.channel_id,
-                    d.message_id,
-                    "always",
+                    channel_id,
+                    message_id,
+                    DisableReason::Once,
                     &tool_name,
                     lang,
                 )
+                .await;
+            }
+        }
+
+        PermAction::Deny => {
+            let pending = data.pending_permissions.lock().await.remove(&request_id);
+            if let Some(p) = pending {
+                let tool_name = p.tool_name.clone();
+                let message_id = p.message_id;
+                tracing::info!(request_id = %request_id, action = "deny", "permission button clicked");
+                let _ = p.response_tx.send(PermissionDecision::Deny);
+                let _ = disable_permission_buttons(
+                    ctx,
+                    channel_id,
+                    message_id,
+                    DisableReason::Deny,
+                    &tool_name,
+                    lang,
+                )
+                .await;
+            }
+        }
+
+        PermAction::ScopeToggle => unreachable!("handled above"),
+
+        PermAction::AllowAlways(rule_kind) => {
+            handle_allow_always(ctx, component, data, &request_id, rule_kind, lang).await;
+        }
+    }
+
+    Ok(())
+}
+
+/// ScopeToggle: Project ↔ Global 전환. UpdateMessage 로 메시지 즉시 갱신
+/// (Acknowledge + edit_message 의 race / 2-call 회피, review #297 w3).
+async fn handle_scope_toggle(
+    ctx: &Context,
+    component: &poise::serenity_prelude::ComponentInteraction,
+    data: &Data,
+    request_id: &str,
+    lang: Lang,
+) -> Result<(), PidoryError> {
+    let update = {
+        let mut map = data.pending_permissions.lock().await;
+        let Some(entry) = map.get_mut(request_id) else {
+            // pending 이 없으면 ACK 만 (메시지 변경 안 함)
+            component
+                .create_response(ctx, CreateInteractionResponse::Acknowledge)
                 .await
                 .ok();
+            return Ok(());
+        };
+        let current = entry
+            .scope_override
+            .clone()
+            .unwrap_or_else(default_scope);
+        let new_scope = current.flip();
+        entry.scope_override = Some(new_scope.clone());
+        let tool = entry.tool_name.clone();
+        let input = entry.input.clone().unwrap_or(serde_json::json!({}));
+        let triggered_by = entry.triggered_by;
+        (new_scope, tool, input, triggered_by)
+    };
+    let (scope, tool, input, triggered_by) = update;
+    tracing::info!(request_id = %request_id, ?scope, "permission scope toggled");
+
+    let (content, components) = build_permission_message_parts(
+        &tool,
+        &input,
+        request_id,
+        None,
+        triggered_by,
+        scope,
+        lang,
+    );
+    let response = CreateInteractionResponse::UpdateMessage(
+        CreateInteractionResponseMessage::new()
+            .content(content)
+            .components(components),
+    );
+    if let Err(e) = component.create_response(ctx, response).await {
+        tracing::warn!(request_id = %request_id, error = %e, "scope toggle UpdateMessage 실패");
+    }
+    Ok(())
+}
+
+/// AllowAlways: rule 을 settings 에 저장하고 worker 에 결정 송신.
+///
+/// - rule_text 빌드 실패: 명시적 Deny 송신 (review #297 c2)
+/// - HOME 미설정 + Global scope: 명시적 Deny 송신 (review #297 w1)
+/// - project 미등록: 명시적 Deny 송신 (review #297 c2)
+/// - atomic editor 실패: 명시적 Deny 송신 — worker 가 RecvError 가 아닌 명시적 결정으로 처리 (review #297 c2)
+/// - dismiss 정책: `RuleKind::Tool` 일 때만 같은 tool 의 다른 pending 자동 dismiss
+///   (Exact/Prefix/Domain 은 본 request 만 처리 — 권한 누출 방지, review #297 c1)
+async fn handle_allow_always(
+    ctx: &Context,
+    component: &poise::serenity_prelude::ComponentInteraction,
+    data: &Data,
+    request_id: &str,
+    rule_kind: RuleKind,
+    lang: Lang,
+) {
+    let channel_id = component.channel_id;
+    let pending = data.pending_permissions.lock().await.remove(request_id);
+    let Some(pending) = pending else {
+        return;
+    };
+
+    let scope = pending.scope_override.clone().unwrap_or_else(default_scope);
+    let tool_name = pending.tool_name.clone();
+    let input = pending.input.clone().unwrap_or(serde_json::json!({}));
+    let thread_id = pending.thread_id.clone();
+    let message_id = pending.message_id;
+
+    tracing::info!(
+        request_id = %request_id,
+        tool_name = %tool_name,
+        ?rule_kind,
+        ?scope,
+        "permission AllowAlways clicked"
+    );
+
+    // Helper: 실패 시 명시적 Deny 송신 + UI disable (review #297 c2)
+    async fn fail_with(
+        ctx: &Context,
+        channel_id: poise::serenity_prelude::ChannelId,
+        message_id: poise::serenity_prelude::MessageId,
+        response_tx: tokio::sync::oneshot::Sender<PermissionDecision>,
+        tool_name: &str,
+        reason: DisableReason,
+        lang: Lang,
+        log_reason: &str,
+    ) {
+        tracing::warn!(tool_name = %tool_name, reason = log_reason, "AllowAlways failed; sending Deny");
+        let _ = response_tx.send(PermissionDecision::Deny);
+        let _ = disable_permission_buttons(ctx, channel_id, message_id, reason, tool_name, lang)
+            .await;
+    }
+
+    // 1. Build rule text
+    let rule_text = match build_rule_text(&tool_name, &input, rule_kind.clone()) {
+        Some(r) => r,
+        None => {
+            fail_with(
+                ctx,
+                channel_id,
+                message_id,
+                pending.response_tx,
+                &tool_name,
+                DisableReason::AllowAlwaysFailed {
+                    reason: "rule_kind mismatch".into(),
+                },
+                lang,
+                "rule_kind mismatch",
+            )
+            .await;
+            return;
+        }
+    };
+
+    // 2. Resolve project root
+    let channel_id_str = channel_id.to_string();
+    let project = match repository::get_project_by_channel(&data.db, &channel_id_str).await {
+        Ok(Some(p)) => p,
+        _ => {
+            fail_with(
+                ctx,
+                channel_id,
+                message_id,
+                pending.response_tx,
+                &tool_name,
+                DisableReason::AllowAlwaysFailed {
+                    reason: "project not registered".into(),
+                },
+                lang,
+                "project not registered",
+            )
+            .await;
+            return;
+        }
+    };
+    let project_root = std::path::PathBuf::from(&project.path);
+
+    // 3. Resolve HOME — Global scope 에서만 필요. 미설정 시 명시적 실패 (review #297 w1)
+    let home = match std::env::var("HOME") {
+        Ok(h) => std::path::PathBuf::from(h),
+        Err(_) if matches!(scope, Scope::Global) => {
+            fail_with(
+                ctx,
+                channel_id,
+                message_id,
+                pending.response_tx,
+                &tool_name,
+                DisableReason::AllowAlwaysFailed {
+                    reason: "HOME env not set; cannot resolve global settings".into(),
+                },
+                lang,
+                "HOME not set for Global scope",
+            )
+            .await;
+            return;
+        }
+        Err(_) => std::path::PathBuf::new(), // Project scope 에서는 사용 안 함
+    };
+    let settings_path = scope_to_path(scope.clone(), &project_root, &home);
+
+    // 4. Atomic editor
+    let notifier = DiscordNotifier {
+        ctx: ctx.clone(),
+        interaction: component.clone(),
+        lang,
+    };
+    let result = claude_settings::add_permission(&settings_path, &rule_text, &notifier).await;
+
+    let (success, disable_reason) = match result {
+        Ok(MergeOutcome::Added) => (
+            true,
+            DisableReason::AllowAlwaysSuccess {
+                rule_text: rule_text.clone(),
+            },
+        ),
+        Ok(MergeOutcome::AlreadyPresent) => (true, DisableReason::AllowAlwaysAlreadyPresent),
+        Ok(MergeOutcome::ConflictResolved) => (true, DisableReason::AllowAlwaysConflictResolved),
+        Err(ref e)
+            if matches!(
+                e,
+                ClaudeSettingsError::LockConflict { .. }
+                    | ClaudeSettingsError::LockTimeout { .. }
+            ) =>
+        {
+            (false, DisableReason::AllowAlwaysLockTimeout)
+        }
+        Err(e) => (
+            false,
+            DisableReason::AllowAlwaysFailed {
+                reason: format!("{}", e),
+            },
+        ),
+    };
+
+    if success {
+        let _ = pending.response_tx.send(PermissionDecision::AllowAlways {
+            rule_kind: rule_kind.clone(),
+            scope: scope.clone(),
+        });
+
+        // c1 fix: RuleKind::Tool 일 때만 같은 tool 의 다른 pending 자동 dismiss.
+        // Exact/Prefix/Domain 은 더 좁은 매칭이라 다른 명령까지 통과시키면 권한 누출.
+        if matches!(rule_kind, RuleKind::Tool) {
+            let dismissed = dismiss_pending_by_tool(
+                &data.pending_permissions,
+                &thread_id,
+                &tool_name,
+                PermissionDecision::AllowAlways {
+                    rule_kind: rule_kind.clone(),
+                    scope: scope.clone(),
+                },
+                request_id,
+            )
+            .await;
+            for d in &dismissed {
+                let _ = disable_permission_buttons(
+                    ctx,
+                    channel_id,
+                    d.message_id,
+                    DisableReason::AutoDismissedByAlwaysChain {
+                        triggering_rule: rule_text.clone(),
+                    },
+                    &tool_name,
+                    lang,
+                )
+                .await;
                 tracing::info!(
                     thread_id = %d.thread_id,
                     request_id = %d.request_id,
                     tool_name = %tool_name,
-                    "permission auto-dismissed by always_allow chain"
+                    triggering_rule = %rule_text,
+                    "permission auto-dismissed by AllowAlways(Tool) chain"
                 );
             }
         }
+    } else {
+        // c2 fix: 실패 시 명시적 Deny 송신. drop 시 RecvError 처리는 worker 측 우연에 의존 → 위험.
+        tracing::warn!(
+            request_id = %request_id,
+            tool_name = %tool_name,
+            "AllowAlways atomic editor failed; sending explicit Deny to worker"
+        );
+        let _ = pending.response_tx.send(PermissionDecision::Deny);
     }
-    Ok(())
+
+    let _ = disable_permission_buttons(
+        ctx,
+        channel_id,
+        message_id,
+        disable_reason,
+        &tool_name,
+        lang,
+    )
+    .await;
 }
 
 async fn handle_question_option(

@@ -10,6 +10,10 @@ use poise::serenity_prelude::{
 use tokio::sync::{Mutex, mpsc};
 use tracing::warn;
 
+use crate::claude_settings::danger::classify_command;
+use crate::claude_settings::rule::{
+    RuleKind, Scope, available_rule_kinds, build_rule_text, default_scope,
+};
 use crate::error::PidoryError;
 use crate::handler::formatter::inline_code;
 use crate::handler::question_ui;
@@ -17,39 +21,188 @@ use crate::i18n::Lang;
 use crate::subprocess::permission::{PermissionDecision, PermissionRequest};
 use crate::{PendingPermission, PendingQuestionGroup};
 
+/// Permission 버튼 클릭 결과로 취할 행동.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PermAction {
+    /// 이번 한 번만 허용
+    Once,
+    /// 거부
+    Deny,
+    /// Scope(global/project) 토글
+    ScopeToggle,
+    /// 영구 허용 (rule 저장) — 저장 방식은 RuleKind로 결정
+    AllowAlways(RuleKind),
+}
+
+/// `perm:{request_id}:{tail}` 형식의 custom_id를 파싱한다.
+///
+/// - `perm:` 접두사 없으면 `None`
+/// - `request_id`에 `:` 포함 가능 — suffix strip 방식으로 tail 만 분리
+/// - 알 수 없는 tail → `None`
+///
+/// Legacy 토큰 (`:allow`, `:always`) 도 backward-compat 으로 인식한다 (review #297 w4):
+///   - `:allow`  → `PermAction::Once` (이전 Allow = 한 번만 허용)
+///   - `:always` → `PermAction::AllowAlways(RuleKind::Tool)` (이전 Always = tool 전체 허용)
+pub fn parse_permission_custom_id(custom_id: &str) -> Option<(String, PermAction)> {
+    let rest = custom_id.strip_prefix("perm:")?;
+    // tail suffix longest-first matching
+    let (request_id, action) = if let Some(rid) = rest.strip_suffix(":scope:toggle") {
+        (rid, PermAction::ScopeToggle)
+    } else if let Some(rid) = rest.strip_suffix(":always:exact") {
+        (rid, PermAction::AllowAlways(RuleKind::Exact))
+    } else if let Some(rid) = rest.strip_suffix(":always:prefix") {
+        (rid, PermAction::AllowAlways(RuleKind::Prefix))
+    } else if let Some(rid) = rest.strip_suffix(":always:domain") {
+        (rid, PermAction::AllowAlways(RuleKind::Domain))
+    } else if let Some(rid) = rest.strip_suffix(":always:tool") {
+        (rid, PermAction::AllowAlways(RuleKind::Tool))
+    } else if let Some(rid) = rest.strip_suffix(":once") {
+        (rid, PermAction::Once)
+    } else if let Some(rid) = rest.strip_suffix(":deny") {
+        (rid, PermAction::Deny)
+    } else if let Some(rid) = rest.strip_suffix(":allow") {
+        // Legacy: 이전 버전의 "Allow" 버튼 = 한 번만 허용
+        (rid, PermAction::Once)
+    } else if let Some(rid) = rest.strip_suffix(":always") {
+        // Legacy: 이전 버전의 "Always Allow" 버튼 = tool 전체 허용
+        (rid, PermAction::AllowAlways(RuleKind::Tool))
+    } else {
+        return None;
+    };
+
+    if request_id.is_empty() {
+        return None;
+    }
+
+    Some((request_id.to_string(), action))
+}
+
+/// Internal helper: builds `(content, components)` for a permission message.
+/// Used by both `create_permission_message` and `ScopeToggle` edit path.
+pub fn build_permission_message_parts(
+    tool_name: &str,
+    input: &serde_json::Value,
+    request_id: &str,
+    decision_reason: Option<&str>,
+    triggered_by: UserId,
+    scope: Scope,
+    lang: Lang,
+) -> (String, Vec<CreateActionRow>) {
+    let summary = format_tool_input_summary(tool_name, input);
+    let reason = decision_reason
+        .map(|r| format!("\n> {}", r))
+        .unwrap_or_default();
+
+    // 헤더 scope 표시
+    let scope_label = match &scope {
+        Scope::Project => "📁 project".to_string(),
+        Scope::Global => "🌐 global  ⚠️ 모든 프로젝트에 적용됨".to_string(),
+    };
+    let header = format!(
+        "🔒 <@{}>  {}  ·  scope: {}",
+        triggered_by,
+        inline_code(tool_name),
+        scope_label,
+    );
+
+    // 미리보기: available_rule_kinds → build_rule_text 각 줄
+    let kinds = available_rule_kinds(tool_name, input);
+    let preview_lines: Vec<String> = kinds
+        .iter()
+        .filter_map(|kind| {
+            build_rule_text(tool_name, input, kind.clone()).map(|rule_text| {
+                // classify_command 호출 — skeleton (P1.5에서 활용), 현재 시각 변경 없음
+                let _severity = classify_command(&rule_text);
+                let prefix = match kind {
+                    RuleKind::Exact => "🔓 이 명령만",
+                    RuleKind::Prefix => "🔓⚙ 같은 prefix",
+                    RuleKind::Domain => "🔓⚙ 같은 도메인",
+                    RuleKind::Tool => "🔓⚠ 도구 전체",
+                };
+                format!("{} → {}", prefix, inline_code(&rule_text))
+            })
+        })
+        .collect();
+
+    let preview_section = if preview_lines.is_empty() {
+        String::new()
+    } else {
+        format!("\n\n영속 옵션:\n{}", preview_lines.join("\n"))
+    };
+
+    let content = format!(
+        "{}\n{}{}{}",
+        header, summary, reason, preview_section
+    );
+
+    // Row 1: once + deny (항상 2 버튼)
+    let once_btn = CreateButton::new(format!("perm:{}:once", request_id))
+        .label(lang.btn_once())
+        .style(ButtonStyle::Success)
+        .emoji('✅');
+    let deny_btn = CreateButton::new(format!("perm:{}:deny", request_id))
+        .label(lang.btn_deny())
+        .style(ButtonStyle::Danger)
+        .emoji('❌');
+    let row1 = CreateActionRow::Buttons(vec![once_btn, deny_btn]);
+
+    // Row 2: available_rule_kinds → 각 RuleKind 1 버튼
+    let row2_buttons: Vec<CreateButton> = kinds
+        .iter()
+        .map(|kind| match kind {
+            RuleKind::Exact => CreateButton::new(format!("perm:{}:always:exact", request_id))
+                .label(lang.btn_always_exact())
+                .style(ButtonStyle::Primary)
+                .emoji('🔓'),
+            RuleKind::Prefix => CreateButton::new(format!("perm:{}:always:prefix", request_id))
+                .label(lang.btn_always_prefix())
+                .style(ButtonStyle::Secondary)
+                .emoji('🔓'),
+            RuleKind::Domain => CreateButton::new(format!("perm:{}:always:domain", request_id))
+                .label(lang.btn_always_domain())
+                .style(ButtonStyle::Secondary)
+                .emoji('🔓'),
+            // Tool 전체 허용은 매우 위험 — Danger style 로 시각적 경고 (review #297 s3)
+            RuleKind::Tool => CreateButton::new(format!("perm:{}:always:tool", request_id))
+                .label(lang.btn_always_tool())
+                .style(ButtonStyle::Danger)
+                .emoji('⚠'),
+        })
+        .collect();
+    let row2 = CreateActionRow::Buttons(row2_buttons);
+
+    // Row 3: scope toggle (1 버튼)
+    let (scope_btn_label, scope_btn_style) = match &scope {
+        Scope::Project => (lang.btn_scope_global_off(), ButtonStyle::Secondary),
+        Scope::Global => (lang.btn_scope_global_on(), ButtonStyle::Primary),
+    };
+    let scope_btn = CreateButton::new(format!("perm:{}:scope:toggle", request_id))
+        .label(scope_btn_label)
+        .style(scope_btn_style);
+    let row3 = CreateActionRow::Buttons(vec![scope_btn]);
+
+    (content, vec![row1, row2, row3])
+}
+
 pub fn create_permission_message(
     tool_name: &str,
     input: &serde_json::Value,
     request_id: &str,
     decision_reason: Option<&str>,
     triggered_by: UserId,
+    scope: Scope,
     lang: Lang,
 ) -> CreateMessage {
-    let summary = format_tool_input_summary(tool_name, input);
-    let reason = decision_reason
-        .map(|r| format!("\n> {}", r))
-        .unwrap_or_default();
-    let content = format!(
-        "<@{}> 🔒 {} {}\n{}{}",
-        triggered_by, inline_code(tool_name), lang.permission_request_label(), summary, reason
+    let (content, components) = build_permission_message_parts(
+        tool_name,
+        input,
+        request_id,
+        decision_reason,
+        triggered_by,
+        scope,
+        lang,
     );
-
-    let allow_btn = CreateButton::new(format!("perm:{}:allow", request_id))
-        .label(lang.btn_allow())
-        .style(ButtonStyle::Success)
-        .emoji('✅');
-    let always_btn = CreateButton::new(format!("perm:{}:always", request_id))
-        .label(lang.btn_always_allow())
-        .style(ButtonStyle::Success)
-        .emoji('🔓');
-    let deny_btn = CreateButton::new(format!("perm:{}:deny", request_id))
-        .label(lang.btn_deny())
-        .style(ButtonStyle::Danger)
-        .emoji('❌');
-
-    let row = CreateActionRow::Buttons(vec![allow_btn, always_btn, deny_btn]);
-
-    CreateMessage::new().content(content).components(vec![row])
+    CreateMessage::new().content(content).components(components)
 }
 
 pub fn format_tool_input_summary(tool_name: &str, input: &serde_json::Value) -> String {
@@ -109,20 +262,70 @@ pub fn format_tool_input_summary(tool_name: &str, input: &serde_json::Value) -> 
     }
 }
 
+/// `disable_permission_buttons` 에 전달되는 결과 이유.
+#[derive(Debug)]
+pub enum DisableReason {
+    /// 이번 한 번만 허용됨
+    Once,
+    /// 거부됨
+    Deny,
+    /// Always Allow 성공 — rule이 새로 추가됨 (MergeOutcome::Added)
+    AllowAlwaysSuccess { rule_text: String },
+    /// Already present — 동일 rule이 이미 존재함 (MergeOutcome::AlreadyPresent)
+    AllowAlwaysAlreadyPresent,
+    /// Conflict resolved — 충돌 규칙이 자동 해소됨 (MergeOutcome::ConflictResolved)
+    AllowAlwaysConflictResolved,
+    /// Lock timeout — 파일 잠금 대기 초과 (ClaudeSettingsError::LockTimeout 등)
+    AllowAlwaysLockTimeout,
+    /// 그 외 atomic editor 실패
+    AllowAlwaysFailed { reason: String },
+    /// 같은 tool 의 다른 pending 이 AlwaysAllow 처리되어 자동 취소됨 (review #297 s1)
+    AutoDismissedByAlwaysChain { triggering_rule: String },
+}
+
 pub async fn disable_permission_buttons(
     ctx: &Context,
     channel_id: ChannelId,
     message_id: MessageId,
-    chosen_action: &str,
+    reason: DisableReason,
     tool_name: &str,
     lang: Lang,
 ) -> Result<(), PidoryError> {
-    let label = match chosen_action {
-        "allow" => format!("-# ✅ {}", lang.perm_allowed(tool_name)),
-        "always" => format!("-# 🔓 {}", lang.perm_always_allowed(tool_name)),
-        "deny" => format!("-# ❌ {}", lang.perm_denied(tool_name)),
-        _ => format!("-# {} — {}", inline_code(tool_name), chosen_action),
+    let label = match reason {
+        DisableReason::Once => match lang {
+            Lang::Ko => "-# ✅ 한 번만 허용됨".to_string(),
+            Lang::En => "-# ✅ Allowed once".to_string(),
+        },
+        DisableReason::Deny => match lang {
+            Lang::Ko => "-# ❌ 거부됨".to_string(),
+            Lang::En => "-# ❌ Denied".to_string(),
+        },
+        DisableReason::AllowAlwaysSuccess { rule_text } => {
+            format!("-# {}", lang.msg_save_success(&rule_text))
+        }
+        DisableReason::AllowAlwaysAlreadyPresent => match lang {
+            Lang::Ko => "-# 🔓 이미 등록됨".to_string(),
+            Lang::En => "-# 🔓 Already present".to_string(),
+        },
+        DisableReason::AllowAlwaysConflictResolved => match lang {
+            Lang::Ko => "-# 🔓 충돌 자동 해소됨".to_string(),
+            Lang::En => "-# 🔓 Conflict resolved".to_string(),
+        },
+        DisableReason::AllowAlwaysLockTimeout => {
+            format!("-# {}", lang.msg_save_failed_lock_timeout())
+        }
+        DisableReason::AllowAlwaysFailed { reason } => match lang {
+            Lang::Ko => format!("-# ⚠️ 권한 저장 실패: {}", reason),
+            Lang::En => format!("-# ⚠️ Permission save failed: {}", reason),
+        },
+        DisableReason::AutoDismissedByAlwaysChain { triggering_rule } => match lang {
+            Lang::Ko => format!("-# 🔓 `{}` 등록으로 자동 취소됨", triggering_rule),
+            Lang::En => format!("-# 🔓 Auto-dismissed by `{}`", triggering_rule),
+        },
     };
+
+    // tool_name은 라벨에 미포함이지만 향후 로깅 등에 활용 가능
+    let _ = tool_name;
 
     let edit = EditMessage::new().content(label).components(vec![]);
 
@@ -168,6 +371,7 @@ pub async fn run_permission_handler(
                             thread_id: thread_id.clone(),
                             triggered_by,
                             input: Some(perm_req.input),
+                            scope_override: None,
                         };
                         pending_permissions
                             .lock()
@@ -219,6 +423,7 @@ pub async fn run_permission_handler(
                                 thread_id: thread_id.clone(),
                                 triggered_by,
                                 input: Some(perm_req.input.clone()),
+                                scope_override: None,
                             };
                             pending_permissions.lock().await.insert(sub_id, pending);
                         }
@@ -252,6 +457,7 @@ pub async fn run_permission_handler(
             &perm_req.request_id,
             perm_req.decision_reason.as_deref(),
             triggered_by,
+            default_scope(), // P1.3 (#288) 에서 DB user_settings 조회로 교체
             lang,
         );
 
@@ -266,7 +472,8 @@ pub async fn run_permission_handler(
                     message_id: sent.id,
                     thread_id: thread_id.clone(),
                     triggered_by,
-                    input: None,
+                    input: Some(perm_req.input),
+                    scope_override: None,
                 };
                 pending_permissions
                     .lock()
@@ -334,6 +541,69 @@ pub(crate) async fn dismiss_pending_by_tool(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::claude_settings::rule::RuleKind;
+
+    // ── parse_permission_custom_id ────────────────────────────────────────────
+
+    #[test]
+    fn parse_perm_once() {
+        let result = parse_permission_custom_id("perm:abc-123:once");
+        assert_eq!(result, Some(("abc-123".to_string(), PermAction::Once)));
+    }
+
+    #[test]
+    fn parse_perm_deny() {
+        let result = parse_permission_custom_id("perm:abc-123:deny");
+        assert_eq!(result, Some(("abc-123".to_string(), PermAction::Deny)));
+    }
+
+    #[test]
+    fn parse_perm_scope_toggle() {
+        let result = parse_permission_custom_id("perm:abc-123:scope:toggle");
+        assert_eq!(result, Some(("abc-123".to_string(), PermAction::ScopeToggle)));
+    }
+
+    #[test]
+    fn parse_perm_always_exact() {
+        let result = parse_permission_custom_id("perm:abc-123:always:exact");
+        assert_eq!(
+            result,
+            Some(("abc-123".to_string(), PermAction::AllowAlways(RuleKind::Exact)))
+        );
+    }
+
+    #[test]
+    fn parse_perm_always_tool() {
+        let result = parse_permission_custom_id("perm:abc-123:always:tool");
+        assert_eq!(
+            result,
+            Some(("abc-123".to_string(), PermAction::AllowAlways(RuleKind::Tool)))
+        );
+    }
+
+    #[test]
+    fn parse_perm_rid_with_colon_always_prefix() {
+        // rid에 ':' 포함 — suffix strip 방식으로 정확히 보존해야 한다
+        let result = parse_permission_custom_id("perm:rid-with:colon:always:prefix");
+        assert_eq!(
+            result,
+            Some(("rid-with:colon".to_string(), PermAction::AllowAlways(RuleKind::Prefix)))
+        );
+    }
+
+    #[test]
+    fn parse_perm_invalid_tail_returns_none() {
+        let result = parse_permission_custom_id("perm:abc:invalid");
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn parse_perm_wrong_prefix_returns_none() {
+        let result = parse_permission_custom_id("not-perm:abc:once");
+        assert_eq!(result, None);
+    }
+
+    // ── format_tool_input_summary ─────────────────────────────────────────────
 
     #[test]
     fn format_bash_summary() {
@@ -458,6 +728,7 @@ mod tests {
             thread_id: thread_id.to_string(),
             triggered_by: UserId::new(99999),
             input: None,
+            scope_override: None,
         };
         (pending, rx)
     }
@@ -594,7 +865,10 @@ mod tests {
             &map,
             "thread-test",
             "WebFetch",
-            PermissionDecision::AlwaysAllow,
+            PermissionDecision::AllowAlways {
+                rule_kind: crate::claude_settings::rule::RuleKind::Exact,
+                scope: crate::claude_settings::rule::Scope::Project,
+            },
             "nonexistent",
         )
         .await;
@@ -602,7 +876,7 @@ mod tests {
         assert_eq!(dismissed.len(), 1);
 
         let decision = rx1.await.expect("response_tx must have fired");
-        assert_eq!(decision, PermissionDecision::AlwaysAllow);
+        assert!(matches!(decision, PermissionDecision::AllowAlways { .. }));
     }
 
     /// Cross-session dismiss 방지: 다른 thread_id 의 pending 은 같은 tool_name 이어도 건드리지 않는다.
@@ -692,5 +966,167 @@ mod tests {
 
         // Pending map remains empty since no messages were processed.
         assert!(pending.lock().await.is_empty());
+    }
+
+    // ── create_permission_message: 3 ActionRow 구조 검증 ─────────────────────
+    //
+    // serenity CreateMessage/CreateButton 필드는 private → serde_json::to_value로
+    // 직렬화 후 JSON 구조로 검증한다.
+
+    fn msg_to_json(msg: CreateMessage) -> serde_json::Value {
+        serde_json::to_value(msg).expect("CreateMessage must be serializable")
+    }
+
+    fn get_rows(v: &serde_json::Value) -> &serde_json::Value {
+        v.get("components").expect("components field must exist")
+    }
+
+    fn row_buttons(rows: &serde_json::Value, idx: usize) -> &serde_json::Value {
+        rows.as_array()
+            .expect("components must be array")[idx]
+            .get("components")
+            .expect("row must have components")
+    }
+
+    fn btn_custom_id(buttons: &serde_json::Value, idx: usize) -> &str {
+        buttons.as_array()
+            .expect("buttons must be array")[idx]
+            .get("custom_id")
+            .and_then(|v| v.as_str())
+            .expect("button must have custom_id")
+    }
+
+    fn btn_style(buttons: &serde_json::Value, idx: usize) -> u64 {
+        buttons.as_array()
+            .expect("buttons must be array")[idx]
+            .get("style")
+            .and_then(|v| v.as_u64())
+            .expect("button must have style")
+    }
+
+    /// Bash + Project scope → Row1=2버튼, Row2=3버튼(Exact/Prefix/Tool), Row3=1버튼
+    #[test]
+    fn create_permission_message_bash_project_three_rows() {
+        let input = serde_json::json!({"command": "npm test"});
+        let msg = create_permission_message(
+            "Bash",
+            &input,
+            "rid-001",
+            None,
+            UserId::new(12345),
+            Scope::Project,
+            Lang::Ko,
+        );
+        let v = msg_to_json(msg);
+        let rows = get_rows(&v);
+        assert_eq!(rows.as_array().unwrap().len(), 3, "Bash+Project → 3 ActionRow");
+
+        // Row 1: once + deny = 2 버튼
+        let row1 = row_buttons(rows, 0);
+        assert_eq!(row1.as_array().unwrap().len(), 2, "Row1: once + deny");
+        assert!(btn_custom_id(row1, 0).ends_with(":once"), "Row1[0] = once");
+        assert!(btn_custom_id(row1, 1).ends_with(":deny"), "Row1[1] = deny");
+
+        // Row 2: Exact + Prefix + Tool = 3 버튼
+        let row2 = row_buttons(rows, 1);
+        assert_eq!(row2.as_array().unwrap().len(), 3, "Row2: Exact+Prefix+Tool for Bash");
+        assert!(btn_custom_id(row2, 0).ends_with(":always:exact"), "Row2[0] = always:exact");
+        assert!(btn_custom_id(row2, 1).ends_with(":always:prefix"), "Row2[1] = always:prefix");
+        assert!(btn_custom_id(row2, 2).ends_with(":always:tool"), "Row2[2] = always:tool");
+
+        // Row 3: scope toggle = 1 버튼
+        let row3 = row_buttons(rows, 2);
+        assert_eq!(row3.as_array().unwrap().len(), 1, "Row3: scope toggle");
+        assert!(btn_custom_id(row3, 0).ends_with(":scope:toggle"), "Row3[0] = scope:toggle");
+    }
+
+    /// WebFetch + Project scope (정상 URL) → Row2=2버튼(Domain, Tool)
+    #[test]
+    fn create_permission_message_webfetch_project_two_always_buttons() {
+        let input = serde_json::json!({"url": "https://api.example.com/v1"});
+        let msg = create_permission_message(
+            "WebFetch",
+            &input,
+            "rid-002",
+            None,
+            UserId::new(12345),
+            Scope::Project,
+            Lang::Ko,
+        );
+        let v = msg_to_json(msg);
+        let rows = get_rows(&v);
+        assert_eq!(rows.as_array().unwrap().len(), 3, "WebFetch+Project → 3 ActionRow");
+
+        let row2 = row_buttons(rows, 1);
+        assert_eq!(row2.as_array().unwrap().len(), 2, "Row2: Domain+Tool for WebFetch with hostname");
+        assert!(btn_custom_id(row2, 0).ends_with(":always:domain"), "Row2[0] = always:domain");
+        assert!(btn_custom_id(row2, 1).ends_with(":always:tool"), "Row2[1] = always:tool");
+    }
+
+    /// Grep + Project scope → Row2=1버튼(Tool)
+    #[test]
+    fn create_permission_message_grep_project_one_always_button() {
+        let input = serde_json::json!({"pattern": "fn main"});
+        let msg = create_permission_message(
+            "Grep",
+            &input,
+            "rid-003",
+            None,
+            UserId::new(12345),
+            Scope::Project,
+            Lang::Ko,
+        );
+        let v = msg_to_json(msg);
+        let rows = get_rows(&v);
+        assert_eq!(rows.as_array().unwrap().len(), 3, "Grep+Project → 3 ActionRow");
+
+        let row2 = row_buttons(rows, 1);
+        assert_eq!(row2.as_array().unwrap().len(), 1, "Row2: Tool only for Grep");
+        assert!(btn_custom_id(row2, 0).ends_with(":always:tool"), "Row2[0] = always:tool");
+    }
+
+    /// Bash + Global scope → 헤더에 "🌐 global" + "⚠️" 포함, Row3 버튼 Primary(style=1)
+    #[test]
+    fn create_permission_message_bash_global_header_contains_global_warning() {
+        let input = serde_json::json!({"command": "npm install"});
+        let msg = create_permission_message(
+            "Bash",
+            &input,
+            "rid-004",
+            None,
+            UserId::new(99999),
+            Scope::Global,
+            Lang::Ko,
+        );
+        let v = msg_to_json(msg);
+        let content = v.get("content").and_then(|v| v.as_str()).unwrap_or("");
+        assert!(content.contains("🌐 global"), "헤더에 🌐 global 포함");
+        assert!(content.contains("⚠️"), "헤더에 ⚠️ 포함");
+        assert!(content.contains("모든 프로젝트에 적용됨"), "경고 문구 포함");
+
+        // Row 3 scope 버튼은 Primary(style=1) — Global on
+        let rows = get_rows(&v);
+        let row3 = row_buttons(rows, 2);
+        // Discord: Primary=1, Secondary=2, Success=3, Danger=4
+        assert_eq!(btn_style(row3, 0), 1, "Global scope → Primary(1) 버튼");
+    }
+
+    /// Project scope → Row 3 버튼 Secondary(style=2)
+    #[test]
+    fn create_permission_message_project_scope_button_secondary() {
+        let input = serde_json::json!({"command": "ls"});
+        let msg = create_permission_message(
+            "Bash",
+            &input,
+            "rid-005",
+            None,
+            UserId::new(12345),
+            Scope::Project,
+            Lang::Ko,
+        );
+        let v = msg_to_json(msg);
+        let rows = get_rows(&v);
+        let row3 = row_buttons(rows, 2);
+        assert_eq!(btn_style(row3, 0), 2, "Project scope → Secondary(2) 버튼");
     }
 }
