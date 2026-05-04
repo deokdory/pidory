@@ -96,12 +96,20 @@ impl Lang {
         }
     }
 
+    /// scope 토글 버튼 — 현재 Project (클릭 시 Global 전환)
     pub fn btn_scope_global_off(&self) -> &'static str {
-        "🌐 global ⊘"
+        match self {
+            Lang::Ko => "→ 전역",
+            Lang::En => "→ Global",
+        }
     }
 
+    /// scope 토글 버튼 — 현재 Global (클릭 시 Project 전환)
     pub fn btn_scope_global_on(&self) -> &'static str {
-        "🌐 global ✓"
+        match self {
+            Lang::Ko => "→ 프로젝트",
+            Lang::En => "→ Project",
+        }
     }
 
     pub fn msg_save_success(&self, rule: &str) -> String {
