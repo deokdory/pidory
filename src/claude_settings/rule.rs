@@ -45,6 +45,11 @@ impl Scope {
     }
 }
 
+/// AlwaysAllow 의 default scope. P1.3 (#288) 에서 DB user_settings 조회로 교체.
+pub fn default_scope() -> Scope {
+    Scope::Project
+}
+
 /// Scope와 경로 정보로 settings 파일 절대 경로를 반환한다.
 ///
 /// - `Scope::Project` → `{project_root}/.claude/settings.local.json`
@@ -57,6 +62,9 @@ pub fn scope_to_path(scope: Scope, project_root: &Path, home: &Path) -> PathBuf 
 }
 
 /// 주어진 tool + input에 대해 선택 가능한 RuleKind 목록을 반환한다.
+///
+/// Unknown tool 은 `Tool` 만 반환한다 — input schema 를 모르므로 Exact 의 첫
+/// string 필드 fallback 은 비결정적이라 위험하다 (review #297 s2 fix).
 pub fn available_rule_kinds(tool: &str, input: &serde_json::Value) -> Vec<RuleKind> {
     match tool {
         "Bash" => {
@@ -76,12 +84,20 @@ pub fn available_rule_kinds(tool: &str, input: &serde_json::Value) -> Vec<RuleKi
         }
         "Read" | "Edit" | "Write" => vec![RuleKind::Exact, RuleKind::Tool],
         "Grep" | "Glob" => vec![RuleKind::Tool],
-        _ => vec![RuleKind::Exact, RuleKind::Tool],
+        _ => vec![RuleKind::Tool],
     }
 }
 
 /// 주어진 tool + input + kind로 settings.json에 삽입할 rule 문자열을 생성한다.
+///
+/// `RuleKind::Tool` 은 항상 `<Tool>(*)` canonical form 으로 직렬화한다 — bare
+/// tool name (e.g. `"Bash"`) 은 Claude permission spec 에 정의되어 있지 않다
+/// (review #297 w2 fix, memory: reference_claude_permission_rule_syntax).
 pub fn build_rule_text(tool: &str, input: &serde_json::Value, kind: RuleKind) -> Option<String> {
+    // RuleKind::Tool: 항상 <Tool>(*) canonical form
+    if matches!(kind, RuleKind::Tool) {
+        return Some(format!("{}(*)", tool));
+    }
     match (tool, kind) {
         ("Bash", RuleKind::Exact) => {
             let cmd = input.get("command").and_then(|v| v.as_str()).unwrap_or("");
@@ -96,7 +112,6 @@ pub fn build_rule_text(tool: &str, input: &serde_json::Value, kind: RuleKind) ->
             let first_token = cmd.split_whitespace().next()?;
             Some(format!("Bash({} *)", first_token))
         }
-        ("Bash", RuleKind::Tool) => Some("Bash".to_string()),
         ("WebFetch", RuleKind::Domain) => {
             let url = input.get("url").and_then(|v| v.as_str()).unwrap_or("");
             let host = parse_host(url)?;
@@ -106,8 +121,7 @@ pub fn build_rule_text(tool: &str, input: &serde_json::Value, kind: RuleKind) ->
                 Some(format!("WebFetch(domain:{})", host))
             }
         }
-        ("WebFetch", RuleKind::Tool) => Some("WebFetch".to_string()),
-        // WebFetch는 Domain과 Tool만 지원 — Exact/Prefix는 mismatch
+        // WebFetch 는 Domain 만 지원 (Tool 은 위에서 처리)
         ("WebFetch", _) => None,
         ("Read", RuleKind::Exact) => {
             let file_path = input.get("file_path").and_then(|v| v.as_str()).unwrap_or("");
@@ -117,7 +131,6 @@ pub fn build_rule_text(tool: &str, input: &serde_json::Value, kind: RuleKind) ->
                 Some(format!("Read({})", file_path))
             }
         }
-        ("Read", RuleKind::Tool) => Some("Read".to_string()),
         ("Edit", RuleKind::Exact) => {
             let file_path = input.get("file_path").and_then(|v| v.as_str()).unwrap_or("");
             if file_path.is_empty() {
@@ -126,7 +139,6 @@ pub fn build_rule_text(tool: &str, input: &serde_json::Value, kind: RuleKind) ->
                 Some(format!("Edit({})", file_path))
             }
         }
-        ("Edit", RuleKind::Tool) => Some("Edit".to_string()),
         ("Write", RuleKind::Exact) => {
             let file_path = input.get("file_path").and_then(|v| v.as_str()).unwrap_or("");
             if file_path.is_empty() {
@@ -135,25 +147,7 @@ pub fn build_rule_text(tool: &str, input: &serde_json::Value, kind: RuleKind) ->
                 Some(format!("Write({})", file_path))
             }
         }
-        ("Write", RuleKind::Tool) => Some("Write".to_string()),
-        ("Grep", RuleKind::Tool) => Some("Grep".to_string()),
-        ("Glob", RuleKind::Tool) => Some("Glob".to_string()),
-        (tool, RuleKind::Exact) => {
-            // 기타 tool: input의 첫 string 필드 값을 사용
-            let first_val = input
-                .as_object()
-                .and_then(|obj| {
-                    obj.values()
-                        .find_map(|v| v.as_str())
-                })
-                .unwrap_or("");
-            if first_val.is_empty() {
-                None
-            } else {
-                Some(format!("{}({})", tool, first_val))
-            }
-        }
-        (tool, RuleKind::Tool) => Some(tool.to_string()),
+        // Unknown tool: Exact 비활성화 (input schema 를 모르므로 비결정적)
         _ => None,
     }
 }
@@ -250,8 +244,14 @@ mod tests {
 
     #[test]
     fn available_kinds_unknown_tool() {
+        // Unknown tool: input schema 모르므로 Tool 만 (review #297 s2 fix)
         let kinds = available_rule_kinds("Unknown", &json!({}));
-        assert_eq!(kinds, vec![RuleKind::Exact, RuleKind::Tool]);
+        assert_eq!(kinds, vec![RuleKind::Tool]);
+    }
+
+    #[test]
+    fn default_scope_is_project() {
+        assert_eq!(default_scope(), Scope::Project);
     }
 
     // build_rule_text 테스트
@@ -270,8 +270,9 @@ mod tests {
 
     #[test]
     fn build_bash_tool() {
+        // Tool 은 항상 <Tool>(*) canonical form (review #297 w2 fix)
         let result = build_rule_text("Bash", &json!({}), RuleKind::Tool);
-        assert_eq!(result, Some("Bash".to_string()));
+        assert_eq!(result, Some("Bash(*)".to_string()));
     }
 
     #[test]
@@ -283,7 +284,7 @@ mod tests {
     #[test]
     fn build_webfetch_tool() {
         let result = build_rule_text("WebFetch", &json!({}), RuleKind::Tool);
-        assert_eq!(result, Some("WebFetch".to_string()));
+        assert_eq!(result, Some("WebFetch(*)".to_string()));
     }
 
     #[test]
@@ -295,7 +296,21 @@ mod tests {
     #[test]
     fn build_grep_tool() {
         let result = build_rule_text("Grep", &json!({}), RuleKind::Tool);
-        assert_eq!(result, Some("Grep".to_string()));
+        assert_eq!(result, Some("Grep(*)".to_string()));
+    }
+
+    #[test]
+    fn build_unknown_tool_exact_returns_none() {
+        // Unknown tool: Exact 비활성화 (review #297 s2 fix)
+        let result = build_rule_text("MyTool", &json!({"x": "y"}), RuleKind::Exact);
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn build_unknown_tool_tool_form() {
+        // Unknown tool 도 Tool 은 항상 가능
+        let result = build_rule_text("MyTool", &json!({}), RuleKind::Tool);
+        assert_eq!(result, Some("MyTool(*)".to_string()));
     }
 
     #[test]

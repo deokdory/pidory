@@ -11,7 +11,9 @@ use tokio::sync::{Mutex, mpsc};
 use tracing::warn;
 
 use crate::claude_settings::danger::classify_command;
-use crate::claude_settings::rule::{RuleKind, Scope, available_rule_kinds, build_rule_text};
+use crate::claude_settings::rule::{
+    RuleKind, Scope, available_rule_kinds, build_rule_text, default_scope,
+};
 use crate::error::PidoryError;
 use crate::handler::formatter::inline_code;
 use crate::handler::question_ui;
@@ -35,15 +37,15 @@ pub enum PermAction {
 /// `perm:{request_id}:{tail}` 형식의 custom_id를 파싱한다.
 ///
 /// - `perm:` 접두사 없으면 `None`
-/// - `request_id`에 `:` 포함 가능 — `splitn(2, ':')` 으로 tail만 분리
+/// - `request_id`에 `:` 포함 가능 — suffix strip 방식으로 tail 만 분리
 /// - 알 수 없는 tail → `None`
+///
+/// Legacy 토큰 (`:allow`, `:always`) 도 backward-compat 으로 인식한다 (review #297 w4):
+///   - `:allow`  → `PermAction::Once` (이전 Allow = 한 번만 허용)
+///   - `:always` → `PermAction::AllowAlways(RuleKind::Tool)` (이전 Always = tool 전체 허용)
 pub fn parse_permission_custom_id(custom_id: &str) -> Option<(String, PermAction)> {
     let rest = custom_id.strip_prefix("perm:")?;
-    // splitn(2, ':') on rest → ["rid_possibly_with_colons_and_everything_before_last_sep", "tail"]
-    // 하지만 rid가 ':'를 포함할 수 있으므로 tail을 고정 길이로 매칭해야 한다.
-    // 전략: 알려진 tail suffix를 앞에서부터 매칭.
-    // tail 패턴 (longest first):
-    //   "scope:toggle", "always:exact", "always:prefix", "always:domain", "always:tool", "once", "deny"
+    // tail suffix longest-first matching
     let (request_id, action) = if let Some(rid) = rest.strip_suffix(":scope:toggle") {
         (rid, PermAction::ScopeToggle)
     } else if let Some(rid) = rest.strip_suffix(":always:exact") {
@@ -58,6 +60,12 @@ pub fn parse_permission_custom_id(custom_id: &str) -> Option<(String, PermAction
         (rid, PermAction::Once)
     } else if let Some(rid) = rest.strip_suffix(":deny") {
         (rid, PermAction::Deny)
+    } else if let Some(rid) = rest.strip_suffix(":allow") {
+        // Legacy: 이전 버전의 "Allow" 버튼 = 한 번만 허용
+        (rid, PermAction::Once)
+    } else if let Some(rid) = rest.strip_suffix(":always") {
+        // Legacy: 이전 버전의 "Always Allow" 버튼 = tool 전체 허용
+        (rid, PermAction::AllowAlways(RuleKind::Tool))
     } else {
         return None;
     };
@@ -154,9 +162,10 @@ pub fn build_permission_message_parts(
                 .label(lang.btn_always_domain())
                 .style(ButtonStyle::Secondary)
                 .emoji('🔓'),
+            // Tool 전체 허용은 매우 위험 — Danger style 로 시각적 경고 (review #297 s3)
             RuleKind::Tool => CreateButton::new(format!("perm:{}:always:tool", request_id))
                 .label(lang.btn_always_tool())
-                .style(ButtonStyle::Secondary)
+                .style(ButtonStyle::Danger)
                 .emoji('⚠'),
         })
         .collect();
@@ -253,7 +262,7 @@ pub fn format_tool_input_summary(tool_name: &str, input: &serde_json::Value) -> 
     }
 }
 
-/// `disable_permission_buttons` 에 전달되는 결과 이유 — 7 case.
+/// `disable_permission_buttons` 에 전달되는 결과 이유.
 #[derive(Debug)]
 pub enum DisableReason {
     /// 이번 한 번만 허용됨
@@ -270,6 +279,8 @@ pub enum DisableReason {
     AllowAlwaysLockTimeout,
     /// 그 외 atomic editor 실패
     AllowAlwaysFailed { reason: String },
+    /// 같은 tool 의 다른 pending 이 AlwaysAllow 처리되어 자동 취소됨 (review #297 s1)
+    AutoDismissedByAlwaysChain { triggering_rule: String },
 }
 
 pub async fn disable_permission_buttons(
@@ -306,6 +317,10 @@ pub async fn disable_permission_buttons(
         DisableReason::AllowAlwaysFailed { reason } => match lang {
             Lang::Ko => format!("-# ⚠️ 권한 저장 실패: {}", reason),
             Lang::En => format!("-# ⚠️ Permission save failed: {}", reason),
+        },
+        DisableReason::AutoDismissedByAlwaysChain { triggering_rule } => match lang {
+            Lang::Ko => format!("-# 🔓 `{}` 등록으로 자동 취소됨", triggering_rule),
+            Lang::En => format!("-# 🔓 Auto-dismissed by `{}`", triggering_rule),
         },
     };
 
@@ -442,7 +457,7 @@ pub async fn run_permission_handler(
             &perm_req.request_id,
             perm_req.decision_reason.as_deref(),
             triggered_by,
-            Scope::Project, // P1.3 미구현 — 현재 하드코딩
+            default_scope(), // P1.3 (#288) 에서 DB user_settings 조회로 교체
             lang,
         );
 

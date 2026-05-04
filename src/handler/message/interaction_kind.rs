@@ -1,3 +1,4 @@
+use crate::handler::permission_ui::{PermAction, parse_permission_custom_id};
 use crate::handler::reset_ui::ResetAction;
 
 /// Discriminated union of every button/select custom_id format the bot produces.
@@ -19,7 +20,7 @@ use crate::handler::reset_ui::ResetAction;
 pub(crate) enum InteractionKind {
     Permission {
         request_id: String,
-        action: PermissionAction,
+        action: PermAction,
     },
     QuestionOption {
         request_id: String,
@@ -45,14 +46,6 @@ pub(crate) enum InteractionKind {
     },
 }
 
-/// Button action for permission prompts (`perm:<rid>:<action>`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum PermissionAction {
-    Allow,
-    Always,
-    Deny,
-}
-
 /// Which stage of the cancel confirmation flow a button belongs to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CancelStage {
@@ -71,35 +64,11 @@ impl InteractionKind {
     /// invalid field values (e.g. non-numeric index, unknown action token).
     pub(crate) fn from_custom_id(s: &str) -> Option<Self> {
         // Order is load-bearing — see module-level comment.
-        if let Some(rest) = s.strip_prefix("perm:") {
-            // The full custom_id format is re-parsed in handle_permission via
-            // parse_permission_custom_id (which handles all 6 PermAction variants
-            // including multi-segment tails like "always:exact", "scope:toggle").
-            // Here we only need to validate the prefix and route to handle_permission.
-            //
-            // Known tail tokens (last colon-segment):
-            //   Legacy: "allow", "always", "deny"
-            //   New: "once", "deny", "toggle" (scope:toggle), "exact"/"prefix"/"domain"/"tool" (always:*)
-            let (request_id, action_str) = rest.rsplit_once(':')?;
-            if request_id.is_empty() {
-                return None;
-            }
-            // Map known tail tokens to a sentinel PermissionAction for routing.
-            // handle_permission ignores this and re-parses the full custom_id.
-            let action = match action_str {
-                "allow" => PermissionAction::Allow,
-                "always" => PermissionAction::Always,
-                "deny" => PermissionAction::Deny,
-                // New tails routed as Allow (sentinel); handle_permission re-parses.
-                "once" | "toggle" | "exact" | "prefix" | "domain" | "tool" => {
-                    PermissionAction::Allow
-                }
-                _ => return None,
-            };
-            Some(Self::Permission {
-                request_id: request_id.to_string(),
-                action,
-            })
+        if s.starts_with("perm:") {
+            // Single source of truth: parse_permission_custom_id (review #297 w4).
+            // 모든 PermAction variant + legacy "allow"/"always" 인식.
+            let (request_id, action) = parse_permission_custom_id(s)?;
+            Some(Self::Permission { request_id, action })
         } else if let Some(rest) = s.strip_prefix("ask_cancel_confirm:") {
             Some(Self::QuestionCancel {
                 request_id: rest.to_string(),
@@ -170,25 +139,25 @@ mod tests {
     // ── Permission ──────────────────────────────────────────────────────────
 
     #[test]
-    fn parse_permission_allow() {
+    fn parse_permission_legacy_allow_routes_to_once() {
         let result = InteractionKind::from_custom_id("perm:abc:allow");
         assert_eq!(
             result,
             Some(InteractionKind::Permission {
                 request_id: "abc".to_string(),
-                action: PermissionAction::Allow,
+                action: PermAction::Once,
             })
         );
     }
 
     #[test]
-    fn parse_permission_always() {
+    fn parse_permission_legacy_always_routes_to_always_tool() {
         let result = InteractionKind::from_custom_id("perm:abc:always");
         assert_eq!(
             result,
             Some(InteractionKind::Permission {
                 request_id: "abc".to_string(),
-                action: PermissionAction::Always,
+                action: PermAction::AllowAlways(crate::claude_settings::rule::RuleKind::Tool),
             })
         );
     }
@@ -200,7 +169,43 @@ mod tests {
             result,
             Some(InteractionKind::Permission {
                 request_id: "abc".to_string(),
-                action: PermissionAction::Deny,
+                action: PermAction::Deny,
+            })
+        );
+    }
+
+    #[test]
+    fn parse_permission_once() {
+        let result = InteractionKind::from_custom_id("perm:abc:once");
+        assert_eq!(
+            result,
+            Some(InteractionKind::Permission {
+                request_id: "abc".to_string(),
+                action: PermAction::Once,
+            })
+        );
+    }
+
+    #[test]
+    fn parse_permission_always_exact() {
+        let result = InteractionKind::from_custom_id("perm:abc:always:exact");
+        assert_eq!(
+            result,
+            Some(InteractionKind::Permission {
+                request_id: "abc".to_string(),
+                action: PermAction::AllowAlways(crate::claude_settings::rule::RuleKind::Exact),
+            })
+        );
+    }
+
+    #[test]
+    fn parse_permission_scope_toggle() {
+        let result = InteractionKind::from_custom_id("perm:abc:scope:toggle");
+        assert_eq!(
+            result,
+            Some(InteractionKind::Permission {
+                request_id: "abc".to_string(),
+                action: PermAction::ScopeToggle,
             })
         );
     }
