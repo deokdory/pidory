@@ -1,13 +1,20 @@
 use std::collections::HashMap;
 
-use poise::serenity_prelude::{Context, UserId};
+use poise::serenity_prelude::{Context, EditMessage, UserId};
 
 use crate::PendingQuestionGroup;
 use crate::Data;
+use crate::claude_settings::{self, ClaudeSettingsError, MergeOutcome};
+use crate::claude_settings::rule::{Scope, build_rule_text, scope_to_path};
 use crate::db::repository;
 use crate::error::PidoryError;
+use crate::handler::discord_notifier::DiscordNotifier;
 use crate::handler::message::interaction_kind::{CancelStage, InteractionKind, PermissionAction};
-use crate::handler::{cleanup::cleanup_session_state, permission_ui, question_ui, reset_ui};
+use crate::handler::permission_ui::{
+    DisableReason, PermAction, build_permission_message_parts, disable_permission_buttons,
+    dismiss_pending_by_tool, parse_permission_custom_id,
+};
+use crate::handler::{cleanup::cleanup_session_state, question_ui, reset_ui};
 use crate::i18n::Lang;
 use crate::subprocess::permission::PermissionDecision;
 
@@ -191,8 +198,8 @@ pub(super) async fn handle_interaction(
     let kind = InteractionKind::from_custom_id(&component.data.custom_id);
 
     match kind {
-        Some(InteractionKind::Permission { request_id, action }) => {
-            handle_permission(ctx, component, data, request_id, action).await
+        Some(InteractionKind::Permission { request_id: _, action }) => {
+            handle_permission(ctx, component, data, action).await
         }
         Some(InteractionKind::QuestionOption { request_id, index }) => {
             handle_question_option(ctx, component, data, request_id, index).await
@@ -216,78 +223,273 @@ pub(super) async fn handle_interaction(
     }
 }
 
+/// Returns the default scope for AlwaysAllow operations.
+/// P1.3 (#288) 에서 DB user_settings 테이블 조회로 교체
+fn default_scope() -> Scope {
+    Scope::Project
+}
+
 async fn handle_permission(
     ctx: &Context,
     component: &poise::serenity_prelude::ComponentInteraction,
     data: &Data,
-    request_id: String,
-    action: PermissionAction,
+    _legacy_action: PermissionAction,
 ) -> Result<(), PidoryError> {
     let lang = data.config.language;
-    let (decision, action_str) = match action {
-        PermissionAction::Allow => (PermissionDecision::Allow, "allow"),
-        PermissionAction::Always => (PermissionDecision::AlwaysAllow, "always"),
-        PermissionAction::Deny => (PermissionDecision::Deny, "deny"),
-    };
-    let Some(_triggered_by) = verify_component_auth(component, ctx, data, &request_id, lang).await
+    let channel_id = component.channel_id;
+
+    // Re-parse with the full PermAction parser (handles all 6 variants including
+    // always:exact, always:prefix, scope:toggle, etc.).
+    let Some((request_id, perm_action)) =
+        parse_permission_custom_id(&component.data.custom_id)
     else {
         return Ok(());
     };
-    tracing::info!(request_id = %request_id, action = %action_str, "permission button clicked");
+
+    // Auth check — must happen before defer to send ephemeral on failure.
+    let Some(_triggered_by) =
+        verify_component_auth(component, ctx, data, &request_id, lang).await
+    else {
+        return Ok(());
+    };
+
+    // Defer immediately (3 s Discord timeout). Followups have 15 min window.
     component
         .create_response(
             ctx,
-            poise::serenity_prelude::CreateInteractionResponse::UpdateMessage(
-                poise::serenity_prelude::CreateInteractionResponseMessage::new(),
-            ),
+            poise::serenity_prelude::CreateInteractionResponse::Acknowledge,
         )
         .await
         .ok();
-    let pending = data.pending_permissions.lock().await.remove(&request_id);
-    if let Some(p) = pending {
-        let tool_name = p.tool_name.clone();
-        let thread_id = p.thread_id.clone();
-        let message_id = p.message_id;
-        let _ = p.response_tx.send(decision);
-        permission_ui::disable_permission_buttons(
-            ctx,
-            component.channel_id,
-            message_id,
-            action_str,
-            &tool_name,
-            lang,
-        )
-        .await
-        .ok();
-        if action_str == "always" {
-            let dismissed = permission_ui::dismiss_pending_by_tool(
-                &data.pending_permissions,
-                &thread_id,
-                &tool_name,
-                PermissionDecision::Allow,
-                &request_id,
-            )
-            .await;
-            for d in &dismissed {
-                permission_ui::disable_permission_buttons(
+
+    match perm_action {
+        PermAction::Once => {
+            let pending = data.pending_permissions.lock().await.remove(&request_id);
+            if let Some(p) = pending {
+                let tool_name = p.tool_name.clone();
+                let message_id = p.message_id;
+                tracing::info!(request_id = %request_id, action = "once", "permission button clicked");
+                let _ = p.response_tx.send(PermissionDecision::Allow);
+                let _ = disable_permission_buttons(
                     ctx,
-                    component.channel_id,
-                    d.message_id,
-                    "always",
+                    channel_id,
+                    message_id,
+                    DisableReason::Once,
                     &tool_name,
                     lang,
                 )
-                .await
-                .ok();
-                tracing::info!(
-                    thread_id = %d.thread_id,
-                    request_id = %d.request_id,
-                    tool_name = %tool_name,
-                    "permission auto-dismissed by always_allow chain"
-                );
+                .await;
             }
         }
+
+        PermAction::Deny => {
+            let pending = data.pending_permissions.lock().await.remove(&request_id);
+            if let Some(p) = pending {
+                let tool_name = p.tool_name.clone();
+                let message_id = p.message_id;
+                tracing::info!(request_id = %request_id, action = "deny", "permission button clicked");
+                let _ = p.response_tx.send(PermissionDecision::Deny);
+                let _ = disable_permission_buttons(
+                    ctx,
+                    channel_id,
+                    message_id,
+                    DisableReason::Deny,
+                    &tool_name,
+                    lang,
+                )
+                .await;
+            }
+        }
+
+        PermAction::ScopeToggle => {
+            // Mutate scope_override in-place — do NOT remove from map.
+            let update = {
+                let mut map = data.pending_permissions.lock().await;
+                let Some(entry) = map.get_mut(&request_id) else {
+                    return Ok(());
+                };
+                let current = entry
+                    .scope_override
+                    .clone()
+                    .unwrap_or_else(default_scope);
+                let new_scope = current.flip();
+                entry.scope_override = Some(new_scope.clone());
+                let tool = entry.tool_name.clone();
+                let input = entry.input.clone().unwrap_or(serde_json::json!({}));
+                let triggered_by = entry.triggered_by;
+                let message_id = entry.message_id;
+                (new_scope, tool, input, triggered_by, message_id)
+            };
+            let (scope, tool, input, triggered_by, message_id) = update;
+            tracing::info!(request_id = %request_id, ?scope, "permission scope toggled");
+            let (content, components) = build_permission_message_parts(
+                &tool,
+                &input,
+                &request_id,
+                None,
+                triggered_by,
+                scope,
+                lang,
+            );
+            let edit = EditMessage::new().content(content).components(components);
+            let _ = channel_id.edit_message(ctx, message_id, edit).await;
+        }
+
+        PermAction::AllowAlways(rule_kind) => {
+            let pending = data.pending_permissions.lock().await.remove(&request_id);
+            let Some(pending) = pending else {
+                return Ok(());
+            };
+
+            let scope = pending.scope_override.clone().unwrap_or_else(default_scope);
+            let tool_name = pending.tool_name.clone();
+            let input = pending.input.clone().unwrap_or(serde_json::json!({}));
+            let thread_id = pending.thread_id.clone();
+            let message_id = pending.message_id;
+
+            tracing::info!(
+                request_id = %request_id,
+                tool_name = %tool_name,
+                ?rule_kind,
+                ?scope,
+                "permission AlwaysAllow clicked"
+            );
+
+            // Build rule text
+            let rule_text = match build_rule_text(&tool_name, &input, rule_kind.clone()) {
+                Some(r) => r,
+                None => {
+                    tracing::warn!(
+                        request_id = %request_id,
+                        tool_name = %tool_name,
+                        "rule_kind mismatch — no rule text produced"
+                    );
+                    let _ = disable_permission_buttons(
+                        ctx,
+                        channel_id,
+                        message_id,
+                        DisableReason::AllowAlwaysFailed {
+                            reason: "rule_kind mismatch".into(),
+                        },
+                        &tool_name,
+                        lang,
+                    )
+                    .await;
+                    return Ok(());
+                }
+            };
+
+            // Resolve settings file path from scope + project root
+            let channel_id_str = channel_id.to_string();
+            let project = match repository::get_project_by_channel(&data.db, &channel_id_str).await
+            {
+                Ok(Some(p)) => p,
+                _ => {
+                    let _ = disable_permission_buttons(
+                        ctx,
+                        channel_id,
+                        message_id,
+                        DisableReason::AllowAlwaysFailed {
+                            reason: "project not registered".into(),
+                        },
+                        &tool_name,
+                        lang,
+                    )
+                    .await;
+                    return Ok(());
+                }
+            };
+            let project_root = std::path::PathBuf::from(&project.path);
+            let home = std::env::var("HOME")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|_| std::path::PathBuf::from("/tmp"));
+            let settings_path = scope_to_path(scope.clone(), &project_root, &home);
+
+            // Call atomic editor with Discord conflict notifier
+            let notifier = DiscordNotifier {
+                ctx: ctx.clone(),
+                interaction: component.clone(),
+                lang,
+            };
+            let result = claude_settings::add_permission(&settings_path, &rule_text, &notifier).await;
+
+            let disable_reason = match result {
+                Ok(MergeOutcome::Added) => DisableReason::AllowAlwaysSuccess {
+                    rule_text: rule_text.clone(),
+                },
+                Ok(MergeOutcome::AlreadyPresent) => DisableReason::AllowAlwaysAlreadyPresent,
+                Ok(MergeOutcome::ConflictResolved) => DisableReason::AllowAlwaysConflictResolved,
+                Err(ref e)
+                    if matches!(
+                        e,
+                        ClaudeSettingsError::LockConflict { .. }
+                            | ClaudeSettingsError::LockTimeout { .. }
+                    ) =>
+                {
+                    DisableReason::AllowAlwaysLockTimeout
+                }
+                Err(e) => DisableReason::AllowAlwaysFailed {
+                    reason: format!("{}", e),
+                },
+            };
+
+            // Send decision to worker only on success; on failure leave worker to timeout.
+            let success = matches!(
+                disable_reason,
+                DisableReason::AllowAlwaysSuccess { .. }
+                    | DisableReason::AllowAlwaysAlreadyPresent
+                    | DisableReason::AllowAlwaysConflictResolved
+            );
+            if success {
+                let _ = pending.response_tx.send(PermissionDecision::AllowAlways {
+                    rule_kind: rule_kind.clone(),
+                    scope: scope.clone(),
+                });
+                // Dismiss other pending requests for the same tool in this thread
+                let dismissed = dismiss_pending_by_tool(
+                    &data.pending_permissions,
+                    &thread_id,
+                    &tool_name,
+                    PermissionDecision::AllowAlways {
+                        rule_kind: rule_kind.clone(),
+                        scope: scope.clone(),
+                    },
+                    &request_id,
+                )
+                .await;
+                for d in &dismissed {
+                    let _ = disable_permission_buttons(
+                        ctx,
+                        channel_id,
+                        d.message_id,
+                        DisableReason::AllowAlwaysAlreadyPresent,
+                        &tool_name,
+                        lang,
+                    )
+                    .await;
+                    tracing::info!(
+                        thread_id = %d.thread_id,
+                        request_id = %d.request_id,
+                        tool_name = %tool_name,
+                        "permission auto-dismissed by always_allow chain"
+                    );
+                }
+            }
+            // Note: on failure, pending.response_tx is dropped here.
+            // Worker will timeout and handle accordingly.
+
+            let _ = disable_permission_buttons(
+                ctx,
+                channel_id,
+                message_id,
+                disable_reason,
+                &tool_name,
+                lang,
+            )
+            .await;
+        }
     }
+
     Ok(())
 }
 

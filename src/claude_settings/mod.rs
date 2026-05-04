@@ -31,6 +31,8 @@ mod lock;
 mod cleanup;
 mod notifier;
 mod editor;
+pub mod rule;
+pub mod danger;
 
 #[allow(unused_imports)]
 pub use error::ClaudeSettingsError;
@@ -41,3 +43,7 @@ pub use notifier::{ConflictEvent, ConflictNotifier, LoggingNotifier, MergeOutcom
 #[allow(unused_imports)]
 pub use cleanup::cleanup_leftover_temp;
 // RMW core (apply_mutation)는 pub(crate)만 — P1.4 진입 시 승격 (Plan Must NOT Have)
+#[allow(unused_imports)]
+pub use rule::{RuleKind, Scope, scope_to_path, available_rule_kinds, build_rule_text};
+#[allow(unused_imports)]
+pub use danger::{Severity, classify_command};

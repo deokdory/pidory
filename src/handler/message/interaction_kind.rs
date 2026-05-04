@@ -72,14 +72,28 @@ impl InteractionKind {
     pub(crate) fn from_custom_id(s: &str) -> Option<Self> {
         // Order is load-bearing — see module-level comment.
         if let Some(rest) = s.strip_prefix("perm:") {
+            // The full custom_id format is re-parsed in handle_permission via
+            // parse_permission_custom_id (which handles all 6 PermAction variants
+            // including multi-segment tails like "always:exact", "scope:toggle").
+            // Here we only need to validate the prefix and route to handle_permission.
+            //
+            // Known tail tokens (last colon-segment):
+            //   Legacy: "allow", "always", "deny"
+            //   New: "once", "deny", "toggle" (scope:toggle), "exact"/"prefix"/"domain"/"tool" (always:*)
             let (request_id, action_str) = rest.rsplit_once(':')?;
             if request_id.is_empty() {
                 return None;
             }
+            // Map known tail tokens to a sentinel PermissionAction for routing.
+            // handle_permission ignores this and re-parses the full custom_id.
             let action = match action_str {
                 "allow" => PermissionAction::Allow,
                 "always" => PermissionAction::Always,
                 "deny" => PermissionAction::Deny,
+                // New tails routed as Allow (sentinel); handle_permission re-parses.
+                "once" | "toggle" | "exact" | "prefix" | "domain" | "tool" => {
+                    PermissionAction::Allow
+                }
                 _ => return None,
             };
             Some(Self::Permission {
