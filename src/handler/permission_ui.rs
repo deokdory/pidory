@@ -21,6 +21,12 @@ use crate::i18n::Lang;
 use crate::subprocess::permission::{PermissionDecision, PermissionRequest};
 use crate::{PendingPermission, PendingQuestionGroup};
 
+/// Disabled "항상 허용" 레이블 버튼의 custom_id.
+///
+/// Discord 는 disabled 버튼 클릭 시 interaction 을 발사하지 않지만, 방어적으로
+/// `parse_permission_custom_id` 가 이 ID 를 인식하지 않도록 강제한다 (test: `parse_perm_label_returns_none`).
+pub const LABEL_BUTTON_CUSTOM_ID: &str = "perm:_label";
+
 /// Permission 버튼 클릭 결과로 취할 행동.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PermAction {
@@ -127,11 +133,11 @@ pub fn build_permission_message_parts(
     let preview_section = if preview_lines.is_empty() {
         String::new()
     } else {
-        let header_text = match lang {
-            Lang::Ko => "항상 허용 옵션:",
-            Lang::En => "Always allow options:",
-        };
-        format!("\n\n{}\n{}", header_text, preview_lines.join("\n"))
+        format!(
+            "\n\n{}\n{}",
+            lang.msg_always_allow_options_header(),
+            preview_lines.join("\n")
+        )
     };
 
     let content = format!(
@@ -156,7 +162,7 @@ pub fn build_permission_message_parts(
     //   WebFetch(domain): label + Domain + Tool + scope         = 4 ✓
     //   Read/Edit/Write:  label + Exact + Tool + scope          = 4 ✓
     //   Grep/Glob/IP:     label + Tool + scope                  = 3 ✓
-    let label_btn = CreateButton::new("perm:_label")
+    let label_btn = CreateButton::new(LABEL_BUTTON_CUSTOM_ID)
         .label(lang.btn_always_allow())
         .style(ButtonStyle::Secondary)
         .disabled(true);
@@ -179,13 +185,22 @@ pub fn build_permission_message_parts(
     }));
 
     let (scope_btn_label, scope_btn_style) = match &scope {
-        Scope::Project => (lang.btn_scope_global_off(), ButtonStyle::Secondary),
-        Scope::Global => (lang.btn_scope_global_on(), ButtonStyle::Primary),
+        Scope::Project => (lang.btn_scope_toggle_to_global(), ButtonStyle::Secondary),
+        Scope::Global => (lang.btn_scope_toggle_to_project(), ButtonStyle::Primary),
     };
     row2_buttons.push(
         CreateButton::new(format!("perm:{}:scope:toggle", request_id))
             .label(scope_btn_label)
             .style(scope_btn_style),
+    );
+
+    // Discord ActionRow 5버튼 한도 — 향후 새 tool 의 RuleKind 가 늘면 컴파일 통과해도
+    // Discord API 가 메시지 거부 (silent fail). debug build 에서 조기 검출 (review #298 s2).
+    debug_assert!(
+        row2_buttons.len() <= 5,
+        "ActionRow exceeds Discord 5-button limit (tool={}, count={})",
+        tool_name,
+        row2_buttons.len(),
     );
 
     let row2 = CreateActionRow::Buttons(row2_buttons);
@@ -609,6 +624,14 @@ mod tests {
     #[test]
     fn parse_perm_wrong_prefix_returns_none() {
         let result = parse_permission_custom_id("not-perm:abc:once");
+        assert_eq!(result, None);
+    }
+
+    /// Disabled 레이블 버튼의 custom_id 는 해석되지 않아야 한다 (review #298 s4).
+    /// 향후 parse 규칙이 바뀌어도 이 ID 가 우연히 매칭되면 핸들러가 의도치 않은 분기로 빠짐.
+    #[test]
+    fn parse_perm_label_returns_none() {
+        let result = parse_permission_custom_id(LABEL_BUTTON_CUSTOM_ID);
         assert_eq!(result, None);
     }
 
@@ -1039,7 +1062,7 @@ mod tests {
         // Row 2: [label, Exact, Prefix, Tool, scope-toggle] = 5 버튼
         let row2 = row_buttons(rows, 1);
         assert_eq!(row2.as_array().unwrap().len(), 5, "Row2: label+Exact+Prefix+Tool+scope");
-        assert_eq!(btn_custom_id(row2, 0), "perm:_label", "Row2[0] = disabled label");
+        assert_eq!(btn_custom_id(row2, 0), LABEL_BUTTON_CUSTOM_ID, "Row2[0] = disabled label");
         assert!(btn_custom_id(row2, 1).ends_with(":always:exact"), "Row2[1] = always:exact");
         assert!(btn_custom_id(row2, 2).ends_with(":always:prefix"), "Row2[2] = always:prefix");
         assert!(btn_custom_id(row2, 3).ends_with(":always:tool"), "Row2[3] = always:tool");
@@ -1089,7 +1112,7 @@ mod tests {
 
         let row2 = row_buttons(rows, 1);
         assert_eq!(row2.as_array().unwrap().len(), 4, "Row2: label+Domain+Tool+scope");
-        assert_eq!(btn_custom_id(row2, 0), "perm:_label");
+        assert_eq!(btn_custom_id(row2, 0), LABEL_BUTTON_CUSTOM_ID);
         assert!(btn_custom_id(row2, 1).ends_with(":always:domain"), "Row2[1] = always:domain");
         assert!(btn_custom_id(row2, 2).ends_with(":always:tool"), "Row2[2] = always:tool");
         assert!(btn_custom_id(row2, 3).ends_with(":scope:toggle"), "Row2[3] = scope:toggle");
@@ -1114,7 +1137,7 @@ mod tests {
 
         let row2 = row_buttons(rows, 1);
         assert_eq!(row2.as_array().unwrap().len(), 3, "Row2: label+Tool+scope");
-        assert_eq!(btn_custom_id(row2, 0), "perm:_label");
+        assert_eq!(btn_custom_id(row2, 0), LABEL_BUTTON_CUSTOM_ID);
         assert!(btn_custom_id(row2, 1).ends_with(":always:tool"), "Row2[1] = always:tool");
         assert!(btn_custom_id(row2, 2).ends_with(":scope:toggle"), "Row2[2] = scope:toggle");
     }

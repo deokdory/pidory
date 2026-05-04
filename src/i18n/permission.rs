@@ -96,19 +96,27 @@ impl Lang {
         }
     }
 
-    /// scope 토글 버튼 — 현재 Project (클릭 시 Global 전환)
-    pub fn btn_scope_global_off(&self) -> &'static str {
+    /// scope 토글 버튼 — 클릭 시 Project → Global 전환 (현재 Project)
+    pub fn btn_scope_toggle_to_global(&self) -> &'static str {
         match self {
             Lang::Ko => "→ 전역",
             Lang::En => "→ Global",
         }
     }
 
-    /// scope 토글 버튼 — 현재 Global (클릭 시 Project 전환)
-    pub fn btn_scope_global_on(&self) -> &'static str {
+    /// scope 토글 버튼 — 클릭 시 Global → Project 전환 (현재 Global)
+    pub fn btn_scope_toggle_to_project(&self) -> &'static str {
         match self {
             Lang::Ko => "→ 프로젝트",
             Lang::En => "→ Project",
+        }
+    }
+
+    /// 권한 메시지 — `항상 허용` 옵션 섹션 헤더
+    pub fn msg_always_allow_options_header(&self) -> &'static str {
+        match self {
+            Lang::Ko => "항상 허용 옵션:",
+            Lang::En => "Always allow options:",
         }
     }
 

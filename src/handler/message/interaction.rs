@@ -436,9 +436,12 @@ async fn handle_allow_always(
     //
     // `component.channel_id` 는 스레드의 ID (parent channel 이 아님). `projects` 는 부모 channel_id PK.
     // → `pending.thread_id` 로 sessions 조회 → session.channel_id (부모) 로 projects 조회.
+    //
+    // `Err(_)` 와 `Ok(None)` 을 분리 처리 — DB 에러(연결 끊김 등)는 `tracing::error!` 로 기록해야
+    // 운영 중 디버깅 가능 (review #298 w1).
     let session = match repository::get_session_by_thread(&data.db, &thread_id).await {
         Ok(Some(s)) => s,
-        _ => {
+        Ok(None) => {
             fail_with(
                 ctx,
                 channel_id,
@@ -454,10 +457,31 @@ async fn handle_allow_always(
             .await;
             return;
         }
+        Err(e) => {
+            tracing::error!(
+                error = %e,
+                thread_id = %thread_id,
+                "session lookup DB error"
+            );
+            fail_with(
+                ctx,
+                channel_id,
+                message_id,
+                pending.response_tx,
+                &tool_name,
+                DisableReason::AllowAlwaysFailed {
+                    reason: format!("DB error: {}", e),
+                },
+                lang,
+                "session lookup DB error",
+            )
+            .await;
+            return;
+        }
     };
     let project = match repository::get_project_by_channel(&data.db, &session.channel_id).await {
         Ok(Some(p)) => p,
-        _ => {
+        Ok(None) => {
             fail_with(
                 ctx,
                 channel_id,
@@ -469,6 +493,27 @@ async fn handle_allow_always(
                 },
                 lang,
                 "project not registered",
+            )
+            .await;
+            return;
+        }
+        Err(e) => {
+            tracing::error!(
+                error = %e,
+                channel_id = %session.channel_id,
+                "project lookup DB error"
+            );
+            fail_with(
+                ctx,
+                channel_id,
+                message_id,
+                pending.response_tx,
+                &tool_name,
+                DisableReason::AllowAlwaysFailed {
+                    reason: format!("DB error: {}", e),
+                },
+                lang,
+                "project lookup DB error",
             )
             .await;
             return;
