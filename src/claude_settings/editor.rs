@@ -1,18 +1,20 @@
 //! Top-level atomic editor entry point (add_permission public API).
 //!
-//! # RMW pipeline (T8 implemented)
+//! # RMW pipeline (review #295 c1 fix)
 //!
 //! ```text
-//! apply_mutation flow (13-step):
+//! apply_mutation flow:
 //!  1. canonical_settings_path      — normalize + expand ~ + reject symlink/dir
 //!  2. acquire_path_lock (L1)       — in-process serialization
 //!  3. ensure_parent_dir            — mkdir -p 0755
-//!  4. open file (O_RDWR|O_CREAT)  — create if absent, mode 0644
-//!  5. size guard (1 MiB)
-//!  6. flock_with_timeout (L2)      — inter-process advisory lock, 5s + 5s retry
-//!  7. fingerprint_old              — mtime + sha256 snapshot
+//!  4. open + flock + inode verify  — open(O_RDWR|O_CREAT|O_NOFOLLOW), flock,
+//!                                    fstat(fd).ino() vs stat(canonical).ino()
+//!                                    불일치(stale inode) 시 fd drop + retry
+//!  5. empty-file `{}` write        — flock 보호 안에서 (이전엔 flock 밖이었음)
+//!  6. size guard (1 MiB)           — flock 보호 안에서
+//!  7. fingerprint_old              — sha256 snapshot
 //!  8. read + parse JSON            — backup + notify on corrupt
-//!  9. mutator(&mut value)          — Fn, idempotent, returns MergeOutcome
+//!  9. mutator(&mut value)          — Fn, idempotent, Result<MergeOutcome>
 //! 10. L4 re-check fingerprint      — if changed: re-read + re-apply (1 retry)
 //! 11. write to temp (.{name}.tmp.{pid}.{nano})
 //! 12. fsync temp
@@ -21,6 +23,9 @@
 //! 15. flock release (file drop)
 //! 16. L1 release (guard drop)
 //! ```
+//!
+//! Step 4의 inode verify가 vim 방식 atomic rename 감지를 흡수해, 이전 PR body의
+//! "L4 fingerprint atomic rename 미감지" Known Limitation을 자연 해소한다.
 //!
 //! ## spawn_blocking decision
 //!
@@ -35,9 +40,9 @@
 //! - The Tokio docs note that short blocking operations (<1 ms) are acceptable
 //!   directly in async tasks without `spawn_blocking`.
 
-use std::fs::OpenOptions;
+use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -98,33 +103,43 @@ pub async fn add_permission(
     notifier: &dyn ConflictNotifier,
 ) -> Result<MergeOutcome, ClaudeSettingsError> {
     let rule_owned = rule.to_string();
+    let path_owned = path.to_path_buf();
     apply_mutation(path, notifier, move |value| {
         let normalized = normalize_rule(&rule_owned);
 
-        // Ensure permissions.allow array exists
-        let obj = match value.as_object_mut() {
-            Some(o) => o,
-            None => return MergeOutcome::Added,
-        };
+        // review #295 w2: shape 불일치는 silent no-op + Added 반환 대신 InvalidShape Err.
+        let obj = value.as_object_mut().ok_or_else(|| {
+            ClaudeSettingsError::InvalidShape {
+                path: path_owned.clone(),
+                reason: "root JSON is not an object".to_string(),
+            }
+        })?;
         let perms = obj
             .entry("permissions")
             .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
-        let perms_obj = match perms.as_object_mut() {
-            Some(o) => o,
-            None => return MergeOutcome::Added,
-        };
+        let perms_obj = perms.as_object_mut().ok_or_else(|| {
+            ClaudeSettingsError::InvalidShape {
+                path: path_owned.clone(),
+                reason: "`permissions` is not an object".to_string(),
+            }
+        })?;
         let allow_val = perms_obj
             .entry("allow")
             .or_insert_with(|| serde_json::Value::Array(Vec::new()));
         let arr = match allow_val {
             serde_json::Value::Array(a) => a,
-            _ => return MergeOutcome::Added,
+            _ => {
+                return Err(ClaudeSettingsError::InvalidShape {
+                    path: path_owned.clone(),
+                    reason: "`permissions.allow` is not an array".to_string(),
+                });
+            }
         };
 
-        match merge_into_allow(arr, normalized) {
+        Ok(match merge_into_allow(arr, normalized) {
             MergeAction::Added => MergeOutcome::Added,
             MergeAction::AlreadyPresent => MergeOutcome::AlreadyPresent,
-        }
+        })
     })
     .await
 }
@@ -133,12 +148,72 @@ pub async fn add_permission(
 // RMW core — pub(crate) only (Plan Must NOT Have — P1.4 흡수 방어)
 // ---------------------------------------------------------------------------
 
+/// open(O_RDWR|O_CREAT|O_NOFOLLOW) → flock(LOCK_EX) → inode verify 를 한 번
+/// 통과시킬 때까지 retry한다 (review #295 c1 fix).
+///
+/// inode mismatch가 발생하는 경우:
+/// - 다른 writer가 우리의 open과 flock 사이에 atomic rename으로 새 파일을 교체.
+/// - 우리 fd는 unlinked old inode를 가리키지만 flock은 그 fd 기준으로만 유효 →
+///   flock이 *현재 path*를 보호하지 않음 → RMW가 lost-update 일으킬 수 있음.
+///
+/// inode verify 결과:
+/// - `fstat(fd).ino() == stat(canonical).ino()` → 통과, file 반환.
+/// - 불일치 → fd drop (flock 자동 release), 짧은 backoff 후 retry.
+/// - `MAX_RETRIES` 초과 → `LockConflict` 반환 (path 가 끊임없이 바뀌는 비정상 상황).
+///
+/// `O_NOFOLLOW`도 여기서 적용 (review #295 w1) — symlink TOCTOU 차단.
+async fn open_lock_verify(
+    canonical: &Path,
+    notifier: &dyn ConflictNotifier,
+) -> Result<File, ClaudeSettingsError> {
+    const MAX_RETRIES: u32 = 3;
+
+    for attempt in 0..MAX_RETRIES {
+        #[allow(clippy::suspicious_open_options)]
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .mode(0o644)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(canonical)?;
+
+        if let Err(e) = flock_with_timeout(&file, canonical, FLOCK_TIMEOUT).await {
+            notifier.notify_conflict(ConflictEvent::LockTimeout {
+                path: canonical.to_path_buf(),
+                waited: FLOCK_TIMEOUT,
+            });
+            return Err(e);
+        }
+
+        let fd_ino = file.metadata()?.ino();
+        match std::fs::metadata(canonical) {
+            Ok(path_meta) if path_meta.ino() == fd_ino => return Ok(file),
+            Ok(_) | Err(_) => {
+                // stale inode (또는 path가 사라짐) — fd drop으로 flock release 후 retry.
+                drop(file);
+                if attempt + 1 < MAX_RETRIES {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            }
+        }
+    }
+
+    Err(ClaudeSettingsError::LockConflict {
+        path: canonical.to_path_buf(),
+    })
+}
+
 /// Atomically read-modify-write a Claude settings JSON file.
 ///
 /// `mutator` receives a mutable reference to the parsed JSON value and returns
-/// a [`MergeOutcome`] indicating what happened.  It is called as `Fn` (not
-/// `FnOnce`) so that L4 conflict resolution can re-apply the mutation on a
-/// freshly read value (1 retry).
+/// a [`Result<MergeOutcome, ClaudeSettingsError>`].  Returning `Err` aborts the
+/// RMW (no temp write, no rename) and propagates the error to the caller —
+/// useful for surfacing shape-mismatch issues like
+/// [`ClaudeSettingsError::InvalidShape`] (review #295 w2).
+///
+/// `mutator` is called as `Fn` (not `FnOnce`) so that L4 conflict resolution
+/// can re-apply the mutation on a freshly read value (1 retry).
 ///
 /// # Errors
 ///
@@ -149,7 +224,10 @@ pub(crate) async fn apply_mutation<F>(
     mutator: F,
 ) -> Result<MergeOutcome, ClaudeSettingsError>
 where
-    F: Fn(&mut serde_json::Value) -> MergeOutcome + Send + Sync + 'static,
+    F: Fn(&mut serde_json::Value) -> Result<MergeOutcome, ClaudeSettingsError>
+        + Send
+        + Sync
+        + 'static,
 {
     // ── Step 1: canonical path ──────────────────────────────────────────────
     let canonical = canonical_settings_path(path)?;
@@ -160,24 +238,20 @@ where
     // ── Step 3: ensure parent dir ──────────────────────────────────────────
     ensure_parent_dir(&canonical)?;
 
-    // ── Step 4: open file (create if absent, mode 0644) ────────────────────
-    // `create(true)` without `truncate` is intentional: we read existing content
-    // before writing. The atomic write goes to a separate temp file.
-    #[allow(clippy::suspicious_open_options)]
-    let mut file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .mode(0o644)
-        .open(&canonical)?;
+    // ── Step 4: open + flock + inode verify (review #295 c1 fix) ───────────
+    // open한 fd가 *현재 path가 가리키는 inode*와 같은지 검증. 다른 writer가
+    // atomic rename으로 새 파일을 만들어두면 우리 fd는 unlinked old inode를
+    // 가리키게 됨 → 그 fd로 RMW하면 lost-update. flock 후 inode 비교로 차단.
+    let mut file = open_lock_verify(&canonical, notifier).await?;
 
-    // Newly created empty file: write `{}` so JSON parse succeeds
+    // ── Step 5: empty-file `{}` write (flock 보호 안에서) ───────────────────
+    // 이전엔 flock 밖에서 수행돼 외부 atomic write를 덮어쓸 위험이 있었음 (c1).
     if file.metadata()?.len() == 0 {
         file.write_all(b"{}")?;
         file.seek(SeekFrom::Start(0))?;
     }
 
-    // ── Step 5: size guard ─────────────────────────────────────────────────
+    // ── Step 6: size guard (flock 보호 안에서) ──────────────────────────────
     let file_size = file.metadata()?.len();
     if file_size > SIZE_LIMIT {
         return Err(ClaudeSettingsError::FileTooLarge {
@@ -185,15 +259,6 @@ where
             size: file_size,
             limit: SIZE_LIMIT,
         });
-    }
-
-    // ── Step 6: L2 flock (inter-process advisory) ──────────────────────────
-    if let Err(e) = flock_with_timeout(&file, &canonical, FLOCK_TIMEOUT).await {
-        notifier.notify_conflict(ConflictEvent::LockTimeout {
-            path: canonical.clone(),
-            waited: FLOCK_TIMEOUT,
-        });
-        return Err(e);
     }
 
     // ── Step 7: fingerprint_old ─────────────────────────────────────────────
@@ -227,7 +292,8 @@ where
     };
 
     // ── Step 9: apply mutator ──────────────────────────────────────────────
-    let mut outcome = mutator(&mut value);
+    // mutator가 Err 반환하면 RMW 중단 (write 안 함). review #295 w2.
+    let mut outcome = mutator(&mut value)?;
 
     // ── Step 10: L4 re-check fingerprint ──────────────────────────────────
     let fingerprint_new = fingerprint(&mut file)?;
@@ -239,7 +305,8 @@ where
 
         match serde_json::from_slice::<serde_json::Value>(&raw2) {
             Ok(mut fresh_value) => {
-                mutator(&mut fresh_value);
+                // 두 번째 mutator 호출도 Err 가능 — 그대로 propagate.
+                mutator(&mut fresh_value)?;
                 value = fresh_value;
                 outcome = MergeOutcome::ConflictResolved;
             }
@@ -341,6 +408,16 @@ fn write_atomic(
 // Tests
 // ---------------------------------------------------------------------------
 
+/// # Race tests scope (review #295 w3)
+///
+/// 본 모듈의 race tests는 **in-process race만 검증한다**. `LOCK_REGISTRY`가
+/// process-global `OnceLock`이라 std::thread + 별도 tokio runtime을 띄워도
+/// 같은 LockRegistry 싱글톤을 공유 → L1 mutex로 직렬화된다. 따라서
+/// `ac2_in_process_race_via_two_runtimes`는 이름과 달리 *in-process race*다.
+///
+/// 진짜 inter-process race (별도 process spawn, OS-level flock 만으로 직렬화)
+/// 검증은 별도 helper binary가 필요하며, **E3 multi-bot federation 진입 전
+/// close 조건**으로 트래킹된다 (별도 follow-up issue 참조).
 #[cfg(test)]
 mod race_tests {
     use super::*;
@@ -421,15 +498,16 @@ mod race_tests {
         }
     }
 
-    // ── AC2: inter-process race (separate tokio runtimes in threads) ──────────
+    // ── AC2: in-process race via two tokio runtimes ──────────────────────────
     /// 2개 std::thread (각자 별도 tokio runtime)가 각각 50개 rule add → 최종 allow == 100.
     ///
-    /// Note: 실제 OS child process spawn은 별도 binary 빌드 필요 + 복잡도가 높아
-    /// 별도 tokio runtime을 갖는 std::thread로 시뮬레이션.
-    /// L1 lock registry는 per-process 전역이라 별도 thread의 별도 runtime은
-    /// L1 공유가 안 됨 → L2 flock만으로 직렬화. 이는 실제 inter-process 동작과 동일.
+    /// **주의 (review #295 w3 fix)**: `LOCK_REGISTRY`가 process-global `OnceLock`이라
+    /// 별도 thread + 별도 tokio runtime도 같은 LockRegistry 싱글톤을 공유한다.
+    /// 따라서 두 thread가 같은 path에 대해 L1 mutex로 직렬화된다 → 본 테스트는
+    /// 실제로 *in-process race*이며, L2 flock 동작은 직접 검증되지 않는다.
+    /// 진짜 inter-process race 검증은 별도 helper binary가 필요 (모듈 head doc 참조).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn ac2_inter_process_race_simulated() {
+    async fn ac2_in_process_race_via_two_runtimes() {
         for _round in 0..10 {
             let tmp = TempDir::new().unwrap();
             let path = tmp.path().join("settings.json");
@@ -545,8 +623,27 @@ mod race_tests {
     // ── AC4: vim contention — LOCK_EX held by another fd ──────────────────────
     /// 별도 thread가 LOCK_EX를 획득한 채 대기 → add_permission 호출 →
     /// flock_with_timeout (5s + 5s) 내에 LockConflict + TestNotifier에 LockTimeout 1개.
+    ///
+    /// review #295 s1: holder는 RAII guard로 종료 — assertion이 panic해도 guard
+    /// `Drop`이 done 신호를 보내고 thread join을 보장해 hang 방지.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn ac4_vim_contention_lock_conflict() {
+        /// holder thread를 안전하게 종료시키는 RAII guard.
+        struct LockHolderGuard {
+            done_tx: Option<std::sync::mpsc::Sender<()>>,
+            handle: Option<std::thread::JoinHandle<()>>,
+        }
+        impl Drop for LockHolderGuard {
+            fn drop(&mut self) {
+                if let Some(tx) = self.done_tx.take() {
+                    let _ = tx.send(());
+                }
+                if let Some(h) = self.handle.take() {
+                    let _ = h.join();
+                }
+            }
+        }
+
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("settings.json");
         std::fs::write(&path, b"{}").unwrap();
@@ -556,24 +653,27 @@ mod race_tests {
         let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
 
         // Holder thread: acquire LOCK_EX on a separate fd, hold until signalled
-        let holder = std::thread::spawn(move || {
+        let handle = std::thread::spawn(move || {
             let f = File::open(&holder_path).unwrap();
             f.lock().unwrap();
             ready_tx.send(()).unwrap();
             // Hold lock long enough for both flock_with_timeout attempts (5s + 5s) to expire
-            done_rx.recv().unwrap();
-            f.unlock().unwrap();
+            let _ = done_rx.recv();
+            let _ = f.unlock();
         });
 
         ready_rx.recv().unwrap();
+
+        // Guard ensures the holder is signalled and joined even on panic below.
+        let _holder_guard = LockHolderGuard {
+            done_tx: Some(done_tx),
+            handle: Some(handle),
+        };
 
         let notifier = Arc::new(TestNotifier::new());
         let notifier_ref: &dyn ConflictNotifier = &*notifier;
 
         let result = add_permission(&path, "Bash(vim_test)", notifier_ref).await;
-
-        done_tx.send(()).unwrap();
-        holder.join().unwrap();
 
         assert!(
             matches!(result, Err(ClaudeSettingsError::LockConflict { .. })),
@@ -696,6 +796,51 @@ mod integration_tests {
         });
         assert_eq!(actual, expected, "theme field should be preserved when adding to permissions-absent file");
     }
+
+    // ── IT5 (review #295 c1): 외부 atomic rename 후 add_permission 정상 동작 ──
+    /// 1) settings.json에 rule_a add → inode_a.
+    /// 2) 외부에서 settings.json을 새 파일(`{"hijacked":true}`)로 atomic rename →
+    ///    settings.json은 inode_b를 가리킴.
+    /// 3) add_permission(rule_b) → 새 inode에 정상 add (inode verify가 옛 fd 사용 차단).
+    /// 4) 검증: 최종 settings.json = `{"hijacked":true, "permissions":{"allow":["Bash(rule_b)"]}}`.
+    ///
+    /// 본 테스트는 c1 fix의 *결과 정확성* (외부 rename 후에도 새 inode에 add) 을 본다.
+    /// open과 flock 사이의 mid-call race는 timing 의존성이 커 본 테스트 범위 밖이며,
+    /// `open_lock_verify`의 retry 로직 doc + 본 시나리오로 회귀를 충분히 차단한다.
+    #[tokio::test]
+    async fn it5_external_atomic_rename_then_add() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("settings.json");
+        std::fs::write(&path, b"{}").unwrap();
+
+        // 1) 첫 add — inode_a
+        add_permission(&path, "Bash(rule_a)", &LoggingNotifier)
+            .await
+            .expect("first add_permission should succeed");
+
+        // 2) 외부 atomic rename: 같은 디렉터리에 새 파일을 만들고 rename으로 교체.
+        let replacement = tmp.path().join("replacement.json");
+        std::fs::write(&replacement, br#"{"hijacked":true}"#).unwrap();
+        std::fs::rename(&replacement, &path).unwrap();
+
+        // 3) 두 번째 add — 새 inode (inode_b)에 add
+        let outcome = add_permission(&path, "Bash(rule_b)", &LoggingNotifier)
+            .await
+            .expect("add_permission must succeed against the new inode");
+        assert_eq!(outcome, MergeOutcome::Added);
+
+        // 4) 새 파일 내용 + rule_b 둘 다 보존
+        let content = std::fs::read_to_string(&path).unwrap();
+        let actual: serde_json::Value = serde_json::from_str(&content).unwrap();
+        let expected: serde_json::Value = serde_json::json!({
+            "hijacked": true,
+            "permissions": { "allow": ["Bash(rule_b)"] }
+        });
+        assert_eq!(
+            actual, expected,
+            "post-rename add must operate on the new inode without losing its content"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -737,22 +882,38 @@ mod edge_tests {
 
     // ── EC1: EACCES (read-only parent dir) ──────────────────────────────────
     /// parent dir을 chmod 0o555로 만들어 write 불가 → add_permission이 Err 반환.
-    /// cleanup: chmod 0o755로 복구 (TempDir Drop 안전).
+    /// review #295 s1: chmod 복구는 RAII guard로 처리 — panic 시에도 unwind 중
+    /// `Drop`이 자동 복구해 TempDir 삭제 실패를 방지한다.
     #[tokio::test]
     async fn ec1_eacces_readonly_parent_dir() {
         use std::os::unix::fs::PermissionsExt;
+
+        /// `Drop`에서 directory 권한을 `restore_mode`로 복구하는 RAII guard.
+        struct PermGuard {
+            path: std::path::PathBuf,
+            restore_mode: u32,
+        }
+        impl Drop for PermGuard {
+            fn drop(&mut self) {
+                let _ = std::fs::set_permissions(
+                    &self.path,
+                    std::fs::Permissions::from_mode(self.restore_mode),
+                );
+            }
+        }
 
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path().to_path_buf();
         let path = dir.join("settings.json");
 
-        // Make parent dir read-only (no write)
+        // Make parent dir read-only (no write). Guard restores 0o755 on drop.
+        let _restore = PermGuard {
+            path: dir.clone(),
+            restore_mode: 0o755,
+        };
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
 
         let result = add_permission(&path, "Bash(ls)", &LoggingNotifier).await;
-
-        // Cleanup: restore write permission before TempDir drops (to avoid panic)
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
 
         assert!(
             result.is_err(),
@@ -955,6 +1116,69 @@ mod edge_tests {
             allow[0],
             serde_json::Value::String("Bash(timeout 30 npm test)".to_string()),
             "process wrapper rule should be stored verbatim without stripping"
+        );
+    }
+
+    // ── EC9 (review #295 w2): root JSON이 object 아님 → InvalidShape ──────────
+    /// settings.json = `[]` → add_permission → `Err(InvalidShape)`. 파일 변경 X.
+    #[tokio::test]
+    async fn ec9_invalid_shape_root_not_object() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("settings.json");
+        std::fs::write(&path, b"[]").unwrap();
+
+        let result = add_permission(&path, "Bash(ls)", &LoggingNotifier).await;
+
+        assert!(
+            matches!(
+                result,
+                Err(ClaudeSettingsError::InvalidShape { ref reason, .. }) if reason.contains("root")
+            ),
+            "expected InvalidShape for non-object root, got: {result:?}"
+        );
+
+        // 파일은 silent overwrite 안 되고 그대로
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(content, "[]", "settings.json must remain unchanged on InvalidShape");
+    }
+
+    // ── EC10 (review #295 w2): permissions가 object 아님 → InvalidShape ───────
+    /// settings.json = `{"permissions":"strict"}` → add_permission → InvalidShape.
+    #[tokio::test]
+    async fn ec10_invalid_shape_permissions_not_object() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("settings.json");
+        std::fs::write(&path, br#"{"permissions":"strict"}"#).unwrap();
+
+        let result = add_permission(&path, "Bash(ls)", &LoggingNotifier).await;
+
+        assert!(
+            matches!(
+                result,
+                Err(ClaudeSettingsError::InvalidShape { ref reason, .. })
+                    if reason.contains("permissions") && reason.contains("object")
+            ),
+            "expected InvalidShape for non-object permissions, got: {result:?}"
+        );
+    }
+
+    // ── EC11 (review #295 w2): permissions.allow가 array 아님 → InvalidShape ──
+    /// settings.json = `{"permissions":{"allow":"all"}}` → add_permission → InvalidShape.
+    #[tokio::test]
+    async fn ec11_invalid_shape_allow_not_array() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("settings.json");
+        std::fs::write(&path, br#"{"permissions":{"allow":"all"}}"#).unwrap();
+
+        let result = add_permission(&path, "Bash(ls)", &LoggingNotifier).await;
+
+        assert!(
+            matches!(
+                result,
+                Err(ClaudeSettingsError::InvalidShape { ref reason, .. })
+                    if reason.contains("allow") && reason.contains("array")
+            ),
+            "expected InvalidShape for non-array allow, got: {result:?}"
         );
     }
 }

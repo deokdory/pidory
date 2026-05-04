@@ -1373,6 +1373,7 @@ dependencies = [
  "comfy-table",
  "filetime",
  "futures-util",
+ "libc",
  "poise",
  "reqwest",
  "serde",

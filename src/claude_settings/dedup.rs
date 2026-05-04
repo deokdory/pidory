@@ -15,19 +15,24 @@ pub(crate) enum MergeAction {
 
 /// Normalize a permission rule to its canonical form.
 ///
-/// Transformations applied (in order):
-/// 1. Trailing `:*` just before closing `)` → ` *`
+/// Transformations applied:
+/// 1. `WebFetch(http[s]://...)` → `WebFetch(domain:<host>)`. WebFetch는 이 단계
+///    하나만 적용하며, trailing wildcard 정규화는 건너뛴다 (review #295 s2 fix).
+///    이미 정규화된 `WebFetch(domain:...)`는 그대로 반환. host 추출 실패 시 입력 그대로.
+/// 2. 나머지 rule에 대해 trailing `:*` just before closing `)` → ` *`
 ///    e.g. `Bash(npm:*)` → `Bash(npm *)`, `Bash(npm arg:*)` → `Bash(npm arg *)`
-///    Middle `:*` (not immediately before `)`) is left untouched.
-/// 2. `WebFetch(http[s]://...)` → `WebFetch(domain:<host>)`
-///    Already-normalized `WebFetch(domain:...)` is returned as-is.
-///    If host extraction fails, input is returned unchanged.
-/// 3. All other forms (path namespace `./`, `//`, `~/`, `/` etc.) are returned unchanged.
+///    Middle `:*` (not immediately before `)`)는 손대지 않는다.
+/// 3. path namespace 4종 (`./`, `//`, `~/`, `/`) 등은 변경 없음.
+///
+/// WebFetch에 trailing wildcard normalize를 적용하지 않는 이유:
+/// `WebFetch(https://example.com:*)` 같은 입력이 들어오면 `:*`가 URL의 일부로
+/// 잘못 해석돼 `WebFetch(domain:example.com *)` 같은 부정확한 결과를 만들었다.
 #[allow(dead_code)]
 pub(crate) fn normalize_rule(input: &str) -> String {
-    // Step 1: trailing :* normalization
-    // Step 2: URL → domain extraction
-    normalize_webfetch_url(&normalize_trailing_wildcard(input))
+    if input.starts_with("WebFetch(") {
+        return normalize_webfetch_url(input);
+    }
+    normalize_trailing_wildcard(input)
 }
 
 /// Replace trailing `:*)` with ` *)` at the end of the string.

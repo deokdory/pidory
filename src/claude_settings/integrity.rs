@@ -1,8 +1,15 @@
 //! Integrity checking for settings files.
 //!
-//! mtime은 trigger, sha256이 본 검증. mtime 1초 resolution OS (HFS+)에서 false negative
-//! 방지를 위해 sha256 cross-check 필수. vim atomic rename이 inode를 바꾸지 않는 케이스도
-//! sha256으로 검출.
+//! sha256이 유일한 변경 검증 기준이다. mtime은 fingerprint 구조체에 보관하지만
+//! `changed()` 비교에는 사용하지 않는다 (review #295 c2 fix).
+//!
+//! mtime을 trigger로 쓰던 이전 설계는 다음 케이스에서 false negative를 만들었다:
+//! - mtime 1초 resolution OS (HFS+, FAT32) — 1초 미만 안에 두 write가 일어나면 mtime 동일
+//! - mtime 보존 도구 — `touch -r`, `cp -p`, 일부 git checkout 동작
+//! - vim atomic rename — inode가 바뀌어도 새 파일 mtime이 우연히 같을 수 있음
+//!
+//! sha256 only 비교는 위 모든 경우를 정확히 잡고, 같은 내용 re-write는 hash가
+//! 같아 자연스럽게 false 반환된다.
 
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
@@ -45,15 +52,15 @@ pub(crate) fn fingerprint(file: &mut File) -> Result<FileFingerprint, ClaudeSett
     Ok(FileFingerprint { mtime, sha256 })
 }
 
-/// Returns `true` only when the file content has actually changed.
+/// Returns `true` if the file content has actually changed.
 ///
-/// Logic:
-/// - `mtime` same → `false` (definitely no change)
-/// - `mtime` different but `sha256` same → `false` (touched but content unchanged)
-/// - `mtime` different and `sha256` different → `true` (real change)
+/// sha256 비교가 유일한 기준이다. mtime은 무시 (module doc 참조).
+///
+/// - `sha256` 같음 → `false` (내용 동일 — `touch`로 mtime만 바뀐 경우 포함)
+/// - `sha256` 다름 → `true` (실제 변경)
 #[allow(dead_code)]
 pub(crate) fn changed(old: &FileFingerprint, new: &FileFingerprint) -> bool {
-    old.mtime != new.mtime && old.sha256 != new.sha256
+    old.sha256 != new.sha256
 }
 
 #[cfg(test)]
@@ -141,16 +148,13 @@ mod tests {
         );
     }
 
-    /// Test 3: mtime forced identical, different content → changed == false
+    /// Test 3: mtime forced identical, different content → changed == true
     ///
-    /// `changed` uses mtime as the trigger gate. When mtime is the same,
-    /// we skip sha256 comparison entirely (cheap fast path). This test
-    /// documents that behaviour: if an external agent sets mtime back to
-    /// the original value after modifying the file, we would NOT detect
-    /// the change. This is an acceptable trade-off — the sha256 cross-check
-    /// only fires when mtime *does* differ.
+    /// review #295 c2 fix: `changed`는 sha256만 비교한다. mtime이 같아도 sha256이
+    /// 다르면 변경으로 판정 — coarse-resolution FS, mtime 보존 편집 도구 등의
+    /// false negative를 차단한다.
     #[test]
-    fn forced_same_mtime_different_content_not_changed() {
+    fn forced_same_mtime_different_content_is_changed() {
         let mut tmp_a = NamedTempFile::new().unwrap();
         write!(tmp_a, "{{}}").unwrap();
         tmp_a.flush().unwrap();
@@ -169,10 +173,9 @@ mod tests {
         let fp_a = fingerprint(&mut fa).unwrap();
         let fp_b = fingerprint(&mut fb).unwrap();
 
-        // mtime trigger is the same → changed must be false regardless of sha256.
         assert!(
-            !changed(&fp_a, &fp_b),
-            "same mtime should short-circuit to false even with different content"
+            changed(&fp_a, &fp_b),
+            "sha256 differs → changed must be true regardless of mtime"
         );
     }
 

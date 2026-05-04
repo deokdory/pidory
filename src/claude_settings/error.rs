@@ -54,6 +54,12 @@ pub enum ClaudeSettingsError {
     /// The supplied path is invalid for the given reason.
     #[error("invalid path {path}: {reason}")]
     InvalidPath { path: PathBuf, reason: String },
+
+    /// 기존 settings JSON의 형태가 mutator 기대와 다름 (root가 object 아님,
+    /// `permissions`가 object 아님, `permissions.allow`가 array 아님 등).
+    /// review #295 w2 — 이전에는 silent no-op + `Added` 반환이었음.
+    #[error("invalid settings shape at {path}: {reason}")]
+    InvalidShape { path: PathBuf, reason: String },
 }
 
 #[cfg(test)]

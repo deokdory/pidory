@@ -32,6 +32,12 @@ use super::error::ClaudeSettingsError;
 // ---------------------------------------------------------------------------
 
 /// Global per-path mutex registry for in-process serialization (L1).
+///
+/// **주의 (review #295 w4)**: 현재 entry는 한 번 추가되면 영구 보관된다.
+/// pidory 본체는 `settings.json` + `settings.local.json` 두 path만 다루므로
+/// 실사용 영향은 0이지만, P1.4 (#289) generic API 진입 시 dynamic path 지원
+/// 추가 시점에는 GC sweep (`Arc::strong_count(&entry) == 1` 검사 후 cleanup)이
+/// 필요하다. #289 작업 항목에 포함 권장.
 #[allow(dead_code)]
 pub(crate) struct LockRegistry {
     inner: Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>,
