@@ -39,6 +39,8 @@ pub struct PendingPermission {
     pub thread_id: String,
     pub triggered_by: serenity::UserId,
     pub input: Option<serde_json::Value>,
+    /// User-selected scope override for AlwaysAllow. None = use default_scope().
+    pub scope_override: Option<claude_settings::rule::Scope>,
 }
 
 /// Tracks a multi-question AskUserQuestion group.

@@ -4,10 +4,12 @@ use std::collections::{HashMap, HashSet};
 
 use poise::serenity_prelude::UserId;
 
+use crate::claude_settings::rule::{RuleKind, Scope};
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PermissionDecision {
     Allow,
-    AlwaysAllow,
+    AllowAlways { rule_kind: RuleKind, scope: Scope },
     Deny,
     Answer(HashMap<String, String>),
 }
@@ -43,6 +45,10 @@ impl PermissionCache {
 
     pub fn clear(&mut self) {
         self.allowed_tools.clear();
+    }
+
+    pub fn clear_tool(&mut self, tool_name: &str) {
+        self.allowed_tools.remove(tool_name);
     }
 }
 
@@ -96,10 +102,38 @@ mod tests {
     #[test]
     fn decision_enum_values() {
         let allow = PermissionDecision::Allow;
-        let always = PermissionDecision::AlwaysAllow;
+        let always = PermissionDecision::AllowAlways {
+            rule_kind: RuleKind::Exact,
+            scope: Scope::Project,
+        };
         let deny = PermissionDecision::Deny;
         assert_ne!(allow, always);
         assert_ne!(allow, deny);
         assert_ne!(always, deny);
+    }
+
+    #[test]
+    fn cache_clear_tool_removes_single() {
+        let mut cache = PermissionCache::new();
+        cache.add_always_allow("Bash");
+        cache.add_always_allow("Write");
+        cache.clear_tool("Bash");
+        assert!(!cache.is_always_allowed("Bash"));
+        assert!(cache.is_always_allowed("Write"));
+    }
+
+    #[test]
+    fn allow_always_destructures() {
+        let decision = PermissionDecision::AllowAlways {
+            rule_kind: RuleKind::Prefix,
+            scope: Scope::Global,
+        };
+        match decision {
+            PermissionDecision::AllowAlways { rule_kind, scope } => {
+                assert_eq!(rule_kind, RuleKind::Prefix);
+                assert_eq!(scope, Scope::Global);
+            }
+            _ => panic!("expected AllowAlways"),
+        }
     }
 }

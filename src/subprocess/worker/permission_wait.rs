@@ -11,6 +11,7 @@ use poise::serenity_prelude::{MessageId, UserId};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 use tokio::sync::{Mutex, mpsc, mpsc::error::TrySendError};
 
+use crate::claude_settings::rule::{RuleKind, Scope};
 use crate::ratelimit::RateLimitInfo;
 use crate::subprocess::parser::{StreamEvent, build_control_response_allow, build_control_response_deny, build_control_response_ask_answer};
 use crate::subprocess::permission::{PermissionCache, PermissionDecision, PermissionRequest};
@@ -23,7 +24,7 @@ use super::io::build_user_message_json;
 #[allow(dead_code)]
 pub(super) enum PermissionWaitResult {
     Allow,
-    AlwaysAllow(String),                          // tool_name
+    AllowAlways { tool_name: String, rule_kind: RuleKind, scope: Scope },
     Deny(String),                                 // reason
     Error,                                        // stdin error → caller does break
     Answer(std::collections::HashMap<String, String>), // answers for AskUserQuestion
@@ -48,11 +49,12 @@ async fn write_permission_response(
             tracing::info!(request_id = %request_id, behavior = "allow", "control_response written");
             Ok(false)
         }
-        PermissionWaitResult::AlwaysAllow(tool_name) => {
+        PermissionWaitResult::AllowAlways { tool_name, rule_kind: _, scope: _ } => {
             let resp = build_control_response_allow(request_id, input);
             stdin.write_all(resp.as_bytes()).await?;
             stdin.flush().await?;
-            permission_cache.add_always_allow(&tool_name);
+            // settings.json이 source of truth — cache는 invalidate (handler의 add_permission이 처리)
+            permission_cache.clear_tool(&tool_name);
             tracing::info!(request_id = %request_id, behavior = "always_allow", tool_name = %tool_name, "control_response written");
             Ok(false)
         }
@@ -391,12 +393,13 @@ where
                             tracing::info!(thread_id = %thread_id, request_id = %rid, tool_name = %tool_name, behavior = "allow", "control_response written");
                             r
                         }
-                        PermissionDecision::AlwaysAllow => {
+                        PermissionDecision::AllowAlways { rule_kind: _, scope: _ } => {
                             let resp = build_control_response_allow(&rid, input);
                             let r = stdin.write_all(resp.as_bytes()).await;
                             if r.is_ok() {
                                 let _ = stdin.flush().await;
-                                permission_cache.add_always_allow(tool_name);
+                                // settings.json이 source of truth — cache는 invalidate (handler의 add_permission이 처리)
+                                permission_cache.clear_tool(tool_name);
                             }
                             tracing::info!(thread_id = %thread_id, request_id = %rid, tool_name = %tool_name, behavior = "always_allow", "control_response written");
                             r
@@ -453,10 +456,14 @@ mod tests {
 
     #[test]
     fn permission_wait_result_always_allow_carries_tool_name() {
-        let r = PermissionWaitResult::AlwaysAllow("bash".to_string());
+        let r = PermissionWaitResult::AllowAlways {
+            tool_name: "bash".to_string(),
+            rule_kind: RuleKind::Exact,
+            scope: Scope::Project,
+        };
         match r {
-            PermissionWaitResult::AlwaysAllow(name) => assert_eq!(name, "bash"),
-            _ => panic!("expected AlwaysAllow"),
+            PermissionWaitResult::AllowAlways { tool_name, .. } => assert_eq!(tool_name, "bash"),
+            _ => panic!("expected AllowAlways"),
         }
     }
 
@@ -514,30 +521,45 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn write_permission_response_always_allow_updates_cache() {
+    async fn write_permission_response_always_allow_invalidates_cache() {
         let mut stdin = spawn_cat_stdin().await;
         let mut cache = PermissionCache::new();
-        assert!(!cache.is_always_allowed("Bash"));
+
+        // 사전 조건: 다른 경로로 cache에 들어가 있던 상태 (예: 이전 prompt 시)
+        cache.add_always_allow("Bash");
+        assert!(cache.is_always_allowed("Bash"));
+
         let input = serde_json::json!({"command": "echo hi"});
         let result = write_permission_response(
-            PermissionWaitResult::AlwaysAllow("Bash".to_string()),
+            PermissionWaitResult::AllowAlways {
+                tool_name: "Bash".to_string(),
+                rule_kind: RuleKind::Exact,
+                scope: Scope::Project,
+            },
             "req-003",
             &input,
             &mut stdin,
             &mut cache,
         )
         .await;
-        assert_eq!(result.unwrap(), false, "AlwaysAllow must return Ok(false)");
-        assert!(cache.is_always_allowed("Bash"), "cache must record the always-allowed tool");
+        assert_eq!(result.unwrap(), false, "AllowAlways must return Ok(false)");
+        assert!(!cache.is_always_allowed("Bash"), "cache must be invalidated (settings.json is now source of truth)");
     }
 
     #[tokio::test]
     async fn write_permission_response_always_allow_does_not_affect_other_tools() {
         let mut stdin = spawn_cat_stdin().await;
         let mut cache = PermissionCache::new();
+        cache.add_always_allow("Bash");
+        cache.add_always_allow("Read");  // 다른 tool도 미리 등록
+
         let input = serde_json::json!({});
         write_permission_response(
-            PermissionWaitResult::AlwaysAllow("Write".to_string()),
+            PermissionWaitResult::AllowAlways {
+                tool_name: "Write".to_string(),
+                rule_kind: RuleKind::Exact,
+                scope: Scope::Project,
+            },
             "req-004",
             &input,
             &mut stdin,
@@ -545,8 +567,12 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(cache.is_always_allowed("Write"));
-        assert!(!cache.is_always_allowed("Bash"), "unrelated tools must not be in cache");
+
+        // Write는 cache에 없었으니 변화 없음
+        assert!(!cache.is_always_allowed("Write"));
+        // 다른 tool은 영향 없음
+        assert!(cache.is_always_allowed("Bash"), "Bash should still be cached");
+        assert!(cache.is_always_allowed("Read"), "Read should still be cached");
     }
 
     #[tokio::test]
