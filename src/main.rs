@@ -1,5 +1,6 @@
 #![warn(clippy::await_holding_lock)]
 
+mod claude_settings;
 mod commands;
 mod config;
 mod db;
