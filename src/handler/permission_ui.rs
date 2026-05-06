@@ -140,9 +140,10 @@ pub fn build_level2_message_parts(
     let preview_section = if preview_lines.is_empty() {
         String::new()
     } else {
-        // 끝에 \n 추가 — 미리보기 마지막 룰과 버튼 row 사이 시각적 여유 (review #298 QA)
+        // 끝에 zero-width space + \n — Discord 가 trailing whitespace 를 trim 하므로
+        // 단순 \n 만으로는 시각적 여유가 안 만들어짐. ZWSP 로 visible 한 줄 확보.
         format!(
-            "\n\n{}\n{}\n",
+            "\n\n{}\n{}\n\u{200B}",
             lang.msg_always_allow_options_header(),
             preview_lines.join("\n")
         )
