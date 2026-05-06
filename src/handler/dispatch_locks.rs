@@ -105,11 +105,17 @@ mod tests {
         use crate::db::repository::{
             create_session, register_project, try_acquire_session, update_session_status,
         };
-        use sqlx::SqlitePool;
+        use sqlx::PgPool;
 
-        async fn setup_test_pool() -> SqlitePool {
-            let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
+        async fn setup_test_pool() -> PgPool {
+            let database_url = std::env::var("TEST_DATABASE_URL")
+                .expect("TEST_DATABASE_URL must be set for db integration tests");
+            let pool = PgPool::connect(&database_url).await.unwrap();
             sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+            sqlx::query("TRUNCATE sessions, projects RESTART IDENTITY CASCADE")
+                .execute(&pool)
+                .await
+                .unwrap();
             pool
         }
 
@@ -121,6 +127,7 @@ mod tests {
         /// session is still `idle`; the other arrives after the status has
         /// been flipped to `running` and therefore gets `false`.
         #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        #[ignore = "requires TEST_DATABASE_URL"]
         async fn concurrent_acquire_serialized_with_db() {
             let pool = setup_test_pool().await;
             register_project(&pool, "ch-test", "/tmp", None)

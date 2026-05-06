@@ -479,7 +479,7 @@ async fn cleanup_orphaned_thread(
 async fn drain_initial_turn(
     mut event_rx: mpsc::Receiver<StreamEvent>,
     thread_id: &str,
-    db: &sqlx::SqlitePool,
+    db: &sqlx::PgPool,
     session_states: Arc<tokio::sync::Mutex<std::collections::HashMap<String, SessionState>>>,
     timeout_secs: u64,
 ) -> Result<(), PidoryError> {

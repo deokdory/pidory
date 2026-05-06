@@ -42,7 +42,7 @@ pub(super) async fn handle_bg_turn(
     thread_id: &str,
     channel_id: &ChannelId,
     ctx: &Context,
-    db: &sqlx::SqlitePool,
+    db: &sqlx::PgPool,
     lang: Lang,
     show_context_percent: bool,
     model_name: &mut String,

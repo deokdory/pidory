@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
 use poise::serenity_prelude::{ChannelId, Context, MessageId};
-use sqlx::SqlitePool;
+use sqlx::PgPool;
 use tokio::sync::{Mutex, watch};
 use tokio::task::JoinSet;
 use tracing::{Instrument, info_span};
@@ -96,7 +96,7 @@ pub(super) async fn run_supervisor(
     permission_fut: impl Future<Output = ()> + Send + 'static,
     sessions: Arc<Mutex<HashMap<String, SessionInner>>>,
     handles: SessionCleanupHandles,
-    db: SqlitePool,
+    db: PgPool,
     ctx: Context,
     notification_channel: Option<ChannelId>,
     session_count_tx: watch::Sender<usize>,
@@ -149,7 +149,7 @@ async fn do_cleanup(
     thread_id: &str,
     sessions: &Arc<Mutex<HashMap<String, SessionInner>>>,
     handles: &SessionCleanupHandles,
-    db: &SqlitePool,
+    db: &PgPool,
     ctx: &Context,
     notification_channel: Option<ChannelId>,
     session_count_tx: &watch::Sender<usize>,
@@ -175,10 +175,10 @@ async fn do_cleanup(
     super::session_manager::kill_with_timeout(&mut inner.child).await;
 
     // 3. DB status update → error
-    if let Err(e) = sqlx::query!(
-        "UPDATE sessions SET status = 'error' WHERE thread_id = ?",
-        thread_id
+    if let Err(e) = sqlx::query(
+        "UPDATE sessions SET status = 'error' WHERE thread_id = $1",
     )
+    .bind(thread_id)
     .execute(db)
     .await
     {

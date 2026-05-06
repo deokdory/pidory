@@ -192,7 +192,7 @@ pub async fn process_turn_events(
     channel_id: ChannelId,
     msg_id: MessageId,
     thread_id: &str,
-    db: &sqlx::SqlitePool,
+    db: &sqlx::PgPool,
     max_chunk_length: usize,
     max_chunks: usize,
     lang: Lang,

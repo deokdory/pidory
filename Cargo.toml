@@ -3,12 +3,21 @@ name = "pidory"
 version = "0.6.7"
 edition = "2024"
 
+[features]
+default = []
+migrate = ["sqlx/sqlite"]
+
+[[bin]]
+name = "pidory-migrate"
+path = "src/bin/migrate.rs"
+required-features = ["migrate"]
+
 [dependencies]
 futures-util = "0.3"
 poise = "0.6"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 serenity = { version = "0.12", default-features = false, features = ["client", "gateway", "model", "cache"] }
-sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite"] }
+sqlx = { version = "0.8", features = ["runtime-tokio", "postgres"] }
 tokio = { version = "1", features = ["full"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 serde = { version = "1", features = ["derive"] }

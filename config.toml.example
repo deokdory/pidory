@@ -18,8 +18,11 @@ max_sessions = 10             # 동시 세션 상한
 idle_timeout_secs = 7200      # 유휴 세션 타임아웃 (초), 0 to disable
 # default_model = "sonnet"    # opus | sonnet | haiku | claude-sonnet-4-6
 
+# [database] path is DEPRECATED — DATABASE_URL env is the authoritative source.
+# Keep this section for backwards compatibility only.
+# Set DATABASE_URL in /etc/pidory/db.env (Linux service) or as an env variable.
 [database]
-path = "pidory.db"            # SQLite DB 경로
+path = "pidory.db"            # deprecated, ignored
 
 [response]
 max_chunk_length = 1900       # Discord 2000자 여유분

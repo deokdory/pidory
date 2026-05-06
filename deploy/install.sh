@@ -10,12 +10,13 @@ OS="$(uname -s)"
 echo "=== pidory deployment ($OS) ==="
 
 # 1. Build
-echo "[1/5] Building release binary..."
+echo "[1/6] Building release binaries..."
 cd "$PROJECT_DIR"
 cargo build --release
+cargo build --bin pidory-migrate --features migrate --release
 
 # 2. Check .env
-echo "[2/5] Checking environment..."
+echo "[2/6] Checking environment..."
 if [ ! -f "$PROJECT_DIR/.env" ]; then
     echo "WARNING: .env not found."
     echo "Create it with: echo 'PIDORY_DISCORD_TOKEN=your_token' > $PROJECT_DIR/.env"
@@ -23,11 +24,11 @@ fi
 
 # 3. Copy config if not exists + detect claude CLI path
 if [ ! -f "$PROJECT_DIR/config.toml" ]; then
-    echo "[3/5] Creating config.toml from example..."
+    echo "[3/6] Creating config.toml from example..."
     cp "$PROJECT_DIR/config.toml.example" "$PROJECT_DIR/config.toml"
     echo "IMPORTANT: Edit config.toml with your Discord guild_id and owner_id"
 else
-    echo "[3/5] config.toml already exists, skipping"
+    echo "[3/6] config.toml already exists, skipping"
 fi
 
 # Detect claude CLI absolute path and inject into config.toml
@@ -40,8 +41,25 @@ else
     echo "WARNING: claude CLI not found in PATH. Set binary_path in config.toml manually."
 fi
 
-# 4. Install skills
-echo "[4/5] Installing skills..."
+# 4. Install pidory-migrate binary
+echo "[4/6] Installing pidory-migrate..."
+sudo install -o "$USER_NAME" -m 0755 \
+    "$PROJECT_DIR/target/release/pidory-migrate" \
+    /usr/local/bin/pidory-migrate
+# Create /etc/pidory/ for db.env (postgres-setup.sh will populate DATABASE_URL)
+if [ ! -d /etc/pidory ]; then
+    sudo mkdir -p /etc/pidory
+    sudo chown "$USER_NAME:$USER_NAME" /etc/pidory
+    sudo chmod 700 /etc/pidory
+fi
+# Ensure db.env has correct permissions if it already exists
+if [ -f /etc/pidory/db.env ]; then
+    sudo chown "$USER_NAME:$USER_NAME" /etc/pidory/db.env
+    sudo chmod 600 /etc/pidory/db.env
+fi
+
+# 5. Install skills
+echo "[5/6] Installing skills..."
 SKILLS_TARGET="$HOME/.claude/skills"
 if [ -d "$PROJECT_DIR/skills" ]; then
     mkdir -p "$SKILLS_TARGET"
@@ -57,8 +75,8 @@ else
     echo "  No skills directory found, skipping"
 fi
 
-# 5. Install service
-echo "[5/5] Installing service..."
+# 6. Install service
+echo "[6/6] Installing service..."
 
 if [ "$OS" = "Darwin" ]; then
     # macOS — launchd
@@ -120,3 +138,4 @@ echo ""
 echo "Don't forget to:"
 echo "  1. Edit config.toml with your Discord guild_id and owner_id"
 echo "  2. Set Discord token in .env: echo 'PIDORY_DISCORD_TOKEN=your_token' > .env"
+echo "  3. Run scripts/postgres-setup.sh to create /etc/pidory/db.env with DATABASE_URL"
