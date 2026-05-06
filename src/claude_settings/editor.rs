@@ -55,23 +55,32 @@ use crate::claude_settings::lock::{acquire_path_lock, flock_with_timeout};
 use crate::claude_settings::path::{canonical_settings_path, ensure_parent_dir};
 
 const SIZE_LIMIT: u64 = 1_048_576; // 1 MiB
-const FLOCK_TIMEOUT: Duration = Duration::from_secs(5);
+const FLOCK_TIMEOUT: Duration = Duration::from_secs(3);
 
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
 
-/// Adds a permission rule to the `permissions.allow` array of the Claude
-/// settings file at `path`.
+/// Adds multiple permission rules to the `permissions.allow` array of the Claude
+/// settings file at `path` in a single atomic RMW cycle.
 ///
 /// Behavior:
+/// - Empty `rules` slice → returns `Ok(MergeOutcome::AlreadyPresent)` immediately
+///   without touching the file or acquiring any lock.
 /// - Creates the file (mode 0644) and parent directory (mode 0755) if absent.
-/// - Normalizes the rule (canonical form: `Bash(npm *)`, `WebFetch(domain:...)`).
-/// - Dedups against existing rules — exact-match string equality after normalization.
+/// - Normalizes each rule (canonical form: `Bash(npm *)`, `WebFetch(domain:...)`).
+/// - Dedups each rule against existing rules — exact-match string equality after
+///   normalization.
+/// - All rules are merged within a **single lock acquisition** — no partial success.
 /// - Preserves all other top-level fields (`theme`, `model`, `hooks`, etc.).
-/// - Returns [`MergeOutcome::Added`] on first insert, [`MergeOutcome::AlreadyPresent`]
-///   on duplicate, [`MergeOutcome::ConflictResolved`] if an external write
-///   was detected and re-merged.
+///
+/// ## `MergeOutcome` aggregation
+///
+/// Priority: `Added` > `ConflictResolved` > `AlreadyPresent`.
+/// - `Added` — at least one rule was newly inserted.
+/// - `AlreadyPresent` — all rules were already present (no file change).
+/// - `ConflictResolved` — an external write was detected and re-merged
+///   (set by the RMW core's L4 fingerprint check, not by this mutator).
 ///
 /// # Errors
 ///
@@ -81,33 +90,35 @@ const FLOCK_TIMEOUT: Duration = Duration::from_secs(5);
 /// - [`JsonCorrupted`] — existing settings file is invalid JSON; a backup
 ///   is saved at `<path>.corrupted-<unix_ts>` and `notifier.notify_conflict`
 ///   fires before the error is returned.
-/// - [`LockConflict`] — could not acquire flock within 5s + 5s retry.
+/// - [`LockConflict`] — could not acquire flock within 3s + 3s retry.
 ///
-/// # Example
+/// # Examples
 ///
 /// ```no_run
-/// # use pidory::claude_settings::{add_permission, LoggingNotifier};
+/// # use pidory::claude_settings::{add_permissions, LoggingNotifier};
 /// # use std::path::Path;
-/// # async fn ex() -> Result<(), Box<dyn std::error::Error>> {
-/// add_permission(
-///     Path::new("/tmp/settings.json"),
-///     "Bash(npm *)",
+/// # async fn ex() {
+/// let outcome = add_permissions(
+///     Path::new("/path/to/settings.json"),
+///     &["Bash(find /tmp)", "Bash(head -3)"],
 ///     &LoggingNotifier,
-/// ).await?;
-/// # Ok(()) }
+/// ).await.unwrap();
+/// # }
 /// ```
 #[allow(dead_code)]
-pub async fn add_permission(
+pub async fn add_permissions(
     path: &Path,
-    rule: &str,
+    rules: &[&str],
     notifier: &dyn ConflictNotifier,
 ) -> Result<MergeOutcome, ClaudeSettingsError> {
-    let rule_owned = rule.to_string();
+    if rules.is_empty() {
+        return Ok(MergeOutcome::AlreadyPresent);
+    }
+
+    let rules_owned: Vec<String> = rules.iter().map(|r| r.to_string()).collect();
     let path_owned = path.to_path_buf();
     apply_mutation(path, notifier, move |value| {
-        let normalized = normalize_rule(&rule_owned);
-
-        // review #295 w2: shape 불일치는 silent no-op + Added 반환 대신 InvalidShape Err.
+        // review #295 w2: shape 불일치는 InvalidShape Err.
         let obj = value.as_object_mut().ok_or_else(|| {
             ClaudeSettingsError::InvalidShape {
                 path: path_owned.clone(),
@@ -136,12 +147,70 @@ pub async fn add_permission(
             }
         };
 
-        Ok(match merge_into_allow(arr, normalized) {
-            MergeAction::Added => MergeOutcome::Added,
-            MergeAction::AlreadyPresent => MergeOutcome::AlreadyPresent,
+        // Merge all rules in one pass. Outcome priority: Added > AlreadyPresent.
+        // ConflictResolved is set by the L4 fingerprint layer in apply_mutation.
+        let mut any_added = false;
+        for rule_str in &rules_owned {
+            let normalized = normalize_rule(rule_str);
+            match merge_into_allow(arr, normalized) {
+                MergeAction::Added => any_added = true,
+                MergeAction::AlreadyPresent => {}
+            }
+        }
+
+        Ok(if any_added {
+            MergeOutcome::Added
+        } else {
+            MergeOutcome::AlreadyPresent
         })
     })
     .await
+}
+
+/// Adds a permission rule to the `permissions.allow` array of the Claude
+/// settings file at `path`.
+///
+/// This is a convenience wrapper around [`add_permissions`] for the single-rule case.
+///
+/// Behavior:
+/// - Creates the file (mode 0644) and parent directory (mode 0755) if absent.
+/// - Normalizes the rule (canonical form: `Bash(npm *)`, `WebFetch(domain:...)`).
+/// - Dedups against existing rules — exact-match string equality after normalization.
+/// - Preserves all other top-level fields (`theme`, `model`, `hooks`, etc.).
+/// - Returns [`MergeOutcome::Added`] on first insert, [`MergeOutcome::AlreadyPresent`]
+///   on duplicate, [`MergeOutcome::ConflictResolved`] if an external write
+///   was detected and re-merged.
+///
+/// # Errors
+///
+/// See [`ClaudeSettingsError`] for the full set. Notable cases:
+/// - [`SymlinkNotSupported`]/[`IsADirectory`] — `path` invalid type.
+/// - [`FileTooLarge`] — settings file exceeds 1 MiB.
+/// - [`JsonCorrupted`] — existing settings file is invalid JSON; a backup
+///   is saved at `<path>.corrupted-<unix_ts>` and `notifier.notify_conflict`
+///   fires before the error is returned.
+/// - [`LockConflict`] — could not acquire flock within 3s + 3s retry.
+///
+/// # Example
+///
+/// ```no_run
+/// # use pidory::claude_settings::{add_permission, LoggingNotifier};
+/// # use std::path::Path;
+/// # async fn ex() -> Result<(), Box<dyn std::error::Error>> {
+/// add_permission(
+///     Path::new("/tmp/settings.json"),
+///     "Bash(npm *)",
+///     &LoggingNotifier,
+/// ).await?;
+/// # Ok(()) }
+/// ```
+#[allow(dead_code)]
+pub async fn add_permission(
+    path: &Path,
+    rule: &str,
+    notifier: &dyn ConflictNotifier,
+) -> Result<MergeOutcome, ClaudeSettingsError> {
+    add_permissions(path, &[rule], notifier).await
 }
 
 // ---------------------------------------------------------------------------
@@ -622,7 +691,7 @@ mod race_tests {
 
     // ── AC4: vim contention — LOCK_EX held by another fd ──────────────────────
     /// 별도 thread가 LOCK_EX를 획득한 채 대기 → add_permission 호출 →
-    /// flock_with_timeout (5s + 5s) 내에 LockConflict + TestNotifier에 LockTimeout 1개.
+    /// flock_with_timeout (3s + 3s) 내에 LockConflict + TestNotifier에 LockTimeout 1개.
     ///
     /// review #295 s1: holder는 RAII guard로 종료 — assertion이 panic해도 guard
     /// `Drop`이 done 신호를 보내고 thread join을 보장해 hang 방지.
@@ -657,7 +726,7 @@ mod race_tests {
             let f = File::open(&holder_path).unwrap();
             f.lock().unwrap();
             ready_tx.send(()).unwrap();
-            // Hold lock long enough for both flock_with_timeout attempts (5s + 5s) to expire
+            // Hold lock long enough for both flock_with_timeout attempts (3s + 3s) to expire
             let _ = done_rx.recv();
             let _ = f.unlock();
         });
@@ -1179,6 +1248,217 @@ mod edge_tests {
                     if reason.contains("allow") && reason.contains("array")
             ),
             "expected InvalidShape for non-array allow, got: {result:?}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// add_permissions (batch API) tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod batch_tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    use crate::claude_settings::{add_permissions, LoggingNotifier, MergeOutcome};
+
+    // ── BP1: 빈 슬라이스 → AlreadyPresent, 파일 변경 X ─────────────────────
+    /// Empty rules slice → `Ok(AlreadyPresent)` immediately, no file touched.
+    #[tokio::test]
+    async fn add_permissions_empty_slice_noop() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("settings.json");
+        std::fs::write(&path, b"{}").unwrap();
+
+        // Capture mtime before call
+        let mtime_before = std::fs::metadata(&path).unwrap().modified().unwrap();
+
+        let outcome = add_permissions(&path, &[], &LoggingNotifier)
+            .await
+            .expect("add_permissions with empty slice should succeed");
+
+        assert_eq!(
+            outcome,
+            MergeOutcome::AlreadyPresent,
+            "empty slice must return AlreadyPresent"
+        );
+
+        // File must not be touched (mtime unchanged, content unchanged)
+        let mtime_after = std::fs::metadata(&path).unwrap().modified().unwrap();
+        assert_eq!(mtime_before, mtime_after, "file must not be modified for empty slice");
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(content, "{}", "file content must remain unchanged for empty slice");
+    }
+
+    // ── BP2: 단일 룰 — add_permission과 동등 ────────────────────────────────
+    /// Single rule via `add_permissions` behaves identically to `add_permission`.
+    #[tokio::test]
+    async fn add_permissions_single_rule_equiv() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("settings.json");
+        std::fs::write(&path, b"{}").unwrap();
+
+        let outcome = add_permissions(&path, &["Bash(npm *)"], &LoggingNotifier)
+            .await
+            .expect("add_permissions single rule should succeed");
+
+        assert_eq!(outcome, MergeOutcome::Added);
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        let actual: serde_json::Value = serde_json::from_str(&content).unwrap();
+        let expected: serde_json::Value = serde_json::json!({
+            "permissions": {
+                "allow": ["Bash(npm *)"]
+            }
+        });
+        assert_eq!(actual, expected, "single-rule batch must produce same result as add_permission");
+
+        // Duplicate add → AlreadyPresent
+        let second = add_permissions(&path, &["Bash(npm *)"], &LoggingNotifier)
+            .await
+            .expect("duplicate single-rule add should succeed");
+        assert_eq!(second, MergeOutcome::AlreadyPresent);
+    }
+
+    // ── BP3: 복수 룰 — 단일 RMW 사이클에서 atomic merge ────────────────────
+    /// Multiple rules are merged in a single RMW cycle; all rules appear in the file.
+    #[tokio::test]
+    async fn add_permissions_multiple_rules_atomic() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("settings.json");
+        std::fs::write(&path, b"{}").unwrap();
+
+        let outcome = add_permissions(
+            &path,
+            &["Bash(find /tmp)", "Bash(head -3)", "Bash(ls)"],
+            &LoggingNotifier,
+        )
+        .await
+        .expect("add_permissions multiple rules should succeed");
+
+        assert_eq!(outcome, MergeOutcome::Added);
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&content).unwrap();
+        let allow = v["permissions"]["allow"].as_array().unwrap();
+
+        assert_eq!(allow.len(), 3, "all 3 rules must be present");
+        assert!(
+            allow.contains(&serde_json::json!("Bash(find /tmp)")),
+            "Bash(find /tmp) missing"
+        );
+        assert!(
+            allow.contains(&serde_json::json!("Bash(head -3)")),
+            "Bash(head -3) missing"
+        );
+        assert!(
+            allow.contains(&serde_json::json!("Bash(ls)")),
+            "Bash(ls) missing"
+        );
+    }
+
+    // ── BP4: 일부 이미 존재 → Added (신규 1개 이상 추가됨) ──────────────────
+    /// When some rules already exist and some are new, outcome is `Added`.
+    #[tokio::test]
+    async fn add_permissions_partial_already_present() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("settings.json");
+
+        // Pre-populate with one rule
+        std::fs::write(
+            &path,
+            br#"{"permissions":{"allow":["Bash(ls)"]}}"#,
+        )
+        .unwrap();
+
+        // Add two rules: one already present, one new
+        let outcome = add_permissions(&path, &["Bash(ls)", "Bash(pwd)"], &LoggingNotifier)
+            .await
+            .expect("add_permissions partial already-present should succeed");
+
+        // At least one was new → Added
+        assert_eq!(
+            outcome,
+            MergeOutcome::Added,
+            "partial new rules must return Added"
+        );
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&content).unwrap();
+        let allow = v["permissions"]["allow"].as_array().unwrap();
+
+        assert_eq!(allow.len(), 2, "exactly 2 rules expected (no duplicate)");
+        assert!(
+            allow.contains(&serde_json::json!("Bash(ls)")),
+            "Bash(ls) must be preserved"
+        );
+        assert!(
+            allow.contains(&serde_json::json!("Bash(pwd)")),
+            "Bash(pwd) must be newly added"
+        );
+    }
+
+    // ── BP5: 모두 이미 존재 → AlreadyPresent ────────────────────────────────
+    /// When all rules are already present, outcome is `AlreadyPresent`.
+    #[tokio::test]
+    async fn add_permissions_all_already_present() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("settings.json");
+
+        std::fs::write(
+            &path,
+            br#"{"permissions":{"allow":["Bash(ls)","Bash(pwd)"]}}"#,
+        )
+        .unwrap();
+
+        let outcome = add_permissions(&path, &["Bash(ls)", "Bash(pwd)"], &LoggingNotifier)
+            .await
+            .expect("add_permissions all-present should succeed");
+
+        assert_eq!(
+            outcome,
+            MergeOutcome::AlreadyPresent,
+            "all already-present rules must return AlreadyPresent"
+        );
+
+        // File content unchanged in terms of allow length
+        let content = std::fs::read_to_string(&path).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&content).unwrap();
+        let allow = v["permissions"]["allow"].as_array().unwrap();
+        assert_eq!(allow.len(), 2, "no duplicates should be added");
+    }
+
+    // ── BP6: 정규화 적용 확인 ────────────────────────────────────────────────
+    /// Rules are normalized before merging (e.g., `Bash(npm:*)` → `Bash(npm *)`).
+    #[tokio::test]
+    async fn add_permissions_normalization_applied() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("settings.json");
+        std::fs::write(&path, b"{}").unwrap();
+
+        // Add two rules that normalize to the same canonical form
+        let outcome = add_permissions(
+            &path,
+            &["Bash(npm:*)", "Bash(npm *)"],
+            &LoggingNotifier,
+        )
+        .await
+        .expect("add_permissions normalization test should succeed");
+
+        // First rule is new (Added), second is a duplicate after normalization
+        assert_eq!(outcome, MergeOutcome::Added);
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&content).unwrap();
+        let allow = v["permissions"]["allow"].as_array().unwrap();
+
+        assert_eq!(allow.len(), 1, "normalized duplicates must be deduped to 1 entry");
+        assert_eq!(
+            allow[0],
+            serde_json::json!("Bash(npm *)"),
+            "stored rule must be in canonical form"
         );
     }
 }

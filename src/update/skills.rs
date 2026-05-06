@@ -86,14 +86,14 @@ pub(super) fn sync_skills_to(worktree: &Path, target_root: &Path) -> Result<usiz
         }
 
         // 3. If final exists, rename final -> old
-        if final_dir.exists() {
-            if let Err(e) = fs::rename(&final_dir, &old_dir) {
-                let _ = fs::remove_dir_all(&staging);
-                return Err(Error::SkillSyncFailed(format!(
-                    "failed to move '{}' to old: {e}",
-                    name_str
-                )));
-            }
+        if final_dir.exists()
+            && let Err(e) = fs::rename(&final_dir, &old_dir)
+        {
+            let _ = fs::remove_dir_all(&staging);
+            return Err(Error::SkillSyncFailed(format!(
+                "failed to move '{}' to old: {e}",
+                name_str
+            )));
         }
 
         // 4. staging -> final

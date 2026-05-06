@@ -21,7 +21,7 @@ use super::io::{build_user_message_json, build_interrupt_json, say_silent_chunke
 use super::permission_wait::{wait_for_permissions, PermissionsWaitResult, InitialControlRequest};
 use super::ratelimit_bridge::handle_ratelimit_event;
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
 pub(super) async fn run_active_turn(
     stdin: &mut ChildStdin,
     reader: &mut BufReader<ChildStdout>,

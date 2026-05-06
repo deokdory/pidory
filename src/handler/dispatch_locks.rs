@@ -70,10 +70,10 @@ impl ThreadDispatchLocks {
         // Hold the outer Mutex<HashMap> for the whole check-and-remove — this
         // is atomic with concurrent `get_or_create` calls on the same key.
         // `Arc::strong_count == 1` means the map holds the only reference.
-        if let Some(arc) = map.get(thread_id) {
-            if Arc::strong_count(arc) == 1 {
-                map.remove(thread_id);
-            }
+        if let Some(arc) = map.get(thread_id)
+            && Arc::strong_count(arc) == 1
+        {
+            map.remove(thread_id);
         }
     }
 

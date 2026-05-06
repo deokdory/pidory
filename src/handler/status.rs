@@ -151,14 +151,13 @@ impl ProgressIndicator {
         let elapsed = (Instant::now() - self.started).saturating_sub(self.pause_elapsed);
         let text = self.format_done(elapsed);
 
-        if let Some(mid) = self.message_id {
-            if let Err(e) = self
+        if let Some(mid) = self.message_id
+            && let Err(e) = self
                 .channel_id
                 .edit_message(ctx, mid, EditMessage::new().content(&text))
                 .await
-            {
-                tracing::warn!("ProgressIndicator: failed to finalize message: {}", e);
-            }
+        {
+            tracing::warn!("ProgressIndicator: failed to finalize message: {}", e);
         }
 
         self.active = false;

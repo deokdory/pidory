@@ -41,6 +41,8 @@ pub struct PendingPermission {
     pub input: Option<serde_json::Value>,
     /// User-selected scope override for AlwaysAllow. None = use default_scope().
     pub scope_override: Option<claude_settings::rule::Scope>,
+    /// Claude CLI 가 control_request 에 포함한 decision_reason. Level 2 UI 에 보존.
+    pub decision_reason: Option<String>,
 }
 
 /// Tracks a multi-question AskUserQuestion group.
@@ -77,6 +79,10 @@ pub struct Data {
     /// Event handler가 fresh Context를 background task에 전달하는 채널.
     /// Shard reconnect 후에도 최신 ShardMessenger를 사용할 수 있게 해준다.
     pub ctx_watch: watch::Sender<serenity::Context>,
+    /// AllowAlways 성공 후 다음 user message 도착 시 subprocess --resume 재시작 예약.
+    /// Claude CLI 가 settings.local.json 을 핫 리로드하지 않으므로
+    /// 새 subprocess 가 settings 를 다시 읽어 룰 매칭이 올바르게 동작한다.
+    pub pending_session_restart: Arc<Mutex<HashSet<String>>>,
 }
 
 #[tokio::main]
@@ -202,16 +208,16 @@ async fn main() -> Result<(), PidoryError> {
                 if let Some(worktree) = &worktree_opt {
                     let rollback_marker = worktree.join("target").join("release").join(".update-rolled-back");
                     if rollback_marker.exists() {
-                        if let Ok(contents) = std::fs::read_to_string(&rollback_marker) {
-                            if let Some(channel_id) = config.discord.notification_channel_id {
-                                let msg = format!(
-                                    "⚠️ 업데이트 후 부팅 실패로 자동 롤백됨. 상세: {}",
-                                    contents
-                                );
-                                let _ = poise::serenity_prelude::ChannelId::new(channel_id)
-                                    .say(&ctx, msg)
-                                    .await;
-                            }
+                        if let Ok(contents) = std::fs::read_to_string(&rollback_marker)
+                            && let Some(channel_id) = config.discord.notification_channel_id
+                        {
+                            let msg = format!(
+                                "⚠️ 업데이트 후 부팅 실패로 자동 롤백됨. 상세: {}",
+                                contents
+                            );
+                            let _ = poise::serenity_prelude::ChannelId::new(channel_id)
+                                .say(&ctx, msg)
+                                .await;
                         }
                         let _ = std::fs::remove_file(&rollback_marker);
                     }
@@ -286,37 +292,36 @@ async fn main() -> Result<(), PidoryError> {
                 }
 
                 // Release checker
-                if config.release.enabled {
-                    if let Some(channel_id) = config.discord.notification_channel_id
+                if config.release.enabled
+                    && let Some(channel_id) = config.discord.notification_channel_id
                         .map(poise::serenity_prelude::ChannelId::new)
-                    {
-                        let repo = config.release.repo.clone();
-                        let last_tag_file = config.release.last_tag_file.clone();
-                        let interval_secs = config.release.check_interval_secs;
-                        let token = config.release.token_env.as_ref()
-                            .and_then(|env_name| std::env::var(env_name).ok());
-                        let lang = config.language;
-                        let mut ctx_rx = ctx_tx.subscribe();
-                        tokio::spawn(async move {
-                            let checker = crate::release::ReleaseChecker::new(repo, last_tag_file, token);
-                            let mut interval = tokio::time::interval(
-                                std::time::Duration::from_secs(interval_secs),
-                            );
-                            tracing::info!("Release checker started (interval: {interval_secs}s)");
-                            loop {
-                                tokio::select! {
-                                    _ = interval.tick() => {
-                                        let fresh_ctx = ctx_rx.borrow().clone();
-                                        checker.check_and_notify(&fresh_ctx, channel_id, lang).await;
-                                    }
-                                    result = ctx_rx.changed() => {
-                                        if result.is_err() { break; }
-                                        tracing::debug!("Release checker: context refreshed");
-                                    }
+                {
+                    let repo = config.release.repo.clone();
+                    let last_tag_file = config.release.last_tag_file.clone();
+                    let interval_secs = config.release.check_interval_secs;
+                    let token = config.release.token_env.as_ref()
+                        .and_then(|env_name| std::env::var(env_name).ok());
+                    let lang = config.language;
+                    let mut ctx_rx = ctx_tx.subscribe();
+                    tokio::spawn(async move {
+                        let checker = crate::release::ReleaseChecker::new(repo, last_tag_file, token);
+                        let mut interval = tokio::time::interval(
+                            std::time::Duration::from_secs(interval_secs),
+                        );
+                        tracing::info!("Release checker started (interval: {interval_secs}s)");
+                        loop {
+                            tokio::select! {
+                                _ = interval.tick() => {
+                                    let fresh_ctx = ctx_rx.borrow().clone();
+                                    checker.check_and_notify(&fresh_ctx, channel_id, lang).await;
+                                }
+                                result = ctx_rx.changed() => {
+                                    if result.is_err() { break; }
+                                    tracing::debug!("Release checker: context refreshed");
                                 }
                             }
-                        });
-                    }
+                        }
+                    });
                 }
 
                 let session_states: Arc<Mutex<HashMap<String, SessionState>>> = Arc::new(Mutex::new(HashMap::new()));
@@ -428,6 +433,7 @@ async fn main() -> Result<(), PidoryError> {
                     skill_descriptions,
                     agent_descriptions,
                     ctx_watch: ctx_tx,
+                    pending_session_restart: Arc::new(Mutex::new(HashSet::new())),
                 })
             })
         })

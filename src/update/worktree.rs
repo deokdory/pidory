@@ -83,6 +83,7 @@ pub fn is_dirty(path: &Path) -> Result<bool, Error> {
     Ok(!output.stdout.is_empty())
 }
 
+#[allow(dead_code)]
 pub fn current_commit(path: &Path) -> Result<String, Error> {
     let output = Command::new("git")
         .args(["-C", &path.to_string_lossy(), "rev-parse", "--short", "HEAD"])
@@ -97,6 +98,7 @@ pub fn current_commit(path: &Path) -> Result<String, Error> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
+#[allow(dead_code)]
 pub fn current_branch_or_tag(path: &Path) -> Result<String, Error> {
     // 먼저 태그 체크아웃인지 확인 (detached HEAD + 태그)
     let tag_output = Command::new("git")
