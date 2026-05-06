@@ -193,45 +193,15 @@ async fn handle_message(
     };
 
     // per-thread dispatch 직렬화 lock 획득.
-    // restart 트리거 + get_or_create + try_acquire_session + send_message 전체를
+    // get_or_create + try_acquire_session + (primary turn 시 restart) + send_message 전체를
     // 같은 lock 안에서 직렬화한다.
     // AllowAlways 후 두 메시지가 동시 도착해도 순서 보장 (#258, #298):
-    //   M_A: lock 획득 → restart consume → get_or_create → try_acquire → send
-    //   M_B: lock 대기 → marker 이미 consumed → restart skip → 기존 subprocess 사용
+    //   M_A: lock 획득 → get_or_create → try_acquire=true → restart consume → respawn → send
+    //   M_B: lock 대기 → get_or_create(새 inner 재사용) → try_acquire=false → restart skip (set 보존)
     let _dispatch_lock_arc = data.dispatch_locks.get_or_create(&thread_id).await;
     let _dispatch_guard = _dispatch_lock_arc.lock().await;
 
-    // AllowAlways 성공 후 subprocess restart 예약 처리.
-    // dispatch_lock 안에서 실행하여 동시 도착 메시지와의 race 방지 (#298).
-    // get_or_create 직전에 호출하여 SessionInner 를 먼저 제거한다.
-    // 이후 get_or_create 가 --resume <session_id> 로 새 subprocess 를 spawn한다.
-    if data
-        .pending_session_restart
-        .lock()
-        .await
-        .remove(&thread_id)
-    {
-        if let Some(sid) = session.session_id.as_deref() {
-            if let Err(e) = data
-                .sessions
-                .restart_for_settings_reload(&thread_id, sid)
-                .await
-            {
-                tracing::warn!(
-                    thread_id = %thread_id,
-                    error = %e,
-                    "restart_for_settings_reload failed (session may not exist yet); continuing"
-                );
-            }
-        } else {
-            tracing::warn!(
-                thread_id = %thread_id,
-                "pending_session_restart set but session_id is None; skipping restart"
-            );
-        }
-    }
-
-    // SessionManager: 세션 생성 또는 기존 재사용
+    // SessionManager: 세션 생성 또는 기존 재사용 (restart 없이 먼저 확보)
     match data
         .sessions
         .get_or_create(
@@ -283,6 +253,7 @@ async fn handle_message(
 
     if !acquired {
         // mid-turn inject: event_tx 없이 전송 (context inject 안 함, needs_context 소비 안 함)
+        // pending_session_restart 의 thread_id 는 그대로 보존 — 다음 primary turn 시 재시도
         let mid_turn_downloaded_files =
             download_message_attachments(
                 &new_message.attachments,
@@ -355,6 +326,79 @@ async fn handle_message(
         }
 
         return Ok(());
+    }
+
+    // AllowAlways 성공 후 subprocess restart 예약 처리 — primary turn 시작 시점에만 발동.
+    // dispatch_lock 안에서 실행하여 동시 도착 메시지와의 race 방지 (#298).
+    // mid-turn (acquired=false) 에서는 skip + set 에 thread_id 보존 → 다음 primary turn 시 재시도.
+    // restart 후 get_or_create 재호출: SessionInner 제거 → 새 subprocess spawn (--resume).
+    if data
+        .pending_session_restart
+        .lock()
+        .await
+        .remove(&thread_id)
+    {
+        if let Some(sid) = session.session_id.as_deref() {
+            if let Err(e) = data
+                .sessions
+                .restart_for_settings_reload(&thread_id, sid)
+                .await
+            {
+                tracing::warn!(
+                    thread_id = %thread_id,
+                    error = %e,
+                    "restart_for_settings_reload failed (session may not exist yet); continuing"
+                );
+            }
+            // SessionInner 가 제거됐으므로 같은 dispatch_lock 안에서 즉시 재spawn.
+            match data
+                .sessions
+                .get_or_create(
+                    &thread_id,
+                    &project.path,
+                    session.session_id.as_deref(),
+                    &disallowed_tools,
+                    session.model.as_deref().or(data.config.claude.default_model.as_deref()),
+                    ctx.clone(),
+                    channel_id,
+                    data.db.clone(),
+                    lang,
+                    data.pending_permissions.clone(),
+                    data.pending_question_groups.clone(),
+                    data.config.discord.owner_id,
+                    crate::subprocess::supervisor::SessionCleanupHandles::from_data(data),
+                    data.config.discord.notification_channel_id.map(poise::serenity_prelude::ChannelId::new),
+                )
+                .await
+            {
+                Ok(result) => {
+                    tracing::info!(
+                        thread_id = %thread_id,
+                        evicted = result.evicted_thread_id.as_deref(),
+                        "Session respawned after settings reload restart"
+                    );
+                    if let Some(evicted_tid) = result.evicted_thread_id {
+                        cleanup_session_state(data, &evicted_tid, ctx).await;
+                        if let Err(e) = repository::update_session_status(db, &evicted_tid, "idle").await {
+                            tracing::warn!("Failed to update session status for evicted thread {}: {}", evicted_tid, e);
+                        }
+                    }
+                }
+                Err(e) => {
+                    error!("Failed to respawn session after restart for thread {}: {}", thread_id, e);
+                    channel_id
+                        .say(ctx, format!("❌ {}", lang.session_create_failed(&e)))
+                        .await
+                        .map_err(|e| PidoryError::Discord(Box::new(e)))?;
+                    return Ok(());
+                }
+            }
+        } else {
+            tracing::warn!(
+                thread_id = %thread_id,
+                "pending_session_restart set but session_id is None; skipping restart"
+            );
+        }
     }
 
     // 직접 실행 경로: context inject 판정 (primary 경로만)

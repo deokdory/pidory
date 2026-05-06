@@ -365,14 +365,13 @@ impl SessionManager {
         Self::find_evict_target(&sessions).is_some()
     }
 
-    /// AllowAlways 성공 후 다음 user message 시점에서 호출.
+    /// AllowAlways 성공 후 primary turn 시작 시점에서 호출.
     /// 기존 subprocess 를 종료하고 SessionInner 를 제거한다.
-    /// 이후 `get_or_create` 가 `--resume <session_id>` 로 새 subprocess 를 spawn한다.
+    /// 이후 호출자가 즉시 `get_or_create` 를 재호출하여 `--resume <session_id>` 로 새 subprocess 를 spawn한다.
     ///
-    /// 호출자(`handle_message`)는 새 user message 진입 직후, `get_or_create` 호출 직전에 이 함수를 호출한다.
-    /// SessionInner 가 제거되므로 후속 `get_or_create` 가 `--resume <session_id>` 옵션으로 새 subprocess 를 spawn 한다.
-    /// 같은 thread 의 동시 message 는 `try_acquire_session` 이 후속 단계에서 직렬화하므로 race 없음 —
-    /// 이 시점의 이전 turn 은 이미 `release_session` 된 상태.
+    /// **Invariant**: `try_acquire_session=true` 인 primary turn 시작 시점에서만 호출된다.
+    /// mid-turn inject (acquired=false) 에서는 호출하지 않는다 — 진행 중 worker 를 kill 하면 안 됨.
+    /// SessionInner 가 제거되므로 호출자는 같은 dispatch_lock 안에서 즉시 `get_or_create` 를 재호출해야 한다.
     pub async fn restart_for_settings_reload(&self, thread_id: &str, session_id: &str) -> Result<(), PidoryError> {
         tracing::info!(
             thread_id = %thread_id,
