@@ -65,6 +65,9 @@ pub fn scope_to_path(scope: Scope, project_root: &Path, home: &Path) -> PathBuf 
 ///
 /// Unknown tool 은 `Tool` 만 반환한다 — input schema 를 모르므로 Exact 의 첫
 /// string 필드 fallback 은 비결정적이라 위험하다 (review #297 s2 fix).
+///
+/// MCP tool (`mcp__` prefix) 은 괄호 없는 exact form 만 유효하므로 `Tool` 만 반환한다
+/// (Claude Code permission spec MCP 항목 — `mcp__<server>__<tool>` 형식, 괄호 불가).
 pub fn available_rule_kinds(tool: &str, input: &serde_json::Value) -> Vec<RuleKind> {
     match tool {
         "Bash" => {
@@ -91,6 +94,8 @@ pub fn available_rule_kinds(tool: &str, input: &serde_json::Value) -> Vec<RuleKi
                 vec![RuleKind::Tool]
             }
         }
+        // MCP tool: `mcp__<server>__<tool>` 형식 — Tool 만 허용 (의도 명시)
+        t if t.starts_with("mcp__") => vec![RuleKind::Tool],
         _ => vec![RuleKind::Tool],
     }
 }
@@ -100,9 +105,15 @@ pub fn available_rule_kinds(tool: &str, input: &serde_json::Value) -> Vec<RuleKi
 /// `RuleKind::Tool` 은 항상 `<Tool>(*)` canonical form 으로 직렬화한다 — bare
 /// tool name (e.g. `"Bash"`) 은 Claude permission spec 에 정의되어 있지 않다
 /// (review #297 w2 fix, memory: reference_claude_permission_rule_syntax).
+///
+/// 단, MCP tool (`mcp__` prefix) 은 괄호 없는 exact form 을 반환한다
+/// (Claude Code permission spec MCP 항목 — `mcp__<server>__<tool>` 형식, 괄호 사용 불가).
 pub fn build_rule_text(tool: &str, input: &serde_json::Value, kind: RuleKind) -> Option<String> {
-    // RuleKind::Tool: 항상 <Tool>(*) canonical form
+    // RuleKind::Tool: MCP tool 은 괄호 없는 exact form, 그 외는 <Tool>(*) canonical form
     if matches!(kind, RuleKind::Tool) {
+        if tool.starts_with("mcp__") {
+            return Some(tool.to_string());
+        }
         return Some(format!("{}(*)", tool));
     }
     match (tool, kind) {
@@ -796,5 +807,28 @@ mod tests {
         // Bash + Exact, command 없음 → vec![]
         let result = build_rule_texts("Bash", &json!({}), RuleKind::Exact);
         assert_eq!(result, Vec::<String>::new());
+    }
+
+    // MCP tool 테스트 (#308)
+
+    #[test]
+    fn build_rule_text_mcp_tool_returns_exact_no_parens() {
+        // MCP tool 은 괄호 없는 exact form (invalid `mcp__server__tool(*)` 방지)
+        let result = build_rule_text("mcp__server__tool", &json!({}), RuleKind::Tool);
+        assert_eq!(result, Some("mcp__server__tool".to_string()));
+    }
+
+    #[test]
+    fn build_rule_text_native_tool_keeps_parens() {
+        // native tool 은 기존 동작 유지 — regression guard
+        let result = build_rule_text("Bash", &json!({}), RuleKind::Tool);
+        assert_eq!(result, Some("Bash(*)".to_string()));
+    }
+
+    #[test]
+    fn available_rule_kinds_mcp_returns_tool_only() {
+        // MCP tool 은 Tool 만 (의도 명시, unknown fallback 과 동작 동일)
+        let kinds = available_rule_kinds("mcp__server__tool", &json!({}));
+        assert_eq!(kinds, vec![RuleKind::Tool]);
     }
 }
