@@ -120,11 +120,11 @@ impl Lang {
         }
     }
 
-    /// 권한 메시지 — `항상 허용` 옵션 섹션 헤더 (Discord -# 서브텍스트 스타일)
+    /// 권한 메시지 — `항상 허용` 옵션 섹션 헤더 (Discord Bold 스타일)
     pub fn msg_always_allow_options_header(&self) -> &'static str {
         match self {
-            Lang::Ko => "-# 항상 허용 옵션",
-            Lang::En => "-# Always allow options",
+            Lang::Ko => "**항상 허용 옵션**",
+            Lang::En => "**Always allow options**",
         }
     }
 
@@ -280,8 +280,12 @@ mod tests {
     }
 
     #[test]
-    fn lang_msg_always_allow_options_header_has_discord_subtext_prefix() {
-        assert!(Lang::Ko.msg_always_allow_options_header().starts_with("-#"));
-        assert!(Lang::En.msg_always_allow_options_header().starts_with("-#"));
+    fn lang_msg_always_allow_options_header_is_bold() {
+        assert!(Lang::Ko.msg_always_allow_options_header().starts_with("**"), "Ko must start with **");
+        assert!(Lang::En.msg_always_allow_options_header().starts_with("**"), "En must start with **");
+        assert!(Lang::Ko.msg_always_allow_options_header().ends_with("**"), "Ko must end with **");
+        assert!(Lang::En.msg_always_allow_options_header().ends_with("**"), "En must end with **");
+        assert!(!Lang::Ko.msg_always_allow_options_header().starts_with("-#"), "Ko must not start with -#");
+        assert!(!Lang::En.msg_always_allow_options_header().starts_with("-#"), "En must not start with -#");
     }
 }

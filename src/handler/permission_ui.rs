@@ -133,7 +133,7 @@ pub fn build_level2_message_parts(
                 RuleKind::Tool => lang.btn_always_tool(),
             };
             let rules_with_code: Vec<String> = rules.iter().map(|r| inline_code(r)).collect();
-            Some(format!("{} → {}", prefix, rules_with_code.join(", ")))
+            Some(format!("-# {}\n{}", prefix, rules_with_code.join(", ")))
         })
         .collect();
 
@@ -167,7 +167,7 @@ pub fn build_level2_message_parts(
     let mut row1_buttons: Vec<CreateButton> = kinds.iter().map(|kind| match kind {
         RuleKind::Exact => CreateButton::new(format!("perm:{}:always:exact", request_id))
             .label(lang.btn_always_exact())
-            .style(ButtonStyle::Primary),
+            .style(ButtonStyle::Secondary),
         RuleKind::Prefix => CreateButton::new(format!("perm:{}:always:prefix", request_id))
             .label(lang.btn_always_prefix())
             .style(ButtonStyle::Secondary),
@@ -387,7 +387,7 @@ pub fn build_processing_message_parts(
         .map(|kind| match kind {
             RuleKind::Exact => CreateButton::new(format!("perm:{}:always:exact", request_id))
                 .label(lang.btn_always_exact())
-                .style(ButtonStyle::Primary)
+                .style(ButtonStyle::Secondary)
                 .disabled(true),
             RuleKind::Prefix => CreateButton::new(format!("perm:{}:always:prefix", request_id))
                 .label(lang.btn_always_prefix())
@@ -1412,6 +1412,11 @@ mod tests {
             content.contains("`, `"),
             "미리보기에 콤마 나열 확인: {}", content
         );
+        // 새 포맷: 옵션 이름이 -# 서브텍스트 + 줄바꿈
+        assert!(
+            content.contains("-# 이 명령만\n"),
+            "미리보기에 '-# 이 명령만\\n' 패턴 포함: {}", content
+        );
     }
 
     /// Row1[0] custom_id 가 LABEL_BUTTON_CUSTOM_ID 가 아님 — disabled label 버튼 제거 확인
@@ -1719,9 +1724,15 @@ mod tests {
             "미리보기에 '⚠️ 도구 전체' 포함, got: {}",
             content
         );
+        // 새 포맷: -# prefix + 줄바꿈 구조 (→ 대신 \n)
         assert!(
-            content.contains("→"),
-            "미리보기에 화살표(→) 포함, got: {}",
+            content.contains("-# ⚠️ 도구 전체\n"),
+            "미리보기에 '-# ⚠️ 도구 전체\\n' 패턴 포함, got: {}",
+            content
+        );
+        assert!(
+            !content.contains("⚠️ 도구 전체 →"),
+            "화살표(→) 형식이 제거되어야 함, got: {}",
             content
         );
     }
