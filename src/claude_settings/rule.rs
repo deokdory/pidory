@@ -160,11 +160,11 @@ pub fn build_rule_text(tool: &str, input: &serde_json::Value, kind: RuleKind) ->
 /// # 반환 규칙
 ///
 /// - `Bash` + `Exact` or `Prefix` — sub-command 별 rule 목록 (빈 command → `vec![]`)
-/// - `Bash` + `Tool`              — `vec!["Bash"]` (단일, wildcard 없음)
+/// - `Bash` + `Tool`              — `vec!["Bash(*)"]` (canonical form)
 /// - 그 외 (WebFetch, Read, ...) — `build_rule_text` 위임, None → `vec![]`
 pub fn build_rule_texts(tool: &str, input: &serde_json::Value, kind: RuleKind) -> Vec<String> {
     match (tool, &kind) {
-        ("Bash", RuleKind::Tool) => vec!["Bash".to_string()],
+        ("Bash", RuleKind::Tool) => vec!["Bash(*)".to_string()],
         ("Bash", RuleKind::Exact) | ("Bash", RuleKind::Prefix) => {
             let cmd = input.get("command").and_then(|v| v.as_str()).unwrap_or("");
             if cmd.is_empty() {
@@ -716,7 +716,7 @@ mod tests {
             &json!({"command": "find /tmp | head -3"}),
             RuleKind::Tool,
         );
-        assert_eq!(result, vec!["Bash".to_string()]);
+        assert_eq!(result, vec!["Bash(*)".to_string()]);
     }
 
     #[test]

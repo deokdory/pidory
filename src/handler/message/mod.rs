@@ -192,7 +192,17 @@ async fn handle_message(
         None => data.config.claude.default_disallowed_tools.clone(),
     };
 
+    // per-thread dispatch 직렬화 lock 획득.
+    // restart 트리거 + get_or_create + try_acquire_session + send_message 전체를
+    // 같은 lock 안에서 직렬화한다.
+    // AllowAlways 후 두 메시지가 동시 도착해도 순서 보장 (#258, #298):
+    //   M_A: lock 획득 → restart consume → get_or_create → try_acquire → send
+    //   M_B: lock 대기 → marker 이미 consumed → restart skip → 기존 subprocess 사용
+    let _dispatch_lock_arc = data.dispatch_locks.get_or_create(&thread_id).await;
+    let _dispatch_guard = _dispatch_lock_arc.lock().await;
+
     // AllowAlways 성공 후 subprocess restart 예약 처리.
+    // dispatch_lock 안에서 실행하여 동시 도착 메시지와의 race 방지 (#298).
     // get_or_create 직전에 호출하여 SessionInner 를 먼저 제거한다.
     // 이후 get_or_create 가 --resume <session_id> 로 새 subprocess 를 spawn한다.
     if data
@@ -264,11 +274,6 @@ async fn handle_message(
             return Ok(());
         }
     }
-
-    // per-thread dispatch 직렬화 lock 획득
-    // try_acquire_session 이전에 획득해야 primary/mid-turn 분기 역전 레이스를 방지함 (#258)
-    let _dispatch_lock_arc = data.dispatch_locks.get_or_create(&thread_id).await;
-    let _dispatch_guard = _dispatch_lock_arc.lock().await;
 
     let compact_args = helpers::parse_compact_command(&new_message.content);
     let is_cli_command = compact_args.is_some();
