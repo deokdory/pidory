@@ -192,6 +192,35 @@ async fn handle_message(
         None => data.config.claude.default_disallowed_tools.clone(),
     };
 
+    // AllowAlways 성공 후 subprocess restart 예약 처리.
+    // get_or_create 직전에 호출하여 SessionInner 를 먼저 제거한다.
+    // 이후 get_or_create 가 --resume <session_id> 로 새 subprocess 를 spawn한다.
+    if data
+        .pending_session_restart
+        .lock()
+        .await
+        .remove(&thread_id)
+    {
+        if let Some(sid) = session.session_id.as_deref() {
+            if let Err(e) = data
+                .sessions
+                .restart_for_settings_reload(&thread_id, sid)
+                .await
+            {
+                tracing::warn!(
+                    thread_id = %thread_id,
+                    error = %e,
+                    "restart_for_settings_reload failed (session may not exist yet); continuing"
+                );
+            }
+        } else {
+            tracing::warn!(
+                thread_id = %thread_id,
+                "pending_session_restart set but session_id is None; skipping restart"
+            );
+        }
+    }
+
     // SessionManager: 세션 생성 또는 기존 재사용
     match data
         .sessions
@@ -321,35 +350,6 @@ async fn handle_message(
         }
 
         return Ok(());
-    }
-
-    // AllowAlways 성공 후 subprocess restart 예약 처리.
-    // acquired==true 이므로 이전 turn 이 완전히 종료됨이 보장된다.
-    // get_or_create 가 --resume <session_id> 로 새 subprocess 를 spawn한다.
-    if data
-        .pending_session_restart
-        .lock()
-        .await
-        .remove(&thread_id)
-    {
-        if let Some(sid) = session.session_id.as_deref() {
-            if let Err(e) = data
-                .sessions
-                .restart_for_settings_reload(&thread_id, sid)
-                .await
-            {
-                tracing::warn!(
-                    thread_id = %thread_id,
-                    error = %e,
-                    "restart_for_settings_reload failed (session may not exist yet); continuing"
-                );
-            }
-        } else {
-            tracing::warn!(
-                thread_id = %thread_id,
-                "pending_session_restart set but session_id is None; skipping restart"
-            );
-        }
     }
 
     // 직접 실행 경로: context inject 판정 (primary 경로만)

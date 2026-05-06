@@ -369,8 +369,10 @@ impl SessionManager {
     /// 기존 subprocess 를 종료하고 SessionInner 를 제거한다.
     /// 이후 `get_or_create` 가 `--resume <session_id>` 로 새 subprocess 를 spawn한다.
     ///
-    /// 호출자(`handle_message`)는 `try_acquire_session` 이 `true` 를 반환한 직후에 이 함수를 호출한다.
-    /// 즉, DB status 가 `running` 으로 전환되었으므로 이전 turn 이 완전히 종료됨이 보장된다.
+    /// 호출자(`handle_message`)는 새 user message 진입 직후, `get_or_create` 호출 직전에 이 함수를 호출한다.
+    /// SessionInner 가 제거되므로 후속 `get_or_create` 가 `--resume <session_id>` 옵션으로 새 subprocess 를 spawn 한다.
+    /// 같은 thread 의 동시 message 는 `try_acquire_session` 이 후속 단계에서 직렬화하므로 race 없음 —
+    /// 이 시점의 이전 turn 은 이미 `release_session` 된 상태.
     pub async fn restart_for_settings_reload(&self, thread_id: &str, session_id: &str) -> Result<(), PidoryError> {
         tracing::info!(
             thread_id = %thread_id,
