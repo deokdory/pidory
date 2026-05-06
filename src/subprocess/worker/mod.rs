@@ -31,6 +31,7 @@ use turn_active::run_active_turn;
 
 // ─── SessionWorker struct ───────────────────────────────────────────────────
 
+#[allow(clippy::type_complexity)]
 pub(super) struct SessionWorker {
     // IO
     stdin: ChildStdin,
@@ -64,7 +65,7 @@ pub(super) struct SessionWorker {
 }
 
 impl SessionWorker {
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
     pub(super) fn new(
         stdin: ChildStdin,
         reader: BufReader<ChildStdout>,

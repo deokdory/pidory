@@ -95,6 +95,7 @@ pub(super) async fn say_silent(ctx: &Context, channel_id: ChannelId, content: im
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn send_event_to_discord(
     ctx: &Context,
     channel_id: ChannelId,
@@ -525,10 +526,10 @@ pub async fn process_turn_events(
             for event in &events {
                 if let StreamEvent::Assistant { content, .. } = event {
                     for block in content {
-                        if let ContentBlock::ToolUse { name, input, .. } = block {
-                            if name == "TodoWrite" {
-                                tracker.update(ctx, input).await;
-                            }
+                        if let ContentBlock::ToolUse { name, input, .. } = block
+                            && name == "TodoWrite"
+                        {
+                            tracker.update(ctx, input).await;
                         }
                     }
                 }

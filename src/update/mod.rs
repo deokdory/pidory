@@ -11,6 +11,7 @@ pub mod worktree;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
+#[allow(dead_code)]
 pub enum Error {
     #[error("working tree has uncommitted changes")]
     DirtyTree,

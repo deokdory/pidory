@@ -10,6 +10,7 @@ use poise::serenity_prelude::{
 use crate::claude_settings::{ConflictEvent, ConflictNotifier};
 use crate::i18n::Lang;
 
+#[allow(dead_code)]
 pub struct DiscordNotifier {
     pub ctx: Context,
     pub interaction: ComponentInteraction,
@@ -39,6 +40,7 @@ impl ConflictNotifier for DiscordNotifier {
 }
 
 /// 4 ConflictEvent → (title, body) 변환. 한/영 분기.
+#[allow(dead_code)]
 fn format_event(event: &ConflictEvent, lang: Lang) -> (String, String) {
     match event {
         ConflictEvent::MtimeChanged {

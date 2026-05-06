@@ -23,7 +23,7 @@ use super::io::{say_silent_chunked, build_user_message_json, build_interrupt_jso
 use super::permission_wait::{wait_for_permissions, PermissionsWaitResult, InitialControlRequest};
 use super::ratelimit_bridge::handle_ratelimit_event;
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
 pub(super) async fn handle_bg_turn(
     stdin: &mut ChildStdin,
     reader: &mut BufReader<ChildStdout>,
@@ -157,11 +157,11 @@ pub(super) async fn handle_bg_turn(
                             }
                             Ok(StreamEvent::User { ref tool_results, .. }) => {
                                 for result in tool_results {
-                                    if result.is_error {
-                                        if let Some(formatted) = formatter::format_tool_result_with_name(result, None, lang) {
-                                            let bg_text = lang.bg_notification(&formatted);
-                                            say_silent_chunked(ctx, channel_id, &bg_text).await;
-                                        }
+                                    if result.is_error
+                                        && let Some(formatted) = formatter::format_tool_result_with_name(result, None, lang)
+                                    {
+                                        let bg_text = lang.bg_notification(&formatted);
+                                        say_silent_chunked(ctx, channel_id, &bg_text).await;
                                     }
                                 }
                             }

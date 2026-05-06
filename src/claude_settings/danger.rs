@@ -7,6 +7,7 @@
 
 /// Permission rule의 위험도 등급.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)]
 pub enum Severity {
     /// 안전한 명령 (읽기 전용, 부작용 없음)
     Safe,

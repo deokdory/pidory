@@ -473,6 +473,7 @@ async fn handle_allow_always(
     );
 
     // Helper: 실패 시 명시적 Deny 송신 + UI disable (review #297 c2)
+    #[allow(clippy::too_many_arguments)]
     async fn fail_with(
         ctx: &Context,
         channel_id: poise::serenity_prelude::ChannelId,
