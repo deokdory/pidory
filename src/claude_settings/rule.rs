@@ -294,7 +294,7 @@ fn split_by_shell_operators(cmd: &str) -> Vec<String> {
                         parts.push(segment);
                     }
                     start = i + 2;
-                    i = i + 2;
+                    i += 2;
                     continue;
                 } else if ch == ';' {
                     let segment = cmd[byte_index(cmd, start)..byte_index(cmd, i)].trim().to_string();
