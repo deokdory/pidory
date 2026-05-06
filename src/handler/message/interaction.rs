@@ -239,6 +239,13 @@ async fn handle_permission(
     let Some(_triggered_by) =
         verify_component_auth(component, ctx, data, &request_id, lang).await
     else {
+        // pending 없는 stale UI 케이스: verify_component_auth 가 None 반환하지만 ACK 미송신.
+        // unauthorized 케이스는 이미 ephemeral 응답을 보냈으므로 두 번째 Acknowledge 는
+        // Discord 가 HTTP 400 으로 reject — .ok() 로 silently ignore.
+        component
+            .create_response(ctx, CreateInteractionResponse::Acknowledge)
+            .await
+            .ok();
         return Ok(());
     };
 
@@ -693,8 +700,8 @@ async fn handle_allow_always(
 
     // 7. 결과 분기
     match outcome {
-        Some(_) => {
-            // 성공 — AllowAlwaysSuccess 메시지
+        Some(merge_outcome) => {
+            // 성공 (Added / AlreadyPresent / ConflictResolved)
             let _ = pending.response_tx.send(PermissionDecision::AllowAlways {
                 rule_kind: rule_kind.clone(),
                 scope: scope.clone(),
@@ -739,15 +746,22 @@ async fn handle_allow_always(
                 }
             }
 
-            let _ = disable_permission_buttons(
-                ctx,
-                channel_id,
-                message_id,
-                DisableReason::AllowAlwaysSuccess {
+            // outcome 별 disable reason 분기 (w3 fix: Some(_) 와일드카드 → 명시적 분기)
+            let disable_reason = match merge_outcome {
+                MergeOutcome::Added => DisableReason::AllowAlwaysSuccess {
                     rules,
                     scope: scope.clone(),
                     project_basename,
                 },
+                MergeOutcome::AlreadyPresent => DisableReason::AllowAlwaysAlreadyPresent,
+                MergeOutcome::ConflictResolved => DisableReason::AllowAlwaysConflictResolved,
+            };
+
+            let _ = disable_permission_buttons(
+                ctx,
+                channel_id,
+                message_id,
+                disable_reason,
                 &tool_name,
                 lang,
             )

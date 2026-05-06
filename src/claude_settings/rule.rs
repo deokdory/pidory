@@ -183,13 +183,15 @@ pub fn build_rule_texts(tool: &str, input: &serde_json::Value, kind: RuleKind) -
     }
 }
 
-/// Bash 명령 문자열을 shell 연산자(`|`, `||`, `&&`, `;`) 기준으로 sub-command로 분리한다.
+/// Bash 명령 문자열을 shell 연산자(`|`, `||`, `|&`, `&&`, `;`) 기준으로 sub-command로 분리한다.
 ///
 /// # 동작
 ///
 /// - quote(`"`, `'`) 내부의 연산자는 분리 기준에서 제외된다.
 /// - `\` 로 이스케이프된 문자는 연산자 검출에서 제외된다.
 /// - shlex 로 파싱 유효성 검증(닫히지 않은 quote 등)을 수행한다. 실패 시 `vec![cmd.trim()]` fallback.
+/// - nested syntax (`$(...)`, `<(...)`, `<<EOF`, subshell `(...)`) 발견 시 분리 포기 → 단일 sub-command fallback
+/// - `|&` (stderr pipe) 도 단일 연산자로 처리
 /// - 각 sub-command의 leading/trailing whitespace는 제거된다.
 /// - 빈 문자열 / whitespace-only → `vec![]`
 ///
@@ -208,6 +210,20 @@ pub fn split_bash_subcommands(cmd: &str) -> Vec<String> {
     // shlex 로 파싱 유효성 검증 (닫히지 않은 quote 등)
     // shlex::split() 이 None 을 반환하면 파싱 실패 → fallback
     if shlex::split(trimmed).is_none() {
+        return vec![trimmed.to_string()];
+    }
+
+    // 보수적 fallback: nested shell syntax 발견 시 분리 포기 (review #298 w2)
+    // - $(...) command substitution
+    // - <(...) / >(...) process substitution
+    // - <<EOF heredoc
+    // - 단순 prefix `(` 시작은 subshell — 안전하게 단일 룰로 처리
+    if trimmed.contains("$(")
+        || trimmed.contains("<(")
+        || trimmed.contains(">(")
+        || trimmed.contains("<<")
+        || trimmed.starts_with('(')
+    {
         return vec![trimmed.to_string()];
     }
 
@@ -258,9 +274,9 @@ fn split_by_shell_operators(cmd: &str) -> Vec<String> {
                 if ch == '"' || ch == '\'' {
                     in_quote = Some(ch);
                 } else if ch == '|' {
-                    // `||` 또는 단순 `|`
-                    let op_end = if i + 1 < len && chars[i + 1] == '|' {
-                        i + 2
+                    // `||`, `|&` (stderr pipe), 또는 단순 `|`
+                    let op_end = if i + 1 < len && (chars[i + 1] == '|' || chars[i + 1] == '&') {
+                        i + 2  // `||` 또는 `|&` (Bash stderr pipe)
                     } else {
                         i + 1
                     };
@@ -594,6 +610,68 @@ mod tests {
         assert_eq!(
             split_bash_subcommands(input),
             vec![input.to_string()]
+        );
+    }
+
+    // review #298 w2: nested shell syntax fallback 테스트
+
+    #[test]
+    fn split_command_substitution_fallback() {
+        // $(...) command substitution → 단일 sub-command fallback
+        let input = "echo $(cmd1 | cmd2)";
+        assert_eq!(
+            split_bash_subcommands(input),
+            vec![input.to_string()]
+        );
+    }
+
+    #[test]
+    fn split_subshell_fallback() {
+        // (...) subshell prefix → 단일 sub-command fallback
+        let input = "(cmd1 | cmd2)";
+        assert_eq!(
+            split_bash_subcommands(input),
+            vec![input.to_string()]
+        );
+    }
+
+    #[test]
+    fn split_process_substitution_fallback() {
+        // <(...) process substitution → 단일 sub-command fallback
+        let input = "diff <(a | b) file";
+        assert_eq!(
+            split_bash_subcommands(input),
+            vec![input.to_string()]
+        );
+    }
+
+    #[test]
+    fn split_heredoc_fallback() {
+        // << heredoc → 단일 sub-command fallback
+        let input = "cat <<EOF\nfoo | bar\nEOF";
+        assert_eq!(
+            split_bash_subcommands(input),
+            vec![input.to_string()]
+        );
+    }
+
+    // review #298 s1: `|&` (Bash stderr pipe) 테스트
+
+    #[test]
+    fn split_pipe_ampersand() {
+        // `|&` 는 단일 연산자 → cmd1, cmd2 로 분리
+        assert_eq!(
+            split_bash_subcommands("cmd1 |& cmd2"),
+            vec!["cmd1".to_string(), "cmd2".to_string()]
+        );
+    }
+
+    #[test]
+    fn split_pipe_ampersand_with_pipe() {
+        // `|` 와 `|&` 혼합 → 3개
+        assert_eq!(
+            split_bash_subcommands("cmd1 | cmd2 |& cmd3"),
+            vec!["cmd1".to_string(), "cmd2".to_string(), "cmd3".to_string()]
         );
     }
 
