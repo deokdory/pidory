@@ -13,7 +13,7 @@ use crate::error::PidoryError;
 use crate::handler::discord_notifier::DiscordNotifier;
 use crate::handler::message::interaction_kind::{CancelStage, InteractionKind};
 use crate::handler::permission_ui::{
-    DisableReason, PermAction, build_permission_message_parts, disable_permission_buttons,
+    DisableReason, PermAction, build_level2_message_parts, disable_permission_buttons,
     dismiss_pending_by_tool,
 };
 use crate::handler::{cleanup::cleanup_session_state, question_ui, reset_ui};
@@ -338,7 +338,7 @@ async fn handle_scope_toggle(
     let (scope, tool, input, triggered_by) = update;
     tracing::info!(request_id = %request_id, ?scope, "permission scope toggled");
 
-    let (content, components) = build_permission_message_parts(
+    let (content, components) = build_level2_message_parts(
         &tool,
         &input,
         request_id,

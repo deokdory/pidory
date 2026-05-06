@@ -12,7 +12,7 @@ use tracing::warn;
 
 use crate::claude_settings::danger::classify_command;
 use crate::claude_settings::rule::{
-    RuleKind, Scope, available_rule_kinds, build_rule_text, default_scope,
+    RuleKind, Scope, available_rule_kinds, build_rule_texts, default_scope,
 };
 use crate::error::PidoryError;
 use crate::handler::formatter::inline_code;
@@ -83,9 +83,13 @@ pub fn parse_permission_custom_id(custom_id: &str) -> Option<(String, PermAction
     Some((request_id.to_string(), action))
 }
 
-/// Internal helper: builds `(content, components)` for a permission message.
-/// Used by both `create_permission_message` and `ScopeToggle` edit path.
-pub fn build_permission_message_parts(
+/// Internal helper: builds `(content, components)` for a Level 2 permission message.
+/// Used by `ScopeToggle` edit path and `always:expand` expand path.
+///
+/// Level 2 UI: 헤더(scope 포함) + 미리보기 섹션 + 2-row 버튼.
+/// - Row 1: 영속 옵션(Exact/Prefix/Domain/Tool) + scope 토글
+/// - Row 2: 한 번만(Success) + 거부(Danger)
+pub fn build_level2_message_parts(
     tool_name: &str,
     input: &serde_json::Value,
     request_id: &str,
@@ -112,22 +116,27 @@ pub fn build_permission_message_parts(
         scope_label,
     );
 
-    // 미리보기: available_rule_kinds → build_rule_text 각 줄. 버튼 라벨과 1:1 대응.
+    // 미리보기: available_rule_kinds → build_rule_texts(복수형) → 콤마 나열.
     let kinds = available_rule_kinds(tool_name, input);
     let preview_lines: Vec<String> = kinds
         .iter()
         .filter_map(|kind| {
-            build_rule_text(tool_name, input, kind.clone()).map(|rule_text| {
-                // classify_command 호출 — skeleton (P1.5에서 활용), 현재 시각 변경 없음
-                let _severity = classify_command(&rule_text);
-                let prefix = match kind {
-                    RuleKind::Exact => lang.btn_always_exact(),
-                    RuleKind::Prefix => lang.btn_always_prefix(),
-                    RuleKind::Domain => lang.btn_always_domain(),
-                    RuleKind::Tool => lang.btn_always_tool(),
-                };
-                format!("{} → {}", prefix, inline_code(&rule_text))
-            })
+            let rules = build_rule_texts(tool_name, input, kind.clone());
+            if rules.is_empty() {
+                return None;
+            }
+            // classify_command 호출 — skeleton (P1.5에서 활용), 현재 시각 변경 없음
+            for r in &rules {
+                let _severity = classify_command(r);
+            }
+            let prefix = match kind {
+                RuleKind::Exact => lang.btn_always_exact(),
+                RuleKind::Prefix => lang.btn_always_prefix(),
+                RuleKind::Domain => lang.btn_always_domain(),
+                RuleKind::Tool => lang.btn_always_tool(),
+            };
+            let rules_with_code: Vec<String> = rules.iter().map(|r| inline_code(r)).collect();
+            Some(format!("{} → {}", prefix, rules_with_code.join(", ")))
         })
         .collect();
 
@@ -146,30 +155,15 @@ pub fn build_permission_message_parts(
         header, summary, reason, preview_section
     );
 
-    // Row 1: once + deny — 아이콘 없이 (Danger 색이 아이콘을 가려서 가독성 저하)
-    let once_btn = CreateButton::new(format!("perm:{}:once", request_id))
-        .label(lang.btn_once())
-        .style(ButtonStyle::Success);
-    let deny_btn = CreateButton::new(format!("perm:{}:deny", request_id))
-        .label(lang.btn_deny())
-        .style(ButtonStyle::Danger);
-    let row1 = CreateActionRow::Buttons(vec![once_btn, deny_btn]);
-
-    // Row 2: [항상 허용 disabled label] + always-allow buttons + scope toggle
+    // Row 1: always-allow 버튼들 + scope 토글
     //
-    // Discord 는 ActionRow 사이에 텍스트 삽입 불가 → disabled 버튼이 섹션 헤더 역할.
-    // ActionRow 5버튼 한도 검증:
-    //   Bash:             label + Exact + Prefix + Tool + scope = 5 ✓
-    //   WebFetch(domain): label + Domain + Tool + scope         = 4 ✓
-    //   Read/Edit/Write:  label + Exact + Tool + scope          = 4 ✓
-    //   Grep/Glob/IP:     label + Tool + scope                  = 3 ✓
-    let label_btn = CreateButton::new(LABEL_BUTTON_CUSTOM_ID)
-        .label(lang.btn_always_allow())
-        .style(ButtonStyle::Secondary)
-        .disabled(true);
-
-    let mut row2_buttons: Vec<CreateButton> = vec![label_btn];
-    row2_buttons.extend(kinds.iter().map(|kind| match kind {
+    // LABEL disabled 버튼 제거 — Level 2 컨텍스트상 자명 (review #298 T7).
+    // ActionRow 5버튼 한도 검증 (label 제거 후):
+    //   Bash:             Exact + Prefix + Tool + scope = 4 ✓
+    //   WebFetch(domain): Domain + Tool + scope         = 3 ✓
+    //   Read/Edit/Write:  Exact + Tool + scope          = 3 ✓
+    //   Grep/Glob/IP:     Tool + scope                  = 2 ✓
+    let mut row1_buttons: Vec<CreateButton> = kinds.iter().map(|kind| match kind {
         RuleKind::Exact => CreateButton::new(format!("perm:{}:always:exact", request_id))
             .label(lang.btn_always_exact())
             .style(ButtonStyle::Primary),
@@ -183,13 +177,13 @@ pub fn build_permission_message_parts(
         RuleKind::Tool => CreateButton::new(format!("perm:{}:always:tool", request_id))
             .label(lang.btn_always_tool())
             .style(ButtonStyle::Danger),
-    }));
+    }).collect();
 
     let (scope_btn_label, scope_btn_style) = match &scope {
         Scope::Project => (lang.btn_scope_toggle_to_global(), ButtonStyle::Secondary),
         Scope::Global => (lang.btn_scope_toggle_to_project(), ButtonStyle::Primary),
     };
-    row2_buttons.push(
+    row1_buttons.push(
         CreateButton::new(format!("perm:{}:scope:toggle", request_id))
             .label(scope_btn_label)
             .style(scope_btn_style),
@@ -198,15 +192,69 @@ pub fn build_permission_message_parts(
     // Discord ActionRow 5버튼 한도 — 향후 새 tool 의 RuleKind 가 늘면 컴파일 통과해도
     // Discord API 가 메시지 거부 (silent fail). debug build 에서 조기 검출 (review #298 s2).
     debug_assert!(
-        row2_buttons.len() <= 5,
+        row1_buttons.len() <= 5,
         "ActionRow exceeds Discord 5-button limit (tool={}, count={})",
         tool_name,
-        row2_buttons.len(),
+        row1_buttons.len(),
     );
 
-    let row2 = CreateActionRow::Buttons(row2_buttons);
+    let row1 = CreateActionRow::Buttons(row1_buttons);
+
+    // Row 2: 한 번만 + 거부
+    let row2 = CreateActionRow::Buttons(vec![
+        CreateButton::new(format!("perm:{}:once", request_id))
+            .label(lang.btn_once())
+            .style(ButtonStyle::Success),
+        CreateButton::new(format!("perm:{}:deny", request_id))
+            .label(lang.btn_deny())
+            .style(ButtonStyle::Danger),
+    ]);
 
     (content, vec![row1, row2])
+}
+
+/// Builds `(content, components)` for a Level 1 permission message.
+///
+/// Level 1 UI: scope 표시 없이 3버튼 `[한 번만, 항상 허용, 거부]`만 제공한다.
+/// "항상 허용" 버튼은 `:always:expand` suffix — T9(ExpandAlways) 가 Level 2 UI 로 펼친다.
+/// 영속 옵션 미리보기 섹션 없음.
+pub fn build_level1_message_parts(
+    tool_name: &str,
+    input: &serde_json::Value,
+    request_id: &str,
+    decision_reason: Option<&str>,
+    triggered_by: UserId,
+    lang: Lang,
+) -> (String, Vec<CreateActionRow>) {
+    let summary = format_tool_input_summary(tool_name, input);
+    let reason = decision_reason
+        .map(|r| format!("\n> {}", r))
+        .unwrap_or_default();
+
+    // 헤더: scope 표시 없음
+    let header = format!(
+        "🔒 <@{}>  {}",
+        triggered_by,
+        inline_code(tool_name),
+    );
+
+    let content = format!("{}\n{}{}", header, summary, reason);
+
+    // 단일 ActionRow: [한 번만 (Success), 항상 허용 (Primary), 거부 (Danger)]
+    // "항상 허용"은 Level 2 expand trigger → `:always:expand` suffix
+    let once_btn = CreateButton::new(format!("perm:{}:once", request_id))
+        .label(lang.btn_once())
+        .style(ButtonStyle::Success);
+    let always_btn = CreateButton::new(format!("perm:{}:always:expand", request_id))
+        .label(lang.btn_always_allow())
+        .style(ButtonStyle::Primary);
+    let deny_btn = CreateButton::new(format!("perm:{}:deny", request_id))
+        .label(lang.btn_deny())
+        .style(ButtonStyle::Danger);
+
+    let row = CreateActionRow::Buttons(vec![once_btn, always_btn, deny_btn]);
+
+    (content, vec![row])
 }
 
 pub fn create_permission_message(
@@ -215,16 +263,15 @@ pub fn create_permission_message(
     request_id: &str,
     decision_reason: Option<&str>,
     triggered_by: UserId,
-    scope: Scope,
+    _scope: Scope,
     lang: Lang,
 ) -> CreateMessage {
-    let (content, components) = build_permission_message_parts(
+    let (content, components) = build_level1_message_parts(
         tool_name,
         input,
         request_id,
         decision_reason,
         triggered_by,
-        scope,
         lang,
     );
     CreateMessage::new().content(content).components(components)
@@ -285,6 +332,96 @@ pub fn format_tool_input_summary(tool_name: &str, input: &serde_json::Value) -> 
             })
             .unwrap_or_default(),
     }
+}
+
+/// Builds `(content, components)` for a "processing" state permission message.
+///
+/// 진입 직후 또는 재시도 사이에 버튼을 모두 disabled 로 변경해 사용자 중복 클릭을 차단한다.
+/// 구조는 Level 2 (`build_permission_message_parts`) 와 동일하되:
+/// - 미리보기 섹션 없음 (간결화)
+/// - 진행 상태 텍스트 추가 (attempt 유무에 따라 분기)
+/// - 모든 버튼 `.disabled(true)`
+#[allow(clippy::too_many_arguments)]
+pub fn build_processing_message_parts(
+    tool_name: &str,
+    input: &serde_json::Value,
+    request_id: &str,
+    triggered_by: UserId,
+    scope: Scope,
+    lang: Lang,
+    attempt: Option<(u32, u32)>,
+) -> (String, Vec<CreateActionRow>) {
+    // 헤더 — Level 2 와 동일
+    let scope_label = match &scope {
+        Scope::Project => "📁 project".to_string(),
+        Scope::Global => "🌐 global  ⚠️ 모든 프로젝트에 적용됨".to_string(),
+    };
+    let header = format!(
+        "🔒 <@{}>  {}  ·  {}: {}",
+        triggered_by,
+        inline_code(tool_name),
+        lang.lbl_scope_label_header(),
+        scope_label,
+    );
+    let summary = format_tool_input_summary(tool_name, input);
+
+    // 진행 상태 텍스트
+    let processing_text = match attempt {
+        None => lang.msg_processing_no_retry().to_string(),
+        Some((n, total)) => lang.msg_processing_with_attempt(n, total),
+    };
+
+    let content = format!("{}\n{}\n\n{}", header, summary, processing_text);
+
+    // 컴포넌트 — Level 2 구조 복제 + 모두 disabled
+    let kinds = available_rule_kinds(tool_name, input);
+    let mut row1_buttons: Vec<CreateButton> = kinds
+        .iter()
+        .map(|kind| match kind {
+            RuleKind::Exact => CreateButton::new(format!("perm:{}:always:exact", request_id))
+                .label(lang.btn_always_exact())
+                .style(ButtonStyle::Primary)
+                .disabled(true),
+            RuleKind::Prefix => CreateButton::new(format!("perm:{}:always:prefix", request_id))
+                .label(lang.btn_always_prefix())
+                .style(ButtonStyle::Secondary)
+                .disabled(true),
+            RuleKind::Domain => CreateButton::new(format!("perm:{}:always:domain", request_id))
+                .label(lang.btn_always_domain())
+                .style(ButtonStyle::Secondary)
+                .disabled(true),
+            RuleKind::Tool => CreateButton::new(format!("perm:{}:always:tool", request_id))
+                .label(lang.btn_always_tool())
+                .style(ButtonStyle::Danger)
+                .disabled(true),
+        })
+        .collect();
+
+    let (scope_btn_label, scope_btn_style) = match &scope {
+        Scope::Project => (lang.btn_scope_toggle_to_global(), ButtonStyle::Secondary),
+        Scope::Global => (lang.btn_scope_toggle_to_project(), ButtonStyle::Primary),
+    };
+    row1_buttons.push(
+        CreateButton::new(format!("perm:{}:scope:toggle", request_id))
+            .label(scope_btn_label)
+            .style(scope_btn_style)
+            .disabled(true),
+    );
+
+    let row1 = CreateActionRow::Buttons(row1_buttons);
+
+    let row2 = CreateActionRow::Buttons(vec![
+        CreateButton::new(format!("perm:{}:once", request_id))
+            .label(lang.btn_once())
+            .style(ButtonStyle::Success)
+            .disabled(true),
+        CreateButton::new(format!("perm:{}:deny", request_id))
+            .label(lang.btn_deny())
+            .style(ButtonStyle::Danger)
+            .disabled(true),
+    ]);
+
+    (content, vec![row1, row2])
 }
 
 /// `disable_permission_buttons` 에 전달되는 결과 이유.
@@ -1011,7 +1148,7 @@ mod tests {
         assert!(pending.lock().await.is_empty());
     }
 
-    // ── create_permission_message: 3 ActionRow 구조 검증 ─────────────────────
+    // ── build_level2_message_parts: 2-row 구조 검증 ──────────────────────────
     //
     // serenity CreateMessage/CreateButton 필드는 private → serde_json::to_value로
     // 직렬화 후 JSON 구조로 검증한다.
@@ -1047,156 +1184,356 @@ mod tests {
             .expect("button must have style")
     }
 
-    /// Bash + Project scope → Row1=2버튼, Row2=[label, Exact, Prefix, Tool, scope]=5버튼
-    #[test]
-    fn create_permission_message_bash_project_two_rows() {
-        let input = serde_json::json!({"command": "npm test"});
-        let msg = create_permission_message(
-            "Bash",
-            &input,
-            "rid-001",
+    fn level2_parts_to_json(
+        tool_name: &str,
+        input: &serde_json::Value,
+        request_id: &str,
+        scope: Scope,
+    ) -> serde_json::Value {
+        let (content, components) = build_level2_message_parts(
+            tool_name,
+            input,
+            request_id,
             None,
             UserId::new(12345),
-            Scope::Project,
+            scope,
             Lang::Ko,
         );
-        let v = msg_to_json(msg);
+        let msg = CreateMessage::new().content(content).components(components);
+        serde_json::to_value(msg).expect("CreateMessage must be serializable")
+    }
+
+    /// Bash + Project → Row1=[Exact, Prefix, Tool, scope]=4버튼, Row2=[once, deny]=2버튼
+    #[test]
+    fn level2_bash_two_rows() {
+        let input = serde_json::json!({"command": "npm test"});
+        let v = level2_parts_to_json("Bash", &input, "rid-l2-001", Scope::Project);
         let rows = get_rows(&v);
         assert_eq!(rows.as_array().unwrap().len(), 2, "Bash+Project → 2 ActionRow");
 
-        // Row 1: once + deny = 2 버튼
+        // Row 1: [Exact, Prefix, Tool, scope] = 4 버튼
         let row1 = row_buttons(rows, 0);
-        assert_eq!(row1.as_array().unwrap().len(), 2, "Row1: once + deny");
-        assert!(btn_custom_id(row1, 0).ends_with(":once"), "Row1[0] = once");
-        assert!(btn_custom_id(row1, 1).ends_with(":deny"), "Row1[1] = deny");
+        assert_eq!(row1.as_array().unwrap().len(), 4, "Row1: Exact+Prefix+Tool+scope");
+        assert!(btn_custom_id(row1, 0).ends_with(":always:exact"), "Row1[0] = always:exact");
+        assert!(btn_custom_id(row1, 1).ends_with(":always:prefix"), "Row1[1] = always:prefix");
+        assert!(btn_custom_id(row1, 2).ends_with(":always:tool"), "Row1[2] = always:tool");
+        assert!(btn_custom_id(row1, 3).ends_with(":scope:toggle"), "Row1[3] = scope:toggle");
 
-        // Row 2: [label, Exact, Prefix, Tool, scope-toggle] = 5 버튼
+        // Row 2: [once, deny] = 2 버튼
         let row2 = row_buttons(rows, 1);
-        assert_eq!(row2.as_array().unwrap().len(), 5, "Row2: label+Exact+Prefix+Tool+scope");
-        assert_eq!(btn_custom_id(row2, 0), LABEL_BUTTON_CUSTOM_ID, "Row2[0] = disabled label");
-        assert!(btn_custom_id(row2, 1).ends_with(":always:exact"), "Row2[1] = always:exact");
-        assert!(btn_custom_id(row2, 2).ends_with(":always:prefix"), "Row2[2] = always:prefix");
-        assert!(btn_custom_id(row2, 3).ends_with(":always:tool"), "Row2[3] = always:tool");
-        assert!(btn_custom_id(row2, 4).ends_with(":scope:toggle"), "Row2[4] = scope:toggle");
+        assert_eq!(row2.as_array().unwrap().len(), 2, "Row2: once+deny");
+        assert!(btn_custom_id(row2, 0).ends_with(":once"), "Row2[0] = once");
+        assert!(btn_custom_id(row2, 1).ends_with(":deny"), "Row2[1] = deny");
     }
 
-    /// Row 2 첫 버튼은 disabled — Discord 가 클릭 이벤트 보내지 않아 핸들러 호출 안 됨
+    /// WebFetch + Project (정상 URL) → Row1=[Domain, Tool, scope]=3버튼, Row2=[once, deny]=2버튼
     #[test]
-    fn create_permission_message_label_button_is_disabled() {
-        let input = serde_json::json!({"command": "ls"});
-        let msg = create_permission_message(
-            "Bash",
-            &input,
-            "rid-disabled",
-            None,
-            UserId::new(12345),
-            Scope::Project,
-            Lang::Ko,
-        );
-        let v = msg_to_json(msg);
-        let rows = get_rows(&v);
-        let row2 = row_buttons(rows, 1);
-        let label_btn = &row2.as_array().unwrap()[0];
-        assert_eq!(
-            label_btn.get("disabled").and_then(|v| v.as_bool()),
-            Some(true),
-            "label button must be disabled"
-        );
-    }
-
-    /// WebFetch + Project scope (정상 URL) → Row2=[label, Domain, Tool, scope] = 4 버튼
-    #[test]
-    fn create_permission_message_webfetch_project_two_always_buttons() {
+    fn level2_webfetch_two_rows() {
         let input = serde_json::json!({"url": "https://api.example.com/v1"});
-        let msg = create_permission_message(
-            "WebFetch",
-            &input,
-            "rid-002",
-            None,
-            UserId::new(12345),
-            Scope::Project,
-            Lang::Ko,
-        );
-        let v = msg_to_json(msg);
+        let v = level2_parts_to_json("WebFetch", &input, "rid-l2-002", Scope::Project);
         let rows = get_rows(&v);
         assert_eq!(rows.as_array().unwrap().len(), 2, "WebFetch+Project → 2 ActionRow");
 
+        // Row 1: [Domain, Tool, scope] = 3 버튼
+        let row1 = row_buttons(rows, 0);
+        assert_eq!(row1.as_array().unwrap().len(), 3, "Row1: Domain+Tool+scope");
+        assert!(btn_custom_id(row1, 0).ends_with(":always:domain"), "Row1[0] = always:domain");
+        assert!(btn_custom_id(row1, 1).ends_with(":always:tool"), "Row1[1] = always:tool");
+        assert!(btn_custom_id(row1, 2).ends_with(":scope:toggle"), "Row1[2] = scope:toggle");
+
+        // Row 2: [once, deny] = 2 버튼
         let row2 = row_buttons(rows, 1);
-        assert_eq!(row2.as_array().unwrap().len(), 4, "Row2: label+Domain+Tool+scope");
-        assert_eq!(btn_custom_id(row2, 0), LABEL_BUTTON_CUSTOM_ID);
-        assert!(btn_custom_id(row2, 1).ends_with(":always:domain"), "Row2[1] = always:domain");
-        assert!(btn_custom_id(row2, 2).ends_with(":always:tool"), "Row2[2] = always:tool");
-        assert!(btn_custom_id(row2, 3).ends_with(":scope:toggle"), "Row2[3] = scope:toggle");
+        assert_eq!(row2.as_array().unwrap().len(), 2, "Row2: once+deny");
+        assert!(btn_custom_id(row2, 0).ends_with(":once"), "Row2[0] = once");
+        assert!(btn_custom_id(row2, 1).ends_with(":deny"), "Row2[1] = deny");
     }
 
-    /// Grep + Project scope → Row2=[label, Tool, scope] = 3 버튼
+    /// Grep + Project → Row1=[Tool, scope]=2버튼, Row2=[once, deny]=2버튼
     #[test]
-    fn create_permission_message_grep_project_one_always_button() {
+    fn level2_grep_two_rows() {
         let input = serde_json::json!({"pattern": "fn main"});
-        let msg = create_permission_message(
-            "Grep",
-            &input,
-            "rid-003",
-            None,
-            UserId::new(12345),
-            Scope::Project,
-            Lang::Ko,
-        );
-        let v = msg_to_json(msg);
+        let v = level2_parts_to_json("Grep", &input, "rid-l2-003", Scope::Project);
         let rows = get_rows(&v);
         assert_eq!(rows.as_array().unwrap().len(), 2, "Grep+Project → 2 ActionRow");
 
+        // Row 1: [Tool, scope] = 2 버튼
+        let row1 = row_buttons(rows, 0);
+        assert_eq!(row1.as_array().unwrap().len(), 2, "Row1: Tool+scope");
+        assert!(btn_custom_id(row1, 0).ends_with(":always:tool"), "Row1[0] = always:tool");
+        assert!(btn_custom_id(row1, 1).ends_with(":scope:toggle"), "Row1[1] = scope:toggle");
+
+        // Row 2: [once, deny] = 2 버튼
         let row2 = row_buttons(rows, 1);
-        assert_eq!(row2.as_array().unwrap().len(), 3, "Row2: label+Tool+scope");
-        assert_eq!(btn_custom_id(row2, 0), LABEL_BUTTON_CUSTOM_ID);
-        assert!(btn_custom_id(row2, 1).ends_with(":always:tool"), "Row2[1] = always:tool");
-        assert!(btn_custom_id(row2, 2).ends_with(":scope:toggle"), "Row2[2] = scope:toggle");
+        assert_eq!(row2.as_array().unwrap().len(), 2, "Row2: once+deny");
+        assert!(btn_custom_id(row2, 0).ends_with(":once"), "Row2[0] = once");
+        assert!(btn_custom_id(row2, 1).ends_with(":deny"), "Row2[1] = deny");
     }
 
     /// Bash + Global scope → 헤더에 "🌐 global" + "⚠️" 포함, scope 버튼 Primary(style=1)
     #[test]
-    fn create_permission_message_bash_global_header_contains_global_warning() {
+    fn level2_global_scope_header() {
         let input = serde_json::json!({"command": "npm install"});
-        let msg = create_permission_message(
+        let (content, components) = build_level2_message_parts(
             "Bash",
             &input,
-            "rid-004",
+            "rid-l2-004",
             None,
             UserId::new(99999),
             Scope::Global,
             Lang::Ko,
         );
-        let v = msg_to_json(msg);
-        let content = v.get("content").and_then(|v| v.as_str()).unwrap_or("");
         assert!(content.contains("🌐 global"), "헤더에 🌐 global 포함");
         assert!(content.contains("⚠️"), "헤더에 ⚠️ 포함");
         assert!(content.contains("모든 프로젝트에 적용됨"), "경고 문구 포함");
 
-        // Row 2 마지막 버튼 (scope toggle) Primary(style=1) — Global on
+        // Row 1 마지막 버튼 (scope toggle) Primary(style=1) — Global on
+        let msg = CreateMessage::new().content(content).components(components);
+        let v = serde_json::to_value(msg).unwrap();
         let rows = get_rows(&v);
-        let row2 = row_buttons(rows, 1);
-        let last_idx = row2.as_array().unwrap().len() - 1;
+        let row1 = row_buttons(rows, 0);
+        let last_idx = row1.as_array().unwrap().len() - 1;
         // Discord: Primary=1, Secondary=2, Success=3, Danger=4
-        assert_eq!(btn_style(row2, last_idx), 1, "Global scope → Primary(1) 버튼");
+        assert_eq!(btn_style(row1, last_idx), 1, "Global scope → Primary(1) 버튼");
     }
 
-    /// Project scope → scope 버튼 Secondary(style=2)
+    /// 파이프 명령 → 미리보기에 콤마 나열 (Bash(find /tmp), Bash(head -3))
     #[test]
-    fn create_permission_message_project_scope_button_secondary() {
-        let input = serde_json::json!({"command": "ls"});
-        let msg = create_permission_message(
+    fn level2_pipe_command_preview() {
+        let input = serde_json::json!({"command": "find /tmp | head -3"});
+        let (content, _) = build_level2_message_parts(
             "Bash",
             &input,
-            "rid-005",
+            "rid-l2-005",
             None,
             UserId::new(12345),
             Scope::Project,
             Lang::Ko,
         );
-        let v = msg_to_json(msg);
+        // Exact 라인: 두 sub-command 가 콤마로 나열되어야 한다
+        assert!(
+            content.contains("find /tmp") && content.contains("head -3"),
+            "미리보기에 두 sub-command 포함: {}", content
+        );
+        // 콤마 나열 확인 — inline_code 가 backtick 으로 감싸므로 `)`, ` 패턴
+        assert!(
+            content.contains("`, `"),
+            "미리보기에 콤마 나열 확인: {}", content
+        );
+    }
+
+    /// Row1[0] custom_id 가 LABEL_BUTTON_CUSTOM_ID 가 아님 — disabled label 버튼 제거 확인
+    #[test]
+    fn level2_no_label_button() {
+        let input = serde_json::json!({"command": "npm test"});
+        let v = level2_parts_to_json("Bash", &input, "rid-l2-006", Scope::Project);
         let rows = get_rows(&v);
-        let row2 = row_buttons(rows, 1);
-        let last_idx = row2.as_array().unwrap().len() - 1;
-        assert_eq!(btn_style(row2, last_idx), 2, "Project scope → Secondary(2) 버튼");
+        let row1 = row_buttons(rows, 0);
+        let first_cid = btn_custom_id(row1, 0);
+        assert_ne!(
+            first_cid, LABEL_BUTTON_CUSTOM_ID,
+            "Row1[0] must not be the disabled label button, got: {}", first_cid
+        );
+    }
+
+    // ── build_level1_message_parts ────────────────────────────────────────────
+
+    fn level1_msg_to_json(
+        tool_name: &str,
+        input: &serde_json::Value,
+        request_id: &str,
+    ) -> serde_json::Value {
+        let msg = create_permission_message(
+            tool_name,
+            input,
+            request_id,
+            None,
+            UserId::new(12345),
+            Scope::Project,
+            Lang::Ko,
+        );
+        msg_to_json(msg)
+    }
+
+    /// Level 1 메시지는 단일 ActionRow 에 버튼 3개: once / always:expand / deny
+    #[test]
+    fn level1_message_three_buttons() {
+        let input = serde_json::json!({"command": "npm test"});
+        let v = level1_msg_to_json("Bash", &input, "rid-l1-001");
+        let rows = get_rows(&v);
+
+        assert_eq!(
+            rows.as_array().unwrap().len(),
+            1,
+            "Level 1 → exactly 1 ActionRow"
+        );
+
+        let btns = row_buttons(rows, 0);
+        assert_eq!(btns.as_array().unwrap().len(), 3, "Level 1 → 3 buttons");
+        assert!(btn_custom_id(btns, 0).ends_with(":once"), "btn[0] = once");
+        assert!(
+            btn_custom_id(btns, 1).ends_with(":always:expand"),
+            "btn[1] = always:expand"
+        );
+        assert!(btn_custom_id(btns, 2).ends_with(":deny"), "btn[2] = deny");
+    }
+
+    /// Level 1 헤더에 scope 문자열(`적용 범위:`, `scope:`) 미포함
+    #[test]
+    fn level1_message_no_scope_in_header() {
+        let input = serde_json::json!({"command": "ls"});
+        let v = level1_msg_to_json("Bash", &input, "rid-l1-002");
+        let content = v.get("content").and_then(|v| v.as_str()).unwrap_or("");
+
+        assert!(
+            !content.contains("적용 범위"),
+            "Level 1 content must not contain '적용 범위'"
+        );
+        assert!(
+            !content.contains("scope:"),
+            "Level 1 content must not contain 'scope:'"
+        );
+    }
+
+    /// Level 1 메시지에 항상 허용 옵션 미리보기 섹션 미포함
+    #[test]
+    fn level1_message_no_preview() {
+        let input = serde_json::json!({"command": "npm install"});
+        let v = level1_msg_to_json("Bash", &input, "rid-l1-003");
+        let content = v.get("content").and_then(|v| v.as_str()).unwrap_or("");
+
+        assert!(
+            !content.contains("항상 허용 옵션"),
+            "Level 1 content must not contain '항상 허용 옵션'"
+        );
+    }
+
+    /// Level 1 두 번째 버튼(index 1)의 custom_id 가 `:always:expand` 로 끝나야 한다
+    #[test]
+    fn level1_always_button_custom_id() {
+        let input = serde_json::json!({"pattern": "fn main"});
+        let v = level1_msg_to_json("Grep", &input, "rid-l1-004");
+        let rows = get_rows(&v);
+        let btns = row_buttons(rows, 0);
+
+        let cid = btn_custom_id(btns, 1);
+        assert!(
+            cid.ends_with(":always:expand"),
+            "Level 1 always button custom_id must end with ':always:expand', got: {}",
+            cid
+        );
+        // request_id 도 포함되어야 함
+        assert!(
+            cid.contains("rid-l1-004"),
+            "custom_id must contain request_id"
+        );
+    }
+
+    // ── build_processing_message_parts ────────────────────────────────────────
+
+    fn processing_parts_to_json(
+        tool_name: &str,
+        input: &serde_json::Value,
+        request_id: &str,
+        scope: Scope,
+        attempt: Option<(u32, u32)>,
+    ) -> (serde_json::Value, Vec<serde_json::Value>) {
+        let (content, components) = build_processing_message_parts(
+            tool_name,
+            input,
+            request_id,
+            UserId::new(12345),
+            scope,
+            Lang::Ko,
+            attempt,
+        );
+        let components_json: Vec<serde_json::Value> = components
+            .into_iter()
+            .map(|row| serde_json::to_value(row).expect("row must be serializable"))
+            .collect();
+        (serde_json::Value::String(content), components_json)
+    }
+
+    fn all_buttons_in_rows(rows: &[serde_json::Value]) -> Vec<&serde_json::Value> {
+        rows.iter()
+            .flat_map(|row| {
+                row.get("components")
+                    .and_then(|c| c.as_array())
+                    .map(|arr| arr.iter().collect::<Vec<_>>())
+                    .unwrap_or_default()
+            })
+            .collect()
+    }
+
+    /// attempt=None → content 에 "⏳ 권한 저장 중..." 포함, "재시도" 미포함
+    #[test]
+    fn processing_message_no_retry() {
+        let input = serde_json::json!({"command": "npm test"});
+        let (content_val, _rows) =
+            processing_parts_to_json("Bash", &input, "rid-proc-001", Scope::Project, None);
+        let content = content_val.as_str().unwrap_or("");
+
+        assert!(
+            content.contains("⏳"),
+            "content must contain ⏳ (got: {})",
+            content
+        );
+        assert!(
+            content.contains("권한 저장 중"),
+            "content must contain '권한 저장 중' (got: {})",
+            content
+        );
+        assert!(
+            !content.contains("재시도"),
+            "content must NOT contain '재시도' when attempt=None (got: {})",
+            content
+        );
+    }
+
+    /// attempt=Some((2,3)) → content 에 "재시도 2/3" 포함
+    #[test]
+    fn processing_message_with_attempt() {
+        let input = serde_json::json!({"command": "cargo build"});
+        let (content_val, _rows) = processing_parts_to_json(
+            "Bash",
+            &input,
+            "rid-proc-002",
+            Scope::Project,
+            Some((2, 3)),
+        );
+        let content = content_val.as_str().unwrap_or("");
+
+        assert!(
+            content.contains("재시도 2/3"),
+            "content must contain '재시도 2/3' (got: {})",
+            content
+        );
+        assert!(
+            content.contains("⏳"),
+            "content must contain ⏳ (got: {})",
+            content
+        );
+    }
+
+    /// 모든 버튼이 disabled=true 여야 한다
+    #[test]
+    fn processing_message_all_buttons_disabled() {
+        let input = serde_json::json!({"command": "ls -la"});
+        let (_content, rows) =
+            processing_parts_to_json("Bash", &input, "rid-proc-003", Scope::Project, None);
+
+        assert!(!rows.is_empty(), "must have at least one ActionRow");
+
+        let buttons = all_buttons_in_rows(&rows);
+        assert!(!buttons.is_empty(), "must have at least one button");
+
+        for (i, btn) in buttons.iter().enumerate() {
+            assert_eq!(
+                btn.get("disabled").and_then(|v| v.as_bool()),
+                Some(true),
+                "button[{}] must be disabled (got: {:?})",
+                i,
+                btn
+            );
+        }
     }
 }
