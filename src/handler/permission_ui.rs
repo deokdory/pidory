@@ -38,6 +38,8 @@ pub enum PermAction {
     ScopeToggle,
     /// 영구 허용 (rule 저장) — 저장 방식은 RuleKind로 결정
     AllowAlways(RuleKind),
+    /// Level 1 "항상 허용" 클릭 → Level 2 UI expand 트리거 (영속화 결정 X)
+    ExpandAlways,
 }
 
 /// `perm:{request_id}:{tail}` 형식의 custom_id를 파싱한다.
@@ -52,7 +54,9 @@ pub enum PermAction {
 pub fn parse_permission_custom_id(custom_id: &str) -> Option<(String, PermAction)> {
     let rest = custom_id.strip_prefix("perm:")?;
     // tail suffix longest-first matching
-    let (request_id, action) = if let Some(rid) = rest.strip_suffix(":scope:toggle") {
+    let (request_id, action) = if let Some(rid) = rest.strip_suffix(":always:expand") {
+        (rid, PermAction::ExpandAlways)
+    } else if let Some(rid) = rest.strip_suffix(":scope:toggle") {
         (rid, PermAction::ScopeToggle)
     } else if let Some(rid) = rest.strip_suffix(":always:exact") {
         (rid, PermAction::AllowAlways(RuleKind::Exact))
@@ -773,6 +777,46 @@ mod tests {
     fn parse_perm_wrong_prefix_returns_none() {
         let result = parse_permission_custom_id("not-perm:abc:once");
         assert_eq!(result, None);
+    }
+
+    #[test]
+    fn parse_perm_always_expand() {
+        let result = parse_permission_custom_id("perm:abc-123:always:expand");
+        assert_eq!(result, Some(("abc-123".to_string(), PermAction::ExpandAlways)));
+    }
+
+    #[test]
+    fn parse_perm_always_expand_rid_with_colon() {
+        // rid에 ':' 포함 — suffix strip 방식으로 정확히 보존해야 한다
+        let result = parse_permission_custom_id("perm:rid:with:colon:always:expand");
+        assert_eq!(result, Some(("rid:with:colon".to_string(), PermAction::ExpandAlways)));
+    }
+
+    #[test]
+    fn parse_perm_expand_not_confused_with_exact() {
+        // longest-first 검증: ":always:exact" 는 ExpandAlways 가 아닌 AllowAlways(Exact) 로 매칭
+        let result = parse_permission_custom_id("perm:rid:always:exact");
+        assert_eq!(
+            result,
+            Some(("rid".to_string(), PermAction::AllowAlways(RuleKind::Exact)))
+        );
+    }
+
+    /// Legacy ":always" (suffix only) → AllowAlways(RuleKind::Tool) 회귀 보호 (review #297 w4)
+    #[test]
+    fn parse_perm_always_legacy() {
+        let result = parse_permission_custom_id("perm:abc-123:always");
+        assert_eq!(
+            result,
+            Some(("abc-123".to_string(), PermAction::AllowAlways(RuleKind::Tool)))
+        );
+    }
+
+    /// Legacy ":allow" → Once 회귀 보호 (review #297 w4)
+    #[test]
+    fn parse_perm_allow_legacy() {
+        let result = parse_permission_custom_id("perm:abc-123:allow");
+        assert_eq!(result, Some(("abc-123".to_string(), PermAction::Once)));
     }
 
     /// Disabled 레이블 버튼의 custom_id 는 해석되지 않아야 한다 (review #298 s4).
