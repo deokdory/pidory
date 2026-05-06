@@ -471,7 +471,13 @@ pub async fn disable_permission_buttons(
             Lang::En => "-# ❌ Denied".to_string(),
         },
         DisableReason::AllowAlwaysSuccess { rules, scope, project_basename } => {
-            let rules_joined = rules.join(", ");
+            // 각 rule 을 inline_code 로 감싸 Discord markdown(`*` → italic) 회피.
+            // `Bash(ls *)` 같은 룰의 별표가 italic 으로 깨지지 않도록 백틱 적용.
+            let rules_joined = rules
+                .iter()
+                .map(|r| inline_code(r))
+                .collect::<Vec<_>>()
+                .join(", ");
             let basename = project_basename
                 .unwrap_or_else(|| lang.msg_project_basename_fallback().to_string());
             format!("-# {}", match scope {
