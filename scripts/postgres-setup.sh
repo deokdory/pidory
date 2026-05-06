@@ -111,14 +111,14 @@ fi
 
 # Wait for postgres to be ready
 for i in 1 2 3 4 5; do
-    if sudo -u postgres psql -c '\q' &>/dev/null 2>&1; then
+    if sudo -u postgres psql -c '\q' &>/dev/null; then
         break
     fi
     echo "  Waiting for PostgreSQL to be ready... ($i/5)"
     sleep 2
 done
 
-if ! sudo -u postgres psql -c '\q' &>/dev/null 2>&1; then
+if ! sudo -u postgres psql -c '\q' &>/dev/null; then
     echo "ERROR: PostgreSQL is not responding after startup." >&2
     echo "  Check: systemctl status $PG_SERVICE" >&2
     exit 1
@@ -169,8 +169,8 @@ fi
 # ---------------------------------------------------------------------------
 echo "[step 6/8] Ensuring /etc/pidory/ directory..."
 mkdir -p /etc/pidory
-chown "${DEPLOY_USER}:${DEPLOY_USER}" /etc/pidory
-chmod 700 /etc/pidory
+chown "root:${DEPLOY_USER}" /etc/pidory
+chmod 0750 /etc/pidory
 
 # ---------------------------------------------------------------------------
 # 9. /etc/pidory/db.env 작성
@@ -196,15 +196,14 @@ if [ -z "$URL_ESCAPED_PASSWORD" ]; then
     URL_ESCAPED_PASSWORD="$DB_PASSWORD"
 fi
 
-# db.env 작성 (atomic write via temp file)
-DB_ENV_TMP="$(mktemp /etc/pidory/db.env.XXXXXX)"
+# db.env 작성 (atomic write via install)
+DB_ENV_TMP="$(mktemp)"
 printf 'DATABASE_URL=postgres://pidory:%s@localhost/pidory\n' "$URL_ESCAPED_PASSWORD" \
     > "$DB_ENV_TMP"
-chmod 600 "$DB_ENV_TMP"
-chown "${DEPLOY_USER}:${DEPLOY_USER}" "$DB_ENV_TMP"
-mv "$DB_ENV_TMP" /etc/pidory/db.env
+install -m 0640 -o root -g "$DEPLOY_USER" "$DB_ENV_TMP" /etc/pidory/db.env
+rm -f "$DB_ENV_TMP"
 
-echo "  Written: /etc/pidory/db.env (mode 600)"
+echo "  Written: /etc/pidory/db.env (mode 0640, root:${DEPLOY_USER})"
 
 # ---------------------------------------------------------------------------
 # 10. systemctl daemon-reload + restart pidory

@@ -23,7 +23,7 @@ ExecStartPre=/usr/local/bin/pidory-migrate
 # Security hardening
 NoNewPrivileges=true
 ProtectSystem=strict
-ReadWritePaths=__PROJECT_DIR__ __HOME_DIR__/.claude /tmp /etc/pidory /var/lib/pidory
+ReadWritePaths=__PROJECT_DIR__ __HOME_DIR__/.claude /tmp /var/lib/pidory
 
 [Install]
 WantedBy=multi-user.target

@@ -49,13 +49,13 @@ sudo install -o "$USER_NAME" -m 0755 \
 # Create /etc/pidory/ for db.env (postgres-setup.sh will populate DATABASE_URL)
 if [ ! -d /etc/pidory ]; then
     sudo mkdir -p /etc/pidory
-    sudo chown "$USER_NAME:$USER_NAME" /etc/pidory
-    sudo chmod 700 /etc/pidory
+    sudo chown "root:$USER_NAME" /etc/pidory
+    sudo chmod 0750 /etc/pidory
 fi
 # Ensure db.env has correct permissions if it already exists
 if [ -f /etc/pidory/db.env ]; then
-    sudo chown "$USER_NAME:$USER_NAME" /etc/pidory/db.env
-    sudo chmod 600 /etc/pidory/db.env
+    sudo chown "root:$USER_NAME" /etc/pidory/db.env
+    sudo chmod 0640 /etc/pidory/db.env
 fi
 
 # 5. Install skills
