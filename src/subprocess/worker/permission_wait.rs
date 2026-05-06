@@ -59,7 +59,7 @@ async fn write_permission_response(
             } else {
                 permission_cache.clear_tool(&tool_name);
             }
-            tracing::info!(request_id = %request_id, behavior = "always_allow", tool_name = %tool_name, "control_response written");
+            tracing::info!(request_id = %request_id, behavior = "always_allow", tool_name = %tool_name, rule_kind = ?rule_kind, "control_response written");
             Ok(false)
         }
         PermissionWaitResult::Deny(reason) => {
@@ -413,7 +413,7 @@ where
                                     permission_cache.clear_tool(tool_name);
                                 }
                             }
-                            tracing::info!(thread_id = %thread_id, request_id = %rid, tool_name = %tool_name, behavior = "always_allow", "control_response written");
+                            tracing::info!(thread_id = %thread_id, request_id = %rid, tool_name = %tool_name, behavior = "always_allow", rule_kind = ?rule_kind, "control_response written");
                             r
                         }
                         PermissionDecision::Deny => {
@@ -1181,7 +1181,7 @@ mod tests {
         let (mut reader, _reader_write) = make_duplex_reader(&[]).await;
         let mut line = String::new();
 
-        let (mut stdin_write, _stdin_read) = tokio::io::duplex(4096);
+        let (mut stdin_write, mut stdin_read) = tokio::io::duplex(4096);
         let (permission_tx, mut permission_rx) = tokio::sync::mpsc::channel::<PermissionRequest>(32);
         let mut cache = PermissionCache::new();
         let (_queue_tx, mut queue_rx, _interrupt_tx, mut interrupt_rx, queue_size, pending_recalls, ratelimit_tx) = setup_channels!();
@@ -1205,6 +1205,11 @@ mod tests {
 
         assert!(matches!(result, PermissionsWaitResult::AllResolved { .. }));
         assert!(cache.is_always_allowed("Bash"), "Tool kind AllowAlways must add to cache");
+
+        let writes = drain_stdin_writes(&mut stdin_read, 1).await;
+        assert_eq!(writes.len(), 1, "stdin 1건 (cr1 allow) 기록되어야 함");
+        assert_eq!(writes[0]["response"]["response"]["behavior"], "allow", "cr1 → allow");
+        assert_eq!(writes[0]["response"]["request_id"], "cr1");
     }
 
     /// AllowAlways + RuleKind::Exact → clear_tool 호출, cache 에 추가하지 않음
@@ -1267,25 +1272,25 @@ mod tests {
 
         let initial_cr1 = make_initial_cr("cr1", "Bash");
 
-        let handler_task = tokio::spawn(async move {
-            let mut recv_count = 0usize;
-            // 1st call: cr1
+        // tokio::join! 으로 wait_for_permissions 와 receiver 처리를 동시에 실행.
+        // permission_rx 를 task 로 move 하지 않고 테스트 본체에 유지 → receiver lifecycle 보존.
+        let respond_task = async {
             if let Some(req) = permission_rx.recv().await {
-                recv_count += 1;
                 let _ = req.response_tx.send(PermissionDecision::AllowAlways {
                     rule_kind: RuleKind::Tool,
                     scope: Scope::Project,
                 });
             }
-            // 2nd call: cr2 는 cache hit → permission_rx 에 오지 않음
-            recv_count
-        });
+        };
 
-        let result1 = wait_for_permissions(
-            &mut stdin_write, &mut reader1, &mut line, &mut queue_rx, &mut interrupt_rx,
-            &queue_size, &pending_recalls, "test-thread", None, &ratelimit_tx,
-            &mut cache, &permission_tx, initial_cr1,
-        ).await;
+        let (result1, _) = tokio::join!(
+            wait_for_permissions(
+                &mut stdin_write, &mut reader1, &mut line, &mut queue_rx, &mut interrupt_rx,
+                &queue_size, &pending_recalls, "test-thread", None, &ratelimit_tx,
+                &mut cache, &permission_tx, initial_cr1,
+            ),
+            respond_task,
+        );
         assert!(matches!(result1, PermissionsWaitResult::AllResolved { .. }), "1st call must AllResolved");
         assert!(cache.is_always_allowed("Bash"), "cache must have Bash after 1st call");
 
@@ -1300,10 +1305,14 @@ mod tests {
             &queue_size, &pending_recalls, "test-thread", None, &ratelimit_tx,
             &mut cache, &permission_tx, initial_cr2,
         ).await;
-
-        let recv_count = handler_task.await.unwrap();
-        assert_eq!(recv_count, 1, "permission_tx 는 cr1 1건만 수신해야 함 (cr2 는 cache hit)");
         assert!(matches!(result2, PermissionsWaitResult::AllResolved { .. }), "2nd call must AllResolved (cache hit)");
+
+        // permission_rx 는 살아있지만 2nd call 은 cache hit 이라 메시지가 오지 않아야 함
+        let no_msg = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            permission_rx.recv(),
+        ).await;
+        assert!(no_msg.is_err(), "receiver 가 살아있는데 두 번째 메시지가 도착하면 cache hit 실패");
 
         // stdin: cr1 allow + cr2 auto-allow = 2건
         let writes = drain_stdin_writes(&mut stdin_read, 2).await;
