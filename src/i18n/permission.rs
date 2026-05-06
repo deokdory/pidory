@@ -193,6 +193,22 @@ impl Lang {
             Lang::En => "Permission conflict",
         }
     }
+
+    /// Bash input 이 너무 길어 truncate 된 경우 끝에 붙는 안내
+    pub fn msg_input_truncated(&self) -> &'static str {
+        match self {
+            Lang::Ko => "... (입력이 길어 잘림)",
+            Lang::En => "... (input truncated)",
+        }
+    }
+
+    /// 권한 요청 메시지 전송 실패 시 채널에 표시하는 안내
+    pub fn msg_send_failed_too_long(&self) -> &'static str {
+        match self {
+            Lang::Ko => "⚠️ 입력이 너무 길어 권한 요청 메시지를 표시할 수 없어 자동으로 거부되었어요. 짧은 명령으로 나눠서 시도해주세요.",
+            Lang::En => "⚠️ Input too long to display permission request — automatically denied. Try splitting into shorter commands.",
+        }
+    }
 }
 
 #[cfg(test)]

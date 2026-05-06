@@ -102,7 +102,7 @@ pub fn build_level2_message_parts(
     scope: Scope,
     lang: Lang,
 ) -> (String, Vec<CreateActionRow>) {
-    let summary = format_tool_input_summary(tool_name, input);
+    let summary = format_tool_input_summary(tool_name, input, lang);
     let reason = decision_reason
         .map(|r| format!("\n> {}", r))
         .unwrap_or_default();
@@ -227,7 +227,7 @@ pub fn build_level1_message_parts(
     triggered_by: UserId,
     lang: Lang,
 ) -> (String, Vec<CreateActionRow>) {
-    let summary = format_tool_input_summary(tool_name, input);
+    let summary = format_tool_input_summary(tool_name, input, lang);
     let reason = decision_reason
         .map(|r| format!("\n> {}", r))
         .unwrap_or_default();
@@ -284,14 +284,21 @@ pub fn create_permission_message(
     CreateMessage::new().content(content).components(components)
 }
 
-pub fn format_tool_input_summary(tool_name: &str, input: &serde_json::Value) -> String {
+pub fn format_tool_input_summary(tool_name: &str, input: &serde_json::Value, lang: Lang) -> String {
     match tool_name {
         "Bash" => {
             let command = input
                 .get("command")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
-            format!("```\n{}\n```", command)
+            const MAX_BASH_INPUT: usize = 1500;
+            let display = if command.chars().count() > MAX_BASH_INPUT {
+                let head: String = command.chars().take(MAX_BASH_INPUT).collect();
+                format!("{}\n{}", head, lang.msg_input_truncated())
+            } else {
+                command.to_string()
+            };
+            format!("```\n{}\n```", display)
         }
         "Edit" | "Write" => {
             let file_path = input
@@ -364,7 +371,7 @@ pub fn build_processing_message_parts(
         triggered_by,
         inline_code(tool_name),
     );
-    let summary = format_tool_input_summary(tool_name, input);
+    let summary = format_tool_input_summary(tool_name, input, lang);
 
     // 진행 상태 텍스트
     let processing_text = match attempt {
@@ -671,8 +678,11 @@ pub async fn run_permission_handler(
             }
             Err(e) => {
                 tracing::info!(thread_id = %thread_id, request_id = %log_request_id, tool_name = %log_tool_name, "permission message send failed");
-                warn!("Failed to send permission message: {}", e);
-                // 전송 실패 시 deny
+                warn!("Failed to send permission message (likely too long): {}", e);
+                // 사용자 안내 — 짧은 fallback 메시지
+                let _ = channel_id.send_message(&ctx,
+                    CreateMessage::new().content(format!("-# {}", lang.msg_send_failed_too_long()))
+                ).await.ok();
                 let _ = perm_req.response_tx.send(PermissionDecision::Deny);
             }
         }
@@ -844,7 +854,7 @@ mod tests {
     #[test]
     fn format_bash_summary() {
         let input = serde_json::json!({"command": "ls -la"});
-        let result = format_tool_input_summary("Bash", &input);
+        let result = format_tool_input_summary("Bash", &input, Lang::Ko);
         assert!(result.contains("ls -la"));
         assert!(result.contains("```"));
     }
@@ -852,35 +862,35 @@ mod tests {
     #[test]
     fn format_edit_summary() {
         let input = serde_json::json!({"file_path": "/tmp/foo.rs"});
-        let result = format_tool_input_summary("Edit", &input);
+        let result = format_tool_input_summary("Edit", &input, Lang::Ko);
         assert_eq!(result, "`/tmp/foo.rs`");
     }
 
     #[test]
     fn format_unknown_summary() {
         let input = serde_json::json!({});
-        let result = format_tool_input_summary("Unknown", &input);
+        let result = format_tool_input_summary("Unknown", &input, Lang::Ko);
         assert_eq!(result, "");
     }
 
     #[test]
     fn format_webfetch_summary() {
         let input = serde_json::json!({"url": "https://example.com/page"});
-        let result = format_tool_input_summary("WebFetch", &input);
+        let result = format_tool_input_summary("WebFetch", &input, Lang::Ko);
         assert_eq!(result, "`https://example.com/page`");
     }
 
     #[test]
     fn format_websearch_summary() {
         let input = serde_json::json!({"query": "rust async tokio"});
-        let result = format_tool_input_summary("WebSearch", &input);
+        let result = format_tool_input_summary("WebSearch", &input, Lang::Ko);
         assert_eq!(result, "`rust async tokio`");
     }
 
     #[test]
     fn format_unknown_with_string_field() {
         let input = serde_json::json!({"some_field": "some value"});
-        let result = format_tool_input_summary("UnknownTool", &input);
+        let result = format_tool_input_summary("UnknownTool", &input, Lang::Ko);
         assert_eq!(result, "`some value`");
     }
 
@@ -888,7 +898,7 @@ mod tests {
     fn format_unknown_with_long_string_field() {
         let long_str = "a".repeat(150);
         let input = serde_json::json!({"field": long_str});
-        let result = format_tool_input_summary("UnknownTool", &input);
+        let result = format_tool_input_summary("UnknownTool", &input, Lang::Ko);
         assert_eq!(result, format!("`{}`", "a".repeat(100)));
     }
 
@@ -897,35 +907,35 @@ mod tests {
     #[test]
     fn format_write_summary() {
         let input = serde_json::json!({"file_path": "/src/main.rs"});
-        let result = format_tool_input_summary("Write", &input);
+        let result = format_tool_input_summary("Write", &input, Lang::Ko);
         assert_eq!(result, "`/src/main.rs`");
     }
 
     #[test]
     fn format_read_summary() {
         let input = serde_json::json!({"file_path": "/etc/hosts"});
-        let result = format_tool_input_summary("Read", &input);
+        let result = format_tool_input_summary("Read", &input, Lang::Ko);
         assert_eq!(result, "`/etc/hosts`");
     }
 
     #[test]
     fn format_grep_summary() {
         let input = serde_json::json!({"pattern": "fn main"});
-        let result = format_tool_input_summary("Grep", &input);
+        let result = format_tool_input_summary("Grep", &input, Lang::Ko);
         assert_eq!(result, "`fn main`");
     }
 
     #[test]
     fn format_glob_summary() {
         let input = serde_json::json!({"pattern": "**/*.rs"});
-        let result = format_tool_input_summary("Glob", &input);
+        let result = format_tool_input_summary("Glob", &input, Lang::Ko);
         assert_eq!(result, "`**/*.rs`");
     }
 
     #[test]
     fn format_bash_empty_command() {
         let input = serde_json::json!({"command": ""});
-        let result = format_tool_input_summary("Bash", &input);
+        let result = format_tool_input_summary("Bash", &input, Lang::Ko);
         // Empty command still produces code-fence block
         assert!(result.contains("```"));
     }
@@ -934,8 +944,35 @@ mod tests {
     fn format_bash_missing_command_key() {
         // If "command" key is absent, falls back to empty string
         let input = serde_json::json!({});
-        let result = format_tool_input_summary("Bash", &input);
+        let result = format_tool_input_summary("Bash", &input, Lang::Ko);
         assert!(result.contains("```"));
+    }
+
+    #[test]
+    fn format_bash_summary_truncates_long_input() {
+        // 2000자 입력 → 1500자로 잘리고 truncate 안내 포함
+        let long_cmd: String = "a".repeat(2000);
+        let input = serde_json::json!({"command": long_cmd});
+        let result = format_tool_input_summary("Bash", &input, Lang::Ko);
+        assert!(result.contains("```"));
+        // 원본 2000자가 아닌 1500자만 포함되어야 함
+        let head: String = "a".repeat(1500);
+        assert!(result.contains(&head));
+        // 1501번째 'a' 는 없어야 함 (잘렸으므로)
+        let too_long: String = "a".repeat(1501);
+        assert!(!result.contains(&too_long));
+        // truncate 안내 메시지 포함
+        assert!(result.contains(Lang::Ko.msg_input_truncated()));
+    }
+
+    #[test]
+    fn format_bash_summary_short_unchanged() {
+        // 100자 입력 → 그대로
+        let short_cmd: String = "b".repeat(100);
+        let input = serde_json::json!({"command": short_cmd});
+        let result = format_tool_input_summary("Bash", &input, Lang::Ko);
+        assert!(result.contains(&short_cmd));
+        assert!(!result.contains(Lang::Ko.msg_input_truncated()));
     }
 
     // ── dismiss_pending_by_tool ───────────────────────────────────────────────
