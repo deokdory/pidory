@@ -35,10 +35,10 @@ fn load_agent_descriptions_from_dir(agents_path: &Path) -> HashMap<String, Strin
         if path.extension().and_then(|e| e.to_str()) != Some("md") {
             continue;
         }
-        if let Ok(content) = fs::read_to_string(&path) {
-            if let Some((name, desc)) = parse_frontmatter_fields(&content) {
-                descriptions.insert(name, desc);
-            }
+        if let Ok(content) = fs::read_to_string(&path)
+            && let Some((name, desc)) = parse_frontmatter_fields(&content)
+        {
+            descriptions.insert(name, desc);
         }
     }
 
@@ -153,9 +153,9 @@ pub async fn agent(
     Ok(())
 }
 
-async fn autocomplete_agent<'a>(
+async fn autocomplete_agent(
     ctx: Context<'_>,
-    partial: &'a str,
+    partial: &str,
 ) -> Vec<poise::serenity_prelude::AutocompleteChoice> {
     let data = ctx.data();
     let thread_id = ctx.channel_id().to_string();

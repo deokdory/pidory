@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::time::Instant;
 
+#[allow(dead_code)]
 pub struct BackgroundTask {
     pub task_id: String,
     pub task_type: String,
@@ -41,6 +42,7 @@ impl BackgroundTaskTracker {
         self.tasks.remove(task_id)
     }
 
+    #[allow(dead_code)]
     pub fn active_count(&self) -> usize {
         self.tasks.len()
     }

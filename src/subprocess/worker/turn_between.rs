@@ -29,7 +29,7 @@ pub(super) enum BetweenTurnsAction {
     ProcessMessage(QueuedMessage),
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
 pub(super) async fn handle_between_turns_event(
     stdin: &mut ChildStdin,
     reader: &mut BufReader<ChildStdout>,

@@ -21,6 +21,7 @@ pub struct PendingReset {
     pub requested_by: UserId,
 }
 
+#[allow(dead_code)]
 pub fn create_reset_confirm_message(content: &str, thread_id: &str) -> CreateMessage {
     let confirm_btn = CreateButton::new(format!("reset:{}:confirm", thread_id))
         .label("✅ 예, 리셋")

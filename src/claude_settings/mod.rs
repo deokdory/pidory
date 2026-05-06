@@ -39,6 +39,8 @@ pub use error::ClaudeSettingsError;
 #[allow(unused_imports)]
 pub use editor::add_permission;
 #[allow(unused_imports)]
+pub use editor::add_permissions;
+#[allow(unused_imports)]
 pub use notifier::{ConflictEvent, ConflictNotifier, LoggingNotifier, MergeOutcome};
 #[allow(unused_imports)]
 pub use cleanup::cleanup_leftover_temp;

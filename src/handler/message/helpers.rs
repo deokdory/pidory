@@ -63,7 +63,7 @@ pub(super) fn parse_compact_command(content: &str) -> Option<Option<&str>> {
     // `/compact` 뒤에 공백/탭이 있어야 인자로 인식
     if lower.starts_with("/compact") {
         let after = &trimmed["/compact".len()..];
-        if after.starts_with(|c: char| c == ' ' || c == '\t') {
+        if after.starts_with([' ', '\t']) {
             let args = after.trim();
             if args.is_empty() {
                 return Some(None);

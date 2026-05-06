@@ -23,10 +23,10 @@ pub struct LockGuard {
 impl Drop for LockGuard {
     fn drop(&mut self) {
         // Only delete if the file still contains our PID (protect against overwrites).
-        if let Ok(contents) = fs::read_to_string(&self.path) {
-            if contents.trim().parse::<u32>().ok() == Some(self.pid) {
-                let _ = fs::remove_file(&self.path);
-            }
+        if let Ok(contents) = fs::read_to_string(&self.path)
+            && contents.trim().parse::<u32>().ok() == Some(self.pid)
+        {
+            let _ = fs::remove_file(&self.path);
         }
         // File missing or different PID → leave it alone.
     }

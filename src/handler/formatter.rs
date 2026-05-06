@@ -1440,7 +1440,7 @@ pub fn format_tool_use(name: &str, input: &serde_json::Value) -> String {
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
             if skill_name.is_empty() {
-                format!("-# 🔧 **Skill**")
+                "-# 🔧 **Skill**".to_string()
             } else {
                 format!("-# 🔧 **Skill** {}", skill_name)
             }

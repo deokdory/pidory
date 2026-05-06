@@ -12,7 +12,7 @@ use tracing::warn;
 
 use crate::claude_settings::danger::classify_command;
 use crate::claude_settings::rule::{
-    RuleKind, Scope, available_rule_kinds, build_rule_text, default_scope,
+    RuleKind, Scope, available_rule_kinds, build_rule_texts, default_scope,
 };
 use crate::error::PidoryError;
 use crate::handler::formatter::inline_code;
@@ -20,6 +20,12 @@ use crate::handler::question_ui;
 use crate::i18n::Lang;
 use crate::subprocess::permission::{PermissionDecision, PermissionRequest};
 use crate::{PendingPermission, PendingQuestionGroup};
+
+/// Disabled "항상 허용" 레이블 버튼의 custom_id.
+///
+/// Discord 는 disabled 버튼 클릭 시 interaction 을 발사하지 않지만, 방어적으로
+/// `parse_permission_custom_id` 가 이 ID 를 인식하지 않도록 강제한다 (test: `parse_perm_label_returns_none`).
+pub const LABEL_BUTTON_CUSTOM_ID: &str = "perm:_label";
 
 /// Permission 버튼 클릭 결과로 취할 행동.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -32,6 +38,8 @@ pub enum PermAction {
     ScopeToggle,
     /// 영구 허용 (rule 저장) — 저장 방식은 RuleKind로 결정
     AllowAlways(RuleKind),
+    /// Level 1 "항상 허용" 클릭 → Level 2 UI expand 트리거 (영속화 결정 X)
+    ExpandAlways,
 }
 
 /// `perm:{request_id}:{tail}` 형식의 custom_id를 파싱한다.
@@ -46,7 +54,9 @@ pub enum PermAction {
 pub fn parse_permission_custom_id(custom_id: &str) -> Option<(String, PermAction)> {
     let rest = custom_id.strip_prefix("perm:")?;
     // tail suffix longest-first matching
-    let (request_id, action) = if let Some(rid) = rest.strip_suffix(":scope:toggle") {
+    let (request_id, action) = if let Some(rid) = rest.strip_suffix(":always:expand") {
+        (rid, PermAction::ExpandAlways)
+    } else if let Some(rid) = rest.strip_suffix(":scope:toggle") {
         (rid, PermAction::ScopeToggle)
     } else if let Some(rid) = rest.strip_suffix(":always:exact") {
         (rid, PermAction::AllowAlways(RuleKind::Exact))
@@ -77,9 +87,13 @@ pub fn parse_permission_custom_id(custom_id: &str) -> Option<(String, PermAction
     Some((request_id.to_string(), action))
 }
 
-/// Internal helper: builds `(content, components)` for a permission message.
-/// Used by both `create_permission_message` and `ScopeToggle` edit path.
-pub fn build_permission_message_parts(
+/// Internal helper: builds `(content, components)` for a Level 2 permission message.
+/// Used by `ScopeToggle` edit path and `always:expand` expand path.
+///
+/// Level 2 UI: 헤더(scope 포함) + 미리보기 섹션 + 2-row 버튼.
+/// - Row 1: 영속 옵션(Exact/Prefix/Domain/Tool) + scope 토글
+/// - Row 2: 한 번만(Success) + 거부(Danger)
+pub fn build_level2_message_parts(
     tool_name: &str,
     input: &serde_json::Value,
     request_id: &str,
@@ -88,100 +102,168 @@ pub fn build_permission_message_parts(
     scope: Scope,
     lang: Lang,
 ) -> (String, Vec<CreateActionRow>) {
-    let summary = format_tool_input_summary(tool_name, input);
+    let summary = format_tool_input_summary(tool_name, input, lang);
     let reason = decision_reason
         .map(|r| format!("\n> {}", r))
         .unwrap_or_default();
 
-    // 헤더 scope 표시
-    let scope_label = match &scope {
-        Scope::Project => "📁 project".to_string(),
-        Scope::Global => "🌐 global  ⚠️ 모든 프로젝트에 적용됨".to_string(),
-    };
     let header = format!(
-        "🔒 <@{}>  {}  ·  scope: {}",
+        "🔒 <@{}>  {}",
         triggered_by,
         inline_code(tool_name),
-        scope_label,
     );
 
-    // 미리보기: available_rule_kinds → build_rule_text 각 줄
+    // 미리보기: available_rule_kinds → build_rule_texts(복수형) → 콤마 나열.
     let kinds = available_rule_kinds(tool_name, input);
     let preview_lines: Vec<String> = kinds
         .iter()
         .filter_map(|kind| {
-            build_rule_text(tool_name, input, kind.clone()).map(|rule_text| {
-                // classify_command 호출 — skeleton (P1.5에서 활용), 현재 시각 변경 없음
-                let _severity = classify_command(&rule_text);
-                let prefix = match kind {
-                    RuleKind::Exact => "🔓 이 명령만",
-                    RuleKind::Prefix => "🔓⚙ 같은 prefix",
-                    RuleKind::Domain => "🔓⚙ 같은 도메인",
-                    RuleKind::Tool => "🔓⚠ 도구 전체",
-                };
-                format!("{} → {}", prefix, inline_code(&rule_text))
-            })
+            let rules = build_rule_texts(tool_name, input, kind.clone());
+            if rules.is_empty() {
+                return None;
+            }
+            // classify_command 호출 — skeleton (P1.5에서 활용), 현재 시각 변경 없음
+            for r in &rules {
+                let _severity = classify_command(r);
+            }
+            let prefix = match kind {
+                RuleKind::Exact => lang.btn_always_exact(),
+                RuleKind::Prefix => lang.btn_always_prefix(),
+                RuleKind::Domain => lang.btn_always_domain(),
+                RuleKind::Tool => lang.btn_always_tool(),
+            };
+            let rules_with_code: Vec<String> = rules.iter().map(|r| inline_code(r)).collect();
+            Some(format!("-# {}\n{}", prefix, rules_with_code.join(", ")))
         })
         .collect();
 
     let preview_section = if preview_lines.is_empty() {
         String::new()
     } else {
-        format!("\n\n영속 옵션:\n{}", preview_lines.join("\n"))
+        // 끝에 zero-width space + \n — Discord 가 trailing whitespace 를 trim 하므로
+        // 단순 \n 만으로는 시각적 여유가 안 만들어짐. ZWSP 로 visible 한 줄 확보.
+        format!(
+            "\n\n{}\n{}\n\u{200B}",
+            lang.msg_always_allow_options_header(),
+            preview_lines.join("\n")
+        )
     };
 
     let content = format!(
-        "{}\n{}{}{}",
-        header, summary, reason, preview_section
+        "{}\n{}\n{}{}{}",
+        lang.lbl_permission_request_section_header(),
+        header,
+        summary,
+        reason,
+        preview_section
     );
 
-    // Row 1: once + deny (항상 2 버튼)
+    // Row 1: always-allow 버튼들 + scope 토글
+    //
+    // LABEL disabled 버튼 제거 — Level 2 컨텍스트상 자명 (review #298 T7).
+    // ActionRow 5버튼 한도 검증 (label 제거 후):
+    //   Bash:             Exact + Prefix + Tool + scope = 4 ✓
+    //   WebFetch(domain): Domain + Tool + scope         = 3 ✓
+    //   Read/Edit/Write:  Exact + Tool + scope          = 3 ✓
+    //   Grep/Glob/IP:     Tool + scope                  = 2 ✓
+    let mut row1_buttons: Vec<CreateButton> = kinds.iter().map(|kind| match kind {
+        RuleKind::Exact => CreateButton::new(format!("perm:{}:always:exact", request_id))
+            .label(lang.btn_always_exact())
+            .style(ButtonStyle::Secondary),
+        RuleKind::Prefix => CreateButton::new(format!("perm:{}:always:prefix", request_id))
+            .label(lang.btn_always_prefix())
+            .style(ButtonStyle::Secondary),
+        RuleKind::Domain => CreateButton::new(format!("perm:{}:always:domain", request_id))
+            .label(lang.btn_always_domain())
+            .style(ButtonStyle::Secondary),
+        // Tool 전체 허용 — 위험성은 라벨 ⚠️ 아이콘으로 명시, 색은 Secondary (review #298 T13)
+        RuleKind::Tool => CreateButton::new(format!("perm:{}:always:tool", request_id))
+            .label(lang.btn_always_tool())
+            .style(ButtonStyle::Secondary),
+    }).collect();
+
+    let (scope_btn_label, scope_btn_style) = match &scope {
+        Scope::Project => (lang.btn_scope_status_project(), ButtonStyle::Secondary),
+        Scope::Global => (lang.btn_scope_status_global(), ButtonStyle::Primary),
+    };
+    row1_buttons.push(
+        CreateButton::new(format!("perm:{}:scope:toggle", request_id))
+            .label(scope_btn_label)
+            .style(scope_btn_style),
+    );
+
+    // Discord ActionRow 5버튼 한도 — 향후 새 tool 의 RuleKind 가 늘면 컴파일 통과해도
+    // Discord API 가 메시지 거부 (silent fail). debug build 에서 조기 검출 (review #298 s2).
+    debug_assert!(
+        row1_buttons.len() <= 5,
+        "ActionRow exceeds Discord 5-button limit (tool={}, count={})",
+        tool_name,
+        row1_buttons.len(),
+    );
+
+    let row1 = CreateActionRow::Buttons(row1_buttons);
+
+    // Row 2: 한 번만 + 거부
+    let row2 = CreateActionRow::Buttons(vec![
+        CreateButton::new(format!("perm:{}:once", request_id))
+            .label(lang.btn_once())
+            .style(ButtonStyle::Success),
+        CreateButton::new(format!("perm:{}:deny", request_id))
+            .label(lang.btn_deny())
+            .style(ButtonStyle::Danger),
+    ]);
+
+    (content, vec![row1, row2])
+}
+
+/// Builds `(content, components)` for a Level 1 permission message.
+///
+/// Level 1 UI: scope 표시 없이 3버튼 `[한 번만, 항상 허용, 거부]`만 제공한다.
+/// "항상 허용" 버튼은 `:always:expand` suffix — T9(ExpandAlways) 가 Level 2 UI 로 펼친다.
+/// 영속 옵션 미리보기 섹션 없음.
+pub fn build_level1_message_parts(
+    tool_name: &str,
+    input: &serde_json::Value,
+    request_id: &str,
+    decision_reason: Option<&str>,
+    triggered_by: UserId,
+    lang: Lang,
+) -> (String, Vec<CreateActionRow>) {
+    let summary = format_tool_input_summary(tool_name, input, lang);
+    let reason = decision_reason
+        .map(|r| format!("\n> {}", r))
+        .unwrap_or_default();
+
+    // 헤더: scope 표시 없음
+    let header = format!(
+        "🔒 <@{}>  {}",
+        triggered_by,
+        inline_code(tool_name),
+    );
+
+    let content = format!(
+        "{}\n{}\n{}{}",
+        lang.lbl_permission_request_section_header(),
+        header,
+        summary,
+        reason
+    );
+
+    // 단일 ActionRow: [한 번만 (Success), 항상 허용 (Primary), 거부 (Danger)]
+    // "항상 허용"은 Level 2 expand trigger → `:always:expand` suffix
     let once_btn = CreateButton::new(format!("perm:{}:once", request_id))
         .label(lang.btn_once())
-        .style(ButtonStyle::Success)
-        .emoji('✅');
+        .style(ButtonStyle::Success);
+    let always_btn = CreateButton::new(format!("perm:{}:always:expand", request_id))
+        .label(lang.btn_always_allow())
+        .style(ButtonStyle::Primary);
     let deny_btn = CreateButton::new(format!("perm:{}:deny", request_id))
         .label(lang.btn_deny())
-        .style(ButtonStyle::Danger)
-        .emoji('❌');
-    let row1 = CreateActionRow::Buttons(vec![once_btn, deny_btn]);
+        .style(ButtonStyle::Danger);
 
-    // Row 2: available_rule_kinds → 각 RuleKind 1 버튼
-    let row2_buttons: Vec<CreateButton> = kinds
-        .iter()
-        .map(|kind| match kind {
-            RuleKind::Exact => CreateButton::new(format!("perm:{}:always:exact", request_id))
-                .label(lang.btn_always_exact())
-                .style(ButtonStyle::Primary)
-                .emoji('🔓'),
-            RuleKind::Prefix => CreateButton::new(format!("perm:{}:always:prefix", request_id))
-                .label(lang.btn_always_prefix())
-                .style(ButtonStyle::Secondary)
-                .emoji('🔓'),
-            RuleKind::Domain => CreateButton::new(format!("perm:{}:always:domain", request_id))
-                .label(lang.btn_always_domain())
-                .style(ButtonStyle::Secondary)
-                .emoji('🔓'),
-            // Tool 전체 허용은 매우 위험 — Danger style 로 시각적 경고 (review #297 s3)
-            RuleKind::Tool => CreateButton::new(format!("perm:{}:always:tool", request_id))
-                .label(lang.btn_always_tool())
-                .style(ButtonStyle::Danger)
-                .emoji('⚠'),
-        })
-        .collect();
-    let row2 = CreateActionRow::Buttons(row2_buttons);
+    let row = CreateActionRow::Buttons(vec![once_btn, always_btn, deny_btn]);
 
-    // Row 3: scope toggle (1 버튼)
-    let (scope_btn_label, scope_btn_style) = match &scope {
-        Scope::Project => (lang.btn_scope_global_off(), ButtonStyle::Secondary),
-        Scope::Global => (lang.btn_scope_global_on(), ButtonStyle::Primary),
-    };
-    let scope_btn = CreateButton::new(format!("perm:{}:scope:toggle", request_id))
-        .label(scope_btn_label)
-        .style(scope_btn_style);
-    let row3 = CreateActionRow::Buttons(vec![scope_btn]);
-
-    (content, vec![row1, row2, row3])
+    (content, vec![row])
 }
 
 pub fn create_permission_message(
@@ -190,29 +272,35 @@ pub fn create_permission_message(
     request_id: &str,
     decision_reason: Option<&str>,
     triggered_by: UserId,
-    scope: Scope,
+    _scope: Scope,
     lang: Lang,
 ) -> CreateMessage {
-    let (content, components) = build_permission_message_parts(
+    let (content, components) = build_level1_message_parts(
         tool_name,
         input,
         request_id,
         decision_reason,
         triggered_by,
-        scope,
         lang,
     );
     CreateMessage::new().content(content).components(components)
 }
 
-pub fn format_tool_input_summary(tool_name: &str, input: &serde_json::Value) -> String {
+pub fn format_tool_input_summary(tool_name: &str, input: &serde_json::Value, lang: Lang) -> String {
     match tool_name {
         "Bash" => {
             let command = input
                 .get("command")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
-            format!("```\n{}\n```", command)
+            const MAX_BASH_INPUT: usize = 1500;
+            let display = if command.chars().count() > MAX_BASH_INPUT {
+                let head: String = command.chars().take(MAX_BASH_INPUT).collect();
+                format!("{}\n{}", head, lang.msg_input_truncated())
+            } else {
+                command.to_string()
+            };
+            format!("```\n{}\n```", display)
         }
         "Edit" | "Write" => {
             let file_path = input
@@ -262,6 +350,96 @@ pub fn format_tool_input_summary(tool_name: &str, input: &serde_json::Value) -> 
     }
 }
 
+/// Builds `(content, components)` for a "processing" state permission message.
+///
+/// 진입 직후 또는 재시도 사이에 버튼을 모두 disabled 로 변경해 사용자 중복 클릭을 차단한다.
+/// 구조는 Level 2 (`build_permission_message_parts`) 와 동일하되:
+/// - 미리보기 섹션 없음 (간결화)
+/// - 진행 상태 텍스트 추가 (attempt 유무에 따라 분기)
+/// - 모든 버튼 `.disabled(true)`
+#[allow(clippy::too_many_arguments)]
+pub fn build_processing_message_parts(
+    tool_name: &str,
+    input: &serde_json::Value,
+    request_id: &str,
+    triggered_by: UserId,
+    scope: Scope,
+    lang: Lang,
+    attempt: Option<(u32, u32)>,
+) -> (String, Vec<CreateActionRow>) {
+    // 헤더 — Level 2 와 동일
+    let header = format!(
+        "🔒 <@{}>  {}",
+        triggered_by,
+        inline_code(tool_name),
+    );
+    let summary = format_tool_input_summary(tool_name, input, lang);
+
+    // 진행 상태 텍스트
+    let processing_text = match attempt {
+        None => lang.msg_processing_no_retry().to_string(),
+        Some((n, total)) => lang.msg_processing_with_attempt(n, total),
+    };
+
+    let content = format!(
+        "{}\n{}\n{}\n\n{}",
+        lang.lbl_permission_request_section_header(),
+        header,
+        summary,
+        processing_text
+    );
+
+    // 컴포넌트 — Level 2 구조 복제 + 모두 disabled
+    let kinds = available_rule_kinds(tool_name, input);
+    let mut row1_buttons: Vec<CreateButton> = kinds
+        .iter()
+        .map(|kind| match kind {
+            RuleKind::Exact => CreateButton::new(format!("perm:{}:always:exact", request_id))
+                .label(lang.btn_always_exact())
+                .style(ButtonStyle::Secondary)
+                .disabled(true),
+            RuleKind::Prefix => CreateButton::new(format!("perm:{}:always:prefix", request_id))
+                .label(lang.btn_always_prefix())
+                .style(ButtonStyle::Secondary)
+                .disabled(true),
+            RuleKind::Domain => CreateButton::new(format!("perm:{}:always:domain", request_id))
+                .label(lang.btn_always_domain())
+                .style(ButtonStyle::Secondary)
+                .disabled(true),
+            RuleKind::Tool => CreateButton::new(format!("perm:{}:always:tool", request_id))
+                .label(lang.btn_always_tool())
+                .style(ButtonStyle::Secondary)
+                .disabled(true),
+        })
+        .collect();
+
+    let (scope_btn_label, scope_btn_style) = match &scope {
+        Scope::Project => (lang.btn_scope_status_project(), ButtonStyle::Secondary),
+        Scope::Global => (lang.btn_scope_status_global(), ButtonStyle::Primary),
+    };
+    row1_buttons.push(
+        CreateButton::new(format!("perm:{}:scope:toggle", request_id))
+            .label(scope_btn_label)
+            .style(scope_btn_style)
+            .disabled(true),
+    );
+
+    let row1 = CreateActionRow::Buttons(row1_buttons);
+
+    let row2 = CreateActionRow::Buttons(vec![
+        CreateButton::new(format!("perm:{}:once", request_id))
+            .label(lang.btn_once())
+            .style(ButtonStyle::Success)
+            .disabled(true),
+        CreateButton::new(format!("perm:{}:deny", request_id))
+            .label(lang.btn_deny())
+            .style(ButtonStyle::Danger)
+            .disabled(true),
+    ]);
+
+    (content, vec![row1, row2])
+}
+
 /// `disable_permission_buttons` 에 전달되는 결과 이유.
 #[derive(Debug)]
 pub enum DisableReason {
@@ -270,13 +448,17 @@ pub enum DisableReason {
     /// 거부됨
     Deny,
     /// Always Allow 성공 — rule이 새로 추가됨 (MergeOutcome::Added)
-    AllowAlwaysSuccess { rule_text: String },
+    AllowAlwaysSuccess {
+        rules: Vec<String>,
+        scope: Scope,
+        project_basename: Option<String>,
+    },
     /// Already present — 동일 rule이 이미 존재함 (MergeOutcome::AlreadyPresent)
     AllowAlwaysAlreadyPresent,
     /// Conflict resolved — 충돌 규칙이 자동 해소됨 (MergeOutcome::ConflictResolved)
     AllowAlwaysConflictResolved,
-    /// Lock timeout — 파일 잠금 대기 초과 (ClaudeSettingsError::LockTimeout 등)
-    AllowAlwaysLockTimeout,
+    /// Max retries exceeded — 파일 잠금 대기 최대 재시도 초과 (자동 거부)
+    AllowAlwaysMaxRetries { attempts: u32 },
     /// 그 외 atomic editor 실패
     AllowAlwaysFailed { reason: String },
     /// 같은 tool 의 다른 pending 이 AlwaysAllow 처리되어 자동 취소됨 (review #297 s1)
@@ -300,8 +482,20 @@ pub async fn disable_permission_buttons(
             Lang::Ko => "-# ❌ 거부됨".to_string(),
             Lang::En => "-# ❌ Denied".to_string(),
         },
-        DisableReason::AllowAlwaysSuccess { rule_text } => {
-            format!("-# {}", lang.msg_save_success(&rule_text))
+        DisableReason::AllowAlwaysSuccess { rules, scope, project_basename } => {
+            // 각 rule 을 inline_code 로 감싸 Discord markdown(`*` → italic) 회피.
+            // `Bash(ls *)` 같은 룰의 별표가 italic 으로 깨지지 않도록 백틱 적용.
+            let rules_joined = rules
+                .iter()
+                .map(|r| inline_code(r))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let basename = project_basename
+                .unwrap_or_else(|| lang.msg_project_basename_fallback().to_string());
+            format!("-# {}", match scope {
+                Scope::Project => lang.msg_save_success_project(&basename, &rules_joined),
+                Scope::Global => lang.msg_save_success_global(&rules_joined),
+            })
         }
         DisableReason::AllowAlwaysAlreadyPresent => match lang {
             Lang::Ko => "-# 🔓 이미 등록됨".to_string(),
@@ -311,8 +505,8 @@ pub async fn disable_permission_buttons(
             Lang::Ko => "-# 🔓 충돌 자동 해소됨".to_string(),
             Lang::En => "-# 🔓 Conflict resolved".to_string(),
         },
-        DisableReason::AllowAlwaysLockTimeout => {
-            format!("-# {}", lang.msg_save_failed_lock_timeout())
+        DisableReason::AllowAlwaysMaxRetries { attempts } => {
+            format!("-# {}", lang.msg_save_failed_max_retries(attempts))
         }
         DisableReason::AllowAlwaysFailed { reason } => match lang {
             Lang::Ko => format!("-# ⚠️ 권한 저장 실패: {}", reason),
@@ -372,6 +566,7 @@ pub async fn run_permission_handler(
                             triggered_by,
                             input: Some(perm_req.input),
                             scope_override: None,
+                            decision_reason: perm_req.decision_reason.clone(),
                         };
                         pending_permissions
                             .lock()
@@ -424,6 +619,7 @@ pub async fn run_permission_handler(
                                 triggered_by,
                                 input: Some(perm_req.input.clone()),
                                 scope_override: None,
+                                decision_reason: perm_req.decision_reason.clone(),
                             };
                             pending_permissions.lock().await.insert(sub_id, pending);
                         }
@@ -474,6 +670,7 @@ pub async fn run_permission_handler(
                     triggered_by,
                     input: Some(perm_req.input),
                     scope_override: None,
+                    decision_reason: perm_req.decision_reason.clone(),
                 };
                 pending_permissions
                     .lock()
@@ -483,8 +680,11 @@ pub async fn run_permission_handler(
             }
             Err(e) => {
                 tracing::info!(thread_id = %thread_id, request_id = %log_request_id, tool_name = %log_tool_name, "permission message send failed");
-                warn!("Failed to send permission message: {}", e);
-                // 전송 실패 시 deny
+                warn!("Failed to send permission message (likely too long): {}", e);
+                // 사용자 안내 — 짧은 fallback 메시지
+                let _ = channel_id.send_message(&ctx,
+                    CreateMessage::new().content(format!("-# {}", lang.msg_send_failed_too_long()))
+                ).await.ok();
                 let _ = perm_req.response_tx.send(PermissionDecision::Deny);
             }
         }
@@ -603,12 +803,60 @@ mod tests {
         assert_eq!(result, None);
     }
 
+    #[test]
+    fn parse_perm_always_expand() {
+        let result = parse_permission_custom_id("perm:abc-123:always:expand");
+        assert_eq!(result, Some(("abc-123".to_string(), PermAction::ExpandAlways)));
+    }
+
+    #[test]
+    fn parse_perm_always_expand_rid_with_colon() {
+        // rid에 ':' 포함 — suffix strip 방식으로 정확히 보존해야 한다
+        let result = parse_permission_custom_id("perm:rid:with:colon:always:expand");
+        assert_eq!(result, Some(("rid:with:colon".to_string(), PermAction::ExpandAlways)));
+    }
+
+    #[test]
+    fn parse_perm_expand_not_confused_with_exact() {
+        // longest-first 검증: ":always:exact" 는 ExpandAlways 가 아닌 AllowAlways(Exact) 로 매칭
+        let result = parse_permission_custom_id("perm:rid:always:exact");
+        assert_eq!(
+            result,
+            Some(("rid".to_string(), PermAction::AllowAlways(RuleKind::Exact)))
+        );
+    }
+
+    /// Legacy ":always" (suffix only) → AllowAlways(RuleKind::Tool) 회귀 보호 (review #297 w4)
+    #[test]
+    fn parse_perm_always_legacy() {
+        let result = parse_permission_custom_id("perm:abc-123:always");
+        assert_eq!(
+            result,
+            Some(("abc-123".to_string(), PermAction::AllowAlways(RuleKind::Tool)))
+        );
+    }
+
+    /// Legacy ":allow" → Once 회귀 보호 (review #297 w4)
+    #[test]
+    fn parse_perm_allow_legacy() {
+        let result = parse_permission_custom_id("perm:abc-123:allow");
+        assert_eq!(result, Some(("abc-123".to_string(), PermAction::Once)));
+    }
+
+    /// Disabled 레이블 버튼의 custom_id 는 해석되지 않아야 한다 (review #298 s4).
+    /// 향후 parse 규칙이 바뀌어도 이 ID 가 우연히 매칭되면 핸들러가 의도치 않은 분기로 빠짐.
+    #[test]
+    fn parse_perm_label_returns_none() {
+        let result = parse_permission_custom_id(LABEL_BUTTON_CUSTOM_ID);
+        assert_eq!(result, None);
+    }
+
     // ── format_tool_input_summary ─────────────────────────────────────────────
 
     #[test]
     fn format_bash_summary() {
         let input = serde_json::json!({"command": "ls -la"});
-        let result = format_tool_input_summary("Bash", &input);
+        let result = format_tool_input_summary("Bash", &input, Lang::Ko);
         assert!(result.contains("ls -la"));
         assert!(result.contains("```"));
     }
@@ -616,35 +864,35 @@ mod tests {
     #[test]
     fn format_edit_summary() {
         let input = serde_json::json!({"file_path": "/tmp/foo.rs"});
-        let result = format_tool_input_summary("Edit", &input);
+        let result = format_tool_input_summary("Edit", &input, Lang::Ko);
         assert_eq!(result, "`/tmp/foo.rs`");
     }
 
     #[test]
     fn format_unknown_summary() {
         let input = serde_json::json!({});
-        let result = format_tool_input_summary("Unknown", &input);
+        let result = format_tool_input_summary("Unknown", &input, Lang::Ko);
         assert_eq!(result, "");
     }
 
     #[test]
     fn format_webfetch_summary() {
         let input = serde_json::json!({"url": "https://example.com/page"});
-        let result = format_tool_input_summary("WebFetch", &input);
+        let result = format_tool_input_summary("WebFetch", &input, Lang::Ko);
         assert_eq!(result, "`https://example.com/page`");
     }
 
     #[test]
     fn format_websearch_summary() {
         let input = serde_json::json!({"query": "rust async tokio"});
-        let result = format_tool_input_summary("WebSearch", &input);
+        let result = format_tool_input_summary("WebSearch", &input, Lang::Ko);
         assert_eq!(result, "`rust async tokio`");
     }
 
     #[test]
     fn format_unknown_with_string_field() {
         let input = serde_json::json!({"some_field": "some value"});
-        let result = format_tool_input_summary("UnknownTool", &input);
+        let result = format_tool_input_summary("UnknownTool", &input, Lang::Ko);
         assert_eq!(result, "`some value`");
     }
 
@@ -652,7 +900,7 @@ mod tests {
     fn format_unknown_with_long_string_field() {
         let long_str = "a".repeat(150);
         let input = serde_json::json!({"field": long_str});
-        let result = format_tool_input_summary("UnknownTool", &input);
+        let result = format_tool_input_summary("UnknownTool", &input, Lang::Ko);
         assert_eq!(result, format!("`{}`", "a".repeat(100)));
     }
 
@@ -661,35 +909,35 @@ mod tests {
     #[test]
     fn format_write_summary() {
         let input = serde_json::json!({"file_path": "/src/main.rs"});
-        let result = format_tool_input_summary("Write", &input);
+        let result = format_tool_input_summary("Write", &input, Lang::Ko);
         assert_eq!(result, "`/src/main.rs`");
     }
 
     #[test]
     fn format_read_summary() {
         let input = serde_json::json!({"file_path": "/etc/hosts"});
-        let result = format_tool_input_summary("Read", &input);
+        let result = format_tool_input_summary("Read", &input, Lang::Ko);
         assert_eq!(result, "`/etc/hosts`");
     }
 
     #[test]
     fn format_grep_summary() {
         let input = serde_json::json!({"pattern": "fn main"});
-        let result = format_tool_input_summary("Grep", &input);
+        let result = format_tool_input_summary("Grep", &input, Lang::Ko);
         assert_eq!(result, "`fn main`");
     }
 
     #[test]
     fn format_glob_summary() {
         let input = serde_json::json!({"pattern": "**/*.rs"});
-        let result = format_tool_input_summary("Glob", &input);
+        let result = format_tool_input_summary("Glob", &input, Lang::Ko);
         assert_eq!(result, "`**/*.rs`");
     }
 
     #[test]
     fn format_bash_empty_command() {
         let input = serde_json::json!({"command": ""});
-        let result = format_tool_input_summary("Bash", &input);
+        let result = format_tool_input_summary("Bash", &input, Lang::Ko);
         // Empty command still produces code-fence block
         assert!(result.contains("```"));
     }
@@ -698,8 +946,35 @@ mod tests {
     fn format_bash_missing_command_key() {
         // If "command" key is absent, falls back to empty string
         let input = serde_json::json!({});
-        let result = format_tool_input_summary("Bash", &input);
+        let result = format_tool_input_summary("Bash", &input, Lang::Ko);
         assert!(result.contains("```"));
+    }
+
+    #[test]
+    fn format_bash_summary_truncates_long_input() {
+        // 2000자 입력 → 1500자로 잘리고 truncate 안내 포함
+        let long_cmd: String = "a".repeat(2000);
+        let input = serde_json::json!({"command": long_cmd});
+        let result = format_tool_input_summary("Bash", &input, Lang::Ko);
+        assert!(result.contains("```"));
+        // 원본 2000자가 아닌 1500자만 포함되어야 함
+        let head: String = "a".repeat(1500);
+        assert!(result.contains(&head));
+        // 1501번째 'a' 는 없어야 함 (잘렸으므로)
+        let too_long: String = "a".repeat(1501);
+        assert!(!result.contains(&too_long));
+        // truncate 안내 메시지 포함
+        assert!(result.contains(Lang::Ko.msg_input_truncated()));
+    }
+
+    #[test]
+    fn format_bash_summary_short_unchanged() {
+        // 100자 입력 → 그대로
+        let short_cmd: String = "b".repeat(100);
+        let input = serde_json::json!({"command": short_cmd});
+        let result = format_tool_input_summary("Bash", &input, Lang::Ko);
+        assert!(result.contains(&short_cmd));
+        assert!(!result.contains(Lang::Ko.msg_input_truncated()));
     }
 
     // ── dismiss_pending_by_tool ───────────────────────────────────────────────
@@ -729,6 +1004,7 @@ mod tests {
             triggered_by: UserId::new(99999),
             input: None,
             scope_override: None,
+            decision_reason: None,
         };
         (pending, rx)
     }
@@ -968,7 +1244,7 @@ mod tests {
         assert!(pending.lock().await.is_empty());
     }
 
-    // ── create_permission_message: 3 ActionRow 구조 검증 ─────────────────────
+    // ── build_level2_message_parts: 2-row 구조 검증 ──────────────────────────
     //
     // serenity CreateMessage/CreateButton 필드는 private → serde_json::to_value로
     // 직렬화 후 JSON 구조로 검증한다.
@@ -1004,129 +1280,567 @@ mod tests {
             .expect("button must have style")
     }
 
-    /// Bash + Project scope → Row1=2버튼, Row2=3버튼(Exact/Prefix/Tool), Row3=1버튼
+    fn level2_parts_to_json(
+        tool_name: &str,
+        input: &serde_json::Value,
+        request_id: &str,
+        scope: Scope,
+    ) -> serde_json::Value {
+        let (content, components) = build_level2_message_parts(
+            tool_name,
+            input,
+            request_id,
+            None,
+            UserId::new(12345),
+            scope,
+            Lang::Ko,
+        );
+        let msg = CreateMessage::new().content(content).components(components);
+        serde_json::to_value(msg).expect("CreateMessage must be serializable")
+    }
+
+    /// Bash + Project → Row1=[Exact, Prefix, Tool, scope]=4버튼, Row2=[once, deny]=2버튼
     #[test]
-    fn create_permission_message_bash_project_three_rows() {
+    fn level2_bash_two_rows() {
         let input = serde_json::json!({"command": "npm test"});
-        let msg = create_permission_message(
-            "Bash",
-            &input,
-            "rid-001",
-            None,
-            UserId::new(12345),
-            Scope::Project,
-            Lang::Ko,
-        );
-        let v = msg_to_json(msg);
+        let v = level2_parts_to_json("Bash", &input, "rid-l2-001", Scope::Project);
         let rows = get_rows(&v);
-        assert_eq!(rows.as_array().unwrap().len(), 3, "Bash+Project → 3 ActionRow");
+        assert_eq!(rows.as_array().unwrap().len(), 2, "Bash+Project → 2 ActionRow");
 
-        // Row 1: once + deny = 2 버튼
+        // Row 1: [Exact, Prefix, Tool, scope] = 4 버튼
         let row1 = row_buttons(rows, 0);
-        assert_eq!(row1.as_array().unwrap().len(), 2, "Row1: once + deny");
-        assert!(btn_custom_id(row1, 0).ends_with(":once"), "Row1[0] = once");
-        assert!(btn_custom_id(row1, 1).ends_with(":deny"), "Row1[1] = deny");
+        assert_eq!(row1.as_array().unwrap().len(), 4, "Row1: Exact+Prefix+Tool+scope");
+        assert!(btn_custom_id(row1, 0).ends_with(":always:exact"), "Row1[0] = always:exact");
+        assert!(btn_custom_id(row1, 1).ends_with(":always:prefix"), "Row1[1] = always:prefix");
+        assert!(btn_custom_id(row1, 2).ends_with(":always:tool"), "Row1[2] = always:tool");
+        assert!(btn_custom_id(row1, 3).ends_with(":scope:toggle"), "Row1[3] = scope:toggle");
 
-        // Row 2: Exact + Prefix + Tool = 3 버튼
+        // Row 2: [once, deny] = 2 버튼
         let row2 = row_buttons(rows, 1);
-        assert_eq!(row2.as_array().unwrap().len(), 3, "Row2: Exact+Prefix+Tool for Bash");
-        assert!(btn_custom_id(row2, 0).ends_with(":always:exact"), "Row2[0] = always:exact");
-        assert!(btn_custom_id(row2, 1).ends_with(":always:prefix"), "Row2[1] = always:prefix");
-        assert!(btn_custom_id(row2, 2).ends_with(":always:tool"), "Row2[2] = always:tool");
-
-        // Row 3: scope toggle = 1 버튼
-        let row3 = row_buttons(rows, 2);
-        assert_eq!(row3.as_array().unwrap().len(), 1, "Row3: scope toggle");
-        assert!(btn_custom_id(row3, 0).ends_with(":scope:toggle"), "Row3[0] = scope:toggle");
+        assert_eq!(row2.as_array().unwrap().len(), 2, "Row2: once+deny");
+        assert!(btn_custom_id(row2, 0).ends_with(":once"), "Row2[0] = once");
+        assert!(btn_custom_id(row2, 1).ends_with(":deny"), "Row2[1] = deny");
     }
 
-    /// WebFetch + Project scope (정상 URL) → Row2=2버튼(Domain, Tool)
+    /// WebFetch + Project (정상 URL) → Row1=[Domain, Tool, scope]=3버튼, Row2=[once, deny]=2버튼
     #[test]
-    fn create_permission_message_webfetch_project_two_always_buttons() {
+    fn level2_webfetch_two_rows() {
         let input = serde_json::json!({"url": "https://api.example.com/v1"});
-        let msg = create_permission_message(
-            "WebFetch",
-            &input,
-            "rid-002",
-            None,
-            UserId::new(12345),
-            Scope::Project,
-            Lang::Ko,
-        );
-        let v = msg_to_json(msg);
+        let v = level2_parts_to_json("WebFetch", &input, "rid-l2-002", Scope::Project);
         let rows = get_rows(&v);
-        assert_eq!(rows.as_array().unwrap().len(), 3, "WebFetch+Project → 3 ActionRow");
+        assert_eq!(rows.as_array().unwrap().len(), 2, "WebFetch+Project → 2 ActionRow");
 
+        // Row 1: [Domain, Tool, scope] = 3 버튼
+        let row1 = row_buttons(rows, 0);
+        assert_eq!(row1.as_array().unwrap().len(), 3, "Row1: Domain+Tool+scope");
+        assert!(btn_custom_id(row1, 0).ends_with(":always:domain"), "Row1[0] = always:domain");
+        assert!(btn_custom_id(row1, 1).ends_with(":always:tool"), "Row1[1] = always:tool");
+        assert!(btn_custom_id(row1, 2).ends_with(":scope:toggle"), "Row1[2] = scope:toggle");
+
+        // Row 2: [once, deny] = 2 버튼
         let row2 = row_buttons(rows, 1);
-        assert_eq!(row2.as_array().unwrap().len(), 2, "Row2: Domain+Tool for WebFetch with hostname");
-        assert!(btn_custom_id(row2, 0).ends_with(":always:domain"), "Row2[0] = always:domain");
-        assert!(btn_custom_id(row2, 1).ends_with(":always:tool"), "Row2[1] = always:tool");
+        assert_eq!(row2.as_array().unwrap().len(), 2, "Row2: once+deny");
+        assert!(btn_custom_id(row2, 0).ends_with(":once"), "Row2[0] = once");
+        assert!(btn_custom_id(row2, 1).ends_with(":deny"), "Row2[1] = deny");
     }
 
-    /// Grep + Project scope → Row2=1버튼(Tool)
+    /// Grep + Project → Row1=[Tool, scope]=2버튼, Row2=[once, deny]=2버튼
     #[test]
-    fn create_permission_message_grep_project_one_always_button() {
+    fn level2_grep_two_rows() {
         let input = serde_json::json!({"pattern": "fn main"});
-        let msg = create_permission_message(
-            "Grep",
-            &input,
-            "rid-003",
-            None,
-            UserId::new(12345),
-            Scope::Project,
-            Lang::Ko,
-        );
-        let v = msg_to_json(msg);
+        let v = level2_parts_to_json("Grep", &input, "rid-l2-003", Scope::Project);
         let rows = get_rows(&v);
-        assert_eq!(rows.as_array().unwrap().len(), 3, "Grep+Project → 3 ActionRow");
+        assert_eq!(rows.as_array().unwrap().len(), 2, "Grep+Project → 2 ActionRow");
 
+        // Row 1: [Tool, scope] = 2 버튼
+        let row1 = row_buttons(rows, 0);
+        assert_eq!(row1.as_array().unwrap().len(), 2, "Row1: Tool+scope");
+        assert!(btn_custom_id(row1, 0).ends_with(":always:tool"), "Row1[0] = always:tool");
+        assert!(btn_custom_id(row1, 1).ends_with(":scope:toggle"), "Row1[1] = scope:toggle");
+
+        // Row 2: [once, deny] = 2 버튼
         let row2 = row_buttons(rows, 1);
-        assert_eq!(row2.as_array().unwrap().len(), 1, "Row2: Tool only for Grep");
-        assert!(btn_custom_id(row2, 0).ends_with(":always:tool"), "Row2[0] = always:tool");
+        assert_eq!(row2.as_array().unwrap().len(), 2, "Row2: once+deny");
+        assert!(btn_custom_id(row2, 0).ends_with(":once"), "Row2[0] = once");
+        assert!(btn_custom_id(row2, 1).ends_with(":deny"), "Row2[1] = deny");
     }
 
-    /// Bash + Global scope → 헤더에 "🌐 global" + "⚠️" 포함, Row3 버튼 Primary(style=1)
+    fn btn_label(buttons: &serde_json::Value, idx: usize) -> &str {
+        buttons.as_array()
+            .expect("buttons must be array")[idx]
+            .get("label")
+            .and_then(|v| v.as_str())
+            .expect("button must have label")
+    }
+
+    /// Bash + Global scope → scope 버튼 라벨에 "⚠️ 적용 범위: 전역" 포함, Primary(style=1)
     #[test]
-    fn create_permission_message_bash_global_header_contains_global_warning() {
+    fn level2_global_scope_header() {
         let input = serde_json::json!({"command": "npm install"});
-        let msg = create_permission_message(
+        let (content, components) = build_level2_message_parts(
             "Bash",
             &input,
-            "rid-004",
+            "rid-l2-004",
             None,
             UserId::new(99999),
             Scope::Global,
             Lang::Ko,
         );
-        let v = msg_to_json(msg);
-        let content = v.get("content").and_then(|v| v.as_str()).unwrap_or("");
-        assert!(content.contains("🌐 global"), "헤더에 🌐 global 포함");
-        assert!(content.contains("⚠️"), "헤더에 ⚠️ 포함");
-        assert!(content.contains("모든 프로젝트에 적용됨"), "경고 문구 포함");
 
-        // Row 3 scope 버튼은 Primary(style=1) — Global on
+        // 헤더에 scope 문자열 미포함
+        assert!(
+            !content.contains("적용 범위:"),
+            "헤더에 '적용 범위:' 미포함, got: {}", content
+        );
+
+        // Row 1 마지막 버튼 (scope toggle) Primary(style=1) + 라벨 확인
+        let msg = CreateMessage::new().content(content).components(components);
+        let v = serde_json::to_value(msg).unwrap();
         let rows = get_rows(&v);
-        let row3 = row_buttons(rows, 2);
+        let row1 = row_buttons(rows, 0);
+        let last_idx = row1.as_array().unwrap().len() - 1;
         // Discord: Primary=1, Secondary=2, Success=3, Danger=4
-        assert_eq!(btn_style(row3, 0), 1, "Global scope → Primary(1) 버튼");
+        assert_eq!(btn_style(row1, last_idx), 1, "Global scope → Primary(1) 버튼");
+        assert_eq!(
+            btn_label(row1, last_idx),
+            "⚠️ 적용 범위: 전역",
+            "Global scope 버튼 라벨 확인"
+        );
     }
 
-    /// Project scope → Row 3 버튼 Secondary(style=2)
+    /// Level 2 content 에 "적용 범위:" 미포함
     #[test]
-    fn create_permission_message_project_scope_button_secondary() {
-        let input = serde_json::json!({"command": "ls"});
-        let msg = create_permission_message(
+    fn level2_no_scope_in_header() {
+        let input = serde_json::json!({"command": "npm test"});
+        let (content, _) = build_level2_message_parts(
             "Bash",
             &input,
-            "rid-005",
+            "rid-l2-scope-hdr",
             None,
             UserId::new(12345),
             Scope::Project,
             Lang::Ko,
         );
-        let v = msg_to_json(msg);
+        assert!(
+            !content.contains("적용 범위:"),
+            "Level 2 content must not contain '적용 범위:' in header, got: {}",
+            content
+        );
+    }
+
+    /// 파이프 명령 → 미리보기에 콤마 나열 (Bash(find /tmp), Bash(head -3))
+    #[test]
+    fn level2_pipe_command_preview() {
+        let input = serde_json::json!({"command": "find /tmp | head -3"});
+        let (content, _) = build_level2_message_parts(
+            "Bash",
+            &input,
+            "rid-l2-005",
+            None,
+            UserId::new(12345),
+            Scope::Project,
+            Lang::Ko,
+        );
+        // Exact 라인: 두 sub-command 가 콤마로 나열되어야 한다
+        assert!(
+            content.contains("find /tmp") && content.contains("head -3"),
+            "미리보기에 두 sub-command 포함: {}", content
+        );
+        // 콤마 나열 확인 — inline_code 가 backtick 으로 감싸므로 `)`, ` 패턴
+        assert!(
+            content.contains("`, `"),
+            "미리보기에 콤마 나열 확인: {}", content
+        );
+        // 새 포맷: 옵션 이름이 -# 서브텍스트 + 줄바꿈
+        assert!(
+            content.contains("-# 이 명령만\n"),
+            "미리보기에 '-# 이 명령만\\n' 패턴 포함: {}", content
+        );
+    }
+
+    /// Row1[0] custom_id 가 LABEL_BUTTON_CUSTOM_ID 가 아님 — disabled label 버튼 제거 확인
+    #[test]
+    fn level2_no_label_button() {
+        let input = serde_json::json!({"command": "npm test"});
+        let v = level2_parts_to_json("Bash", &input, "rid-l2-006", Scope::Project);
         let rows = get_rows(&v);
-        let row3 = row_buttons(rows, 2);
-        assert_eq!(btn_style(row3, 0), 2, "Project scope → Secondary(2) 버튼");
+        let row1 = row_buttons(rows, 0);
+        let first_cid = btn_custom_id(row1, 0);
+        assert_ne!(
+            first_cid, LABEL_BUTTON_CUSTOM_ID,
+            "Row1[0] must not be the disabled label button, got: {}", first_cid
+        );
+    }
+
+    // ── build_level1_message_parts ────────────────────────────────────────────
+
+    fn level1_msg_to_json(
+        tool_name: &str,
+        input: &serde_json::Value,
+        request_id: &str,
+    ) -> serde_json::Value {
+        let msg = create_permission_message(
+            tool_name,
+            input,
+            request_id,
+            None,
+            UserId::new(12345),
+            Scope::Project,
+            Lang::Ko,
+        );
+        msg_to_json(msg)
+    }
+
+    /// Level 1 메시지는 단일 ActionRow 에 버튼 3개: once / always:expand / deny
+    #[test]
+    fn level1_message_three_buttons() {
+        let input = serde_json::json!({"command": "npm test"});
+        let v = level1_msg_to_json("Bash", &input, "rid-l1-001");
+        let rows = get_rows(&v);
+
+        assert_eq!(
+            rows.as_array().unwrap().len(),
+            1,
+            "Level 1 → exactly 1 ActionRow"
+        );
+
+        let btns = row_buttons(rows, 0);
+        assert_eq!(btns.as_array().unwrap().len(), 3, "Level 1 → 3 buttons");
+        assert!(btn_custom_id(btns, 0).ends_with(":once"), "btn[0] = once");
+        assert!(
+            btn_custom_id(btns, 1).ends_with(":always:expand"),
+            "btn[1] = always:expand"
+        );
+        assert!(btn_custom_id(btns, 2).ends_with(":deny"), "btn[2] = deny");
+    }
+
+    /// Level 1 헤더에 scope 문자열(`적용 범위:`, `scope:`) 미포함
+    #[test]
+    fn level1_message_no_scope_in_header() {
+        let input = serde_json::json!({"command": "ls"});
+        let v = level1_msg_to_json("Bash", &input, "rid-l1-002");
+        let content = v.get("content").and_then(|v| v.as_str()).unwrap_or("");
+
+        assert!(
+            !content.contains("적용 범위"),
+            "Level 1 content must not contain '적용 범위'"
+        );
+        assert!(
+            !content.contains("scope:"),
+            "Level 1 content must not contain 'scope:'"
+        );
+    }
+
+    /// Level 1 메시지에 항상 허용 옵션 미리보기 섹션 미포함
+    #[test]
+    fn level1_message_no_preview() {
+        let input = serde_json::json!({"command": "npm install"});
+        let v = level1_msg_to_json("Bash", &input, "rid-l1-003");
+        let content = v.get("content").and_then(|v| v.as_str()).unwrap_or("");
+
+        assert!(
+            !content.contains("항상 허용 옵션"),
+            "Level 1 content must not contain '항상 허용 옵션'"
+        );
+    }
+
+    /// Level 1 두 번째 버튼(index 1)의 custom_id 가 `:always:expand` 로 끝나야 한다
+    #[test]
+    fn level1_always_button_custom_id() {
+        let input = serde_json::json!({"pattern": "fn main"});
+        let v = level1_msg_to_json("Grep", &input, "rid-l1-004");
+        let rows = get_rows(&v);
+        let btns = row_buttons(rows, 0);
+
+        let cid = btn_custom_id(btns, 1);
+        assert!(
+            cid.ends_with(":always:expand"),
+            "Level 1 always button custom_id must end with ':always:expand', got: {}",
+            cid
+        );
+        // request_id 도 포함되어야 함
+        assert!(
+            cid.contains("rid-l1-004"),
+            "custom_id must contain request_id"
+        );
+    }
+
+    // ── build_processing_message_parts ────────────────────────────────────────
+
+    fn processing_parts_to_json(
+        tool_name: &str,
+        input: &serde_json::Value,
+        request_id: &str,
+        scope: Scope,
+        attempt: Option<(u32, u32)>,
+    ) -> (serde_json::Value, Vec<serde_json::Value>) {
+        let (content, components) = build_processing_message_parts(
+            tool_name,
+            input,
+            request_id,
+            UserId::new(12345),
+            scope,
+            Lang::Ko,
+            attempt,
+        );
+        let components_json: Vec<serde_json::Value> = components
+            .into_iter()
+            .map(|row| serde_json::to_value(row).expect("row must be serializable"))
+            .collect();
+        (serde_json::Value::String(content), components_json)
+    }
+
+    fn all_buttons_in_rows(rows: &[serde_json::Value]) -> Vec<&serde_json::Value> {
+        rows.iter()
+            .flat_map(|row| {
+                row.get("components")
+                    .and_then(|c| c.as_array())
+                    .map(|arr| arr.iter().collect::<Vec<_>>())
+                    .unwrap_or_default()
+            })
+            .collect()
+    }
+
+    /// attempt=None → content 에 "⏳ 권한 저장 중..." 포함, "재시도" 미포함
+    #[test]
+    fn processing_message_no_retry() {
+        let input = serde_json::json!({"command": "npm test"});
+        let (content_val, _rows) =
+            processing_parts_to_json("Bash", &input, "rid-proc-001", Scope::Project, None);
+        let content = content_val.as_str().unwrap_or("");
+
+        assert!(
+            content.contains("⏳"),
+            "content must contain ⏳ (got: {})",
+            content
+        );
+        assert!(
+            content.contains("권한 저장 중"),
+            "content must contain '권한 저장 중' (got: {})",
+            content
+        );
+        assert!(
+            !content.contains("재시도"),
+            "content must NOT contain '재시도' when attempt=None (got: {})",
+            content
+        );
+    }
+
+    /// attempt=Some((2,3)) → content 에 "재시도 2/3" 포함
+    #[test]
+    fn processing_message_with_attempt() {
+        let input = serde_json::json!({"command": "cargo build"});
+        let (content_val, _rows) = processing_parts_to_json(
+            "Bash",
+            &input,
+            "rid-proc-002",
+            Scope::Project,
+            Some((2, 3)),
+        );
+        let content = content_val.as_str().unwrap_or("");
+
+        assert!(
+            content.contains("재시도 2/3"),
+            "content must contain '재시도 2/3' (got: {})",
+            content
+        );
+        assert!(
+            content.contains("⏳"),
+            "content must contain ⏳ (got: {})",
+            content
+        );
+    }
+
+    /// 모든 버튼이 disabled=true 여야 한다
+    #[test]
+    fn processing_message_all_buttons_disabled() {
+        let input = serde_json::json!({"command": "ls -la"});
+        let (_content, rows) =
+            processing_parts_to_json("Bash", &input, "rid-proc-003", Scope::Project, None);
+
+        assert!(!rows.is_empty(), "must have at least one ActionRow");
+
+        let buttons = all_buttons_in_rows(&rows);
+        assert!(!buttons.is_empty(), "must have at least one button");
+
+        for (i, btn) in buttons.iter().enumerate() {
+            assert_eq!(
+                btn.get("disabled").and_then(|v| v.as_bool()),
+                Some(true),
+                "button[{}] must be disabled (got: {:?})",
+                i,
+                btn
+            );
+        }
+    }
+
+    // ── T13: section header + Tool 버튼 Secondary ─────────────────────────────
+
+    /// Level 1 content 첫 줄이 "### 권한 요청" 으로 시작해야 한다
+    #[test]
+    fn level1_message_includes_section_header() {
+        let input = serde_json::json!({"command": "npm test"});
+        let (content, _) = build_level1_message_parts(
+            "Bash",
+            &input,
+            "rid-t13-l1-001",
+            None,
+            UserId::new(12345),
+            Lang::Ko,
+        );
+        assert!(
+            content.starts_with("### 권한 요청"),
+            "Level 1 content must start with '### 권한 요청', got: {}",
+            content
+        );
+        assert!(
+            content.contains("### 권한 요청"),
+            "Level 1 content must contain section header"
+        );
+    }
+
+    /// Level 2 content 첫 줄이 "### 권한 요청" 으로 시작해야 한다
+    #[test]
+    fn level2_message_includes_section_header() {
+        let input = serde_json::json!({"command": "npm test"});
+        let (content, _) = build_level2_message_parts(
+            "Bash",
+            &input,
+            "rid-t13-l2-001",
+            None,
+            UserId::new(12345),
+            Scope::Project,
+            Lang::Ko,
+        );
+        assert!(
+            content.starts_with("### 권한 요청"),
+            "Level 2 content must start with '### 권한 요청', got: {}",
+            content
+        );
+    }
+
+    /// Level 2 의 Tool 버튼 style=2 (Secondary), label 에 ⚠ 포함
+    #[test]
+    fn level2_tool_button_secondary_with_warning() {
+        let input = serde_json::json!({"command": "npm test"});
+        let v = level2_parts_to_json("Bash", &input, "rid-t13-l2-002", Scope::Project);
+        let rows = get_rows(&v);
+        let row1 = row_buttons(rows, 0);
+
+        // Bash: Row1 = [Exact(0), Prefix(1), Tool(2), scope(3)]
+        // Tool 버튼은 index 2
+        let tool_style = btn_style(row1, 2);
+        let tool_label = btn_label(row1, 2);
+
+        // Discord: Secondary=2
+        assert_eq!(
+            tool_style, 2,
+            "Tool button must be Secondary(2), got: {}",
+            tool_style
+        );
+        assert!(
+            tool_label.contains('⚠'),
+            "Tool button label must contain ⚠, got: {}",
+            tool_label
+        );
+    }
+
+    /// 미리보기에 "⚠️ 도구 전체 →" 형태 포함 (Tool RuleKind 미리보기)
+    #[test]
+    fn level2_pipe_command_preview_tool_warning() {
+        let input = serde_json::json!({"command": "find /tmp | head -3"});
+        let (content, _) = build_level2_message_parts(
+            "Bash",
+            &input,
+            "rid-t13-l2-003",
+            None,
+            UserId::new(12345),
+            Scope::Project,
+            Lang::Ko,
+        );
+        assert!(
+            content.contains("⚠️ 도구 전체"),
+            "미리보기에 '⚠️ 도구 전체' 포함, got: {}",
+            content
+        );
+        // 새 포맷: -# prefix + 줄바꿈 구조 (→ 대신 \n)
+        assert!(
+            content.contains("-# ⚠️ 도구 전체\n"),
+            "미리보기에 '-# ⚠️ 도구 전체\\n' 패턴 포함, got: {}",
+            content
+        );
+        assert!(
+            !content.contains("⚠️ 도구 전체 →"),
+            "화살표(→) 형식이 제거되어야 함, got: {}",
+            content
+        );
+    }
+
+    /// Processing 메시지 content 첫 줄이 "### 권한 요청" 으로 시작해야 한다
+    #[test]
+    fn processing_message_includes_section_header() {
+        let input = serde_json::json!({"command": "npm test"});
+        let (content_val, _rows) =
+            processing_parts_to_json("Bash", &input, "rid-t13-proc-001", Scope::Project, None);
+        let content = content_val.as_str().unwrap_or("");
+        assert!(
+            content.starts_with("### 권한 요청"),
+            "Processing content must start with '### 권한 요청', got: {}",
+            content
+        );
+    }
+
+    /// Processing 의 Tool 버튼 style=2 (Secondary), disabled
+    #[test]
+    fn processing_tool_button_secondary() {
+        let input = serde_json::json!({"command": "npm test"});
+        let (_content_val, rows) =
+            processing_parts_to_json("Bash", &input, "rid-t13-proc-002", Scope::Project, None);
+
+        // Bash: Row1 = [Exact(0), Prefix(1), Tool(2), scope(3)]
+        let row1_json = &rows[0];
+        let btns = row1_json
+            .get("components")
+            .and_then(|c| c.as_array())
+            .expect("row1 must have components");
+
+        let tool_btn = &btns[2];
+        let style = tool_btn
+            .get("style")
+            .and_then(|v| v.as_u64())
+            .expect("tool button must have style");
+
+        // Discord: Secondary=2
+        assert_eq!(style, 2, "Processing Tool button must be Secondary(2), got: {}", style);
+
+        let disabled = tool_btn
+            .get("disabled")
+            .and_then(|v| v.as_bool())
+            .expect("tool button must have disabled field");
+        assert!(disabled, "Processing Tool button must be disabled");
+    }
+
+    /// Level 1 content 에 '적용 범위' 미포함 — 헤더 추가 후에도 보장
+    #[test]
+    fn level1_message_no_scope_in_header_with_section_header() {
+        let input = serde_json::json!({"command": "ls"});
+        let (content, _) = build_level1_message_parts(
+            "Bash",
+            &input,
+            "rid-t13-l1-002",
+            None,
+            UserId::new(12345),
+            Lang::Ko,
+        );
+        assert!(
+            content.starts_with("### 권한 요청"),
+            "section header 포함, got: {}",
+            content
+        );
+        assert!(
+            !content.contains("적용 범위"),
+            "scope 미포함, got: {}",
+            content
+        );
     }
 }
