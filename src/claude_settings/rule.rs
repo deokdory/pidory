@@ -84,6 +84,13 @@ pub fn available_rule_kinds(tool: &str, input: &serde_json::Value) -> Vec<RuleKi
         }
         "Read" | "Edit" | "Write" => vec![RuleKind::Exact, RuleKind::Tool],
         "Grep" | "Glob" => vec![RuleKind::Tool],
+        "Skill" => {
+            if skill_name(input).is_some() {
+                vec![RuleKind::Exact, RuleKind::Tool]
+            } else {
+                vec![RuleKind::Tool]
+            }
+        }
         _ => vec![RuleKind::Tool],
     }
 }
@@ -146,6 +153,10 @@ pub fn build_rule_text(tool: &str, input: &serde_json::Value, kind: RuleKind) ->
             } else {
                 Some(format!("Write({})", file_path))
             }
+        }
+        ("Skill", RuleKind::Exact) => {
+            let name = skill_name(input)?;
+            Some(format!("Skill({})", name))
         }
         // Unknown tool: Exact 비활성화 (input schema 를 모르므로 비결정적)
         _ => None,
@@ -357,6 +368,19 @@ fn is_ip(host: &str) -> bool {
     IpAddr::from_str(host).is_ok()
 }
 
+/// Claude Code Skill tool 의 input 에서 skill name 을 추출한다.
+///
+/// Claude Code Skill tool 의 input field 우선순위:
+/// 1. `"name"` — 가장 일반적
+/// 2. `"skill"` / `"skill_name"` — 보수적 fallback
+fn skill_name(input: &serde_json::Value) -> Option<String> {
+    ["name", "skill", "skill_name"]
+        .iter()
+        .filter_map(|key| input.get(key).and_then(|v| v.as_str()))
+        .next()
+        .map(|s| s.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -428,6 +452,18 @@ mod tests {
     }
 
     #[test]
+    fn available_kinds_skill_with_name() {
+        let kinds = available_rule_kinds("Skill", &json!({"name": "jira-new"}));
+        assert_eq!(kinds, vec![RuleKind::Exact, RuleKind::Tool]);
+    }
+
+    #[test]
+    fn available_kinds_skill_no_name() {
+        let kinds = available_rule_kinds("Skill", &json!({}));
+        assert_eq!(kinds, vec![RuleKind::Tool]);
+    }
+
+    #[test]
     fn default_scope_is_project() {
         assert_eq!(default_scope(), Scope::Project);
     }
@@ -475,6 +511,32 @@ mod tests {
     fn build_grep_tool() {
         let result = build_rule_text("Grep", &json!({}), RuleKind::Tool);
         assert_eq!(result, Some("Grep(*)".to_string()));
+    }
+
+    #[test]
+    fn build_skill_exact() {
+        let result = build_rule_text("Skill", &json!({"name": "jira-new"}), RuleKind::Exact);
+        assert_eq!(result, Some("Skill(jira-new)".to_string()));
+    }
+
+    #[test]
+    fn build_skill_tool() {
+        let result = build_rule_text("Skill", &json!({"name": "jira-new"}), RuleKind::Tool);
+        assert_eq!(result, Some("Skill(*)".to_string()));
+    }
+
+    #[test]
+    fn build_skill_exact_fallback_skill_field() {
+        // "skill" field fallback
+        let result = build_rule_text("Skill", &json!({"skill": "my-review"}), RuleKind::Exact);
+        assert_eq!(result, Some("Skill(my-review)".to_string()));
+    }
+
+    #[test]
+    fn build_skill_exact_no_name_returns_none() {
+        // name field 없으면 None
+        let result = build_rule_text("Skill", &json!({}), RuleKind::Exact);
+        assert_eq!(result, None);
     }
 
     #[test]
