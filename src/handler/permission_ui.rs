@@ -140,8 +140,9 @@ pub fn build_level2_message_parts(
     let preview_section = if preview_lines.is_empty() {
         String::new()
     } else {
+        // 끝에 \n 추가 — 미리보기 마지막 룰과 버튼 row 사이 시각적 여유 (review #298 QA)
         format!(
-            "\n\n{}\n{}",
+            "\n\n{}\n{}\n",
             lang.msg_always_allow_options_header(),
             preview_lines.join("\n")
         )
