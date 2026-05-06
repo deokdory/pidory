@@ -41,6 +41,8 @@ pub struct PendingPermission {
     pub input: Option<serde_json::Value>,
     /// User-selected scope override for AlwaysAllow. None = use default_scope().
     pub scope_override: Option<claude_settings::rule::Scope>,
+    /// Claude CLI 가 control_request 에 포함한 decision_reason. Level 2 UI 에 보존.
+    pub decision_reason: Option<String>,
 }
 
 /// Tracks a multi-question AskUserQuestion group.
@@ -77,6 +79,10 @@ pub struct Data {
     /// Event handler가 fresh Context를 background task에 전달하는 채널.
     /// Shard reconnect 후에도 최신 ShardMessenger를 사용할 수 있게 해준다.
     pub ctx_watch: watch::Sender<serenity::Context>,
+    /// AllowAlways 성공 후 다음 user message 도착 시 subprocess --resume 재시작 예약.
+    /// Claude CLI 가 settings.local.json 을 핫 리로드하지 않으므로
+    /// 새 subprocess 가 settings 를 다시 읽어 룰 매칭이 올바르게 동작한다.
+    pub pending_session_restart: Arc<Mutex<HashSet<String>>>,
 }
 
 #[tokio::main]
@@ -428,6 +434,7 @@ async fn main() -> Result<(), PidoryError> {
                     skill_descriptions,
                     agent_descriptions,
                     ctx_watch: ctx_tx,
+                    pending_session_restart: Arc::new(Mutex::new(HashSet::new())),
                 })
             })
         })

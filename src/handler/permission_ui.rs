@@ -107,17 +107,10 @@ pub fn build_level2_message_parts(
         .map(|r| format!("\n> {}", r))
         .unwrap_or_default();
 
-    // 헤더 scope 표시
-    let scope_label = match &scope {
-        Scope::Project => "📁 project".to_string(),
-        Scope::Global => "🌐 global  ⚠️ 모든 프로젝트에 적용됨".to_string(),
-    };
     let header = format!(
-        "🔒 <@{}>  {}  ·  {}: {}",
+        "🔒 <@{}>  {}",
         triggered_by,
         inline_code(tool_name),
-        lang.lbl_scope_label_header(),
-        scope_label,
     );
 
     // 미리보기: available_rule_kinds → build_rule_texts(복수형) → 콤마 나열.
@@ -155,8 +148,12 @@ pub fn build_level2_message_parts(
     };
 
     let content = format!(
-        "{}\n{}{}{}",
-        header, summary, reason, preview_section
+        "{}\n{}\n{}{}{}",
+        lang.lbl_permission_request_section_header(),
+        header,
+        summary,
+        reason,
+        preview_section
     );
 
     // Row 1: always-allow 버튼들 + scope 토글
@@ -177,15 +174,15 @@ pub fn build_level2_message_parts(
         RuleKind::Domain => CreateButton::new(format!("perm:{}:always:domain", request_id))
             .label(lang.btn_always_domain())
             .style(ButtonStyle::Secondary),
-        // Tool 전체 허용은 매우 위험 — Danger style (review #297 s3)
+        // Tool 전체 허용 — 위험성은 라벨 ⚠️ 아이콘으로 명시, 색은 Secondary (review #298 T13)
         RuleKind::Tool => CreateButton::new(format!("perm:{}:always:tool", request_id))
             .label(lang.btn_always_tool())
-            .style(ButtonStyle::Danger),
+            .style(ButtonStyle::Secondary),
     }).collect();
 
     let (scope_btn_label, scope_btn_style) = match &scope {
-        Scope::Project => (lang.btn_scope_toggle_to_global(), ButtonStyle::Secondary),
-        Scope::Global => (lang.btn_scope_toggle_to_project(), ButtonStyle::Primary),
+        Scope::Project => (lang.btn_scope_status_project(), ButtonStyle::Secondary),
+        Scope::Global => (lang.btn_scope_status_global(), ButtonStyle::Primary),
     };
     row1_buttons.push(
         CreateButton::new(format!("perm:{}:scope:toggle", request_id))
@@ -242,7 +239,13 @@ pub fn build_level1_message_parts(
         inline_code(tool_name),
     );
 
-    let content = format!("{}\n{}{}", header, summary, reason);
+    let content = format!(
+        "{}\n{}\n{}{}",
+        lang.lbl_permission_request_section_header(),
+        header,
+        summary,
+        reason
+    );
 
     // 단일 ActionRow: [한 번만 (Success), 항상 허용 (Primary), 거부 (Danger)]
     // "항상 허용"은 Level 2 expand trigger → `:always:expand` suffix
@@ -356,16 +359,10 @@ pub fn build_processing_message_parts(
     attempt: Option<(u32, u32)>,
 ) -> (String, Vec<CreateActionRow>) {
     // 헤더 — Level 2 와 동일
-    let scope_label = match &scope {
-        Scope::Project => "📁 project".to_string(),
-        Scope::Global => "🌐 global  ⚠️ 모든 프로젝트에 적용됨".to_string(),
-    };
     let header = format!(
-        "🔒 <@{}>  {}  ·  {}: {}",
+        "🔒 <@{}>  {}",
         triggered_by,
         inline_code(tool_name),
-        lang.lbl_scope_label_header(),
-        scope_label,
     );
     let summary = format_tool_input_summary(tool_name, input);
 
@@ -375,7 +372,13 @@ pub fn build_processing_message_parts(
         Some((n, total)) => lang.msg_processing_with_attempt(n, total),
     };
 
-    let content = format!("{}\n{}\n\n{}", header, summary, processing_text);
+    let content = format!(
+        "{}\n{}\n{}\n\n{}",
+        lang.lbl_permission_request_section_header(),
+        header,
+        summary,
+        processing_text
+    );
 
     // 컴포넌트 — Level 2 구조 복제 + 모두 disabled
     let kinds = available_rule_kinds(tool_name, input);
@@ -396,14 +399,14 @@ pub fn build_processing_message_parts(
                 .disabled(true),
             RuleKind::Tool => CreateButton::new(format!("perm:{}:always:tool", request_id))
                 .label(lang.btn_always_tool())
-                .style(ButtonStyle::Danger)
+                .style(ButtonStyle::Secondary)
                 .disabled(true),
         })
         .collect();
 
     let (scope_btn_label, scope_btn_style) = match &scope {
-        Scope::Project => (lang.btn_scope_toggle_to_global(), ButtonStyle::Secondary),
-        Scope::Global => (lang.btn_scope_toggle_to_project(), ButtonStyle::Primary),
+        Scope::Project => (lang.btn_scope_status_project(), ButtonStyle::Secondary),
+        Scope::Global => (lang.btn_scope_status_global(), ButtonStyle::Primary),
     };
     row1_buttons.push(
         CreateButton::new(format!("perm:{}:scope:toggle", request_id))
@@ -554,6 +557,7 @@ pub async fn run_permission_handler(
                             triggered_by,
                             input: Some(perm_req.input),
                             scope_override: None,
+                            decision_reason: perm_req.decision_reason.clone(),
                         };
                         pending_permissions
                             .lock()
@@ -606,6 +610,7 @@ pub async fn run_permission_handler(
                                 triggered_by,
                                 input: Some(perm_req.input.clone()),
                                 scope_override: None,
+                                decision_reason: perm_req.decision_reason.clone(),
                             };
                             pending_permissions.lock().await.insert(sub_id, pending);
                         }
@@ -656,6 +661,7 @@ pub async fn run_permission_handler(
                     triggered_by,
                     input: Some(perm_req.input),
                     scope_override: None,
+                    decision_reason: perm_req.decision_reason.clone(),
                 };
                 pending_permissions
                     .lock()
@@ -959,6 +965,7 @@ mod tests {
             triggered_by: UserId::new(99999),
             input: None,
             scope_override: None,
+            decision_reason: None,
         };
         (pending, rx)
     }
@@ -1319,7 +1326,15 @@ mod tests {
         assert!(btn_custom_id(row2, 1).ends_with(":deny"), "Row2[1] = deny");
     }
 
-    /// Bash + Global scope → 헤더에 "🌐 global" + "⚠️" 포함, scope 버튼 Primary(style=1)
+    fn btn_label(buttons: &serde_json::Value, idx: usize) -> &str {
+        buttons.as_array()
+            .expect("buttons must be array")[idx]
+            .get("label")
+            .and_then(|v| v.as_str())
+            .expect("button must have label")
+    }
+
+    /// Bash + Global scope → scope 버튼 라벨에 "⚠️ 적용 범위: 전역" 포함, Primary(style=1)
     #[test]
     fn level2_global_scope_header() {
         let input = serde_json::json!({"command": "npm install"});
@@ -1332,11 +1347,14 @@ mod tests {
             Scope::Global,
             Lang::Ko,
         );
-        assert!(content.contains("🌐 global"), "헤더에 🌐 global 포함");
-        assert!(content.contains("⚠️"), "헤더에 ⚠️ 포함");
-        assert!(content.contains("모든 프로젝트에 적용됨"), "경고 문구 포함");
 
-        // Row 1 마지막 버튼 (scope toggle) Primary(style=1) — Global on
+        // 헤더에 scope 문자열 미포함
+        assert!(
+            !content.contains("적용 범위:"),
+            "헤더에 '적용 범위:' 미포함, got: {}", content
+        );
+
+        // Row 1 마지막 버튼 (scope toggle) Primary(style=1) + 라벨 확인
         let msg = CreateMessage::new().content(content).components(components);
         let v = serde_json::to_value(msg).unwrap();
         let rows = get_rows(&v);
@@ -1344,6 +1362,31 @@ mod tests {
         let last_idx = row1.as_array().unwrap().len() - 1;
         // Discord: Primary=1, Secondary=2, Success=3, Danger=4
         assert_eq!(btn_style(row1, last_idx), 1, "Global scope → Primary(1) 버튼");
+        assert_eq!(
+            btn_label(row1, last_idx),
+            "⚠️ 적용 범위: 전역",
+            "Global scope 버튼 라벨 확인"
+        );
+    }
+
+    /// Level 2 content 에 "적용 범위:" 미포함
+    #[test]
+    fn level2_no_scope_in_header() {
+        let input = serde_json::json!({"command": "npm test"});
+        let (content, _) = build_level2_message_parts(
+            "Bash",
+            &input,
+            "rid-l2-scope-hdr",
+            None,
+            UserId::new(12345),
+            Scope::Project,
+            Lang::Ko,
+        );
+        assert!(
+            !content.contains("적용 범위:"),
+            "Level 2 content must not contain '적용 범위:' in header, got: {}",
+            content
+        );
     }
 
     /// 파이프 명령 → 미리보기에 콤마 나열 (Bash(find /tmp), Bash(head -3))
@@ -1585,5 +1628,169 @@ mod tests {
                 btn
             );
         }
+    }
+
+    // ── T13: section header + Tool 버튼 Secondary ─────────────────────────────
+
+    /// Level 1 content 첫 줄이 "### 권한 요청" 으로 시작해야 한다
+    #[test]
+    fn level1_message_includes_section_header() {
+        let input = serde_json::json!({"command": "npm test"});
+        let (content, _) = build_level1_message_parts(
+            "Bash",
+            &input,
+            "rid-t13-l1-001",
+            None,
+            UserId::new(12345),
+            Lang::Ko,
+        );
+        assert!(
+            content.starts_with("### 권한 요청"),
+            "Level 1 content must start with '### 권한 요청', got: {}",
+            content
+        );
+        assert!(
+            content.contains("### 권한 요청"),
+            "Level 1 content must contain section header"
+        );
+    }
+
+    /// Level 2 content 첫 줄이 "### 권한 요청" 으로 시작해야 한다
+    #[test]
+    fn level2_message_includes_section_header() {
+        let input = serde_json::json!({"command": "npm test"});
+        let (content, _) = build_level2_message_parts(
+            "Bash",
+            &input,
+            "rid-t13-l2-001",
+            None,
+            UserId::new(12345),
+            Scope::Project,
+            Lang::Ko,
+        );
+        assert!(
+            content.starts_with("### 권한 요청"),
+            "Level 2 content must start with '### 권한 요청', got: {}",
+            content
+        );
+    }
+
+    /// Level 2 의 Tool 버튼 style=2 (Secondary), label 에 ⚠ 포함
+    #[test]
+    fn level2_tool_button_secondary_with_warning() {
+        let input = serde_json::json!({"command": "npm test"});
+        let v = level2_parts_to_json("Bash", &input, "rid-t13-l2-002", Scope::Project);
+        let rows = get_rows(&v);
+        let row1 = row_buttons(rows, 0);
+
+        // Bash: Row1 = [Exact(0), Prefix(1), Tool(2), scope(3)]
+        // Tool 버튼은 index 2
+        let tool_style = btn_style(row1, 2);
+        let tool_label = btn_label(row1, 2);
+
+        // Discord: Secondary=2
+        assert_eq!(
+            tool_style, 2,
+            "Tool button must be Secondary(2), got: {}",
+            tool_style
+        );
+        assert!(
+            tool_label.contains('⚠'),
+            "Tool button label must contain ⚠, got: {}",
+            tool_label
+        );
+    }
+
+    /// 미리보기에 "⚠️ 도구 전체 →" 형태 포함 (Tool RuleKind 미리보기)
+    #[test]
+    fn level2_pipe_command_preview_tool_warning() {
+        let input = serde_json::json!({"command": "find /tmp | head -3"});
+        let (content, _) = build_level2_message_parts(
+            "Bash",
+            &input,
+            "rid-t13-l2-003",
+            None,
+            UserId::new(12345),
+            Scope::Project,
+            Lang::Ko,
+        );
+        assert!(
+            content.contains("⚠️ 도구 전체"),
+            "미리보기에 '⚠️ 도구 전체' 포함, got: {}",
+            content
+        );
+        assert!(
+            content.contains("→"),
+            "미리보기에 화살표(→) 포함, got: {}",
+            content
+        );
+    }
+
+    /// Processing 메시지 content 첫 줄이 "### 권한 요청" 으로 시작해야 한다
+    #[test]
+    fn processing_message_includes_section_header() {
+        let input = serde_json::json!({"command": "npm test"});
+        let (content_val, _rows) =
+            processing_parts_to_json("Bash", &input, "rid-t13-proc-001", Scope::Project, None);
+        let content = content_val.as_str().unwrap_or("");
+        assert!(
+            content.starts_with("### 권한 요청"),
+            "Processing content must start with '### 권한 요청', got: {}",
+            content
+        );
+    }
+
+    /// Processing 의 Tool 버튼 style=2 (Secondary), disabled
+    #[test]
+    fn processing_tool_button_secondary() {
+        let input = serde_json::json!({"command": "npm test"});
+        let (_content_val, rows) =
+            processing_parts_to_json("Bash", &input, "rid-t13-proc-002", Scope::Project, None);
+
+        // Bash: Row1 = [Exact(0), Prefix(1), Tool(2), scope(3)]
+        let row1_json = &rows[0];
+        let btns = row1_json
+            .get("components")
+            .and_then(|c| c.as_array())
+            .expect("row1 must have components");
+
+        let tool_btn = &btns[2];
+        let style = tool_btn
+            .get("style")
+            .and_then(|v| v.as_u64())
+            .expect("tool button must have style");
+
+        // Discord: Secondary=2
+        assert_eq!(style, 2, "Processing Tool button must be Secondary(2), got: {}", style);
+
+        let disabled = tool_btn
+            .get("disabled")
+            .and_then(|v| v.as_bool())
+            .expect("tool button must have disabled field");
+        assert!(disabled, "Processing Tool button must be disabled");
+    }
+
+    /// Level 1 content 에 '적용 범위' 미포함 — 헤더 추가 후에도 보장
+    #[test]
+    fn level1_message_no_scope_in_header_with_section_header() {
+        let input = serde_json::json!({"command": "ls"});
+        let (content, _) = build_level1_message_parts(
+            "Bash",
+            &input,
+            "rid-t13-l1-002",
+            None,
+            UserId::new(12345),
+            Lang::Ko,
+        );
+        assert!(
+            content.starts_with("### 권한 요청"),
+            "section header 포함, got: {}",
+            content
+        );
+        assert!(
+            !content.contains("적용 범위"),
+            "scope 미포함, got: {}",
+            content
+        );
     }
 }

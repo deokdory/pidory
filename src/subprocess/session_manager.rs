@@ -364,6 +364,20 @@ impl SessionManager {
         Self::find_evict_target(&sessions).is_some()
     }
 
+    /// AllowAlways 성공 후 다음 user message 시점에서 호출.
+    /// 기존 subprocess 를 종료하고 SessionInner 를 제거한다.
+    /// 이후 `get_or_create` 가 `--resume <session_id>` 로 새 subprocess 를 spawn한다.
+    ///
+    /// 진행 중 turn 이 없는 경우에만 호출되어야 한다 (handle_message 에서 보장).
+    pub async fn restart_for_settings_reload(&self, thread_id: &str, session_id: &str) -> Result<(), PidoryError> {
+        tracing::info!(
+            thread_id = %thread_id,
+            session_id = %session_id,
+            "Claude CLI subprocess restart for settings reload"
+        );
+        self.kill_session(thread_id).await
+    }
+
     pub async fn interrupt_session(&self, thread_id: &str) -> Result<(), PidoryError> {
         let sessions = self.sessions.lock().await;
         let inner = sessions.get(thread_id).ok_or_else(|| {

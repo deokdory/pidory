@@ -10,7 +10,6 @@ use crate::claude_settings::rule::{RuleKind, Scope, build_rule_texts, default_sc
 use crate::claude_settings::{self, ClaudeSettingsError, MergeOutcome};
 use crate::db::repository;
 use crate::error::PidoryError;
-use crate::handler::discord_notifier::DiscordNotifier;
 use crate::handler::message::interaction_kind::{CancelStage, InteractionKind};
 use crate::handler::permission_ui::{
     DisableReason, PermAction, build_level2_message_parts, build_processing_message_parts,
@@ -349,16 +348,17 @@ async fn handle_scope_toggle(
         let tool = entry.tool_name.clone();
         let input = entry.input.clone().unwrap_or(serde_json::json!({}));
         let triggered_by = entry.triggered_by;
-        (new_scope, tool, input, triggered_by)
+        let decision_reason = entry.decision_reason.clone();
+        (new_scope, tool, input, triggered_by, decision_reason)
     };
-    let (scope, tool, input, triggered_by) = update;
+    let (scope, tool, input, triggered_by, decision_reason) = update;
     tracing::info!(request_id = %request_id, ?scope, "permission scope toggled");
 
     let (content, components) = build_level2_message_parts(
         &tool,
         &input,
         request_id,
-        None,
+        decision_reason.as_deref(),
         triggered_by,
         scope,
         lang,
@@ -401,16 +401,17 @@ async fn handle_allow_always_expand(
         let tool = entry.tool_name.clone();
         let input = entry.input.clone().unwrap_or(serde_json::json!({}));
         let triggered_by = entry.triggered_by;
-        (scope, tool, input, triggered_by)
+        let decision_reason = entry.decision_reason.clone();
+        (scope, tool, input, triggered_by, decision_reason)
     };
-    let (scope, tool, input, triggered_by) = update;
+    let (scope, tool, input, triggered_by, decision_reason) = update;
     tracing::info!(request_id = %request_id, ?scope, "permission ExpandAlways clicked");
 
     let (content, components) = build_level2_message_parts(
         &tool,
         &input,
         request_id,
-        None,
+        decision_reason.as_deref(),
         triggered_by,
         scope,
         lang,
@@ -644,11 +645,9 @@ async fn handle_allow_always(
     let settings_path = scope_to_path(scope.clone(), &project_root, &home);
 
     // 5. ConflictNotifier 인스턴스 생성
-    let notifier = DiscordNotifier {
-        ctx: ctx.clone(),
-        interaction: component.clone(),
-        lang,
-    };
+    // LoggingNotifier — silent notifier. retry 노이즈 회피 (review #298 v2 F-UI-6)
+    // retry 진행 인디케이터 + 자동 거부 메시지로 사용자 안내 충분.
+    let notifier = claude_settings::LoggingNotifier;
 
     // 6. N=3 retry 루프
     const MAX_RETRIES: u32 = 3;
@@ -706,6 +705,14 @@ async fn handle_allow_always(
                 rule_kind: rule_kind.clone(),
                 scope: scope.clone(),
             });
+
+            // Claude CLI 가 settings.local.json 을 핫 리로드하지 않으므로
+            // 다음 user message 도착 시 subprocess 를 --resume 으로 재시작 예약.
+            // Added / AlreadyPresent / ConflictResolved 세 outcome 모두 동일 처리.
+            data.pending_session_restart
+                .lock()
+                .await
+                .insert(thread_id.clone());
 
             // c1 fix: RuleKind::Tool 일 때만 같은 tool 의 다른 pending 자동 dismiss.
             // Exact/Prefix/Domain 은 더 좁은 매칭이라 다른 명령까지 통과시키면 권한 누출.

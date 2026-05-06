@@ -91,24 +91,32 @@ impl Lang {
 
     pub fn btn_always_tool(&self) -> &'static str {
         match self {
-            Lang::Ko => "도구 전체",
-            Lang::En => "Entire tool",
+            Lang::Ko => "⚠️ 도구 전체",
+            Lang::En => "⚠️ Entire tool",
         }
     }
 
-    /// scope 토글 버튼 — 클릭 시 Project → Global 전환 (현재 Project)
-    pub fn btn_scope_toggle_to_global(&self) -> &'static str {
+    /// 권한 요청 메시지 섹션 헤더 (Discord 제3 레벨 헤더 마크다운)
+    pub fn lbl_permission_request_section_header(&self) -> &'static str {
         match self {
-            Lang::Ko => "→ 전역",
-            Lang::En => "→ Global",
+            Lang::Ko => "### 권한 요청",
+            Lang::En => "### Permission Request",
         }
     }
 
-    /// scope 토글 버튼 — 클릭 시 Global → Project 전환 (현재 Global)
-    pub fn btn_scope_toggle_to_project(&self) -> &'static str {
+    /// scope 토글 버튼 — 현재 Project 상태 표시 (클릭 시 Global 전환)
+    pub fn btn_scope_status_project(&self) -> &'static str {
         match self {
-            Lang::Ko => "→ 프로젝트",
-            Lang::En => "→ Project",
+            Lang::Ko => "📁 적용 범위: 프로젝트",
+            Lang::En => "📁 Applied to: project",
+        }
+    }
+
+    /// scope 토글 버튼 — 현재 Global 상태 표시 (클릭 시 Project 전환)
+    pub fn btn_scope_status_global(&self) -> &'static str {
+        match self {
+            Lang::Ko => "⚠️ 적용 범위: 전역",
+            Lang::En => "⚠️ Applied to: global",
         }
     }
 
@@ -117,14 +125,6 @@ impl Lang {
         match self {
             Lang::Ko => "-# 항상 허용 옵션",
             Lang::En => "-# Always allow options",
-        }
-    }
-
-    /// 적용 범위 라벨 헤더
-    pub fn lbl_scope_label_header(&self) -> &'static str {
-        match self {
-            Lang::Ko => "적용 범위",
-            Lang::En => "Applied to",
         }
     }
 
@@ -200,9 +200,31 @@ mod tests {
     use super::*;
 
     #[test]
-    fn lang_lbl_scope_label_header() {
-        assert_eq!(Lang::Ko.lbl_scope_label_header(), "적용 범위");
-        assert_eq!(Lang::En.lbl_scope_label_header(), "Applied to");
+    fn btn_always_tool_has_warning_icon() {
+        assert!(Lang::Ko.btn_always_tool().contains('⚠'), "Ko label must contain ⚠");
+        assert!(Lang::En.btn_always_tool().contains('⚠'), "En label must contain ⚠");
+        assert!(Lang::Ko.btn_always_tool().contains("도구 전체"), "Ko label must contain '도구 전체'");
+        assert!(Lang::En.btn_always_tool().contains("Entire tool"), "En label must contain 'Entire tool'");
+    }
+
+    #[test]
+    fn lbl_permission_request_section_header_format() {
+        assert_eq!(Lang::Ko.lbl_permission_request_section_header(), "### 권한 요청");
+        assert_eq!(Lang::En.lbl_permission_request_section_header(), "### Permission Request");
+        assert!(Lang::Ko.lbl_permission_request_section_header().starts_with("###"));
+        assert!(Lang::En.lbl_permission_request_section_header().starts_with("###"));
+    }
+
+    #[test]
+    fn btn_scope_status_project_label() {
+        assert_eq!(Lang::Ko.btn_scope_status_project(), "📁 적용 범위: 프로젝트");
+        assert_eq!(Lang::En.btn_scope_status_project(), "📁 Applied to: project");
+    }
+
+    #[test]
+    fn btn_scope_status_global_label() {
+        assert_eq!(Lang::Ko.btn_scope_status_global(), "⚠️ 적용 범위: 전역");
+        assert_eq!(Lang::En.btn_scope_status_global(), "⚠️ Applied to: global");
     }
 
     #[test]
