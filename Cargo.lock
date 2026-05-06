@@ -1380,6 +1380,7 @@ dependencies = [
  "serde_json",
  "serenity",
  "sha2 0.11.0",
+ "shlex",
  "sqlx",
  "tempfile",
  "thiserror 2.0.18",

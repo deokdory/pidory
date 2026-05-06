@@ -105,9 +105,10 @@ pub fn build_permission_message_parts(
         Scope::Global => "🌐 global  ⚠️ 모든 프로젝트에 적용됨".to_string(),
     };
     let header = format!(
-        "🔒 <@{}>  {}  ·  scope: {}",
+        "🔒 <@{}>  {}  ·  {}: {}",
         triggered_by,
         inline_code(tool_name),
+        lang.lbl_scope_label_header(),
         scope_label,
     );
 
@@ -294,13 +295,17 @@ pub enum DisableReason {
     /// 거부됨
     Deny,
     /// Always Allow 성공 — rule이 새로 추가됨 (MergeOutcome::Added)
-    AllowAlwaysSuccess { rule_text: String },
+    AllowAlwaysSuccess {
+        rules: Vec<String>,
+        scope: Scope,
+        project_basename: Option<String>,
+    },
     /// Already present — 동일 rule이 이미 존재함 (MergeOutcome::AlreadyPresent)
     AllowAlwaysAlreadyPresent,
     /// Conflict resolved — 충돌 규칙이 자동 해소됨 (MergeOutcome::ConflictResolved)
     AllowAlwaysConflictResolved,
-    /// Lock timeout — 파일 잠금 대기 초과 (ClaudeSettingsError::LockTimeout 등)
-    AllowAlwaysLockTimeout,
+    /// Max retries exceeded — 파일 잠금 대기 최대 재시도 초과 (자동 거부)
+    AllowAlwaysMaxRetries { attempts: u32 },
     /// 그 외 atomic editor 실패
     AllowAlwaysFailed { reason: String },
     /// 같은 tool 의 다른 pending 이 AlwaysAllow 처리되어 자동 취소됨 (review #297 s1)
@@ -324,8 +329,14 @@ pub async fn disable_permission_buttons(
             Lang::Ko => "-# ❌ 거부됨".to_string(),
             Lang::En => "-# ❌ Denied".to_string(),
         },
-        DisableReason::AllowAlwaysSuccess { rule_text } => {
-            format!("-# {}", lang.msg_save_success(&rule_text))
+        DisableReason::AllowAlwaysSuccess { rules, scope, project_basename } => {
+            let rules_joined = rules.join(", ");
+            let basename = project_basename
+                .unwrap_or_else(|| lang.msg_project_basename_fallback().to_string());
+            format!("-# {}", match scope {
+                Scope::Project => lang.msg_save_success_project(&basename, &rules_joined),
+                Scope::Global => lang.msg_save_success_global(&rules_joined),
+            })
         }
         DisableReason::AllowAlwaysAlreadyPresent => match lang {
             Lang::Ko => "-# 🔓 이미 등록됨".to_string(),
@@ -335,8 +346,8 @@ pub async fn disable_permission_buttons(
             Lang::Ko => "-# 🔓 충돌 자동 해소됨".to_string(),
             Lang::En => "-# 🔓 Conflict resolved".to_string(),
         },
-        DisableReason::AllowAlwaysLockTimeout => {
-            format!("-# {}", lang.msg_save_failed_lock_timeout())
+        DisableReason::AllowAlwaysMaxRetries { attempts } => {
+            format!("-# {}", lang.msg_save_failed_max_retries(attempts))
         }
         DisableReason::AllowAlwaysFailed { reason } => match lang {
             Lang::Ko => format!("-# ⚠️ 권한 저장 실패: {}", reason),

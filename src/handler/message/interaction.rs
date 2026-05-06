@@ -552,11 +552,18 @@ async fn handle_allow_always(
     };
     let result = claude_settings::add_permission(&settings_path, &rule_text, &notifier).await;
 
+    let project_basename = std::path::Path::new(&project.path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .map(|s| s.to_string());
+
     let (success, disable_reason) = match result {
         Ok(MergeOutcome::Added) => (
             true,
             DisableReason::AllowAlwaysSuccess {
-                rule_text: rule_text.clone(),
+                rules: vec![rule_text.clone()],
+                scope: scope.clone(),
+                project_basename: project_basename.clone(),
             },
         ),
         Ok(MergeOutcome::AlreadyPresent) => (true, DisableReason::AllowAlwaysAlreadyPresent),
@@ -568,7 +575,7 @@ async fn handle_allow_always(
                     | ClaudeSettingsError::LockTimeout { .. }
             ) =>
         {
-            (false, DisableReason::AllowAlwaysLockTimeout)
+            (false, DisableReason::AllowAlwaysMaxRetries { attempts: 1 })
         }
         Err(e) => (
             false,
