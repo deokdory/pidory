@@ -1,6 +1,7 @@
 // ─── permission wait / response ─────────────────────────────────────────────
 
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -137,6 +138,8 @@ pub(super) async fn wait_for_permissions<W, R>(
     permission_cache: &mut PermissionCache,
     permission_tx: &mpsc::Sender<PermissionRequest>,
     initial_cr: InitialControlRequest,
+    project_path: &Path,
+    additional_dirs: &Arc<Vec<PathBuf>>,
 ) -> PermissionsWaitResult
 where
     W: tokio::io::AsyncWrite + Unpin,
@@ -182,6 +185,8 @@ where
             decision_reason: initial_cr.decision_reason.clone(),
             response_tx: resp_tx,
             triggered_by: initial_cr.triggered_by,
+            cwd: project_path.to_path_buf(),
+            additional_dirs: Arc::clone(additional_dirs),
         };
 
         match permission_tx.try_send(perm_req) {
@@ -312,6 +317,8 @@ where
                                         decision_reason: decision_reason.clone(),
                                         response_tx: resp_tx,
                                         triggered_by: initial_cr.triggered_by,
+                                        cwd: project_path.to_path_buf(),
+                                        additional_dirs: Arc::clone(additional_dirs),
                                     };
 
                                     match permission_tx.try_send(perm_req) {
@@ -826,6 +833,7 @@ mod tests {
             &mut stdin_write, &mut reader, &mut line, &mut queue_rx, &mut interrupt_rx,
             &queue_size, &pending_recalls, "test-thread", None, &ratelimit_tx,
             &mut cache, &permission_tx, initial_cr,
+            &PathBuf::from("/tmp"), &Arc::new(vec![]),
         ).await;
 
         let received_ids = collect_task.await.unwrap();
@@ -861,6 +869,7 @@ mod tests {
             &mut stdin_write, &mut reader, &mut line, &mut queue_rx, &mut interrupt_rx,
             &queue_size, &pending_recalls, "test-thread", None, &ratelimit_tx,
             &mut cache, &permission_tx, initial_cr,
+            &PathBuf::from("/tmp"), &Arc::new(vec![]),
         ).await;
         handler_task.await.unwrap();
 
@@ -902,6 +911,7 @@ mod tests {
             &mut stdin_write, &mut reader, &mut line, &mut queue_rx, &mut interrupt_rx,
             &queue_size, &pending_recalls, "test-thread", None, &ratelimit_tx,
             &mut cache, &permission_tx, initial_cr,
+            &PathBuf::from("/tmp"), &Arc::new(vec![]),
         ).await;
         handler_task.await.unwrap();
 
@@ -955,6 +965,7 @@ mod tests {
             &mut stdin_write, &mut reader, &mut line, &mut queue_rx, &mut interrupt_rx,
             &queue_size, &pending_recalls, "test-thread", None, &ratelimit_tx,
             &mut cache, &permission_tx, initial_cr,
+            &PathBuf::from("/tmp"), &Arc::new(vec![]),
         ).await;
         handler_task.await.unwrap();
 
@@ -998,6 +1009,7 @@ mod tests {
             &mut stdin_write, &mut reader, &mut line, &mut queue_rx, &mut interrupt_rx,
             &queue_size, &pending_recalls, "test-thread", None, &ratelimit_tx,
             &mut cache, &permission_tx, initial_cr,
+            &PathBuf::from("/tmp"), &Arc::new(vec![]),
         ).await;
         interrupt_task.await.unwrap();
 
@@ -1036,6 +1048,7 @@ mod tests {
             &mut stdin_write, &mut reader, &mut line, &mut queue_rx, &mut interrupt_rx,
             &queue_size, &pending_recalls, "test-thread", None, &ratelimit_tx,
             &mut cache, &permission_tx, initial_cr,
+            &PathBuf::from("/tmp"), &Arc::new(vec![]),
         ).await;
         handler_task.await.unwrap();
 
@@ -1068,6 +1081,7 @@ mod tests {
             &mut stdin_write, &mut reader, &mut line, &mut queue_rx, &mut interrupt_rx,
             &queue_size, &pending_recalls, "test-thread", None, &ratelimit_tx,
             &mut cache, &permission_tx, initial_cr,
+            &PathBuf::from("/tmp"), &Arc::new(vec![]),
         ).await;
 
         assert!(
@@ -1098,6 +1112,8 @@ mod tests {
             decision_reason: None,
             response_tx: dummy_tx,
             triggered_by: poise::serenity_prelude::UserId::new(1),
+            cwd: std::path::PathBuf::from("/tmp"),
+            additional_dirs: Arc::new(vec![]),
         };
         permission_tx.try_send(dummy_req).expect("buffer 가 비어있어야 함");
 
@@ -1108,6 +1124,7 @@ mod tests {
             &mut stdin_write, &mut reader, &mut line, &mut queue_rx, &mut interrupt_rx,
             &queue_size, &pending_recalls, "test-thread", None, &ratelimit_tx,
             &mut cache, &permission_tx, initial_cr,
+            &PathBuf::from("/tmp"), &Arc::new(vec![]),
         ).await;
 
         let writes = drain_stdin_writes(&mut stdin_read, 1).await;
@@ -1147,6 +1164,7 @@ mod tests {
             &mut stdin_write, &mut reader, &mut line, &mut queue_rx, &mut interrupt_rx,
             &queue_size, &pending_recalls, "test-thread", None, &ratelimit_tx,
             &mut cache, &permission_tx, initial_cr,
+            &PathBuf::from("/tmp"), &Arc::new(vec![]),
         ).await;
         handler_task.await.unwrap();
 
@@ -1187,6 +1205,7 @@ mod tests {
             &mut stdin_write, &mut reader, &mut line, &mut queue_rx, &mut interrupt_rx,
             &queue_size, &pending_recalls, "test-thread", None, &ratelimit_tx,
             &mut cache, &permission_tx, initial_cr,
+            &PathBuf::from("/tmp"), &Arc::new(vec![]),
         ).await;
         handler_task.await.unwrap();
 

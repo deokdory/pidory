@@ -349,9 +349,13 @@ async fn handle_scope_toggle(
         let input = entry.input.clone().unwrap_or(serde_json::json!({}));
         let triggered_by = entry.triggered_by;
         let decision_reason = entry.decision_reason.clone();
-        (new_scope, tool, input, triggered_by, decision_reason)
+        let cwd = entry.cwd.clone();
+        let additional_dirs_arc = entry.additional_dirs.clone();
+        let file_path_opt = entry.file_path.clone();
+        (new_scope, tool, input, triggered_by, decision_reason, cwd, additional_dirs_arc, file_path_opt)
     };
-    let (scope, tool, input, triggered_by, decision_reason) = update;
+    let (scope, tool, input, triggered_by, decision_reason, cwd, additional_dirs_arc, file_path_opt) = update;
+    let file_path_str = file_path_opt.as_deref();
     tracing::info!(request_id = %request_id, ?scope, "permission scope toggled");
 
     let (content, components) = build_level2_message_parts(
@@ -362,6 +366,9 @@ async fn handle_scope_toggle(
         triggered_by,
         scope,
         lang,
+        file_path_str,
+        &cwd,
+        &additional_dirs_arc,
     );
     let response = CreateInteractionResponse::UpdateMessage(
         CreateInteractionResponseMessage::new()
@@ -402,9 +409,13 @@ async fn handle_allow_always_expand(
         let input = entry.input.clone().unwrap_or(serde_json::json!({}));
         let triggered_by = entry.triggered_by;
         let decision_reason = entry.decision_reason.clone();
-        (scope, tool, input, triggered_by, decision_reason)
+        let cwd = entry.cwd.clone();
+        let additional_dirs_arc = entry.additional_dirs.clone();
+        let file_path_opt = entry.file_path.clone();
+        (scope, tool, input, triggered_by, decision_reason, cwd, additional_dirs_arc, file_path_opt)
     };
-    let (scope, tool, input, triggered_by, decision_reason) = update;
+    let (scope, tool, input, triggered_by, decision_reason, cwd, additional_dirs_arc, file_path_opt) = update;
+    let file_path_str = file_path_opt.as_deref();
     tracing::info!(request_id = %request_id, ?scope, "permission ExpandAlways clicked");
 
     let (content, components) = build_level2_message_parts(
@@ -415,6 +426,9 @@ async fn handle_allow_always_expand(
         triggered_by,
         scope,
         lang,
+        file_path_str,
+        &cwd,
+        &additional_dirs_arc,
     );
     let response = CreateInteractionResponse::UpdateMessage(
         CreateInteractionResponseMessage::new()
@@ -463,6 +477,9 @@ async fn handle_allow_always(
     let thread_id = pending.thread_id.clone();
     let message_id = pending.message_id;
     let triggered_by = pending.triggered_by;
+    let cwd = pending.cwd.clone();
+    let additional_dirs_arc = pending.additional_dirs.clone();
+    let file_path_opt = pending.file_path.clone();
 
     tracing::info!(
         request_id = %request_id,
@@ -499,6 +516,9 @@ async fn handle_allow_always(
         scope.clone(),
         lang,
         None,
+        file_path_opt.as_deref(),
+        &cwd,
+        &additional_dirs_arc,
     );
     let response = CreateInteractionResponse::UpdateMessage(
         CreateInteractionResponseMessage::new()
@@ -667,6 +687,9 @@ async fn handle_allow_always(
                 scope.clone(),
                 lang,
                 Some((attempt, MAX_RETRIES)),
+                file_path_opt.as_deref(),
+                &cwd,
+                &additional_dirs_arc,
             );
             let _ = channel_id
                 .edit_message(

@@ -1,6 +1,7 @@
 // ─── T3: Background turn handler ───────────────────────────────────────────
 
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
@@ -45,6 +46,8 @@ pub(super) async fn handle_bg_turn(
     lang: Lang,
     show_context_percent: bool,
     model_name: &mut String,
+    project_path: &Path,
+    additional_dirs: &Arc<Vec<PathBuf>>,
 ) {
     let mut used_tools: Vec<String> = Vec::new();
     let mut used_skills: Vec<String> = Vec::new();
@@ -180,6 +183,8 @@ pub(super) async fn handle_bg_turn(
                                     None,
                                     ratelimit_tx, permission_cache, permission_tx,
                                     initial_cr,
+                                    project_path,
+                                    additional_dirs,
                                 ).await;
                                 match result {
                                     PermissionsWaitResult::AllResolved { .. } => {}

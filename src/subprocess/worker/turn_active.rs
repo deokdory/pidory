@@ -1,6 +1,7 @@
 // ─── T4: Active turn handler ───────────────────────────────────────────────
 
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Mutex as StdMutex;
@@ -45,6 +46,8 @@ pub(super) async fn run_active_turn(
     lang: Lang,
     event_tx: mpsc::Sender<StreamEvent>,
     model_name: &mut String,
+    project_path: &Path,
+    additional_dirs: &Arc<Vec<PathBuf>>,
 ) -> bool {
     let mut timeout_deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
     let mut soft_timeout_fired = false;
@@ -174,6 +177,8 @@ pub(super) async fn run_active_turn(
                                         Some(&event_tx),
                                         ratelimit_tx, permission_cache, permission_tx,
                                         initial_cr,
+                                        project_path,
+                                        additional_dirs,
                                     ).await;
                                     match result {
                                         PermissionsWaitResult::AllResolved { .. } => {}

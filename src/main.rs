@@ -43,6 +43,12 @@ pub struct PendingPermission {
     pub scope_override: Option<claude_settings::rule::Scope>,
     /// Claude CLI 가 control_request 에 포함한 decision_reason. Level 2 UI 에 보존.
     pub decision_reason: Option<String>,
+    /// Worker session's project directory (path_safety 검사용).
+    pub cwd: std::path::PathBuf,
+    /// Resolved settings additionalDirectories (path_safety 검사용).
+    pub additional_dirs: std::sync::Arc<Vec<std::path::PathBuf>>,
+    /// tool input에서 추출한 file_path (Edit/Write/Read 등). 없으면 None.
+    pub file_path: Option<String>,
 }
 
 /// Tracks a multi-question AskUserQuestion group.

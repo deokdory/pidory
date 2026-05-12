@@ -93,6 +93,7 @@ pub fn parse_permission_custom_id(custom_id: &str) -> Option<(String, PermAction
 /// Level 2 UI: 헤더(scope 포함) + 미리보기 섹션 + 2-row 버튼.
 /// - Row 1: 영속 옵션(Exact/Prefix/Domain/Tool) + scope 토글
 /// - Row 2: 한 번만(Success) + 거부(Danger)
+#[allow(clippy::too_many_arguments)]
 pub fn build_level2_message_parts(
     tool_name: &str,
     input: &serde_json::Value,
@@ -101,6 +102,9 @@ pub fn build_level2_message_parts(
     triggered_by: UserId,
     scope: Scope,
     lang: Lang,
+    file_path: Option<&str>,
+    cwd: &std::path::Path,
+    additional_dirs: &[std::path::PathBuf],
 ) -> (String, Vec<CreateActionRow>) {
     let summary = format_tool_input_summary(tool_name, input, lang);
     let reason = decision_reason
@@ -114,7 +118,7 @@ pub fn build_level2_message_parts(
     );
 
     // 미리보기: available_rule_kinds → build_rule_texts(복수형) → 콤마 나열.
-    let kinds = available_rule_kinds(tool_name, input);
+    let kinds = available_rule_kinds(tool_name, input, file_path, cwd, additional_dirs);
     let preview_lines: Vec<String> = kinds
         .iter()
         .filter_map(|kind| {
@@ -221,6 +225,7 @@ pub fn build_level2_message_parts(
 /// Level 1 UI: scope 표시 없이 3버튼 `[한 번만, 항상 허용, 거부]`만 제공한다.
 /// "항상 허용" 버튼은 `:always:expand` suffix — T9(ExpandAlways) 가 Level 2 UI 로 펼친다.
 /// 영속 옵션 미리보기 섹션 없음.
+#[allow(clippy::too_many_arguments)]
 pub fn build_level1_message_parts(
     tool_name: &str,
     input: &serde_json::Value,
@@ -228,7 +233,12 @@ pub fn build_level1_message_parts(
     decision_reason: Option<&str>,
     triggered_by: UserId,
     lang: Lang,
+    file_path: Option<&str>,
+    cwd: &std::path::Path,
+    additional_dirs: &[std::path::PathBuf],
 ) -> (String, Vec<CreateActionRow>) {
+    use crate::claude_settings::path_safety::{is_in_protected_prefix, is_outside_workspace};
+
     let summary = format_tool_input_summary(tool_name, input, lang);
     let reason = decision_reason
         .map(|r| format!("\n> {}", r))
@@ -241,31 +251,61 @@ pub fn build_level1_message_parts(
         inline_code(tool_name),
     );
 
-    let content = format!(
-        "{}\n{}\n{}{}",
-        lang.lbl_permission_request_section_header(),
-        header,
-        summary,
-        reason
-    );
+    // 보호 path 여부 판단 — available_rule_kinds와 동일 기준
+    let kinds = available_rule_kinds(tool_name, input, file_path, cwd, additional_dirs);
+    let note = if kinds.is_empty() {
+        if is_in_protected_prefix(file_path) {
+            Some(lang.permission_protected_path_note())
+        } else if is_outside_workspace(file_path, cwd, additional_dirs) {
+            Some(lang.permission_outside_cwd_note())
+        } else {
+            None
+        }
+    } else {
+        None
+    };
 
-    // 단일 ActionRow: [한 번만 (Success), 항상 허용 (Primary), 거부 (Danger)]
-    // "항상 허용"은 Level 2 expand trigger → `:always:expand` suffix
+    let content = if let Some(n) = note {
+        format!(
+            "{}\n{}\n{}{}\n{}",
+            lang.lbl_permission_request_section_header(),
+            header,
+            summary,
+            reason,
+            n
+        )
+    } else {
+        format!(
+            "{}\n{}\n{}{}",
+            lang.lbl_permission_request_section_header(),
+            header,
+            summary,
+            reason
+        )
+    };
+
+    // 단일 ActionRow: [한 번만 (Success), (항상 허용 (Primary),) 거부 (Danger)]
+    // 보호 path이면 "항상 허용" 버튼 hide
     let once_btn = CreateButton::new(format!("perm:{}:once", request_id))
         .label(lang.btn_once())
         .style(ButtonStyle::Success);
-    let always_btn = CreateButton::new(format!("perm:{}:always:expand", request_id))
-        .label(lang.btn_always_allow())
-        .style(ButtonStyle::Primary);
     let deny_btn = CreateButton::new(format!("perm:{}:deny", request_id))
         .label(lang.btn_deny())
         .style(ButtonStyle::Danger);
 
-    let row = CreateActionRow::Buttons(vec![once_btn, always_btn, deny_btn]);
+    let row = if kinds.is_empty() {
+        CreateActionRow::Buttons(vec![once_btn, deny_btn])
+    } else {
+        let always_btn = CreateButton::new(format!("perm:{}:always:expand", request_id))
+            .label(lang.btn_always_allow())
+            .style(ButtonStyle::Primary);
+        CreateActionRow::Buttons(vec![once_btn, always_btn, deny_btn])
+    };
 
     (content, vec![row])
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn create_permission_message(
     tool_name: &str,
     input: &serde_json::Value,
@@ -274,6 +314,9 @@ pub fn create_permission_message(
     triggered_by: UserId,
     _scope: Scope,
     lang: Lang,
+    file_path: Option<&str>,
+    cwd: &std::path::Path,
+    additional_dirs: &[std::path::PathBuf],
 ) -> CreateMessage {
     let (content, components) = build_level1_message_parts(
         tool_name,
@@ -282,6 +325,9 @@ pub fn create_permission_message(
         decision_reason,
         triggered_by,
         lang,
+        file_path,
+        cwd,
+        additional_dirs,
     );
     CreateMessage::new().content(content).components(components)
 }
@@ -366,6 +412,9 @@ pub fn build_processing_message_parts(
     scope: Scope,
     lang: Lang,
     attempt: Option<(u32, u32)>,
+    file_path: Option<&str>,
+    cwd: &std::path::Path,
+    additional_dirs: &[std::path::PathBuf],
 ) -> (String, Vec<CreateActionRow>) {
     // 헤더 — Level 2 와 동일
     let header = format!(
@@ -390,7 +439,7 @@ pub fn build_processing_message_parts(
     );
 
     // 컴포넌트 — Level 2 구조 복제 + 모두 disabled
-    let kinds = available_rule_kinds(tool_name, input);
+    let kinds = available_rule_kinds(tool_name, input, file_path, cwd, additional_dirs);
     let mut row1_buttons: Vec<CreateButton> = kinds
         .iter()
         .map(|kind| match kind {
@@ -567,6 +616,10 @@ pub async fn run_permission_handler(
                             input: Some(perm_req.input),
                             scope_override: None,
                             decision_reason: perm_req.decision_reason.clone(),
+                            cwd: perm_req.cwd,
+                            additional_dirs: perm_req.additional_dirs,
+                            // multi-question/sub-question: 사용자 텍스트 응답이라 file path 검사 대상 아님 (의도된 None)
+                            file_path: None,
                         };
                         pending_permissions
                             .lock()
@@ -620,6 +673,10 @@ pub async fn run_permission_handler(
                                 input: Some(perm_req.input.clone()),
                                 scope_override: None,
                                 decision_reason: perm_req.decision_reason.clone(),
+                                cwd: perm_req.cwd.clone(),
+                                additional_dirs: perm_req.additional_dirs.clone(),
+                                // multi-question/sub-question: 사용자 텍스트 응답이라 file path 검사 대상 아님 (의도된 None)
+                                file_path: None,
                             };
                             pending_permissions.lock().await.insert(sub_id, pending);
                         }
@@ -647,6 +704,12 @@ pub async fn run_permission_handler(
             continue;
         }
 
+        let file_path_owned: Option<String> = crate::claude_settings::path_safety::permission_target_path(
+            &perm_req.tool_name,
+            &perm_req.input,
+        );
+        let file_path_str = file_path_owned.as_deref();
+
         let msg = create_permission_message(
             &perm_req.tool_name,
             &perm_req.input,
@@ -655,6 +718,9 @@ pub async fn run_permission_handler(
             triggered_by,
             default_scope(), // P1.3 (#288) 에서 DB user_settings 조회로 교체
             lang,
+            file_path_str,
+            &perm_req.cwd,
+            &perm_req.additional_dirs,
         );
 
         let log_request_id = perm_req.request_id.clone();
@@ -671,6 +737,9 @@ pub async fn run_permission_handler(
                     input: Some(perm_req.input),
                     scope_override: None,
                     decision_reason: perm_req.decision_reason.clone(),
+                    cwd: perm_req.cwd,
+                    additional_dirs: perm_req.additional_dirs,
+                    file_path: file_path_owned,
                 };
                 pending_permissions
                     .lock()
@@ -1005,6 +1074,9 @@ mod tests {
             input: None,
             scope_override: None,
             decision_reason: None,
+            cwd: std::path::PathBuf::from("/tmp/fake"),
+            additional_dirs: std::sync::Arc::new(vec![]),
+            file_path: None,
         };
         (pending, rx)
     }
@@ -1294,6 +1366,9 @@ mod tests {
             UserId::new(12345),
             scope,
             Lang::Ko,
+            None,
+            std::path::Path::new("/tmp/fake"),
+            &[],
         );
         let msg = CreateMessage::new().content(content).components(components);
         serde_json::to_value(msg).expect("CreateMessage must be serializable")
@@ -1385,6 +1460,9 @@ mod tests {
             UserId::new(99999),
             Scope::Global,
             Lang::Ko,
+            None,
+            std::path::Path::new("/tmp/fake"),
+            &[],
         );
 
         // 헤더에 scope 문자열 미포함
@@ -1420,6 +1498,9 @@ mod tests {
             UserId::new(12345),
             Scope::Project,
             Lang::Ko,
+            None,
+            std::path::Path::new("/tmp/fake"),
+            &[],
         );
         assert!(
             !content.contains("적용 범위:"),
@@ -1440,6 +1521,9 @@ mod tests {
             UserId::new(12345),
             Scope::Project,
             Lang::Ko,
+            None,
+            std::path::Path::new("/tmp/fake"),
+            &[],
         );
         // Exact 라인: 두 sub-command 가 콤마로 나열되어야 한다
         assert!(
@@ -1487,6 +1571,9 @@ mod tests {
             UserId::new(12345),
             Scope::Project,
             Lang::Ko,
+            None,
+            std::path::Path::new("/tmp/fake"),
+            &[],
         );
         msg_to_json(msg)
     }
@@ -1582,6 +1669,9 @@ mod tests {
             scope,
             Lang::Ko,
             attempt,
+            None,
+            std::path::Path::new("/tmp/fake"),
+            &[],
         );
         let components_json: Vec<serde_json::Value> = components
             .into_iter()
@@ -1687,6 +1777,9 @@ mod tests {
             None,
             UserId::new(12345),
             Lang::Ko,
+            None,
+            std::path::Path::new("/tmp/fake"),
+            &[],
         );
         assert!(
             content.starts_with("### 권한 요청"),
@@ -1711,6 +1804,9 @@ mod tests {
             UserId::new(12345),
             Scope::Project,
             Lang::Ko,
+            None,
+            std::path::Path::new("/tmp/fake"),
+            &[],
         );
         assert!(
             content.starts_with("### 권한 요청"),
@@ -1757,6 +1853,9 @@ mod tests {
             UserId::new(12345),
             Scope::Project,
             Lang::Ko,
+            None,
+            std::path::Path::new("/tmp/fake"),
+            &[],
         );
         assert!(
             content.contains("⚠️ 도구 전체"),
@@ -1831,6 +1930,9 @@ mod tests {
             None,
             UserId::new(12345),
             Lang::Ko,
+            None,
+            std::path::Path::new("/tmp/fake"),
+            &[],
         );
         assert!(
             content.starts_with("### 권한 요청"),
@@ -1840,6 +1942,76 @@ mod tests {
         assert!(
             !content.contains("적용 범위"),
             "scope 미포함, got: {}",
+            content
+        );
+    }
+
+    /// 보호 path (/.claude/ prefix) → always 버튼 없음 + protected note 포함
+    #[test]
+    fn build_level1_protected_path_omits_always_button() {
+        let input = serde_json::json!({"file_path": "/proj/.claude/x"});
+        let cwd = std::path::Path::new("/proj");
+        let (content, rows) = build_level1_message_parts(
+            "Edit",
+            &input,
+            "rid-prot-001",
+            None,
+            UserId::new(12345),
+            Lang::Ko,
+            Some("/proj/.claude/x"),
+            cwd,
+            &[],
+        );
+        // 버튼 2개만 (once + deny), always 없음
+        assert_eq!(rows.len(), 1, "단일 ActionRow");
+        let row_json = serde_json::to_value(&rows[0]).expect("row must be serializable");
+        let btns = row_json.get("components").and_then(|c| c.as_array()).expect("row must have components");
+        assert_eq!(btns.len(), 2, "보호 path → 버튼 2개 (once + deny)");
+        let cids: Vec<&str> = btns.iter()
+            .filter_map(|b| b.get("custom_id").and_then(|v| v.as_str()))
+            .collect();
+        assert!(cids.iter().any(|id| id.ends_with(":once")), "once 버튼 있어야 함");
+        assert!(cids.iter().any(|id| id.ends_with(":deny")), "deny 버튼 있어야 함");
+        assert!(!cids.iter().any(|id| id.ends_with(":always:expand")), "always:expand 버튼 없어야 함");
+        // protected note 포함
+        assert!(
+            content.contains(Lang::Ko.permission_protected_path_note()),
+            "protected note 포함, got: {}",
+            content
+        );
+    }
+
+    /// cwd 외부 path → always 버튼 없음 + outside note 포함
+    #[test]
+    fn build_level1_outside_cwd_omits_always_button() {
+        let input = serde_json::json!({"file_path": "/tmp/x.md"});
+        let cwd = std::path::Path::new("/proj");
+        let (content, rows) = build_level1_message_parts(
+            "Edit",
+            &input,
+            "rid-outside-001",
+            None,
+            UserId::new(12345),
+            Lang::Ko,
+            Some("/tmp/x.md"),
+            cwd,
+            &[],
+        );
+        // 버튼 2개만 (once + deny), always 없음
+        assert_eq!(rows.len(), 1, "단일 ActionRow");
+        let row_json = serde_json::to_value(&rows[0]).expect("row must be serializable");
+        let btns = row_json.get("components").and_then(|c| c.as_array()).expect("row must have components");
+        assert_eq!(btns.len(), 2, "cwd 외부 → 버튼 2개 (once + deny)");
+        let cids: Vec<&str> = btns.iter()
+            .filter_map(|b| b.get("custom_id").and_then(|v| v.as_str()))
+            .collect();
+        assert!(cids.iter().any(|id| id.ends_with(":once")), "once 버튼 있어야 함");
+        assert!(cids.iter().any(|id| id.ends_with(":deny")), "deny 버튼 있어야 함");
+        assert!(!cids.iter().any(|id| id.ends_with(":always:expand")), "always:expand 버튼 없어야 함");
+        // outside note 포함
+        assert!(
+            content.contains(Lang::Ko.permission_outside_cwd_note()),
+            "outside note 포함, got: {}",
             content
         );
     }
