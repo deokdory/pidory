@@ -618,6 +618,7 @@ pub async fn run_permission_handler(
                             decision_reason: perm_req.decision_reason.clone(),
                             cwd: perm_req.cwd,
                             additional_dirs: perm_req.additional_dirs,
+                            // multi-question/sub-question: 사용자 텍스트 응답이라 file path 검사 대상 아님 (의도된 None)
                             file_path: None,
                         };
                         pending_permissions
@@ -674,6 +675,7 @@ pub async fn run_permission_handler(
                                 decision_reason: perm_req.decision_reason.clone(),
                                 cwd: perm_req.cwd.clone(),
                                 additional_dirs: perm_req.additional_dirs.clone(),
+                                // multi-question/sub-question: 사용자 텍스트 응답이라 file path 검사 대상 아님 (의도된 None)
                                 file_path: None,
                             };
                             pending_permissions.lock().await.insert(sub_id, pending);
@@ -702,10 +704,10 @@ pub async fn run_permission_handler(
             continue;
         }
 
-        let file_path_owned: Option<String> = perm_req.input
-            .get("file_path")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
+        let file_path_owned: Option<String> = crate::claude_settings::path_safety::permission_target_path(
+            &perm_req.tool_name,
+            &perm_req.input,
+        );
         let file_path_str = file_path_owned.as_deref();
 
         let msg = create_permission_message(

@@ -56,4 +56,4 @@ pub use danger::{Severity, classify_command};
 #[allow(unused_imports)]
 pub use path_safety::is_protected_path;
 #[allow(unused_imports)]
-pub use path_safety::{is_in_protected_prefix, is_outside_workspace};
+pub use path_safety::{is_in_protected_prefix, is_outside_workspace, permission_target_path};
