@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Mutex as StdMutex;
@@ -157,6 +158,8 @@ impl SessionManager {
             cmd.arg("--disallowedTools").arg(disallowed_tools.join(","));
         }
 
+        let resolved = crate::claude_settings::resolve_settings(std::path::Path::new(project_path));
+
         cmd.current_dir(project_path)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -211,6 +214,8 @@ impl SessionManager {
             Arc::clone(&self.pending_recalls),
             self.ratelimit_tx.clone(),
             Arc::clone(&cleanup_handles.session_states),
+            PathBuf::from(project_path),
+            Arc::new(resolved.additional_dirs),
         ).run();
 
         let permission_fut = crate::handler::permission_ui::run_permission_handler(

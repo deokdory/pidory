@@ -1,6 +1,7 @@
 // ─── T2: Between-turns event handling ──────────────────────────────────────
 
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
@@ -52,6 +53,8 @@ pub(super) async fn handle_between_turns_event(
     lang: Lang,
     show_context_percent: bool,
     model_name: &mut String,
+    project_path: &Path,
+    additional_dirs: &Arc<Vec<PathBuf>>,
 ) -> BetweenTurnsAction {
     line.clear();
     tokio::select! {
@@ -121,6 +124,8 @@ pub(super) async fn handle_between_turns_event(
                                 lang,
                                 show_context_percent,
                                 model_name,
+                                project_path,
+                                additional_dirs,
                             ).await;
 
                             BetweenTurnsAction::Continue
@@ -140,6 +145,8 @@ pub(super) async fn handle_between_turns_event(
                                 None,
                                 ratelimit_tx, permission_cache, permission_tx,
                                 initial_cr,
+                                project_path,
+                                additional_dirs,
                             ).await;
                             match result {
                                 PermissionsWaitResult::AllResolved { .. } => BetweenTurnsAction::Continue,

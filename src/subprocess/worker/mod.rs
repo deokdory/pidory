@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Mutex as StdMutex;
@@ -62,6 +63,9 @@ pub(super) struct SessionWorker {
     timeout_secs: u64,
     lang: Lang,
     show_context_percent: bool,
+    // Permission path context
+    pub(super) project_path: PathBuf,
+    pub(super) additional_dirs: Arc<Vec<PathBuf>>,
 }
 
 impl SessionWorker {
@@ -88,6 +92,8 @@ impl SessionWorker {
         pending_recalls: Arc<tokio::sync::Mutex<HashMap<MessageId, (String, Arc<AtomicBool>)>>>,
         ratelimit_tx: tokio::sync::watch::Sender<RateLimitInfo>,
         session_states: Arc<Mutex<HashMap<String, SessionState>>>,
+        project_path: PathBuf,
+        additional_dirs: Arc<Vec<PathBuf>>,
     ) -> Self {
         Self {
             stdin,
@@ -114,6 +120,8 @@ impl SessionWorker {
             timeout_secs,
             lang,
             show_context_percent,
+            project_path,
+            additional_dirs,
         }
     }
 
@@ -143,6 +151,8 @@ impl SessionWorker {
             timeout_secs,
             lang,
             show_context_percent,
+            ref project_path,
+            ref additional_dirs,
             ..
         } = self;
 
@@ -171,6 +181,8 @@ impl SessionWorker {
                 lang,
                 show_context_percent,
                 &mut model_name,
+                project_path,
+                additional_dirs,
             ).await;
 
             match action {
@@ -231,6 +243,8 @@ impl SessionWorker {
                         lang,
                         event_tx,
                         &mut model_name,
+                        project_path,
+                        additional_dirs,
                     ).await;
 
                     // 'turn loop 종료 후 항상 리셋 (정상/비정상 모든 break 경로 커버)
