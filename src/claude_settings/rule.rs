@@ -68,7 +68,16 @@ pub fn scope_to_path(scope: Scope, project_root: &Path, home: &Path) -> PathBuf 
 ///
 /// MCP tool (`mcp__` prefix) 은 괄호 없는 exact form 만 유효하므로 `Tool` 만 반환한다
 /// (Claude Code permission spec MCP 항목 — `mcp__<server>__<tool>` 형식, 괄호 불가).
-pub fn available_rule_kinds(tool: &str, input: &serde_json::Value) -> Vec<RuleKind> {
+pub fn available_rule_kinds(
+    tool: &str,
+    input: &serde_json::Value,
+    file_path: Option<&str>,
+    cwd: &Path,
+    additional_dirs: &[PathBuf],
+) -> Vec<RuleKind> {
+    if crate::claude_settings::path_safety::is_protected_path(file_path, cwd, additional_dirs) {
+        return vec![];
+    }
     match tool {
         "Bash" => {
             let cmd = input.get("command").and_then(|v| v.as_str()).unwrap_or("");
@@ -421,56 +430,56 @@ mod tests {
 
     #[test]
     fn available_kinds_bash_with_command() {
-        let kinds = available_rule_kinds("Bash", &json!({"command": "npm test"}));
+        let kinds = available_rule_kinds("Bash", &json!({"command": "npm test"}), None, Path::new("/tmp/fakecwd"), &[]);
         assert_eq!(kinds, vec![RuleKind::Exact, RuleKind::Prefix, RuleKind::Tool]);
     }
 
     #[test]
     fn available_kinds_bash_empty_command() {
-        let kinds = available_rule_kinds("Bash", &json!({"command": ""}));
+        let kinds = available_rule_kinds("Bash", &json!({"command": ""}), None, Path::new("/tmp/fakecwd"), &[]);
         assert_eq!(kinds, vec![RuleKind::Tool]);
     }
 
     #[test]
     fn available_kinds_webfetch_domain() {
-        let kinds = available_rule_kinds("WebFetch", &json!({"url": "https://example.com/api"}));
+        let kinds = available_rule_kinds("WebFetch", &json!({"url": "https://example.com/api"}), None, Path::new("/tmp/fakecwd"), &[]);
         assert_eq!(kinds, vec![RuleKind::Domain, RuleKind::Tool]);
     }
 
     #[test]
     fn available_kinds_webfetch_ip() {
-        let kinds = available_rule_kinds("WebFetch", &json!({"url": "http://192.168.1.1/api"}));
+        let kinds = available_rule_kinds("WebFetch", &json!({"url": "http://192.168.1.1/api"}), None, Path::new("/tmp/fakecwd"), &[]);
         assert_eq!(kinds, vec![RuleKind::Tool]);
     }
 
     #[test]
     fn available_kinds_read_empty_input() {
-        let kinds = available_rule_kinds("Read", &json!({}));
+        let kinds = available_rule_kinds("Read", &json!({}), None, Path::new("/tmp/fakecwd"), &[]);
         assert_eq!(kinds, vec![RuleKind::Exact, RuleKind::Tool]);
     }
 
     #[test]
     fn available_kinds_grep_empty_input() {
-        let kinds = available_rule_kinds("Grep", &json!({}));
+        let kinds = available_rule_kinds("Grep", &json!({}), None, Path::new("/tmp/fakecwd"), &[]);
         assert_eq!(kinds, vec![RuleKind::Tool]);
     }
 
     #[test]
     fn available_kinds_unknown_tool() {
         // Unknown tool: input schema 모르므로 Tool 만 (review #297 s2 fix)
-        let kinds = available_rule_kinds("Unknown", &json!({}));
+        let kinds = available_rule_kinds("Unknown", &json!({}), None, Path::new("/tmp/fakecwd"), &[]);
         assert_eq!(kinds, vec![RuleKind::Tool]);
     }
 
     #[test]
     fn available_kinds_skill_with_name() {
-        let kinds = available_rule_kinds("Skill", &json!({"name": "jira-new"}));
+        let kinds = available_rule_kinds("Skill", &json!({"name": "jira-new"}), None, Path::new("/tmp/fakecwd"), &[]);
         assert_eq!(kinds, vec![RuleKind::Exact, RuleKind::Tool]);
     }
 
     #[test]
     fn available_kinds_skill_no_name() {
-        let kinds = available_rule_kinds("Skill", &json!({}));
+        let kinds = available_rule_kinds("Skill", &json!({}), None, Path::new("/tmp/fakecwd"), &[]);
         assert_eq!(kinds, vec![RuleKind::Tool]);
     }
 
@@ -828,7 +837,33 @@ mod tests {
     #[test]
     fn available_rule_kinds_mcp_returns_tool_only() {
         // MCP tool 은 Tool 만 (의도 명시, unknown fallback 과 동작 동일)
-        let kinds = available_rule_kinds("mcp__server__tool", &json!({}));
+        let kinds = available_rule_kinds("mcp__server__tool", &json!({}), None, Path::new("/tmp/fakecwd"), &[]);
         assert_eq!(kinds, vec![RuleKind::Tool]);
+    }
+
+    #[test]
+    fn available_rule_kinds_protected_dotclaude_returns_empty() {
+        // .claude/ 하위 경로 → 보호 경로, vec![] 반환
+        let kinds = available_rule_kinds(
+            "Edit",
+            &json!({"file_path": "/proj/.claude/x.md"}),
+            Some("/proj/.claude/x.md"),
+            Path::new("/proj"),
+            &[],
+        );
+        assert_eq!(kinds, vec![]);
+    }
+
+    #[test]
+    fn available_rule_kinds_outside_cwd_returns_empty() {
+        // cwd 외부 경로 → 보호 경로, vec![] 반환
+        let kinds = available_rule_kinds(
+            "Edit",
+            &json!({"file_path": "/tmp/x.md"}),
+            Some("/tmp/x.md"),
+            Path::new("/proj"),
+            &[],
+        );
+        assert_eq!(kinds, vec![]);
     }
 }

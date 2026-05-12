@@ -1,6 +1,8 @@
 #![allow(dead_code)]
 
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
+use std::sync::Arc;
 
 use poise::serenity_prelude::UserId;
 
@@ -22,6 +24,10 @@ pub struct PermissionRequest {
     pub decision_reason: Option<String>,
     pub response_tx: tokio::sync::oneshot::Sender<PermissionDecision>,
     pub triggered_by: UserId,
+    /// Worker session's project directory (used by path_safety check)
+    pub cwd: PathBuf,
+    /// Resolved settings additionalDirectories (Arc shared across requests in same session)
+    pub additional_dirs: Arc<Vec<PathBuf>>,
 }
 
 pub struct PermissionCache {

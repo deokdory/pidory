@@ -209,6 +209,22 @@ impl Lang {
             Lang::En => "⚠️ Input too long to display permission request — automatically denied. Try splitting into shorter commands.",
         }
     }
+
+    /// 보호 path 권한 prompt 안내 메시지 (5 prefix 매칭 대상)
+    pub fn permission_protected_path_note(&self) -> &'static str {
+        match self {
+            Lang::Ko => "ℹ️ 이 파일은 Claude 보안 정책상 영속 매칭 불가 — 매번 prompt 발생",
+            Lang::En => "ℹ️ This file cannot be persistently allowed by Claude policy — prompt every time",
+        }
+    }
+
+    /// cwd 외부 파일 권한 prompt 안내 메시지
+    pub fn permission_outside_cwd_note(&self) -> &'static str {
+        match self {
+            Lang::Ko => "ℹ️ 이 파일은 작업 디렉토리 외부 — 영속 매칭 불가 (`additionalDirectories` 설정 필요)",
+            Lang::En => "ℹ️ This file is outside the working directory — persistent allow disabled (add to `additionalDirectories`)",
+        }
+    }
 }
 
 #[cfg(test)]
