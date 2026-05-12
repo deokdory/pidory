@@ -50,13 +50,17 @@ async fn write_permission_response(
             tracing::info!(request_id = %request_id, behavior = "allow", "control_response written");
             Ok(false)
         }
-        PermissionWaitResult::AllowAlways { tool_name, rule_kind: _, scope: _ } => {
+        PermissionWaitResult::AllowAlways { tool_name, rule_kind, scope: _ } => {
             let resp = build_control_response_allow(request_id, input);
             stdin.write_all(resp.as_bytes()).await?;
             stdin.flush().await?;
-            // settings.json이 source of truth — cache는 invalidate (handler의 add_permission이 처리)
-            permission_cache.clear_tool(&tool_name);
-            tracing::info!(request_id = %request_id, behavior = "always_allow", tool_name = %tool_name, "control_response written");
+            // 일관성 — production path 의 동일 분기 참고
+            if matches!(rule_kind, RuleKind::Tool) {
+                permission_cache.add_always_allow(&tool_name);
+            } else {
+                permission_cache.clear_tool(&tool_name);
+            }
+            tracing::info!(request_id = %request_id, behavior = "always_allow", tool_name = %tool_name, rule_kind = ?rule_kind, "control_response written");
             Ok(false)
         }
         PermissionWaitResult::Deny(reason) => {
@@ -400,15 +404,23 @@ where
                             tracing::info!(thread_id = %thread_id, request_id = %rid, tool_name = %tool_name, behavior = "allow", "control_response written");
                             r
                         }
-                        PermissionDecision::AllowAlways { rule_kind: _, scope: _ } => {
+                        PermissionDecision::AllowAlways { rule_kind, scope: _ } => {
                             let resp = build_control_response_allow(&rid, input);
                             let r = stdin.write_all(resp.as_bytes()).await;
                             if r.is_ok() {
                                 let _ = stdin.flush().await;
-                                // settings.json이 source of truth — cache는 invalidate (handler의 add_permission이 처리)
-                                permission_cache.clear_tool(tool_name);
+                                // NP12-E: settings.json 이 source of truth. Tool kind 만 turn-local mirror
+                                // (Bash(*) 처럼 input 무관한 매칭 규칙) → 같은 turn 내 같은 tool 재호출 시
+                                // cache hit 으로 auto-allow. Exact/Prefix/Domain 은 input-dependent 이라
+                                // tool name 단위 cache 로 정확히 표현 불가 → clear_tool (기존 동작 유지).
+                                // pending_session_restart 가 다음 user message 시 cache 를 자연 폐기시킴.
+                                if matches!(rule_kind, RuleKind::Tool) {
+                                    permission_cache.add_always_allow(tool_name);
+                                } else {
+                                    permission_cache.clear_tool(tool_name);
+                                }
                             }
-                            tracing::info!(thread_id = %thread_id, request_id = %rid, tool_name = %tool_name, behavior = "always_allow", "control_response written");
+                            tracing::info!(thread_id = %thread_id, request_id = %rid, tool_name = %tool_name, behavior = "always_allow", rule_kind = ?rule_kind, "control_response written");
                             r
                         }
                         PermissionDecision::Deny => {
@@ -515,7 +527,7 @@ mod tests {
             &mut cache,
         )
         .await;
-        assert_eq!(result.unwrap(), false, "Allow variant must return Ok(false)");
+        assert!(!result.unwrap(), "Allow variant must return Ok(false)");
     }
 
     #[tokio::test]
@@ -549,7 +561,7 @@ mod tests {
             &mut cache,
         )
         .await;
-        assert_eq!(result.unwrap(), false, "AllowAlways must return Ok(false)");
+        assert!(!result.unwrap(), "AllowAlways must return Ok(false)");
         assert!(!cache.is_always_allowed("Bash"), "cache must be invalidated (settings.json is now source of truth)");
     }
 
@@ -595,7 +607,7 @@ mod tests {
             &mut cache,
         )
         .await;
-        assert_eq!(result.unwrap(), false, "Deny variant must return Ok(false)");
+        assert!(!result.unwrap(), "Deny variant must return Ok(false)");
     }
 
     #[tokio::test]
@@ -629,7 +641,7 @@ mod tests {
             &mut cache,
         )
         .await;
-        assert_eq!(result.unwrap(), true, "Error variant must return Ok(true) to signal break");
+        assert!(result.unwrap(), "Error variant must return Ok(true) to signal break");
     }
 
     #[tokio::test]
@@ -699,7 +711,7 @@ mod tests {
             &mut stdin,
             &mut cache,
         ).await;
-        assert_eq!(result.unwrap(), false);
+        assert!(!result.unwrap());
     }
 
     #[tokio::test]
@@ -1179,6 +1191,156 @@ mod tests {
         assert_eq!(by_rid["cr2"]["response"]["response"]["behavior"], "deny",  "cr2 → full-deny");
         assert_eq!(by_rid["cr3"]["response"]["response"]["behavior"], "deny",  "cr3 → full-deny");
         assert!(matches!(result, PermissionsWaitResult::AllResolved { .. }));
+    }
+
+    /// AllowAlways + RuleKind::Tool → cache.add_always_allow("Bash")
+    #[tokio::test]
+    async fn parallel_allow_always_tool_kind_caches_tool() {
+        let (mut reader, _reader_write) = make_duplex_reader(&[]).await;
+        let mut line = String::new();
+
+        let (mut stdin_write, mut stdin_read) = tokio::io::duplex(4096);
+        let (permission_tx, mut permission_rx) = tokio::sync::mpsc::channel::<PermissionRequest>(32);
+        let mut cache = PermissionCache::new();
+        let (_queue_tx, mut queue_rx, _interrupt_tx, mut interrupt_rx, queue_size, pending_recalls, ratelimit_tx) = setup_channels!();
+
+        let initial_cr = make_initial_cr("cr1", "Bash");
+
+        tokio::spawn(async move {
+            if let Some(req) = permission_rx.recv().await {
+                let _ = req.response_tx.send(PermissionDecision::AllowAlways {
+                    rule_kind: RuleKind::Tool,
+                    scope: Scope::Project,
+                });
+            }
+        });
+
+        let result = wait_for_permissions(
+            &mut stdin_write, &mut reader, &mut line, &mut queue_rx, &mut interrupt_rx,
+            &queue_size, &pending_recalls, "test-thread", None, &ratelimit_tx,
+            &mut cache, &permission_tx, initial_cr,
+        ).await;
+
+        assert!(matches!(result, PermissionsWaitResult::AllResolved { .. }));
+        assert!(cache.is_always_allowed("Bash"), "Tool kind AllowAlways must add to cache");
+
+        let writes = drain_stdin_writes(&mut stdin_read, 1).await;
+        assert_eq!(writes.len(), 1, "stdin 1건 (cr1 allow) 기록되어야 함");
+        assert_eq!(writes[0]["response"]["response"]["behavior"], "allow", "cr1 → allow");
+        assert_eq!(writes[0]["response"]["request_id"], "cr1");
+    }
+
+    /// AllowAlways + RuleKind::Exact → clear_tool 호출, cache 에 추가하지 않음
+    ///
+    /// pre-condition: "Bash" 가 이미 캐시에 있는 상태. initial CR 은 "Write" (캐시 미스) 로 전송.
+    /// mock handler 가 AllowAlways { Exact } 로 응답 → "Write" 는 캐시에 없어야 하고
+    /// 무관한 "Bash" 는 영향 없이 여전히 캐시에 있어야 함.
+    #[tokio::test]
+    async fn parallel_allow_always_exact_kind_clears_tool() {
+        let (mut reader, _reader_write) = make_duplex_reader(&[]).await;
+        let mut line = String::new();
+
+        let (mut stdin_write, _stdin_read) = tokio::io::duplex(4096);
+        let (permission_tx, mut permission_rx) = tokio::sync::mpsc::channel::<PermissionRequest>(32);
+        let mut cache = PermissionCache::new();
+        let (_queue_tx, mut queue_rx, _interrupt_tx, mut interrupt_rx, queue_size, pending_recalls, ratelimit_tx) = setup_channels!();
+
+        // pre-condition: "Bash" 이미 캐시에 있음 (다른 tool)
+        cache.add_always_allow("Bash");
+        assert!(cache.is_always_allowed("Bash"));
+
+        // initial CR: "Write" (캐시 미스 → permission handler 로 전달됨)
+        let initial_cr = make_initial_cr("cr1", "Write");
+
+        tokio::spawn(async move {
+            if let Some(req) = permission_rx.recv().await {
+                let _ = req.response_tx.send(PermissionDecision::AllowAlways {
+                    rule_kind: RuleKind::Exact,
+                    scope: Scope::Project,
+                });
+            }
+        });
+
+        let result = wait_for_permissions(
+            &mut stdin_write, &mut reader, &mut line, &mut queue_rx, &mut interrupt_rx,
+            &queue_size, &pending_recalls, "test-thread", None, &ratelimit_tx,
+            &mut cache, &permission_tx, initial_cr,
+        ).await;
+
+        assert!(matches!(result, PermissionsWaitResult::AllResolved { .. }));
+        assert!(!cache.is_always_allowed("Write"), "Exact kind must clear, not add");
+        assert!(cache.is_always_allowed("Bash"), "unrelated tool must remain in cache");
+    }
+
+    /// Tool kind AllowAlways 처리 후 cache hit → 동일 tool 두 번째 호출 자동 허용
+    ///
+    /// 첫 번째 wait_for_permissions 에서 cr1 AllowAlways(Tool) → cache 에 "Bash" 추가.
+    /// 두 번째 wait_for_permissions 에서 cr2 "Bash" → cache hit → permission_tx 에 보내지 않고
+    /// 즉시 auto-allow stdin write 후 AllResolved 반환.
+    #[tokio::test]
+    async fn parallel_tool_kind_then_same_tool_auto_allowed() {
+        // ── 1st call: cr1 AllowAlways(Tool) ──────────────────────────────────
+        let (mut reader1, _reader_write1) = make_duplex_reader(&[]).await;
+        let mut line = String::new();
+
+        let (mut stdin_write, mut stdin_read) = tokio::io::duplex(8192);
+        let (permission_tx, mut permission_rx) = tokio::sync::mpsc::channel::<PermissionRequest>(32);
+        let mut cache = PermissionCache::new();
+        let (_queue_tx, mut queue_rx, _interrupt_tx, mut interrupt_rx, queue_size, pending_recalls, ratelimit_tx) = setup_channels!();
+
+        let initial_cr1 = make_initial_cr("cr1", "Bash");
+
+        // tokio::join! 으로 wait_for_permissions 와 receiver 처리를 동시에 실행.
+        // permission_rx 를 task 로 move 하지 않고 테스트 본체에 유지 → receiver lifecycle 보존.
+        let respond_task = async {
+            if let Some(req) = permission_rx.recv().await {
+                let _ = req.response_tx.send(PermissionDecision::AllowAlways {
+                    rule_kind: RuleKind::Tool,
+                    scope: Scope::Project,
+                });
+            }
+        };
+
+        let (result1, _) = tokio::join!(
+            wait_for_permissions(
+                &mut stdin_write, &mut reader1, &mut line, &mut queue_rx, &mut interrupt_rx,
+                &queue_size, &pending_recalls, "test-thread", None, &ratelimit_tx,
+                &mut cache, &permission_tx, initial_cr1,
+            ),
+            respond_task,
+        );
+        assert!(matches!(result1, PermissionsWaitResult::AllResolved { .. }), "1st call must AllResolved");
+        assert!(cache.is_always_allowed("Bash"), "cache must have Bash after 1st call");
+
+        // ── 2nd call: cr2 "Bash" → cache hit → auto-allow, permission_tx 불호출 ─
+        let (mut reader2, _reader_write2) = make_duplex_reader(&[]).await;
+        line.clear();
+
+        let initial_cr2 = make_initial_cr("cr2", "Bash");
+
+        let result2 = wait_for_permissions(
+            &mut stdin_write, &mut reader2, &mut line, &mut queue_rx, &mut interrupt_rx,
+            &queue_size, &pending_recalls, "test-thread", None, &ratelimit_tx,
+            &mut cache, &permission_tx, initial_cr2,
+        ).await;
+        assert!(matches!(result2, PermissionsWaitResult::AllResolved { .. }), "2nd call must AllResolved (cache hit)");
+
+        // permission_rx 는 살아있지만 2nd call 은 cache hit 이라 메시지가 오지 않아야 함
+        let no_msg = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            permission_rx.recv(),
+        ).await;
+        assert!(no_msg.is_err(), "receiver 가 살아있는데 두 번째 메시지가 도착하면 cache hit 실패");
+
+        // stdin: cr1 allow + cr2 auto-allow = 2건
+        let writes = drain_stdin_writes(&mut stdin_read, 2).await;
+        assert_eq!(writes.len(), 2, "stdin 에 2건 기록되어야 함");
+        let mut by_rid: std::collections::HashMap<&str, &serde_json::Value> = std::collections::HashMap::new();
+        for w in &writes {
+            by_rid.insert(w["response"]["request_id"].as_str().unwrap(), w);
+        }
+        assert_eq!(by_rid["cr1"]["response"]["response"]["behavior"], "allow", "cr1 → allow");
+        assert_eq!(by_rid["cr2"]["response"]["response"]["behavior"], "allow", "cr2 → auto-allow (cache hit)");
     }
 
     /// 회귀: 단일 CR baseline — 기존 단수 시나리오가 여전히 동작

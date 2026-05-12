@@ -1258,7 +1258,6 @@ mod edge_tests {
 
 #[cfg(test)]
 mod batch_tests {
-    use super::*;
     use tempfile::TempDir;
 
     use crate::claude_settings::{add_permissions, LoggingNotifier, MergeOutcome};
