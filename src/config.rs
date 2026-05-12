@@ -601,7 +601,7 @@ binary_path = "claude"
     #[test]
     fn normalize_nonexistent_path_kept() {
         let path = "/nonexistent-path-xyz-12345".to_string();
-        let result = normalize_project_roots(&[path.clone()]).unwrap();
+        let result = normalize_project_roots(std::slice::from_ref(&path)).unwrap();
         assert_eq!(result, vec![path]);
     }
 

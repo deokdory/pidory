@@ -74,6 +74,22 @@ pub(super) fn parse_compact_command(content: &str) -> Option<Option<&str>> {
     None
 }
 
+/// 순수 함수: context inject 판정 및 content 생성
+pub(super) fn build_context_content(
+    content: &str,
+    is_new_session: bool,
+    had_needs_context: bool,
+    thread_name: &str,
+    lang: Lang,
+) -> String {
+    if is_new_session || had_needs_context {
+        let context = lang.session_context(thread_name);
+        format!("{}\n\n{}", context, content)
+    } else {
+        content.to_string()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -169,21 +185,5 @@ mod tests {
     #[test]
     fn shorten_unknown_with_bracket_suffix() {
         assert_eq!(shorten_model_name("claude-sonnet-4[1m]"), "claude-sonnet-4");
-    }
-}
-
-/// 순수 함수: context inject 판정 및 content 생성
-pub(super) fn build_context_content(
-    content: &str,
-    is_new_session: bool,
-    had_needs_context: bool,
-    thread_name: &str,
-    lang: Lang,
-) -> String {
-    if is_new_session || had_needs_context {
-        let context = lang.session_context(thread_name);
-        format!("{}\n\n{}", context, content)
-    } else {
-        content.to_string()
     }
 }
