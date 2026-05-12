@@ -33,7 +33,11 @@ mod notifier;
 mod editor;
 pub mod rule;
 pub mod danger;
+pub mod path_safety;
+pub mod settings_reader;
 
+#[allow(unused_imports)]
+pub use settings_reader::{ResolvedSettings, resolve_settings};
 #[allow(unused_imports)]
 pub use error::ClaudeSettingsError;
 #[allow(unused_imports)]
@@ -49,3 +53,7 @@ pub use cleanup::cleanup_leftover_temp;
 pub use rule::{RuleKind, Scope, scope_to_path, available_rule_kinds, build_rule_text, default_scope};
 #[allow(unused_imports)]
 pub use danger::{Severity, classify_command};
+#[allow(unused_imports)]
+pub use path_safety::is_protected_path;
+#[allow(unused_imports)]
+pub use path_safety::{is_in_protected_prefix, is_outside_workspace};
