@@ -180,6 +180,7 @@ pub async fn branch(
         cancelled: Arc::new(AtomicBool::new(false)),
         downloaded_files: Vec::new(),
         reply_context: None,
+        sender_info: None,
     };
 
     if let Err(e) = data.sessions.send_message(&thread_id, summary_msg).await {
@@ -379,6 +380,7 @@ pub async fn branch(
         cancelled: Arc::new(AtomicBool::new(false)),
         downloaded_files: Vec::new(),
         reply_context: None,
+        sender_info: None,
     };
 
     if let Err(e) = data.sessions.send_message(&new_thread_id, new_msg).await {

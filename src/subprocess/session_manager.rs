@@ -31,6 +31,11 @@ pub struct ReplyContext {
     pub original_author_name: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct SenderInfo {
+    pub label: String,
+}
+
 pub struct QueuedMessage {
     pub content: String,
     pub channel_id: ChannelId,
@@ -40,6 +45,7 @@ pub struct QueuedMessage {
     pub cancelled: Arc<AtomicBool>,
     pub downloaded_files: Vec<String>,  // 다운로드된 파일의 절대 경로
     pub reply_context: Option<ReplyContext>,
+    pub sender_info: Option<SenderInfo>,
 }
 
 pub(super) struct SessionInner {

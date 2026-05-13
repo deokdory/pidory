@@ -256,7 +256,7 @@ where
                             tracing::info!(thread_id = %thread_id, msg_id = %m.message_id, "Message recalled, skipping");
                             continue;
                         }
-                        let inject_line = build_user_message_json(&m.content, &m.downloaded_files, m.reply_context.as_ref());
+                        let inject_line = build_user_message_json(&m.content, &m.downloaded_files, m.reply_context.as_ref(), m.sender_info.as_ref());
                         if let Err(e) = stdin.write_all(inject_line.as_bytes()).await {
                             tracing::error!("mid-turn stdin write error (wait_for_permissions): {}", e);
                             return PermissionsWaitResult::Interrupted;

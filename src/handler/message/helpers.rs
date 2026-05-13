@@ -74,6 +74,53 @@ pub(super) fn parse_compact_command(content: &str) -> Option<Option<&str>> {
     None
 }
 
+/// `<sender>` / `</sender>` 토큰만 대괄호로 치환 — 다른 XML 태그 보존
+pub(crate) fn sanitize_sender_token(s: &str) -> String {
+    s.replace("</sender>", "[/sender]").replace("<sender>", "[sender]")
+}
+
+/// 메시지 본문 내 `<sender>` / `</sender>` 토큰만 대괄호로 치환
+pub(crate) fn sanitize_sender_body(s: &str) -> String {
+    s.replace("</sender>", "[/sender]").replace("<sender>", "[sender]")
+}
+
+/// Discord 사용자 정보를 sender 레이블로 포맷
+///
+/// - nick + global_name 이 다르면 `"nick (global_name)"`
+/// - 같으면 하나만
+/// - 둘 중 하나만 있으면 있는 쪽
+/// - 둘 다 없으면 username
+/// - 최대 64 chars, char-boundary safe truncate (`...` 로 끝남)
+pub(crate) fn format_sender_label(
+    nick: Option<&str>,
+    global_name: Option<&str>,
+    username: &str,
+) -> String {
+    let s_nick = nick.map(sanitize_sender_token);
+    let s_global = global_name.map(sanitize_sender_token);
+    let s_user = sanitize_sender_token(username);
+
+    let raw = match (s_nick.as_deref(), s_global.as_deref()) {
+        (Some(n), Some(g)) if n == g => n.to_string(),
+        (Some(n), Some(g)) => format!("{} ({})", n, g),
+        (Some(n), None) => n.to_string(),
+        (None, Some(g)) => g.to_string(),
+        (None, None) => s_user,
+    };
+
+    truncate_with_ellipsis(&raw, 64)
+}
+
+fn truncate_with_ellipsis(s: &str, max_chars: usize) -> String {
+    if s.chars().count() <= max_chars {
+        return s.to_string();
+    }
+    let keep = max_chars.saturating_sub(3);
+    let mut out: String = s.chars().take(keep).collect();
+    out.push_str("...");
+    out
+}
+
 /// 순수 함수: context inject 판정 및 content 생성
 pub(super) fn build_context_content(
     content: &str,
@@ -185,5 +232,97 @@ mod tests {
     #[test]
     fn shorten_unknown_with_bracket_suffix() {
         assert_eq!(shorten_model_name("claude-sonnet-4[1m]"), "claude-sonnet-4");
+    }
+
+    // --- format_sender_label ---
+
+    #[test]
+    fn format_sender_label_both_different() {
+        assert_eq!(
+            format_sender_label(Some("Alice"), Some("alice_g"), "alice"),
+            "Alice (alice_g)"
+        );
+    }
+
+    #[test]
+    fn format_sender_label_both_same() {
+        assert_eq!(
+            format_sender_label(Some("Alice"), Some("Alice"), "alice"),
+            "Alice"
+        );
+    }
+
+    #[test]
+    fn format_sender_label_only_nick() {
+        assert_eq!(
+            format_sender_label(Some("Alice"), None, "alice"),
+            "Alice"
+        );
+    }
+
+    #[test]
+    fn format_sender_label_only_global() {
+        assert_eq!(
+            format_sender_label(None, Some("alice_g"), "alice"),
+            "alice_g"
+        );
+    }
+
+    #[test]
+    fn format_sender_label_fallback_username() {
+        assert_eq!(
+            format_sender_label(None, None, "alice"),
+            "alice"
+        );
+    }
+
+    #[test]
+    fn format_sender_label_sanitize_close_tag() {
+        assert_eq!(
+            format_sender_label(Some("A</sender>B"), None, "x"),
+            "A[/sender]B"
+        );
+    }
+
+    #[test]
+    fn format_sender_label_sanitize_open_tag() {
+        assert_eq!(
+            format_sender_label(Some("<sender>injected</sender>"), None, "x"),
+            "[sender]injected[/sender]"
+        );
+    }
+
+    #[test]
+    fn format_sender_label_truncates_long() {
+        let nick = "a".repeat(65);
+        let result = format_sender_label(Some(&nick), None, "x");
+        assert_eq!(result.chars().count(), 64);
+        assert!(result.ends_with("..."));
+    }
+
+    #[test]
+    fn format_sender_label_truncate_unicode_safe() {
+        let nick = "테스트🦀".repeat(20);
+        let result = format_sender_label(Some(&nick), None, "x");
+        // panic 없음 + 길이 <= 64
+        assert!(result.chars().count() <= 64);
+    }
+
+    // --- sanitize_sender_body ---
+
+    #[test]
+    fn sanitize_sender_body_basic() {
+        assert_eq!(
+            sanitize_sender_body("hello </sender>"),
+            "hello [/sender]"
+        );
+    }
+
+    #[test]
+    fn sanitize_sender_body_preserves_other_tags() {
+        assert_eq!(
+            sanitize_sender_body("<user_query>x</user_query>"),
+            "<user_query>x</user_query>"
+        );
     }
 }

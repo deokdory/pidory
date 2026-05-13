@@ -77,7 +77,7 @@ pub(super) async fn run_active_turn(
                         }
                         *last_activity.lock().unwrap_or_else(|p| p.into_inner()) = Instant::now();
                         *current_triggered_by = m.triggered_by;
-                        let inject_line = build_user_message_json(&m.content, &m.downloaded_files, m.reply_context.as_ref());
+                        let inject_line = build_user_message_json(&m.content, &m.downloaded_files, m.reply_context.as_ref(), m.sender_info.as_ref());
                         if let Err(e) = stdin.write_all(inject_line.as_bytes()).await {
                             tracing::error!("mid-turn stdin write error: {}", e);
                             break 'turn false;
@@ -239,7 +239,7 @@ pub(super) async fn run_active_turn(
                                 timeout_secs,
                                 "#36 debug: Soft timeout fired — sending nudge"
                             );
-                            let nudge_line = build_user_message_json("[SYSTEM] No stdout activity for an extended period. A tool may be unresponsive. Check the status of any running tools and recover if needed.", &[], None);
+                            let nudge_line = build_user_message_json("[SYSTEM] No stdout activity for an extended period. A tool may be unresponsive. Check the status of any running tools and recover if needed.", &[], None, None);
                             if let Err(e) = stdin.write_all(nudge_line.as_bytes()).await {
                                 tracing::error!("nudge write error: {}", e);
                                 break 'turn false;
