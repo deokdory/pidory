@@ -119,9 +119,7 @@ fn truncate_with_ellipsis(s: &str, max_chars: usize) -> String {
 /// QueuedMessage를 위한 SenderInfo 구성.
 ///
 /// - `/compact` 명령(compact_args=Some) → None (CLI 메타-커맨드라 sender prefix 미부착)
-/// - 그 외 모든 사용자 메시지 → Some(SenderInfo { label, user_id, label_was_sanitized })
-/// - label_was_sanitized: nick/global_name/username 중 하나라도 sanitize_sender_text가 변환을
-///   일으켰으면 true. io.rs에서 attack-detected system-reminder inject 트리거.
+/// - 그 외 모든 사용자 메시지 → Some(SenderInfo { label, user_id })
 pub(super) fn build_sender_info(message: &Message, compact_args: Option<Option<&str>>) -> Option<SenderInfo> {
     if compact_args.is_some() {
         return None;
@@ -130,15 +128,9 @@ pub(super) fn build_sender_info(message: &Message, compact_args: Option<Option<&
     let global = message.author.global_name.as_deref();
     let username = message.author.name.as_str();
 
-    let was_sanitized = |s: &str| sanitize_sender_text(s) != s;
-    let label_was_sanitized = nick.is_some_and(was_sanitized)
-        || global.is_some_and(was_sanitized)
-        || was_sanitized(username);
-
     Some(SenderInfo {
         label: format_sender_label(nick, global, username),
         user_id: message.author.id.get(),
-        label_was_sanitized,
     })
 }
 
