@@ -16,6 +16,8 @@ Environment=PIDORY_CONFIG=__PROJECT_DIR__/config.qa.toml
 Environment=HOME=__HOME_DIR__
 Environment=RUST_LOG=info
 Environment=PATH=__HOME_DIR__/.local/bin:__HOME_DIR__/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/snap/bin
+# 격리 보장 — pidory-migrate가 prod sqlite (default /var/lib/pidory/pidory.db) 절대 안 봄
+Environment=PIDORY_LEGACY_DB=/var/lib/pidory-qa/pidory.db
 
 EnvironmentFile=-__PROJECT_DIR__/.env.qa
 EnvironmentFile=/etc/pidory-qa/db.env

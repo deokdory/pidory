@@ -52,7 +52,14 @@ fi
 # ---------------------------------------------------------------------------
 # 3. deploy 사용자 자동 감지
 # ---------------------------------------------------------------------------
-DEPLOY_USER="${PIDORY_DEPLOY_USER:-$(stat -c '%U' /etc/pidory-qa 2>/dev/null || echo "${SUDO_USER:-root}")}"
+# sudo 컨텍스트에서 stat -c '%U' /etc/pidory-qa 가 root (디렉토리가 root:user 0750)이라
+# SUDO_USER를 우선. stat은 group(%G)으로 fallback (수동 chown 시나리오 대비).
+DEPLOY_USER="${PIDORY_DEPLOY_USER:-${SUDO_USER:-$(stat -c '%G' /etc/pidory-qa 2>/dev/null || whoami)}}"
+if [ "$DEPLOY_USER" = "root" ]; then
+    echo "ERROR: DEPLOY_USER가 root로 감지됨. PIDORY_DEPLOY_USER env로 명시:" >&2
+    echo "  sudo PIDORY_DEPLOY_USER=deokdory bash scripts/postgres-qa-setup.sh" >&2
+    exit 1
+fi
 echo "[step 1/8] Deploy user: $DEPLOY_USER"
 
 # ---------------------------------------------------------------------------
