@@ -1088,6 +1088,7 @@ async fn handle_reset_confirm(
             channel_id,
             component.message.id,
             reset_ui::ResetOutcome::Expired,
+            lang,
         )
         .await
         .ok();
@@ -1111,6 +1112,7 @@ async fn handle_reset_confirm(
         channel_id,
         pending.message_id,
         reset_ui::ResetOutcome::Confirmed,
+        lang,
     )
     .await
     .ok();
@@ -1147,6 +1149,7 @@ async fn handle_reset_cancel(
         channel_id,
         pending.message_id,
         reset_ui::ResetOutcome::Cancelled,
+        lang,
     )
     .await
     .ok();

@@ -5,14 +5,14 @@ impl Lang {
 
     pub fn soft_timeout_nudge(&self) -> &'static str {
         match self {
-            Lang::Ko => "장시간 무응답 — 확인 메시지를 전송했습니다",
+            Lang::Ko => "장시간 무응답 — 확인 메시지를 보냈어요",
             Lang::En => "No response for a while — sent a check message",
         }
     }
 
     pub fn hard_timeout_kill(&self) -> &'static str {
         match self {
-            Lang::Ko => "응답 시간 초과로 턴을 종료합니다. 다시 시도해 주세요.",
+            Lang::Ko => "응답 시간이 너무 길어서 턴을 끝냈어요. 다시 시도해주세요.",
             Lang::En => "Turn timed out. Please try again.",
         }
     }
@@ -81,7 +81,7 @@ impl Lang {
     pub fn question_write_answer(&self) -> &'static str {
         match self {
             Lang::Ko => "직접 입력",
-            Lang::En => "Write answer",
+            Lang::En => "Custom answer",
         }
     }
 
