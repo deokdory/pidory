@@ -1219,6 +1219,7 @@ mod tests {
             &mut stdin_write, &mut reader, &mut line, &mut queue_rx, &mut interrupt_rx,
             &queue_size, &pending_recalls, "test-thread", None, &ratelimit_tx,
             &mut cache, &permission_tx, initial_cr,
+            Path::new("/tmp"), &Arc::new(vec![]),
         ).await;
 
         assert!(matches!(result, PermissionsWaitResult::AllResolved { .. }));
@@ -1265,6 +1266,7 @@ mod tests {
             &mut stdin_write, &mut reader, &mut line, &mut queue_rx, &mut interrupt_rx,
             &queue_size, &pending_recalls, "test-thread", None, &ratelimit_tx,
             &mut cache, &permission_tx, initial_cr,
+            Path::new("/tmp"), &Arc::new(vec![]),
         ).await;
 
         assert!(matches!(result, PermissionsWaitResult::AllResolved { .. }));
@@ -1301,11 +1303,13 @@ mod tests {
             }
         };
 
+        let test_additional_dirs1: Arc<Vec<PathBuf>> = Arc::new(vec![]);
         let (result1, _) = tokio::join!(
             wait_for_permissions(
                 &mut stdin_write, &mut reader1, &mut line, &mut queue_rx, &mut interrupt_rx,
                 &queue_size, &pending_recalls, "test-thread", None, &ratelimit_tx,
                 &mut cache, &permission_tx, initial_cr1,
+                Path::new("/tmp"), &test_additional_dirs1,
             ),
             respond_task,
         );
@@ -1322,6 +1326,7 @@ mod tests {
             &mut stdin_write, &mut reader2, &mut line, &mut queue_rx, &mut interrupt_rx,
             &queue_size, &pending_recalls, "test-thread", None, &ratelimit_tx,
             &mut cache, &permission_tx, initial_cr2,
+            Path::new("/tmp"), &Arc::new(vec![]),
         ).await;
         assert!(matches!(result2, PermissionsWaitResult::AllResolved { .. }), "2nd call must AllResolved (cache hit)");
 
