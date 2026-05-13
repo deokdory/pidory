@@ -1,6 +1,7 @@
 //! /update 진입 직전 PostgreSQL 셋업 사전 검증. 미완 시 PreflightReport.missing 리스트 반환.
 
 use std::path::Path;
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use crate::i18n::Lang;
@@ -44,20 +45,39 @@ impl PreflightReport {
 }
 
 fn check_database_url() -> bool {
-    std::env::var("DATABASE_URL").is_ok() || Path::new("/etc/pidory/db.env").exists()
+    if std::env::var("DATABASE_URL").is_ok() {
+        return true;
+    }
+    std::fs::read_to_string("/etc/pidory/db.env")
+        .map(|s| s.lines().any(|l| l.trim_start().starts_with("DATABASE_URL=")))
+        .unwrap_or(false)
 }
 
+static EXEC_START_PRE_RE: OnceLock<regex::Regex> = OnceLock::new();
+
 pub(crate) fn check_exec_start_pre_in_text(text: &str) -> bool {
-    let re = regex::Regex::new(r"(?m)^ExecStartPre=.*pidory-migrate(\s|$)").unwrap();
+    let re = EXEC_START_PRE_RE.get_or_init(|| {
+        // systemd prefix: '-' (ignore failure), '+' (full privs), '!' (skip security checks),
+        // '@' (override argv[0]), '|' (pipe), ':' (no env expansion)
+        regex::Regex::new(r"(?m)^ExecStartPre=-?[+!@|:]*/usr/local/bin/pidory-migrate(\s|$)")
+            .expect("static regex literal")
+    });
     re.is_match(text)
 }
 
-fn check_exec_start_pre() -> bool {
-    // 1차: systemctl cat
-    if let Ok(output) = std::process::Command::new("systemctl")
-        .args(["cat", "pidory.service"])
-        .output()
-    {
+async fn check_exec_start_pre() -> bool {
+    // 1차: systemctl cat (spawn_blocking + 3s timeout)
+    let systemctl_result = tokio::time::timeout(
+        Duration::from_secs(3),
+        tokio::task::spawn_blocking(|| {
+            std::process::Command::new("systemctl")
+                .args(["cat", "pidory.service"])
+                .output()
+        }),
+    )
+    .await;
+
+    if let Ok(Ok(Ok(output))) = systemctl_result {
         if let Ok(text) = String::from_utf8(output.stdout) {
             if check_exec_start_pre_in_text(&text) {
                 return true;
@@ -65,8 +85,16 @@ fn check_exec_start_pre() -> bool {
         }
     }
 
-    // 2차 fallback: 직접 파일 읽기
-    if let Ok(text) = std::fs::read_to_string("/etc/systemd/system/pidory.service") {
+    // 2차 fallback: 직접 파일 읽기 (spawn_blocking + 1s timeout)
+    let fs_result = tokio::time::timeout(
+        Duration::from_secs(1),
+        tokio::task::spawn_blocking(|| {
+            std::fs::read_to_string("/etc/systemd/system/pidory.service")
+        }),
+    )
+    .await;
+
+    if let Ok(Ok(Ok(text))) = fs_result {
         if check_exec_start_pre_in_text(&text) {
             return true;
         }
@@ -75,12 +103,18 @@ fn check_exec_start_pre() -> bool {
     false
 }
 
+#[cfg(unix)]
 pub(crate) fn is_executable(path: &Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
     match std::fs::metadata(path) {
         Ok(meta) => meta.permissions().mode() & 0o111 != 0,
         Err(_) => false,
     }
+}
+
+#[cfg(not(unix))]
+pub(crate) fn is_executable(_path: &Path) -> bool {
+    false // 비-Unix 빌드는 셋업 미완으로 간주 (안전 default)
 }
 
 fn check_migrate_binary() -> bool {
@@ -137,7 +171,7 @@ pub async fn check_postgres_setup() -> PreflightReport {
             missing.push(MissingItem::DatabaseUrl);
         }
 
-        if !check_exec_start_pre() {
+        if !check_exec_start_pre().await {
             missing.push(MissingItem::ExecStartPre);
         }
 
@@ -157,7 +191,6 @@ pub async fn check_postgres_setup() -> PreflightReport {
 mod tests {
     use super::*;
     use std::fs;
-    use std::os::unix::fs::PermissionsExt;
 
     #[test]
     fn check_exec_start_pre_in_text_matches_valid_unit() {
@@ -203,8 +236,10 @@ mod tests {
         assert_eq!(report.missing().len(), 3);
     }
 
+    #[cfg(unix)]
     #[test]
     fn migrate_binary_executable_detection() {
+        use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let fake = dir.path().join("fake");
 
@@ -217,5 +252,26 @@ mod tests {
         // 0o644 → not executable
         fs::set_permissions(&fake, fs::Permissions::from_mode(0o644)).unwrap();
         assert!(!is_executable(&fake));
+    }
+
+    #[test]
+    fn check_exec_start_pre_in_text_rejects_wrapper_with_substring() {
+        // echo 가 실제 실행 바이너리 — full path 매칭 강화로 거부
+        let text = "ExecStartPre=/bin/echo /usr/local/bin/pidory-migrate";
+        assert!(!check_exec_start_pre_in_text(text));
+    }
+
+    #[test]
+    fn check_exec_start_pre_in_text_accepts_systemd_prefix() {
+        // '-' prefix = 실패 무시 systemd 문법
+        let text = "ExecStartPre=-/usr/local/bin/pidory-migrate";
+        assert!(check_exec_start_pre_in_text(text));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn is_executable_returns_false_on_missing() {
+        let path = Path::new("/tmp/nonexistent-foobar-xyz-pidory-test-abc123");
+        assert!(!is_executable(path));
     }
 }
