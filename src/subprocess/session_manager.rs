@@ -36,6 +36,9 @@ pub struct SenderInfo {
     pub label: String,
     /// Discord User ID (Snowflake). 영구 식별자 — label은 변경 가능하지만 id는 불변.
     pub user_id: u64,
+    /// nick/global_name/username 중 하나 이상이 sanitize_sender_text 변환을 일으켰는지.
+    /// true면 io.rs에서 attack-detected system-reminder 한 줄 inject.
+    pub label_was_sanitized: bool,
 }
 
 /// 신뢰 boundary 보호용 sanitize — sender / system-reminder 태그 변형 차단.
