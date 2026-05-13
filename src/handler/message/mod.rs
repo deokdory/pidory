@@ -7,7 +7,6 @@ pub use event_processor::process_turn_events;
 pub(crate) use helpers::format_cli_command;
 pub(crate) use helpers::shorten_model_name;
 pub(crate) use helpers::format_ctx_suffix;
-pub(crate) use helpers::sanitize_sender_body;
 
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -23,7 +22,7 @@ use crate::handler::cleanup::cleanup_session_state;
 use crate::handler::emoji;
 use crate::handler::emoji::ReactionStatus;
 use crate::subprocess::parser::StreamEvent;
-use crate::subprocess::session_manager::{QueuedMessage, ReplyContext, SenderInfo};
+use crate::subprocess::session_manager::{QueuedMessage, ReplyContext};
 use crate::Data;
 
 pub async fn handle_event(
@@ -271,17 +270,7 @@ async fn handle_message(
             new_message.content.clone()
         };
 
-        let sender_info = if compact_args.is_some() {
-            None
-        } else {
-            let nick = new_message.member.as_ref().and_then(|m| m.nick.as_deref());
-            let global = new_message.author.global_name.as_deref();
-            let username = new_message.author.name.as_str();
-            Some(SenderInfo {
-                label: helpers::format_sender_label(nick, global, username),
-                user_id: new_message.author.id.get(),
-            })
-        };
+        let sender_info = helpers::build_sender_info(&new_message, compact_args);
 
         let msg = QueuedMessage {
             content,
@@ -455,17 +444,7 @@ async fn handle_message(
         .await
         .ok();
 
-    let sender_info = if compact_args.is_some() {
-        None
-    } else {
-        let nick = new_message.member.as_ref().and_then(|m| m.nick.as_deref());
-        let global = new_message.author.global_name.as_deref();
-        let username = new_message.author.name.as_str();
-        Some(SenderInfo {
-            label: helpers::format_sender_label(nick, global, username),
-            user_id: new_message.author.id.get(),
-        })
-    };
+    let sender_info = helpers::build_sender_info(&new_message, compact_args);
 
     let (event_tx, event_rx) = mpsc::channel::<StreamEvent>(64);
     let msg = QueuedMessage {

@@ -67,6 +67,10 @@ Discord ← handler::message ← event_rx (mpsc channel)
 
 `config.toml` — see `config.toml.example`. Discord token via `PIDORY_DISCORD_TOKEN` env var (or `.env` file).
 
+## Privacy / PII Forwarding
+
+멀티유저 스레드 사용 시 참여자의 Discord 식별자(server nickname, global display name, username, user ID snowflake)가 sender prefix 형태로 Claude CLI subprocess에 전달되어 Anthropic API로 송출됨. 현재 owner-only 운영이라 즉시 위험은 없지만, 다른 사용자를 스레드에 참여시키기 전 명시적 동의 / 개인정보 처리방침 검토 필요. (#316 도입)
+
 ## Deployment
 
 `deploy/install.sh` — auto-detects Linux (systemd) / macOS (launchd). Service files in `deploy/`.
