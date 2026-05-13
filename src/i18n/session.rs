@@ -56,7 +56,7 @@ impl Lang {
 
     pub fn error_occurred(&self) -> &'static str {
         match self {
-            Lang::Ko => "에러가 발생했습니다",
+            Lang::Ko => "오류가 발생했습니다",
             Lang::En => "Error occurred",
         }
     }
@@ -145,7 +145,7 @@ impl Lang {
     pub fn reset_done(&self) -> &'static str {
         match self {
             Lang::Ko => "✅ 리셋됨",
-            Lang::En => "✅ Reset",
+            Lang::En => "✅ Reset complete",
         }
     }
 
