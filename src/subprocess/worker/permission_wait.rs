@@ -256,7 +256,7 @@ where
                             tracing::info!(thread_id = %thread_id, msg_id = %m.message_id, "Message recalled, skipping");
                             continue;
                         }
-                        let inject_line = build_user_message_json(&m.content, &m.downloaded_files, m.reply_context.as_ref());
+                        let inject_line = build_user_message_json(&m.content, &m.downloaded_files, m.reply_context.as_ref(), m.sender_info.as_ref());
                         if let Err(e) = stdin.write_all(inject_line.as_bytes()).await {
                             tracing::error!("mid-turn stdin write error (wait_for_permissions): {}", e);
                             return PermissionsWaitResult::Interrupted;
@@ -1219,6 +1219,7 @@ mod tests {
             &mut stdin_write, &mut reader, &mut line, &mut queue_rx, &mut interrupt_rx,
             &queue_size, &pending_recalls, "test-thread", None, &ratelimit_tx,
             &mut cache, &permission_tx, initial_cr,
+            Path::new("/tmp"), &Arc::new(vec![]),
         ).await;
 
         assert!(matches!(result, PermissionsWaitResult::AllResolved { .. }));
@@ -1265,6 +1266,7 @@ mod tests {
             &mut stdin_write, &mut reader, &mut line, &mut queue_rx, &mut interrupt_rx,
             &queue_size, &pending_recalls, "test-thread", None, &ratelimit_tx,
             &mut cache, &permission_tx, initial_cr,
+            Path::new("/tmp"), &Arc::new(vec![]),
         ).await;
 
         assert!(matches!(result, PermissionsWaitResult::AllResolved { .. }));
@@ -1301,11 +1303,13 @@ mod tests {
             }
         };
 
+        let test_additional_dirs1: Arc<Vec<PathBuf>> = Arc::new(vec![]);
         let (result1, _) = tokio::join!(
             wait_for_permissions(
                 &mut stdin_write, &mut reader1, &mut line, &mut queue_rx, &mut interrupt_rx,
                 &queue_size, &pending_recalls, "test-thread", None, &ratelimit_tx,
                 &mut cache, &permission_tx, initial_cr1,
+                Path::new("/tmp"), &test_additional_dirs1,
             ),
             respond_task,
         );
@@ -1322,6 +1326,7 @@ mod tests {
             &mut stdin_write, &mut reader2, &mut line, &mut queue_rx, &mut interrupt_rx,
             &queue_size, &pending_recalls, "test-thread", None, &ratelimit_tx,
             &mut cache, &permission_tx, initial_cr2,
+            Path::new("/tmp"), &Arc::new(vec![]),
         ).await;
         assert!(matches!(result2, PermissionsWaitResult::AllResolved { .. }), "2nd call must AllResolved (cache hit)");
 

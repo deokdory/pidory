@@ -270,6 +270,8 @@ async fn handle_message(
             new_message.content.clone()
         };
 
+        let sender_info = helpers::build_sender_info(&new_message, compact_args);
+
         let msg = QueuedMessage {
             content,
             channel_id,
@@ -279,6 +281,7 @@ async fn handle_message(
             cancelled: Arc::new(AtomicBool::new(false)),
             downloaded_files: mid_turn_downloaded_files.clone(),
             reply_context: reply_context.clone(),
+            sender_info,
         };
 
         match data.sessions.send_message(&thread_id, msg).await {
@@ -441,6 +444,8 @@ async fn handle_message(
         .await
         .ok();
 
+    let sender_info = helpers::build_sender_info(&new_message, compact_args);
+
     let (event_tx, event_rx) = mpsc::channel::<StreamEvent>(64);
     let msg = QueuedMessage {
         content: content.clone(),
@@ -451,6 +456,7 @@ async fn handle_message(
         cancelled: Arc::new(AtomicBool::new(false)),
         downloaded_files: primary_downloaded_files.clone(),
         reply_context: reply_context.clone(),
+        sender_info,
     };
 
     if let Err(e) = data.sessions.send_message(&thread_id, msg).await {
@@ -533,6 +539,7 @@ pub async fn execute_in_session(
             cancelled: Arc::new(AtomicBool::new(false)),
             downloaded_files: Vec::new(),
             reply_context: None,
+            sender_info: None,
         };
         data.sessions.send_message(thread_id, msg).await?;
         if is_cli_command {
@@ -577,6 +584,7 @@ pub async fn execute_in_session(
         cancelled: Arc::new(AtomicBool::new(false)),
         downloaded_files: Vec::new(),
         reply_context: None,
+        sender_info: None,
     };
 
     // archived tombstone 클리어 (#314) + turn-scoped 필드 초기화 (skill 직접 실행 경로).
