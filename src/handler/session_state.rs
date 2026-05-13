@@ -86,6 +86,20 @@ impl SessionState {
             _ => None,
         }
     }
+
+    /// 새 turn 시작 시 turn-scoped 필드를 초기화한다.
+    ///
+    /// `archived` 클리어가 핵심 (#314): /clear · /del · handle_thread_closed 가 남긴
+    /// tombstone을 새 turn 진입 시점에 소비해야 `process_turn_events`의 archived check가
+    /// silent return으로 새 turn 출력을 삼키지 않는다.
+    ///
+    /// `turn_initiator`는 primary 경로(메시지 수신)와 skill 경로(/skill 명령) 정책이
+    /// 달라서 여기서 다루지 않는다. 호출 사이트가 책임.
+    pub fn begin_turn(&mut self, primary_participant: UserId) {
+        self.archived = false;
+        self.turn_participants = HashSet::from([primary_participant]);
+        self.last_tool_name = None;
+    }
 }
 
 /// 살아있는 세션이 있을 때만 todo_tracker를 take. 세션이 없으면 None을 반환해
@@ -220,5 +234,40 @@ mod tests {
         let _tracker2 = s.try_take_todo_tracker(ChannelId::new(42));
         assert!(_tracker2.is_some());
         assert!(matches!(s.todo_tracker_slot, TodoTrackerSlot::CheckedOut));
+    }
+
+    // begin_turn — #314 회귀 방지: archived tombstone 클리어가 핵심
+    #[test]
+    fn begin_turn_clears_archived_tombstone() {
+        let mut s = SessionState::default();
+        s.archived = true;
+        s.begin_turn(UserId::new(1));
+        assert!(!s.archived, "begin_turn must clear archived tombstone (#314)");
+    }
+
+    #[test]
+    fn begin_turn_replaces_turn_participants_with_single_member() {
+        let mut s = SessionState::default();
+        s.turn_participants = HashSet::from([UserId::new(10), UserId::new(11)]);
+        s.begin_turn(UserId::new(42));
+        assert_eq!(s.turn_participants, HashSet::from([UserId::new(42)]));
+    }
+
+    #[test]
+    fn begin_turn_resets_last_tool_name() {
+        let mut s = SessionState::default();
+        s.last_tool_name = Some("Bash".to_string());
+        s.begin_turn(UserId::new(1));
+        assert!(s.last_tool_name.is_none());
+    }
+
+    #[test]
+    fn begin_turn_does_not_touch_turn_initiator() {
+        // skill 경로는 turn_initiator를 설정하지 않는다.
+        // begin_turn은 단일 책임 (turn-scoped 리셋)만 수행하고 호출 사이트가 결정.
+        let mut s = SessionState::default();
+        s.turn_initiator = Some(UserId::new(99));
+        s.begin_turn(UserId::new(1));
+        assert_eq!(s.turn_initiator, Some(UserId::new(99)));
     }
 }

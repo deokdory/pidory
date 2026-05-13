@@ -412,13 +412,12 @@ async fn handle_message(
         helpers::build_context_content(&new_message.content, is_new_session, had_needs_context, &guild_channel.name, lang)
     };
 
-    // turn 시작: turn_initiator 기록 + turn_participants 초기화 (author만 포함)
+    // turn 시작: archived tombstone 클리어 (#314) + turn-scoped 필드 초기화 + turn_initiator 기록
     {
         let mut guard = data.session_states.lock().await;
         let s = guard.entry(thread_id.clone()).or_default();
+        s.begin_turn(new_message.author.id);
         s.turn_initiator = Some(new_message.author.id);
-        s.turn_participants = std::collections::HashSet::from([new_message.author.id]);
-        s.last_tool_name = None;
     }
 
     // 첨부파일 있으면 ⏬ reaction 먼저
@@ -580,12 +579,12 @@ pub async fn execute_in_session(
         reply_context: None,
     };
 
-    // turn_participants 초기화 (skill 직접 실행 경로)
+    // archived tombstone 클리어 (#314) + turn-scoped 필드 초기화 (skill 직접 실행 경로).
+    // turn_initiator는 skill 경로 정책상 설정하지 않는다.
     {
         let mut guard = data.session_states.lock().await;
         let s = guard.entry(thread_id.to_string()).or_default();
-        s.turn_participants = std::collections::HashSet::from([triggered_by]);
-        s.last_tool_name = None;
+        s.begin_turn(triggered_by);
     }
 
     if let Err(e) = data.sessions.send_message(thread_id, msg).await {
