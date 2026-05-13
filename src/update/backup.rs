@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use super::Error;
-use super::db_url::parse_pg_url;
+use super::db_url::{parse_pg_url, redacted_url};
 
 pub fn backup_binary(worktree: &Path) -> Result<PathBuf, Error> {
     let src = worktree.join("target/release/pidory");
@@ -26,24 +26,25 @@ pub fn backup_binary(worktree: &Path) -> Result<PathBuf, Error> {
     Ok(dst)
 }
 
+fn build_pg_dump_args<'a>(redacted: &'a str, backup_str: &'a str) -> Vec<&'a str> {
+    vec!["--clean", "--if-exists", "-d", redacted, "-f", backup_str]
+}
+
+fn build_psql_args<'a>(redacted: &'a str, backup_str: &'a str) -> Vec<&'a str> {
+    vec!["-v", "ON_ERROR_STOP=1", "-d", redacted, "-f", backup_str]
+}
+
 /// Postgres DB를 backup_dir/pidory-backup.sql 로 pg_dump한다.
 /// 호출자가 backup_dir 결정. 파일명 고정.
 pub fn backup_db(database_url: &str, backup_dir: &Path) -> Result<PathBuf, Error> {
     let parts = parse_pg_url(database_url)?;
+    let redacted = redacted_url(database_url)?;
     let backup_path = backup_dir.join("pidory-backup.sql");
-
-    let port_str = parts.port.to_string();
     let backup_str = backup_path.to_string_lossy().into_owned();
 
+    let args = build_pg_dump_args(&redacted, &backup_str);
     let mut cmd = Command::new("pg_dump");
-    cmd.args([
-        "--clean", "--if-exists",
-        "-U", &parts.user,
-        "-h", &parts.host,
-        "-p", &port_str,
-        "-d", &parts.dbname,
-        "-f", &backup_str,
-    ]);
+    cmd.args(&args);
     if let Some(pw) = &parts.password {
         cmd.env("PGPASSWORD", pw);
     }
@@ -55,8 +56,10 @@ pub fn backup_db(database_url: &str, backup_dir: &Path) -> Result<PathBuf, Error
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-        // stderr는 pg_dump가 출력한 것 — DATABASE_URL/password 원문 미포함 (안전).
-        return Err(Error::BackupFailed(format!("pg_dump 실패: {}", stderr.trim())));
+        tracing::error!("pg_dump stderr: {}", stderr.trim());
+        return Err(Error::BackupFailed(
+            "pg_dump 실패 (자세한 내용은 서버 로그 확인)".into(),
+        ));
     }
 
     verify_backup_magic(&backup_path)?;
@@ -89,18 +92,12 @@ pub fn restore_db(database_url: &str, backup_path: &Path) -> Result<(), Error> {
     }
     verify_backup_magic(backup_path)?;
     let parts = parse_pg_url(database_url)?;
-    let port_str = parts.port.to_string();
+    let redacted = redacted_url(database_url)?;
     let backup_str = backup_path.to_string_lossy().into_owned();
 
+    let args = build_psql_args(&redacted, &backup_str);
     let mut cmd = Command::new("psql");
-    cmd.args([
-        "-U", &parts.user,
-        "-h", &parts.host,
-        "-p", &port_str,
-        "-d", &parts.dbname,
-        "-v", "ON_ERROR_STOP=1",
-        "-f", &backup_str,
-    ]);
+    cmd.args(&args);
     if let Some(pw) = &parts.password {
         cmd.env("PGPASSWORD", pw);
     }
@@ -112,7 +109,10 @@ pub fn restore_db(database_url: &str, backup_path: &Path) -> Result<(), Error> {
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-        return Err(Error::BackupFailed(format!("psql restore 실패: {}", stderr.trim())));
+        tracing::error!("psql stderr: {}", stderr.trim());
+        return Err(Error::BackupFailed(
+            "psql restore 실패 (자세한 내용은 서버 로그 확인)".into(),
+        ));
     }
 
     Ok(())
@@ -277,5 +277,43 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let result = check_disk_space(dir.path(), u64::MAX);
         assert!(matches!(result, Err(Error::InsufficientDiskSpace)));
+    }
+
+    // --- B. s1: 인자 빌더 함수 단위 테스트 ---
+
+    #[test]
+    fn test_build_pg_dump_args_includes_clean_flags() {
+        let args = build_pg_dump_args("postgres://pidory@localhost/pidory", "/tmp/backup.sql");
+        assert!(args.contains(&"--clean"));
+        assert!(args.contains(&"--if-exists"));
+    }
+
+    #[test]
+    fn test_build_pg_dump_args_uses_redacted_url() {
+        let url = "postgres://pidory@localhost/pidory";
+        let path = "/tmp/backup.sql";
+        let args = build_pg_dump_args(url, path);
+        let d_pos = args.iter().position(|&a| a == "-d").expect("-d flag");
+        assert_eq!(args[d_pos + 1], url);
+        let f_pos = args.iter().position(|&a| a == "-f").expect("-f flag");
+        assert_eq!(args[f_pos + 1], path);
+    }
+
+    #[test]
+    fn test_build_psql_args_includes_on_error_stop() {
+        let args = build_psql_args("postgres://pidory@localhost/pidory", "/tmp/backup.sql");
+        let v_pos = args.iter().position(|&a| a == "-v").expect("-v flag");
+        assert_eq!(args[v_pos + 1], "ON_ERROR_STOP=1");
+    }
+
+    #[test]
+    fn test_build_psql_args_uses_redacted_url() {
+        let url = "postgres://pidory@localhost/pidory";
+        let path = "/tmp/backup.sql";
+        let args = build_psql_args(url, path);
+        let d_pos = args.iter().position(|&a| a == "-d").expect("-d flag");
+        assert_eq!(args[d_pos + 1], url);
+        let f_pos = args.iter().position(|&a| a == "-f").expect("-f flag");
+        assert_eq!(args[f_pos + 1], path);
     }
 }

@@ -38,10 +38,12 @@ pub fn parse_pg_url(s: &str) -> Result<PgUrlParts, super::Error> {
         })
         .transpose()?;
 
-    let host = parsed
-        .host_str()
-        .ok_or_else(|| super::Error::BackupFailed("DATABASE_URL 파싱 실패".into()))?
-        .to_string();
+    let host = match parsed.host() {
+        Some(url::Host::Domain(s)) => s.to_string(),
+        Some(url::Host::Ipv4(addr)) => addr.to_string(),
+        Some(url::Host::Ipv6(addr)) => addr.to_string(), // brackets 없는 형태
+        None => return Err(super::Error::BackupFailed("DATABASE_URL 파싱 실패".into())),
+    };
 
     let port = parsed.port().unwrap_or(5432);
 
@@ -62,6 +64,21 @@ pub fn parse_pg_url(s: &str) -> Result<PgUrlParts, super::Error> {
         port,
         dbname,
     })
+}
+
+/// DATABASE_URL에서 password만 제거한 conninfo URI를 반환한다.
+/// pg_dump/psql의 `-d` 인자에 사용. password는 PGPASSWORD env로 별도 전달.
+/// query parameter (sslmode, sslrootcert 등)는 그대로 보존된다.
+pub fn redacted_url(s: &str) -> Result<String, super::Error> {
+    let mut parsed = Url::parse(s)
+        .map_err(|_| super::Error::BackupFailed("DATABASE_URL 파싱 실패".into()))?;
+    match parsed.scheme() {
+        "postgres" | "postgresql" => {}
+        _ => return Err(super::Error::BackupFailed("DATABASE_URL 파싱 실패".into())),
+    }
+    // set_password(None)은 userinfo의 password 부분만 제거, query는 유지
+    let _ = parsed.set_password(None);
+    Ok(parsed.to_string())
 }
 
 #[cfg(test)]
@@ -131,5 +148,45 @@ mod tests {
         // url::Url이 percent-encoded raw bytes를 보존하므로 직접 parse_pg_url 호출.
         let result = parse_pg_url("postgres://pidory:%FF%FE@localhost/pidory");
         assert!(result.is_err());
+    }
+
+    // --- C. s3: IPv6 host brackets strip ---
+
+    #[test]
+    fn parses_ipv6_host_strips_brackets() {
+        let parts = parse_pg_url("postgres://pidory:secret@[::1]/pidory").unwrap();
+        assert_eq!(parts.host, "::1");
+    }
+
+    #[test]
+    fn parses_ipv4_host() {
+        let parts = parse_pg_url("postgres://pidory:secret@192.168.1.1/pidory").unwrap();
+        assert_eq!(parts.host, "192.168.1.1");
+    }
+
+    // --- A. w2: redacted_url ---
+
+    #[test]
+    fn redacted_url_strips_password() {
+        let result = redacted_url("postgres://pidory:secret@localhost/pidory").unwrap();
+        assert_eq!(result, "postgres://pidory@localhost/pidory");
+    }
+
+    #[test]
+    fn redacted_url_preserves_query_params() {
+        let result =
+            redacted_url("postgres://pidory:secret@localhost/pidory?sslmode=require").unwrap();
+        assert_eq!(result, "postgres://pidory@localhost/pidory?sslmode=require");
+    }
+
+    #[test]
+    fn redacted_url_no_password() {
+        let result = redacted_url("postgres://pidory@localhost/pidory").unwrap();
+        assert_eq!(result, "postgres://pidory@localhost/pidory");
+    }
+
+    #[test]
+    fn redacted_url_rejects_invalid_scheme() {
+        assert!(redacted_url("http://pidory:secret@localhost/pidory").is_err());
     }
 }
