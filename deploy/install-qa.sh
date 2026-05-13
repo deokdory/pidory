@@ -9,8 +9,14 @@
 set -euo pipefail
 
 PROJECT_DIR=local path/claude/projects/deokdory/pidory-qa
-USER_NAME="$(whoami)"
-HOME_DIR="$HOME"
+# sudo로 실행돼도 원 사용자 정보 사용 (sudo는 HOME 보존 안 함, 그대로면 /root → systemd unit이 /root/.claude 가리키는 사고)
+USER_NAME="${SUDO_USER:-$(whoami)}"
+HOME_DIR="$(getent passwd "$USER_NAME" | cut -d: -f6)"
+
+if [ -z "$HOME_DIR" ] || [ ! -d "$HOME_DIR" ]; then
+    echo "ERROR: HOME directory for user '$USER_NAME' not found ($HOME_DIR)" >&2
+    exit 1
+fi
 
 # install-qa.sh가 위치한 source worktree 자동 감지 (PR γ branch 등)
 SOURCE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
