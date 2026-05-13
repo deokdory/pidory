@@ -34,6 +34,8 @@ pub struct ReplyContext {
 #[derive(Debug, Clone)]
 pub struct SenderInfo {
     pub label: String,
+    /// Discord User ID (Snowflake). 영구 식별자 — label은 변경 가능하지만 id는 불변.
+    pub user_id: u64,
 }
 
 pub struct QueuedMessage {

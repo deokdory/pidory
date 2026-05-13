@@ -279,6 +279,7 @@ async fn handle_message(
             let username = new_message.author.name.as_str();
             Some(SenderInfo {
                 label: helpers::format_sender_label(nick, global, username),
+                user_id: new_message.author.id.get(),
             })
         };
 
@@ -462,6 +463,7 @@ async fn handle_message(
         let username = new_message.author.name.as_str();
         Some(SenderInfo {
             label: helpers::format_sender_label(nick, global, username),
+            user_id: new_message.author.id.get(),
         })
     };
 
