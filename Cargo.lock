@@ -1375,6 +1375,7 @@ dependencies = [
  "filetime",
  "futures-util",
  "libc",
+ "percent-encoding",
  "poise",
  "regex",
  "reqwest",
@@ -1392,6 +1393,7 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
+ "url",
 ]
 
 [[package]]
