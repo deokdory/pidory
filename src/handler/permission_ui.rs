@@ -783,17 +783,20 @@ pub async fn run_permission_handler(
                 let pp_clone = Arc::clone(&pending_permissions);
                 tokio::spawn(async move {
                     if timeout_rx.await.is_ok() {
-                        // Remove from pending map so button clicks after timeout are no-ops.
-                        pp_clone.lock().await.remove(&rid_for_timeout);
-                        tracing::info!(request_id = %rid_for_timeout, "permission timeout — disabling buttons");
-                        let _ = disable_permission_buttons(
-                            &ctx_clone,
-                            channel_id,
-                            message_id,
-                            DisableReason::Timeout,
-                            &log_tool_name,
-                            lang,
-                        ).await;
+                        // Atomic check-and-act: entry 가 아직 있으면 timeout 으로 처리.
+                        // button click handler 가 먼저 제거했다면 still_pending = false → double edit 방지.
+                        let still_pending = pp_clone.lock().await.remove(&rid_for_timeout).is_some();
+                        if still_pending {
+                            tracing::info!(request_id = %rid_for_timeout, "permission timeout — disabling buttons");
+                            let _ = disable_permission_buttons(
+                                &ctx_clone,
+                                channel_id,
+                                message_id,
+                                DisableReason::Timeout,
+                                &log_tool_name,
+                                lang,
+                            ).await;
+                        }
                     }
                     // If timeout_rx returns Err (sender dropped = worker resolved normally),
                     // do nothing — the normal button-click path already updated the message.

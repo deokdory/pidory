@@ -45,7 +45,8 @@ pub async fn config_default_scope(
     #[description = "Default permission scope"] scope: ScopeChoice,
 ) -> Result<(), Error> {
     let data = ctx.data();
-    let owner_id = data.config.discord.owner_id as i64;
+    let owner_id: i64 = i64::try_from(data.config.discord.owner_id)
+        .expect("Discord snowflake fits in i64 (snowflake < 2^63)");
 
     let new_scope = match scope {
         ScopeChoice::Global => Scope::Global,
@@ -53,10 +54,10 @@ pub async fn config_default_scope(
     };
 
     // DB upsert 먼저
-    repository::upsert_user_default_scope(&data.db, owner_id, new_scope.clone()).await?;
+    repository::upsert_user_default_scope(&data.db, owner_id, new_scope).await?;
 
     // 성공 시 cache 갱신
-    set_default_scope_cache(new_scope.clone());
+    set_default_scope_cache(new_scope);
 
     let reply = poise::CreateReply::default()
         .content(format!(
@@ -73,7 +74,8 @@ pub async fn config_default_scope(
 #[poise::command(slash_command, guild_only, owners_only, rename = "show")]
 pub async fn config_show(ctx: Context<'_>) -> Result<(), Error> {
     let data = ctx.data();
-    let owner_id = data.config.discord.owner_id as i64;
+    let owner_id: i64 = i64::try_from(data.config.discord.owner_id)
+        .expect("Discord snowflake fits in i64 (snowflake < 2^63)");
 
     let scope_from_db = repository::get_user_default_scope(&data.db, owner_id)
         .await?

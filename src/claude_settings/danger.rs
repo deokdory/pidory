@@ -27,13 +27,11 @@ const DANGEROUS_PATTERNS: &[&str] = &[
     "chmod -R 000",
     "chown -R root",
     "chown -R 0:0",
-    "git push --force",
-    "git push -f",
     ":(){:|:&};:",
 ];
 
-/// curl/wget ... | sh/bash 패턴 — 문자열 기반 간단 감지.
-/// `(curl|wget)[^|]*\|` 다음에 공백 후 `sh` 또는 `bash`.
+/// curl/wget ... | sh/bash 패턴 — 토큰 기반 감지.
+/// before 의 *첫 번째 토큰* 만 검사해 `echo "curl is bad" | sh` 같은 false positive 방지.
 fn is_pipe_to_shell(cmd: &str) -> bool {
     let pipe_pos = match cmd.find('|') {
         Some(pos) => pos,
@@ -42,7 +40,9 @@ fn is_pipe_to_shell(cmd: &str) -> bool {
     let before = &cmd[..pipe_pos];
     let after = cmd[pipe_pos + 1..].trim_start();
 
-    let has_curl_or_wget = before.contains("curl") || before.contains("wget");
+    // before 의 첫 토큰만 검사 (echo "curl is bad" | grep curl 같은 false positive 회피)
+    let first_token = before.split_whitespace().next().unwrap_or("");
+    let has_curl_or_wget = matches!(first_token, "curl" | "wget");
     if !has_curl_or_wget {
         return false;
     }
@@ -54,6 +54,17 @@ fn is_pipe_to_shell(cmd: &str) -> bool {
         || after.starts_with("bash ")
         || after.starts_with("sh\t")
         || after.starts_with("bash\t")
+}
+
+/// `git push --force` 또는 `git push -f` 단독 검사 (--force-with-lease 제외).
+/// token 단위 비교로 `--force-with-lease` false positive 방지.
+fn is_dangerous_git_push(cmd: &str) -> bool {
+    let lower = cmd.to_lowercase();
+    if !lower.contains("git push") {
+        return false;
+    }
+    let tokens: Vec<&str> = lower.split_whitespace().collect();
+    tokens.iter().any(|t| *t == "--force" || *t == "-f")
 }
 
 /// Moderate 에 해당하는 wildcard tool-level rule 여부.
@@ -127,17 +138,22 @@ pub fn classify_command(rule: &str) -> Severity {
         }
     }
 
-    // 2. pipe-to-shell 감지
+    // 2. git push --force / -f (--force-with-lease 는 safe)
+    if is_dangerous_git_push(inner) {
+        return Severity::Dangerous;
+    }
+
+    // 3. pipe-to-shell 감지
     if is_pipe_to_shell(inner) {
         return Severity::Dangerous;
     }
 
-    // 3. Wildcard tool-level (Bash(*), Write(*), Edit(*), Read(*), ...)
+    // 4. Wildcard tool-level (Bash(*), Write(*), Edit(*), Read(*), ...)
     if is_wildcard_tool_rule(rule) {
         return Severity::Moderate;
     }
 
-    // 4. 민감 경로 — Write/Edit/Read 등의 inner가 sensitive path
+    // 5. 민감 경로 — Write/Edit/Read 등의 inner가 sensitive path
     if is_sensitive_path(inner) {
         return Severity::Moderate;
     }
@@ -301,5 +317,36 @@ mod tests {
     fn curl_pipe_sh_with_flags() {
         // curl -fsSL url | sh — Dangerous
         assert_eq!(classify_command("Bash(curl -fsSL https://get.rustup.rs | sh)"), Severity::Dangerous);
+    }
+
+    // ── git push --force / -f vs --force-with-lease ───────────────────────────
+
+    #[test]
+    fn git_push_force_with_lease_is_safe() {
+        // --force-with-lease 는 Safe (false positive 방지)
+        assert_eq!(classify_command("Bash(git push --force-with-lease origin main)"), Severity::Safe);
+    }
+
+    #[test]
+    fn git_push_force_dangerous() {
+        // --force 는 Dangerous (회귀 방지)
+        assert_eq!(classify_command("Bash(git push --force origin main)"), Severity::Dangerous);
+    }
+
+    #[test]
+    fn git_push_f_dangerous() {
+        // -f 는 Dangerous (회귀 방지)
+        assert_eq!(classify_command("Bash(git push -f origin main)"), Severity::Dangerous);
+    }
+
+    // ── is_pipe_to_shell: echo "curl..." false positive 방지 ─────────────────
+
+    #[test]
+    fn not_pipe_to_shell_echo_curl_msg() {
+        // echo "do not use curl pipe sh" | grep curl — echo 가 첫 토큰 → Safe
+        assert_eq!(
+            classify_command("Bash(echo \"do not use curl pipe sh\" | grep curl)"),
+            Severity::Safe
+        );
     }
 }

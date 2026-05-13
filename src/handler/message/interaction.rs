@@ -1383,11 +1383,32 @@ async fn check_gitignore_and_warn(
 
     let covered = content.lines().any(|line| {
         let trimmed = line.trim();
-        // 정확 문자열 또는 simple glob 패턴
-        trimmed == ".claude/settings.local.json"
-            || trimmed == ".claude/*.local.json"
-            || trimmed == ".claude/"
-            || trimmed == ".claude"
+        // comment 줄 skip
+        if trimmed.starts_with('#') {
+            return false;
+        }
+        // .gitignore 에서 .claude/settings.local.json 을 커버하는 패턴 인식.
+        // - 정확 경로 / root-anchored / recursive glob
+        // - 디렉터리 단위 (.claude/, .claude)
+        // - wildcard (*.local.json, settings.local.json)
+        matches!(
+            trimmed,
+            ".claude/settings.local.json"
+                | ".claude/*.local.json"
+                | ".claude/"
+                | ".claude"
+                | "/.claude/settings.local.json"
+                | "/.claude/*.local.json"
+                | "/.claude/"
+                | "/.claude"
+                | "**/.claude/settings.local.json"
+                | "**/.claude/*.local.json"
+                | "**/.claude/"
+                | "**/.claude"
+                | ".claude/*"
+                | "*.local.json"
+                | "settings.local.json"
+        )
     });
 
     if !covered {

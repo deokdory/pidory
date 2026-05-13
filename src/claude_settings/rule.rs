@@ -11,6 +11,7 @@ use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::{OnceLock, RwLock};
+use tracing;
 
 /// Claude permission rule 매칭 방식.
 ///
@@ -28,7 +29,7 @@ pub enum RuleKind {
 }
 
 /// Permission rule이 적용되는 파일 범위.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Scope {
     /// `.claude/settings.local.json` — 프로젝트 로컬
     Project,
@@ -76,14 +77,15 @@ fn scope_cache() -> &'static RwLock<Scope> {
 pub fn default_scope() -> Scope {
     scope_cache()
         .read()
-        .map(|g| g.clone())
+        .map(|g| *g)
         .unwrap_or(Scope::Project)
 }
 
 /// cache 에 새 scope 를 쓴다. DB upsert 성공 후 호출한다.
 pub fn set_default_scope_cache(scope: Scope) {
-    if let Ok(mut g) = scope_cache().write() {
-        *g = scope;
+    match scope_cache().write() {
+        Ok(mut g) => *g = scope,
+        Err(e) => tracing::warn!("default_scope cache write poisoned: {}", e),
     }
 }
 

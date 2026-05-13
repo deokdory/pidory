@@ -201,26 +201,36 @@ where
         match permission_tx.try_send(perm_req) {
             Ok(()) => {
                 tracing::info!(thread_id = %thread_id, request_id = %rid, tool_name = %tool_name, "permission_tx send ok");
+                let is_ask_user = tool_name == "AskUserQuestion";
                 pending.insert(rid.clone(), PendingEntry { tool_name, saved_input: initial_cr.input.clone() });
                 // Wrap the oneshot receiver in a timeout race.
                 // On normal response: drop timeout_tx so handler's timeout_rx returns Err (no Discord edit).
                 // On 5-min timeout: fire timeout_tx so handler disables buttons.
                 // biased: resp_rx is checked first — if both branches are ready at the same
                 // time (e.g. in tests with paused time), user decision takes priority.
-                let fut = async move {
-                    tokio::select! {
-                        biased;
-                        result = resp_rx => {
-                            drop(timeout_tx);
-                            (rid, result)
+                // AskUserQuestion 은 사용자 입력 대기 — timeout 의미 없음, 무한 대기.
+                let fut = if is_ask_user {
+                    async move {
+                        let result = resp_rx.await;
+                        drop(timeout_tx); // timeout_tx drop → handler 의 timeout_rx returns Err (no-op)
+                        (rid, result)
+                    }.boxed()
+                } else {
+                    async move {
+                        tokio::select! {
+                            biased;
+                            result = resp_rx => {
+                                drop(timeout_tx);
+                                (rid, result)
+                            }
+                            _ = tokio::time::sleep(PERMISSION_RESPONSE_TIMEOUT) => {
+                                let _ = timeout_tx.send(());
+                                tracing::info!(request_id = %rid, "permission response timeout — auto-deny");
+                                (rid, Ok(PermissionDecision::Deny))
+                            }
                         }
-                        _ = tokio::time::sleep(PERMISSION_RESPONSE_TIMEOUT) => {
-                            let _ = timeout_tx.send(());
-                            tracing::info!(request_id = %rid, "permission response timeout — auto-deny");
-                            (rid, Ok(PermissionDecision::Deny))
-                        }
-                    }
-                }.boxed();
+                    }.boxed()
+                };
                 futures.push(fut);
             }
             Err(TrySendError::Full(dropped)) => {
@@ -353,23 +363,32 @@ where
                                     match permission_tx.try_send(perm_req) {
                                         Ok(()) => {
                                             tracing::info!(thread_id = %thread_id, request_id = %rid, tool_name = %tname, "permission_tx send ok");
-                                            pending.insert(rid.clone(), PendingEntry { tool_name: tname, saved_input: input.clone() });
+                                            pending.insert(rid.clone(), PendingEntry { tool_name: tname.clone(), saved_input: input.clone() });
+                                            // AskUserQuestion 은 사용자 입력 대기 — timeout 의미 없음, 무한 대기.
                                             // Wrap the oneshot receiver in a timeout race (same pattern as initial CR).
                                             // biased: resp_rx checked first (see initial CR comment).
-                                            let fut = async move {
-                                                tokio::select! {
-                                                    biased;
-                                                    result = resp_rx => {
-                                                        drop(timeout_tx);
-                                                        (rid, result)
+                                            let fut = if tname == "AskUserQuestion" {
+                                                async move {
+                                                    let result = resp_rx.await;
+                                                    drop(timeout_tx);
+                                                    (rid, result)
+                                                }.boxed()
+                                            } else {
+                                                async move {
+                                                    tokio::select! {
+                                                        biased;
+                                                        result = resp_rx => {
+                                                            drop(timeout_tx);
+                                                            (rid, result)
+                                                        }
+                                                        _ = tokio::time::sleep(PERMISSION_RESPONSE_TIMEOUT) => {
+                                                            let _ = timeout_tx.send(());
+                                                            tracing::info!(request_id = %rid, "permission response timeout — auto-deny");
+                                                            (rid, Ok(PermissionDecision::Deny))
+                                                        }
                                                     }
-                                                    _ = tokio::time::sleep(PERMISSION_RESPONSE_TIMEOUT) => {
-                                                        let _ = timeout_tx.send(());
-                                                        tracing::info!(request_id = %rid, "permission response timeout — auto-deny");
-                                                        (rid, Ok(PermissionDecision::Deny))
-                                                    }
-                                                }
-                                            }.boxed();
+                                                }.boxed()
+                                            };
                                             futures.push(fut);
                                         }
                                         Err(TrySendError::Full(dropped)) => {
