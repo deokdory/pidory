@@ -2,6 +2,7 @@ use poise::serenity_prelude::{
     ButtonStyle, ChannelId, Context, CreateActionRow, CreateButton, CreateMessage, EditMessage,
     MessageId, UserId,
 };
+use crate::i18n::Lang;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResetAction {
@@ -22,12 +23,12 @@ pub struct PendingReset {
 }
 
 #[allow(dead_code)]
-pub fn create_reset_confirm_message(content: &str, thread_id: &str) -> CreateMessage {
+pub fn create_reset_confirm_message(content: &str, thread_id: &str, lang: Lang) -> CreateMessage {
     let confirm_btn = CreateButton::new(format!("reset:{}:confirm", thread_id))
-        .label("✅ 예, 리셋")
+        .label(lang.btn_reset_confirm())
         .style(ButtonStyle::Danger);
     let cancel_btn = CreateButton::new(format!("reset:{}:cancel", thread_id))
-        .label("❌ 아니요")
+        .label(lang.btn_reset_cancel())
         .style(ButtonStyle::Secondary);
 
     let row = CreateActionRow::Buttons(vec![confirm_btn, cancel_btn]);
@@ -42,11 +43,12 @@ pub async fn disable_reset_buttons(
     channel_id: ChannelId,
     message_id: MessageId,
     outcome: ResetOutcome,
+    lang: Lang,
 ) -> Result<(), serenity::Error> {
     let label = match outcome {
-        ResetOutcome::Confirmed => "✅ 리셋됨",
-        ResetOutcome::Cancelled => "❌ 취소됨",
-        ResetOutcome::Expired => "⏰ 만료됨",
+        ResetOutcome::Confirmed => lang.reset_done(),
+        ResetOutcome::Cancelled => lang.reset_cancelled_label(),
+        ResetOutcome::Expired => lang.reset_expired_label(),
     };
 
     let edit = EditMessage::new().content(label).components(vec![]);

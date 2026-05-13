@@ -14,7 +14,7 @@ impl Lang {
 
     pub fn no_permission(&self) -> &'static str {
         match self {
-            Lang::Ko => "권한이 없습니다",
+            Lang::Ko => "권한이 없어요",
             Lang::En => "Permission denied",
         }
     }

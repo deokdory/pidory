@@ -5,7 +5,7 @@ impl Lang {
 
     pub fn bg_permission_denied(&self, tool_name: &str) -> String {
         match self {
-            Lang::Ko => format!("-# ⚠️ [백그라운드] 권한 거부: {} (캐시에 없음)", tool_name),
+            Lang::Ko => format!("-# ⚠️ [백그라운드] 권한이 거부됐어요: {} (캐시에 없음)", tool_name),
             Lang::En => format!("-# ⚠️ [Background] Permission denied: {} (not in cache)", tool_name),
         }
     }
@@ -26,7 +26,7 @@ impl Lang {
 
     pub fn bg_task_started(&self, description: &str) -> String {
         match self {
-            Lang::Ko => format!("-# 🔔 백그라운드 작업 시작: {}", description),
+            Lang::Ko => format!("-# 🔔 백그라운드 작업을 시작했어요: {}", description),
             Lang::En => format!("-# 🔔 Background task started: {}", description),
         }
     }

@@ -331,7 +331,7 @@ pub async fn new_project(
         Some(id) => id,
         None => {
             let reply = poise::CreateReply::default()
-                .content("❌ Not in a guild")
+                .content(lang.not_in_guild())
                 .ephemeral(true);
             ctx.send(reply).await?;
             return Ok(());
