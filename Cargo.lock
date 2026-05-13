@@ -1375,6 +1375,7 @@ dependencies = [
  "futures-util",
  "libc",
  "poise",
+ "regex",
  "reqwest",
  "serde",
  "serde_json",

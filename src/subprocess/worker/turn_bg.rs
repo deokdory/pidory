@@ -234,7 +234,7 @@ pub(super) async fn handle_bg_turn(
                             continue 'bg_turn;
                         }
                         *current_triggered_by = m.triggered_by;
-                        let inject_line = build_user_message_json(&m.content, &m.downloaded_files, m.reply_context.as_ref());
+                        let inject_line = build_user_message_json(&m.content, &m.downloaded_files, m.reply_context.as_ref(), m.sender_info.as_ref());
                         if let Err(e) = stdin.write_all(inject_line.as_bytes()).await {
                             tracing::error!("mid-turn stdin write error (bg turn): {}", e);
                             if let Err(e) = repository::update_session_status(db, thread_id, "idle").await {

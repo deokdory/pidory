@@ -202,7 +202,7 @@ impl SessionWorker {
                     // 현재 turn 의 triggered_by 업데이트
                     *current_triggered_by = msg.triggered_by;
 
-                    let json_line = build_user_message_json(&msg.content, &msg.downloaded_files, msg.reply_context.as_ref());
+                    let json_line = build_user_message_json(&msg.content, &msg.downloaded_files, msg.reply_context.as_ref(), msg.sender_info.as_ref());
                     if let Err(e) = stdin.write_all(json_line.as_bytes()).await {
                         tracing::error!("stdin write error for thread {}: {}", thread_id, e);
                         break;

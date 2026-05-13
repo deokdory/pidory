@@ -554,6 +554,7 @@ pub async fn kick(
                         cancelled: Arc::new(AtomicBool::new(false)),
                         downloaded_files: Vec::new(),
                         reply_context: None,
+                        sender_info: None,
                     };
 
                     {
