@@ -1,20 +1,14 @@
 pub mod models;
 pub mod repository;
 
-use sqlx::SqlitePool;
+use sqlx::PgPool;
 
 use crate::error::PidoryError;
 
-pub async fn init_pool(db_path: &str) -> Result<SqlitePool, PidoryError> {
-    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+pub async fn init_pool(database_url: &str) -> Result<PgPool, PidoryError> {
+    let pool = sqlx::postgres::PgPoolOptions::new()
         .max_connections(5)
-        .connect(&format!("sqlite://{}?mode=rwc", db_path))
-        .await
-        .map_err(PidoryError::Db)?;
-
-    // WAL mode 활성화
-    sqlx::query("PRAGMA journal_mode=WAL")
-        .execute(&pool)
+        .connect(database_url)
         .await
         .map_err(PidoryError::Db)?;
 

@@ -49,7 +49,7 @@ pub(super) async fn handle_between_turns_event(
     thread_id: &str,
     channel_id: &ChannelId,
     ctx: &Context,
-    db: &sqlx::SqlitePool,
+    db: &sqlx::PgPool,
     lang: Lang,
     show_context_percent: bool,
     model_name: &mut String,

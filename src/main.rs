@@ -17,7 +17,7 @@ use commands::skill::load_skill_descriptions;
 use std::sync::Arc;
 
 use poise::serenity_prelude as serenity;
-use sqlx::SqlitePool;
+use sqlx::PgPool;
 use tokio::sync::{Mutex, oneshot, watch};
 use tracing::info;
 use tracing_subscriber::{EnvFilter, fmt};
@@ -73,7 +73,7 @@ pub struct PendingQuestionGroup {
 
 pub struct Data {
     pub config: Arc<Config>,
-    pub db: SqlitePool,
+    pub db: PgPool,
     pub sessions: Arc<SessionManager>,
     pub pending_permissions: Arc<Mutex<HashMap<String, PendingPermission>>>,
     pub pending_question_groups: Arc<Mutex<HashMap<String, PendingQuestionGroup>>>,
@@ -234,7 +234,9 @@ async fn main() -> Result<(), PidoryError> {
                     .await
                     .map_err(|e| PidoryError::Discord(Box::new(e)))?;
 
-                let db = db::init_pool(&config.database.path).await?;
+                let database_url = std::env::var("DATABASE_URL")
+                    .map_err(|_| PidoryError::Config("DATABASE_URL environment variable not set".to_string()))?;
+                let db = db::init_pool(&database_url).await?;
 
                 info!("Database initialized");
 
