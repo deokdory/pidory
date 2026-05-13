@@ -17,11 +17,13 @@ Environment=HOME=__HOME_DIR__
 Environment=RUST_LOG=info
 
 EnvironmentFile=-__PROJECT_DIR__/config.dev.env
+EnvironmentFile=/etc/pidory/db.env
+ExecStartPre=/usr/local/bin/pidory-migrate
 
 # Security hardening
 NoNewPrivileges=true
 ProtectSystem=strict
-ReadWritePaths=__PROJECT_DIR__ __HOME_DIR__/.claude /tmp
+ReadWritePaths=__PROJECT_DIR__ __HOME_DIR__/.claude /tmp /var/lib/pidory
 
 [Install]
 WantedBy=multi-user.target

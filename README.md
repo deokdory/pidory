@@ -43,6 +43,7 @@ pidory delegates to Discord's built-in permission system, and sessions are **sha
 - [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code) — requires Anthropic Max subscription
 - Discord Bot Token
 - Linux or macOS
+- PostgreSQL 17 (recommended) or system default — installed automatically by `scripts/postgres-setup.sh` on Linux
 
 ## Quick Start
 
@@ -80,12 +81,30 @@ echo 'PIDORY_DISCORD_TOKEN=your_token_here' > .env
 
 ### 5. Run
 
-```bash
-# Direct
-cargo run --release
+**Service deployment (recommended — Linux systemd):**
 
-# Or as a service
-./deploy/install.sh   # auto-detects Linux (systemd) or macOS (launchd)
+```bash
+./deploy/install.sh                 # builds binary, installs systemd service, installs skills
+sudo bash scripts/postgres-setup.sh # installs PostgreSQL, creates DB, writes /etc/pidory/db.env, restarts service
+```
+
+That's it. The service starts automatically and connects to PostgreSQL via `DATABASE_URL` in `/etc/pidory/db.env`.
+
+**Manual / dev (no service):**
+
+```bash
+# Set DATABASE_URL pointing to your PostgreSQL instance
+export DATABASE_URL=postgres://pidory:<your-password>@localhost/pidory
+
+cargo run --release
+```
+
+Verify the service is healthy:
+
+```bash
+sudo systemctl status pidory
+sudo journalctl -u pidory.service -f
+psql -U pidory -d pidory -c 'SELECT count(*) FROM projects'
 ```
 
 ## Service Deployment
@@ -93,11 +112,15 @@ cargo run --release
 ### Linux (systemd)
 
 ```bash
-./deploy/install.sh
-sudo systemctl start pidory
+./deploy/install.sh                  # builds binary, installs service, installs skills
+sudo bash scripts/postgres-setup.sh # sets up PostgreSQL and starts the service
 sudo systemctl status pidory
-journalctl -u pidory -f
+journalctl -u pidory.service -f
 ```
+
+`install.sh` builds the release binary, copies `config.toml.example` if no config exists, installs the service file, enables it on boot, installs the `pidory-migrate` migration binary to `/usr/local/bin/`, and deploys built-in skills to `~/.claude/skills/`.
+
+`postgres-setup.sh` installs PostgreSQL 17 (falls back to system default), creates the `pidory` role and database, writes `DATABASE_URL` to `/etc/pidory/db.env` (mode 600), and restarts the service.
 
 ### macOS (launchd)
 
@@ -107,7 +130,51 @@ launchctl load ~/Library/LaunchAgents/com.pidory.bot.plist
 tail -f ~/.pidory/stderr.log
 ```
 
-`install.sh` builds the release binary, copies `config.toml.example` if no config exists, installs the service file, enables it on boot, and deploys built-in skills to `~/.claude/skills/`.
+`install.sh` builds the release binary, copies `config.toml.example` if no config exists, installs the service file, enables it on boot, and deploys built-in skills to `~/.claude/skills/`. Note: `postgres-setup.sh` is Linux/systemd only — on macOS, set `DATABASE_URL` manually before running.
+
+## Database (PostgreSQL)
+
+pidory uses PostgreSQL as its database backend. The connection is configured via the `DATABASE_URL` environment variable — **this is the authoritative source**. The `[database] path` field in `config.toml` is deprecated and ignored at runtime.
+
+### DATABASE_URL
+
+On Linux service deployments, `DATABASE_URL` is injected from `/etc/pidory/db.env` (via systemd `EnvironmentFile`). The file is written by `scripts/postgres-setup.sh` and has mode 600 (readable only by the pidory service user).
+
+```
+DATABASE_URL=postgres://pidory:<password>@localhost/pidory
+```
+
+To inspect the value:
+
+```bash
+sudo cat /etc/pidory/db.env
+```
+
+For manual or dev setups, export the variable before running:
+
+```bash
+export DATABASE_URL=postgres://pidory:<your-password>@localhost/pidory
+cargo run --release
+```
+
+You can override the legacy SQLite path with `PIDORY_LEGACY_DB` (default: `/var/lib/pidory/pidory.db`). This is only relevant for the migration binary (`pidory-migrate`), which reads the SQLite source on first-run and imports existing data into PostgreSQL.
+
+### Automatic Migration
+
+pidory uses a two-layer migration safety net:
+
+1. **`pidory-migrate` ExecStartPre** — runs before the service starts. Detects if the PostgreSQL database is empty and performs a one-time, transactional import from the SQLite source. Idempotent: subsequent runs are no-ops.
+2. **`sqlx::migrate!` in `init_pool`** — applies any pending schema migrations at startup. Runs every start, handles version upgrades automatically.
+
+Migration is **roll-forward only**. There is no tool to revert from PostgreSQL back to SQLite.
+
+### PostgreSQL Version
+
+PostgreSQL 17 is recommended. `scripts/postgres-setup.sh` installs `postgresql-17` via apt; if unavailable, it falls back to the system default `postgresql` package. Other versions (14, 15, 16) are expected to work.
+
+### Known Limitation
+
+The self-update rollback path in `update/backup.rs` (`restore_db()`) uses the `sqlite3` CLI and does not support PostgreSQL. This means the automatic database restore during a failed self-update does not function in PostgreSQL environments. Normal operation is unaffected. Manual recovery via `pg_dump` / `psql` is the workaround. A follow-up PR will convert this to a `pg_dump`-based implementation.
 
 ## Update
 
@@ -213,9 +280,13 @@ When Claude Code runs a long tool operation, pidory shows a progress indicator m
 
 ### [database]
 
+> **Deprecated.** `DATABASE_URL` environment variable is the authoritative database configuration source. The `path` field below is kept for backwards compatibility only and is ignored at runtime.
+
 | Field | Description | Default |
 |-------|-------------|---------|
-| `path` | SQLite database file path | `"pidory.db"` |
+| `path` | ~~SQLite database file path~~ (deprecated, ignored) | `"pidory.db"` |
+
+Set `DATABASE_URL` via `/etc/pidory/db.env` (Linux service) or as an environment variable (manual/dev).
 
 ### [response]
 

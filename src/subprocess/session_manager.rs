@@ -234,7 +234,7 @@ impl SessionManager {
         model: Option<&str>,
         ctx: Context,
         channel_id: ChannelId,
-        db: sqlx::SqlitePool,
+        db: sqlx::PgPool,
         lang: Lang,
         pending_permissions: Arc<tokio::sync::Mutex<HashMap<String, PendingPermission>>>,
         pending_question_groups: Arc<tokio::sync::Mutex<HashMap<String, crate::PendingQuestionGroup>>>,

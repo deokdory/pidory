@@ -9,8 +9,11 @@ default_disallowed_tools = []
 subprocess_timeout_secs = 600
 max_sessions = 5              # dev는 낮게
 
+# [database] path is DEPRECATED — DATABASE_URL env is the authoritative source.
+# Keep this section for backwards compatibility only.
+# Set DATABASE_URL as an env variable for dev: export DATABASE_URL=postgres://pidory:<pw>@localhost/pidory
 [database]
-path = "pidory-dev.db"        # prod DB와 분리
+path = "pidory-dev.db"        # deprecated, ignored
 
 [response]
 max_chunk_length = 1900
