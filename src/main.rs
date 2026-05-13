@@ -133,13 +133,17 @@ async fn main() -> Result<(), PidoryError> {
             update::marker::RecoveryAction::Normal => {}
             update::marker::RecoveryAction::Rolling { from, to, attempt } => {
                 tracing::warn!("Rolling back: from={} to={} attempt={}", from, to, attempt);
-                let db_path = std::path::PathBuf::from(&config.database.path);
+                let backup_dir = std::path::Path::new(&config.database.path)
+                    .parent()
+                    .unwrap_or(std::path::Path::new("."));
+                let backup_path = backup_dir.join("pidory-backup.sql");
+                let database_url = std::env::var("DATABASE_URL").unwrap_or_default();
                 let mut restore_failed = false;
                 if let Err(e) = update::backup::restore_binary(worktree) {
                     tracing::error!("restore_binary failed: {:?}", e);
                     restore_failed = true;
                 }
-                if let Err(e) = update::backup::restore_db(&db_path) {
+                if let Err(e) = update::backup::restore_db(&database_url, &backup_path) {
                     tracing::error!("restore_db failed: {:?}", e);
                     restore_failed = true;
                 }

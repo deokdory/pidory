@@ -1,8 +1,8 @@
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use super::Error;
+use super::db_url::parse_pg_url;
 
 pub fn backup_binary(worktree: &Path) -> Result<PathBuf, Error> {
     let src = worktree.join("target/release/pidory");
@@ -26,52 +26,88 @@ pub fn backup_binary(worktree: &Path) -> Result<PathBuf, Error> {
     Ok(dst)
 }
 
-pub fn backup_db(db_path: &Path) -> Result<PathBuf, Error> {
-    let backup_path = {
-        let mut p = db_path.as_os_str().to_owned();
-        p.push(".backup");
-        PathBuf::from(p)
-    };
+/// Postgres DB를 backup_dir/pidory-backup.sql 로 pg_dump한다.
+/// 호출자가 backup_dir 결정. 파일명 고정.
+pub fn backup_db(database_url: &str, backup_dir: &Path) -> Result<PathBuf, Error> {
+    let parts = parse_pg_url(database_url)?;
+    let backup_path = backup_dir.join("pidory-backup.sql");
 
-    let db_str = db_path.to_string_lossy();
-    let backup_str = backup_path.to_string_lossy();
+    let port_str = parts.port.to_string();
+    let backup_str = backup_path.to_string_lossy().into_owned();
 
-    // SQL 싱글쿼트 이스케이프(`'` → `''`)로 경로 내 싱글쿼트 주입 방지.
-    // stdin으로 명령 전달하여 dot-command arg 파싱의 모호함도 제거한다.
-    let escaped = backup_str.replace('\'', "''");
-    let dot_cmd = format!(".backup '{}'\n", escaped);
-
-    let mut child = Command::new("sqlite3")
-        .arg(db_str.as_ref())
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
+    let output = Command::new("pg_dump")
+        .args([
+            "-U", &parts.user,
+            "-h", &parts.host,
+            "-p", &port_str,
+            "-d", &parts.dbname,
+            "-f", &backup_str,
+        ])
+        .env("PGPASSWORD", parts.password.as_deref().unwrap_or(""))
         .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| Error::BackupFailed(format!("sqlite3 spawn failed: {}", e)))?;
-
-    {
-        let stdin = child
-            .stdin
-            .as_mut()
-            .ok_or_else(|| Error::BackupFailed("sqlite3 stdin unavailable".to_string()))?;
-        stdin
-            .write_all(dot_cmd.as_bytes())
-            .map_err(|e| Error::BackupFailed(format!("sqlite3 stdin write failed: {}", e)))?;
-    }
-
-    let output = child
-        .wait_with_output()
-        .map_err(|e| Error::BackupFailed(format!("sqlite3 wait failed: {}", e)))?;
+        .stdout(Stdio::piped())
+        .output()
+        .map_err(|e| Error::BackupFailed(format!("pg_dump spawn 실패: {}", e)))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-        return Err(Error::BackupFailed(format!(
-            "sqlite3 .backup failed: {}",
-            stderr
-        )));
+        // stderr는 pg_dump가 출력한 것 — DATABASE_URL/password 원문 미포함 (안전).
+        return Err(Error::BackupFailed(format!("pg_dump 실패: {}", stderr.trim())));
     }
 
+    verify_backup_magic(&backup_path)?;
     Ok(backup_path)
+}
+
+/// Backup 파일이 유효한 pg_dump 산출물인지 첫 줄 매직으로 검증.
+pub(crate) fn verify_backup_magic(path: &Path) -> Result<(), Error> {
+    use std::io::{BufRead, BufReader};
+    let file = std::fs::File::open(path)
+        .map_err(|e| Error::BackupFailed(format!("백업 파일 열기 실패: {}", e)))?;
+    let mut reader = BufReader::new(file);
+    let mut first = String::new();
+    reader
+        .read_line(&mut first)
+        .map_err(|e| Error::BackupFailed(format!("백업 파일 읽기 실패: {}", e)))?;
+    // pg_dump --version 11+ 기본 첫 줄: "-- PostgreSQL database dump"
+    if !first.starts_with("-- PostgreSQL database dump") {
+        return Err(Error::BackupFailed(
+            "백업 파일 검증 실패: 매직 라인 불일치".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Postgres backup_path (pidory-backup.sql)을 psql로 restore한다.
+pub fn restore_db(database_url: &str, backup_path: &Path) -> Result<(), Error> {
+    if !backup_path.exists() {
+        return Err(Error::BackupFailed("복원할 백업 파일 없음".into()));
+    }
+    let parts = parse_pg_url(database_url)?;
+    let port_str = parts.port.to_string();
+    let backup_str = backup_path.to_string_lossy().into_owned();
+
+    let output = Command::new("psql")
+        .args([
+            "-U", &parts.user,
+            "-h", &parts.host,
+            "-p", &port_str,
+            "-d", &parts.dbname,
+            "-v", "ON_ERROR_STOP=1",
+            "-f", &backup_str,
+        ])
+        .env("PGPASSWORD", parts.password.as_deref().unwrap_or(""))
+        .stderr(Stdio::piped())
+        .stdout(Stdio::piped())
+        .output()
+        .map_err(|e| Error::BackupFailed(format!("psql spawn 실패: {}", e)))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        return Err(Error::BackupFailed(format!("psql restore 실패: {}", stderr.trim())));
+    }
+
+    Ok(())
 }
 
 pub fn restore_binary(worktree: &Path) -> Result<(), Error> {
@@ -90,39 +126,6 @@ pub fn restore_binary(worktree: &Path) -> Result<(), Error> {
             e
         ))
     })?;
-
-    Ok(())
-}
-
-pub fn restore_db(db_path: &Path) -> Result<(), Error> {
-    let backup_path = {
-        let mut p = db_path.as_os_str().to_owned();
-        p.push(".backup");
-        PathBuf::from(p)
-    };
-
-    if !backup_path.exists() {
-        return Err(Error::BackupFailed("no db backup to restore".to_string()));
-    }
-
-    std::fs::copy(&backup_path, db_path).map_err(|e| {
-        Error::BackupFailed(format!(
-            "copy {} → {} failed: {}",
-            backup_path.display(),
-            db_path.display(),
-            e
-        ))
-    })?;
-
-    // Remove stale WAL/SHM files so they don't overwrite the restored DB.
-    for ext in &["-wal", "-shm"] {
-        let mut p = db_path.as_os_str().to_owned();
-        p.push(ext);
-        let wal = PathBuf::from(p);
-        if wal.exists() {
-            let _ = std::fs::remove_file(&wal);
-        }
-    }
 
     Ok(())
 }
@@ -169,10 +172,6 @@ mod tests {
     use super::*;
     use std::fs;
     use std::io::Write;
-
-    fn sqlite3_available() -> bool {
-        Command::new("sqlite3").arg("--version").output().is_ok()
-    }
 
     fn make_fake_binary(dir: &Path) -> PathBuf {
         let release_dir = dir.join("target/release");
@@ -228,69 +227,33 @@ mod tests {
     }
 
     #[test]
-    fn test_backup_db_and_restore_db() {
-        if !sqlite3_available() {
-            eprintln!("sqlite3 not found — skipping test_backup_db_and_restore_db");
-            return;
-        }
-
+    fn test_verify_backup_magic_accepts_valid_header() {
+        use std::io::Write;
         let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("pidory.db");
-
-        // create a minimal sqlite DB
-        let status = Command::new("sqlite3")
-            .args([db_path.to_str().unwrap(), "CREATE TABLE t(x);"])
-            .status()
-            .unwrap();
-        assert!(status.success());
-
-        let backup_path = backup_db(&db_path).unwrap();
-        assert!(backup_path.exists());
-
-        // verify backup is a valid SQLite file (sqlite3 .tables exits 0)
-        let verify = Command::new("sqlite3")
-            .args([backup_path.to_str().unwrap(), ".tables"])
-            .output()
-            .unwrap();
-        assert!(verify.status.success());
-
-        // restore: overwrite db, then restore
-        fs::write(&db_path, b"corrupted").unwrap();
-        restore_db(&db_path).unwrap();
-
-        // restored db should be valid again
-        let check = Command::new("sqlite3")
-            .args([db_path.to_str().unwrap(), ".tables"])
-            .output()
-            .unwrap();
-        assert!(check.status.success());
+        let path = dir.path().join("test-backup.sql");
+        let mut f = std::fs::File::create(&path).unwrap();
+        writeln!(f, "-- PostgreSQL database dump").unwrap();
+        writeln!(f, "-- (다른 내용)").unwrap();
+        assert!(verify_backup_magic(&path).is_ok());
     }
 
     #[test]
-    fn test_restore_db_removes_stale_wal() {
-        if !sqlite3_available() {
-            eprintln!("sqlite3 not found — skipping test_restore_db_removes_stale_wal");
-            return;
-        }
-
+    fn test_verify_backup_magic_rejects_invalid_header() {
+        use std::io::Write;
         let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("pidory.db");
+        let path = dir.path().join("test-backup.sql");
+        let mut f = std::fs::File::create(&path).unwrap();
+        writeln!(f, "-- Some other dump").unwrap();
+        let result = verify_backup_magic(&path);
+        assert!(matches!(result, Err(Error::BackupFailed(_))));
+    }
 
-        Command::new("sqlite3")
-            .args([db_path.to_str().unwrap(), "CREATE TABLE t(x);"])
-            .status()
-            .unwrap();
-
-        backup_db(&db_path).unwrap();
-
-        // plant fake WAL/SHM files
-        fs::write(dir.path().join("pidory.db-wal"), b"stale").unwrap();
-        fs::write(dir.path().join("pidory.db-shm"), b"stale").unwrap();
-
-        restore_db(&db_path).unwrap();
-
-        assert!(!dir.path().join("pidory.db-wal").exists());
-        assert!(!dir.path().join("pidory.db-shm").exists());
+    #[test]
+    fn test_verify_backup_magic_rejects_missing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("does-not-exist.sql");
+        let result = verify_backup_magic(&path);
+        assert!(matches!(result, Err(Error::BackupFailed(_))));
     }
 
     #[cfg(target_os = "linux")]
