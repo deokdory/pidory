@@ -26,8 +26,18 @@ SERVICE=pidory-qa.service
 KEYS=("PIDORY_DEV_DISCORD_TOKEN" "pidory-dev/discord-token")
 
 # 사전 조건 검사
+# EUID 0 차단 — deok-guard는 사용자 GPG 키체인(pass) 접근. root로 실행하면 키 못 봄.
+# 내부 sudo systemctl만 root 권한 사용 (sudo -v 캐시 활용).
+if [ "$EUID" -eq 0 ]; then
+    echo "ERROR: try-qa-token.sh는 sudo 없이 호출해줘." >&2
+    echo "  bash scripts/try-qa-token.sh" >&2
+    echo "이유: deok-guard는 사용자 GPG 키체인(pass) 사용. root로 호출 시 secret 못 읽음." >&2
+    echo "내부 sudo systemctl restart는 sudo -v 캐시(15분) 활용." >&2
+    exit 1
+fi
+
 if ! command -v deok-guard &>/dev/null; then
-    echo "ERROR: deok-guard not installed" >&2
+    echo "ERROR: deok-guard not installed (또는 PATH에 없음)" >&2
     exit 1
 fi
 
