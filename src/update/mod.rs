@@ -1,5 +1,6 @@
 pub mod backup;
 pub mod build;
+pub mod db_url;
 pub mod git;
 pub mod lock;
 pub mod marker;

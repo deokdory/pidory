@@ -245,7 +245,21 @@ pub async fn update(
     }
 
     // ── Step 13: DB 백업 ──────────────────────────────────────────────────────
-    if let Err(e) = update::backup::backup_db(std::path::Path::new(&data.config.database.path)) {
+    let database_url = match std::env::var("DATABASE_URL") {
+        Ok(v) => v,
+        Err(_) => {
+            update_status(&reply, ctx, &mut last_edit, "❌ DB 백업 실패: DATABASE_URL 환경변수 미설정".to_string()).await?;
+            return Ok(());
+        }
+    };
+    let backup_dir = std::path::Path::new(&data.config.database.path)
+        .parent()
+        .unwrap_or(std::path::Path::new("."));
+    if let Err(e) = std::fs::create_dir_all(backup_dir) {
+        update_status(&reply, ctx, &mut last_edit, format!("❌ DB 백업 실패: 백업 디렉토리 생성 실패: {}", e)).await?;
+        return Ok(());
+    }
+    if let Err(e) = update::backup::backup_db(&database_url, backup_dir) {
         update_status(&reply, ctx, &mut last_edit, format!("❌ DB 백업 실패: {}", e)).await?;
         return Ok(());
     }
