@@ -120,6 +120,14 @@ pub async fn update(
         return Ok(());
     }
 
+    // ── Step 3.5: postgres preflight ─────────────────────────────────────────
+    let preflight = update::preflight::check_postgres_setup().await;
+    if !preflight.is_complete() {
+        let missing = preflight.missing_labels(lang);
+        update_status(&reply, ctx, &mut last_edit, lang.preflight_blocked(&missing)).await?;
+        return Ok(());
+    }
+
     // ── Step 4: 락 획득 ───────────────────────────────────────────────────────
     let _lock = match update::lock::acquire(&worktree) {
         Ok(guard) => guard,
