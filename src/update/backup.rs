@@ -35,15 +35,19 @@ pub fn backup_db(database_url: &str, backup_dir: &Path) -> Result<PathBuf, Error
     let port_str = parts.port.to_string();
     let backup_str = backup_path.to_string_lossy().into_owned();
 
-    let output = Command::new("pg_dump")
-        .args([
-            "-U", &parts.user,
-            "-h", &parts.host,
-            "-p", &port_str,
-            "-d", &parts.dbname,
-            "-f", &backup_str,
-        ])
-        .env("PGPASSWORD", parts.password.as_deref().unwrap_or(""))
+    let mut cmd = Command::new("pg_dump");
+    cmd.args([
+        "--clean", "--if-exists",
+        "-U", &parts.user,
+        "-h", &parts.host,
+        "-p", &port_str,
+        "-d", &parts.dbname,
+        "-f", &backup_str,
+    ]);
+    if let Some(pw) = &parts.password {
+        cmd.env("PGPASSWORD", pw);
+    }
+    let output = cmd
         .stderr(Stdio::piped())
         .stdout(Stdio::piped())
         .output()
@@ -83,20 +87,24 @@ pub fn restore_db(database_url: &str, backup_path: &Path) -> Result<(), Error> {
     if !backup_path.exists() {
         return Err(Error::BackupFailed("복원할 백업 파일 없음".into()));
     }
+    verify_backup_magic(backup_path)?;
     let parts = parse_pg_url(database_url)?;
     let port_str = parts.port.to_string();
     let backup_str = backup_path.to_string_lossy().into_owned();
 
-    let output = Command::new("psql")
-        .args([
-            "-U", &parts.user,
-            "-h", &parts.host,
-            "-p", &port_str,
-            "-d", &parts.dbname,
-            "-v", "ON_ERROR_STOP=1",
-            "-f", &backup_str,
-        ])
-        .env("PGPASSWORD", parts.password.as_deref().unwrap_or(""))
+    let mut cmd = Command::new("psql");
+    cmd.args([
+        "-U", &parts.user,
+        "-h", &parts.host,
+        "-p", &port_str,
+        "-d", &parts.dbname,
+        "-v", "ON_ERROR_STOP=1",
+        "-f", &backup_str,
+    ]);
+    if let Some(pw) = &parts.password {
+        cmd.env("PGPASSWORD", pw);
+    }
+    let output = cmd
         .stderr(Stdio::piped())
         .stdout(Stdio::piped())
         .output()

@@ -24,12 +24,19 @@ pub fn parse_pg_url(s: &str) -> Result<PgUrlParts, super::Error> {
         return Err(super::Error::BackupFailed("DATABASE_URL 파싱 실패".into()));
     }
     let user = percent_decode_str(raw_user)
-        .decode_utf8_lossy()
+        .decode_utf8()
+        .map_err(|_| super::Error::BackupFailed("DATABASE_URL 파싱 실패".into()))?
         .into_owned();
 
-    let password = parsed.password().map(|p| {
-        percent_decode_str(p).decode_utf8_lossy().into_owned()
-    });
+    let password = parsed
+        .password()
+        .map(|p| {
+            percent_decode_str(p)
+                .decode_utf8()
+                .map(|s| s.into_owned())
+                .map_err(|_| super::Error::BackupFailed("DATABASE_URL 파싱 실패".into()))
+        })
+        .transpose()?;
 
     let host = parsed
         .host_str()
@@ -39,11 +46,14 @@ pub fn parse_pg_url(s: &str) -> Result<PgUrlParts, super::Error> {
     let port = parsed.port().unwrap_or(5432);
 
     let raw_path = parsed.path();
-    let dbname = raw_path.trim_start_matches('/');
-    if dbname.is_empty() {
+    let raw_dbname = raw_path.trim_start_matches('/');
+    if raw_dbname.is_empty() {
         return Err(super::Error::BackupFailed("DATABASE_URL 파싱 실패".into()));
     }
-    let dbname = dbname.to_string();
+    let dbname = percent_decode_str(raw_dbname)
+        .decode_utf8()
+        .map_err(|_| super::Error::BackupFailed("DATABASE_URL 파싱 실패".into()))?
+        .into_owned();
 
     Ok(PgUrlParts {
         user,
@@ -106,5 +116,20 @@ mod tests {
         assert!(parse_pg_url("postgres://:secret@localhost/pidory").is_err());
         // dbname 없음
         assert!(parse_pg_url("postgres://pidory:secret@localhost/").is_err());
+    }
+
+    #[test]
+    fn parses_percent_encoded_dbname() {
+        // "my%20db" → "my db"
+        let parts = parse_pg_url("postgres://pidory:secret@localhost/my%20db").unwrap();
+        assert_eq!(parts.dbname, "my db");
+    }
+
+    #[test]
+    fn rejects_invalid_utf8_in_password() {
+        // %FF%FE는 유효하지 않은 UTF-8 시퀀스 — strict decode로 reject해야 함.
+        // url::Url이 percent-encoded raw bytes를 보존하므로 직접 parse_pg_url 호출.
+        let result = parse_pg_url("postgres://pidory:%FF%FE@localhost/pidory");
+        assert!(result.is_err());
     }
 }

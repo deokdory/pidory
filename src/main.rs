@@ -137,14 +137,24 @@ async fn main() -> Result<(), PidoryError> {
                     .parent()
                     .unwrap_or(std::path::Path::new("."));
                 let backup_path = backup_dir.join("pidory-backup.sql");
-                let database_url = std::env::var("DATABASE_URL").unwrap_or_default();
+                let database_url = match std::env::var("DATABASE_URL") {
+                    Ok(v) => v,
+                    Err(_) => {
+                        tracing::error!("DATABASE_URL missing during rollback — DB restore skipped");
+                        String::new()
+                    }
+                };
                 let mut restore_failed = false;
                 if let Err(e) = update::backup::restore_binary(worktree) {
                     tracing::error!("restore_binary failed: {:?}", e);
                     restore_failed = true;
                 }
-                if let Err(e) = update::backup::restore_db(&database_url, &backup_path) {
-                    tracing::error!("restore_db failed: {:?}", e);
+                if !database_url.is_empty() {
+                    if let Err(e) = update::backup::restore_db(&database_url, &backup_path) {
+                        tracing::error!("restore_db failed: {:?}", e);
+                        restore_failed = true;
+                    }
+                } else {
                     restore_failed = true;
                 }
                 let rollback_marker = worktree.join("target").join("release").join(".update-rolled-back");
