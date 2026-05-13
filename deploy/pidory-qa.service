@@ -1,0 +1,30 @@
+[Unit]
+Description=pidory-qa — Discord ↔ Claude Code Bridge (qa, isolated)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=__USER__
+WorkingDirectory=__PROJECT_DIR__
+ExecStart=__PROJECT_DIR__/target/release/pidory
+Restart=on-failure
+RestartSec=10
+
+# Config — qa
+Environment=PIDORY_CONFIG=__PROJECT_DIR__/config.qa.toml
+Environment=HOME=__HOME_DIR__
+Environment=RUST_LOG=info
+Environment=PATH=__HOME_DIR__/.local/bin:__HOME_DIR__/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/snap/bin
+
+EnvironmentFile=-__PROJECT_DIR__/.env.qa
+EnvironmentFile=/etc/pidory-qa/db.env
+ExecStartPre=/usr/local/bin/pidory-migrate
+
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=__HOME_DIR__/claude __HOME_DIR__/.claude /tmp /var/lib/pidory-qa
+
+[Install]
+WantedBy=multi-user.target

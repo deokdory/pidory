@@ -1,0 +1,19 @@
+[discord]
+guild_id = 1504040703326556230   # qa server
+owner_id = 331704019821133825    # owner (prod와 동일)
+token_env = "PIDORY_DEV_DISCORD_TOKEN"   # 또는 deok-guard로 inject한 다른 키
+
+[claude]
+binary_path = "claude"
+default_disallowed_tools = []
+subprocess_timeout_secs = 600
+max_sessions = 3                 # qa는 낮게
+
+# [database] path is DEPRECATED — DATABASE_URL env is the authoritative source.
+# Set DATABASE_URL via /etc/pidory-qa/db.env
+[database]
+path = "pidory.db"               # deprecated, ignored
+
+[response]
+max_chunk_length = 1900
+max_chunks = 10
