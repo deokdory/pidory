@@ -10,6 +10,7 @@
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::sync::{OnceLock, RwLock};
 
 /// Claude permission rule 매칭 방식.
 ///
@@ -43,12 +44,49 @@ impl Scope {
             Scope::Global => Scope::Project,
         }
     }
+
+    /// DB 저장용 문자열로 변환.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Scope::Project => "project",
+            Scope::Global => "global",
+        }
+    }
+
+    /// DB 문자열에서 복원. 알 수 없는 값은 Project 로 fallback.
+    pub fn from_db_str(s: &str) -> Self {
+        match s {
+            "global" => Scope::Global,
+            _ => Scope::Project,
+        }
+    }
 }
 
-/// AlwaysAllow 의 default scope. P1.3 (#288) 에서 DB user_settings 조회로 교체.
-pub fn default_scope() -> Scope {
-    Scope::Project
+/// default_scope cache — 부팅 시 `load_default_scope_from_db` 로 초기화된다.
+static DEFAULT_SCOPE_CACHE: OnceLock<RwLock<Scope>> = OnceLock::new();
+
+fn scope_cache() -> &'static RwLock<Scope> {
+    DEFAULT_SCOPE_CACHE.get_or_init(|| RwLock::new(Scope::Project))
 }
+
+/// AlwaysAllow 의 default scope.
+///
+/// `load_default_scope_from_db` 로 부팅 시 DB 값을 cache 에 적재한다.
+/// cache 가 초기화되기 전에는 `Scope::Project` 를 반환한다.
+pub fn default_scope() -> Scope {
+    scope_cache()
+        .read()
+        .map(|g| g.clone())
+        .unwrap_or(Scope::Project)
+}
+
+/// cache 에 새 scope 를 쓴다. DB upsert 성공 후 호출한다.
+pub fn set_default_scope_cache(scope: Scope) {
+    if let Ok(mut g) = scope_cache().write() {
+        *g = scope;
+    }
+}
+
 
 /// Scope와 경로 정보로 settings 파일 절대 경로를 반환한다.
 ///

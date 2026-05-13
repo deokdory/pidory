@@ -225,6 +225,46 @@ impl Lang {
             Lang::En => "ℹ️ This file is outside the working directory — persistent allow disabled (add to `additionalDirectories`)",
         }
     }
+
+    /// Level 2 UI — Dangerous 명령 인라인 경고
+    pub fn warn_dangerous_command(&self) -> &'static str {
+        match self {
+            Lang::Ko => "⚠️ 위험 명령 — 영속 허용 시 자동 실행됩니다",
+            Lang::En => "⚠️ Dangerous command — will run automatically if permanently allowed",
+        }
+    }
+
+    /// Level 2 UI — Moderate 명령 인라인 경고
+    pub fn warn_moderate_command(&self) -> &'static str {
+        match self {
+            Lang::Ko => "⚡ 광범위 권한 — 확인 후 진행",
+            Lang::En => "⚡ Broad permission — review before proceeding",
+        }
+    }
+
+    /// Level 2 UI — Global scope 영구 저장 경고
+    pub fn warn_global_permanence(&self) -> &'static str {
+        match self {
+            Lang::Ko => "⚠️ ~/.claude/settings.json 에 영구 저장됩니다 (모든 프로젝트 영향)",
+            Lang::En => "⚠️ Saved permanently to ~/.claude/settings.json (affects all projects)",
+        }
+    }
+
+    /// Project scope 영속 클릭 후 `.gitignore` 미등록 안내
+    pub fn gitignore_missing_advisory(&self) -> &'static str {
+        match self {
+            Lang::Ko => "ℹ️ 이 프로젝트 .gitignore 에 `.claude/settings.local.json` 이 없습니다.\n   권한 정책이 git 에 commit 될 수 있습니다. 다음 줄을 .gitignore 에 추가하세요:\n   .claude/settings.local.json",
+            Lang::En => "ℹ️ `.claude/settings.local.json` is not in this project's .gitignore.\n   Permission policy may be committed to git. Add the following to .gitignore:\n   .claude/settings.local.json",
+        }
+    }
+
+    /// 권한 응답 5분 timeout — 자동 거부됨 레이블
+    pub fn permission_timeout_auto_deny(&self) -> &'static str {
+        match self {
+            Lang::Ko => "⌛ 시간 초과 — 자동 거부됨",
+            Lang::En => "⌛ Timed out — auto-denied",
+        }
+    }
 }
 
 #[cfg(test)]

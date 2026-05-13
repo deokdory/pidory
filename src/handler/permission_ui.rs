@@ -119,16 +119,25 @@ pub fn build_level2_message_parts(
 
     // 미리보기: available_rule_kinds → build_rule_texts(복수형) → 콤마 나열.
     let kinds = available_rule_kinds(tool_name, input, file_path, cwd, additional_dirs);
+
+    // 모든 rule 에 대해 최고 위험도를 계산 (P1.5 위험 명령 경고)
+    use crate::claude_settings::danger::Severity;
+    let overall_severity = kinds.iter().flat_map(|kind| {
+        build_rule_texts(tool_name, input, kind.clone())
+    }).map(|r| classify_command(&r)).fold(Severity::Safe, |acc, s| {
+        match (&acc, &s) {
+            (Severity::Dangerous, _) | (_, Severity::Dangerous) => Severity::Dangerous,
+            (Severity::Moderate, _) | (_, Severity::Moderate) => Severity::Moderate,
+            _ => Severity::Safe,
+        }
+    });
+
     let preview_lines: Vec<String> = kinds
         .iter()
         .filter_map(|kind| {
             let rules = build_rule_texts(tool_name, input, kind.clone());
             if rules.is_empty() {
                 return None;
-            }
-            // classify_command 호출 — skeleton (P1.5에서 활용), 현재 시각 변경 없음
-            for r in &rules {
-                let _severity = classify_command(r);
             }
             let prefix = match kind {
                 RuleKind::Exact => lang.btn_always_exact(),
@@ -153,13 +162,29 @@ pub fn build_level2_message_parts(
         )
     };
 
+    // 위험도 경고 줄 (Dangerous/Moderate 만 표시)
+    let severity_warn = match overall_severity {
+        Severity::Dangerous => format!("\n-# {}", lang.warn_dangerous_command()),
+        Severity::Moderate => format!("\n-# {}", lang.warn_moderate_command()),
+        Severity::Safe => String::new(),
+    };
+
+    // Global scope 영구성 경고 줄
+    let global_warn = if matches!(scope, Scope::Global) {
+        format!("\n-# {}", lang.warn_global_permanence())
+    } else {
+        String::new()
+    };
+
     let content = format!(
-        "{}\n{}\n{}{}{}",
+        "{}\n{}\n{}{}{}{}{}",
         lang.lbl_permission_request_section_header(),
         header,
         summary,
         reason,
-        preview_section
+        preview_section,
+        severity_warn,
+        global_warn
     );
 
     // Row 1: always-allow 버튼들 + scope 토글
@@ -512,6 +537,8 @@ pub enum DisableReason {
     AllowAlwaysFailed { reason: String },
     /// 같은 tool 의 다른 pending 이 AlwaysAllow 처리되어 자동 취소됨 (review #297 s1)
     AutoDismissedByAlwaysChain { triggering_rule: String },
+    /// 5분 응답 없음 — 자동 거부됨
+    Timeout,
 }
 
 pub async fn disable_permission_buttons(
@@ -565,6 +592,7 @@ pub async fn disable_permission_buttons(
             Lang::Ko => format!("-# 🔓 `{}` 등록으로 자동 취소됨", triggering_rule),
             Lang::En => format!("-# 🔓 Auto-dismissed by `{}`", triggering_rule),
         },
+        DisableReason::Timeout => format!("-# {}", lang.permission_timeout_auto_deny()),
     };
 
     // tool_name은 라벨에 미포함이지만 향후 로깅 등에 활용 가능
@@ -725,13 +753,15 @@ pub async fn run_permission_handler(
 
         let log_request_id = perm_req.request_id.clone();
         let log_tool_name = perm_req.tool_name.clone();
+        let timeout_rx = perm_req.timeout_rx;
         match channel_id.send_message(&ctx, msg).await {
             Ok(sent) => {
                 tracing::info!(thread_id = %thread_id, request_id = %log_request_id, tool_name = %log_tool_name, "permission message sent");
+                let message_id = sent.id;
                 let pending = PendingPermission {
                     response_tx: perm_req.response_tx,
                     tool_name: perm_req.tool_name,
-                    message_id: sent.id,
+                    message_id,
                     thread_id: thread_id.clone(),
                     triggered_by,
                     input: Some(perm_req.input),
@@ -744,8 +774,30 @@ pub async fn run_permission_handler(
                 pending_permissions
                     .lock()
                     .await
-                    .insert(perm_req.request_id, pending);
+                    .insert(log_request_id.clone(), pending);
                 tracing::info!(thread_id = %thread_id, request_id = %log_request_id, tool_name = %log_tool_name, "pending_permission inserted");
+
+                // Spawn a task that listens for the worker's timeout signal and disables buttons.
+                let ctx_clone = ctx.clone();
+                let rid_for_timeout = log_request_id.clone();
+                let pp_clone = Arc::clone(&pending_permissions);
+                tokio::spawn(async move {
+                    if timeout_rx.await.is_ok() {
+                        // Remove from pending map so button clicks after timeout are no-ops.
+                        pp_clone.lock().await.remove(&rid_for_timeout);
+                        tracing::info!(request_id = %rid_for_timeout, "permission timeout — disabling buttons");
+                        let _ = disable_permission_buttons(
+                            &ctx_clone,
+                            channel_id,
+                            message_id,
+                            DisableReason::Timeout,
+                            &log_tool_name,
+                            lang,
+                        ).await;
+                    }
+                    // If timeout_rx returns Err (sender dropped = worker resolved normally),
+                    // do nothing — the normal button-click path already updated the message.
+                });
             }
             Err(e) => {
                 tracing::info!(thread_id = %thread_id, request_id = %log_request_id, tool_name = %log_tool_name, "permission message send failed");

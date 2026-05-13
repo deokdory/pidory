@@ -260,6 +260,9 @@ async fn main() -> Result<(), PidoryError> {
                     info!("Reset {} orphaned running sessions", reset_count);
                 }
 
+                // default_scope cache 부팅 초기화
+                db::repository::load_default_scope_from_db(&db, config.discord.owner_id as i64).await;
+
                 let (ratelimit_tx, _) = tokio::sync::watch::channel(crate::ratelimit::RateLimitInfo::default());
 
                 let (session_count_tx, _session_count_rx) = watch::channel(0usize);

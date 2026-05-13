@@ -777,6 +777,11 @@ async fn handle_allow_always(
                 }
             }
 
+            // .gitignore 검사 — Project scope 영속 클릭 시에만 실행 (매번 안내, de-dup v1.0)
+            if matches!(scope, Scope::Project) {
+                check_gitignore_and_warn(ctx, channel_id, &project_root, lang).await;
+            }
+
             // outcome 별 disable reason 분기 (w3 fix: Some(_) 와일드카드 → 명시적 분기)
             let disable_reason = match merge_outcome {
                 MergeOutcome::Added => DisableReason::AllowAlwaysSuccess {
@@ -1357,6 +1362,38 @@ pub(super) async fn handle_modal_interaction(
     }
 
     Ok(())
+}
+
+/// Project scope 영속 클릭 후 `.gitignore` 검사.
+///
+/// `<project_root>/.gitignore` 를 읽어 `.claude/settings.local.json` 또는
+/// `.claude/*.local.json` 패턴이 없으면 thread 에 안내 메시지를 1회 전송한다.
+/// 파일 없음 / 읽기 실패 → silent skip.
+async fn check_gitignore_and_warn(
+    ctx: &Context,
+    channel_id: poise::serenity_prelude::ChannelId,
+    project_root: &std::path::Path,
+    lang: crate::i18n::Lang,
+) {
+    let gitignore_path = project_root.join(".gitignore");
+    let content = match tokio::fs::read_to_string(&gitignore_path).await {
+        Ok(c) => c,
+        Err(_) => return, // 없거나 읽기 실패 → silent skip
+    };
+
+    let covered = content.lines().any(|line| {
+        let trimmed = line.trim();
+        // 정확 문자열 또는 simple glob 패턴
+        trimmed == ".claude/settings.local.json"
+            || trimmed == ".claude/*.local.json"
+            || trimmed == ".claude/"
+            || trimmed == ".claude"
+    });
+
+    if !covered {
+        let advisory = lang.gitignore_missing_advisory();
+        channel_id.say(ctx, advisory).await.ok();
+    }
 }
 
 #[cfg(test)]
