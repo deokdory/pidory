@@ -20,6 +20,9 @@ use crate::subprocess::session_manager::QueuedMessage;
 use super::ratelimit_bridge::handle_ratelimit_event;
 use super::io::build_user_message_json;
 
+/// 권한 응답 대기 최대 시간. 초과 시 자동 deny.
+const PERMISSION_RESPONSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300); // 5min
+
 // ─── T5: Permission wait result (legacy) ────────────────────────────────────
 
 #[allow(dead_code)]
@@ -181,6 +184,7 @@ where
 
         // handler 로 전송
         let (resp_tx, resp_rx) = tokio::sync::oneshot::channel::<PermissionDecision>();
+        let (timeout_tx, timeout_rx) = tokio::sync::oneshot::channel::<()>();
         let perm_req = PermissionRequest {
             request_id: rid.clone(),
             tool_name: tool_name.clone(),
@@ -188,6 +192,7 @@ where
             input: initial_cr.input.clone(),
             decision_reason: initial_cr.decision_reason.clone(),
             response_tx: resp_tx,
+            timeout_rx,
             triggered_by: initial_cr.triggered_by,
             cwd: project_path.to_path_buf(),
             additional_dirs: Arc::clone(additional_dirs),
@@ -196,8 +201,36 @@ where
         match permission_tx.try_send(perm_req) {
             Ok(()) => {
                 tracing::info!(thread_id = %thread_id, request_id = %rid, tool_name = %tool_name, "permission_tx send ok");
+                let is_ask_user = tool_name == "AskUserQuestion";
                 pending.insert(rid.clone(), PendingEntry { tool_name, saved_input: initial_cr.input.clone() });
-                let fut = async move { (rid, resp_rx.await) }.boxed();
+                // Wrap the oneshot receiver in a timeout race.
+                // On normal response: drop timeout_tx so handler's timeout_rx returns Err (no Discord edit).
+                // On 5-min timeout: fire timeout_tx so handler disables buttons.
+                // biased: resp_rx is checked first — if both branches are ready at the same
+                // time (e.g. in tests with paused time), user decision takes priority.
+                // AskUserQuestion 은 사용자 입력 대기 — timeout 의미 없음, 무한 대기.
+                let fut = if is_ask_user {
+                    async move {
+                        let result = resp_rx.await;
+                        drop(timeout_tx); // timeout_tx drop → handler 의 timeout_rx returns Err (no-op)
+                        (rid, result)
+                    }.boxed()
+                } else {
+                    async move {
+                        tokio::select! {
+                            biased;
+                            result = resp_rx => {
+                                drop(timeout_tx);
+                                (rid, result)
+                            }
+                            _ = tokio::time::sleep(PERMISSION_RESPONSE_TIMEOUT) => {
+                                let _ = timeout_tx.send(());
+                                tracing::info!(request_id = %rid, "permission response timeout — auto-deny");
+                                (rid, Ok(PermissionDecision::Deny))
+                            }
+                        }
+                    }.boxed()
+                };
                 futures.push(fut);
             }
             Err(TrySendError::Full(dropped)) => {
@@ -313,6 +346,7 @@ where
                                     // auto-allow 는 pending/futures 에 추가하지 않음 (즉시 처리됨)
                                 } else {
                                     let (resp_tx, resp_rx) = tokio::sync::oneshot::channel::<PermissionDecision>();
+                                    let (timeout_tx, timeout_rx) = tokio::sync::oneshot::channel::<()>();
                                     let perm_req = PermissionRequest {
                                         request_id: rid.clone(),
                                         tool_name: tname.clone(),
@@ -320,6 +354,7 @@ where
                                         input: input.clone(),
                                         decision_reason: decision_reason.clone(),
                                         response_tx: resp_tx,
+                                        timeout_rx,
                                         triggered_by: initial_cr.triggered_by,
                                         cwd: project_path.to_path_buf(),
                                         additional_dirs: Arc::clone(additional_dirs),
@@ -328,8 +363,32 @@ where
                                     match permission_tx.try_send(perm_req) {
                                         Ok(()) => {
                                             tracing::info!(thread_id = %thread_id, request_id = %rid, tool_name = %tname, "permission_tx send ok");
-                                            pending.insert(rid.clone(), PendingEntry { tool_name: tname, saved_input: input.clone() });
-                                            let fut = async move { (rid, resp_rx.await) }.boxed();
+                                            pending.insert(rid.clone(), PendingEntry { tool_name: tname.clone(), saved_input: input.clone() });
+                                            // AskUserQuestion 은 사용자 입력 대기 — timeout 의미 없음, 무한 대기.
+                                            // Wrap the oneshot receiver in a timeout race (same pattern as initial CR).
+                                            // biased: resp_rx checked first (see initial CR comment).
+                                            let fut = if tname == "AskUserQuestion" {
+                                                async move {
+                                                    let result = resp_rx.await;
+                                                    drop(timeout_tx);
+                                                    (rid, result)
+                                                }.boxed()
+                                            } else {
+                                                async move {
+                                                    tokio::select! {
+                                                        biased;
+                                                        result = resp_rx => {
+                                                            drop(timeout_tx);
+                                                            (rid, result)
+                                                        }
+                                                        _ = tokio::time::sleep(PERMISSION_RESPONSE_TIMEOUT) => {
+                                                            let _ = timeout_tx.send(());
+                                                            tracing::info!(request_id = %rid, "permission response timeout — auto-deny");
+                                                            (rid, Ok(PermissionDecision::Deny))
+                                                        }
+                                                    }
+                                                }.boxed()
+                                            };
                                             futures.push(fut);
                                         }
                                         Err(TrySendError::Full(dropped)) => {
@@ -1116,6 +1175,7 @@ mod tests {
         let (_queue_tx, mut queue_rx, _interrupt_tx, mut interrupt_rx, queue_size, pending_recalls, ratelimit_tx) = setup_channels!();
 
         let (dummy_tx, _dummy_rx) = tokio::sync::oneshot::channel::<PermissionDecision>();
+        let (_dummy_timeout_tx, dummy_timeout_rx) = tokio::sync::oneshot::channel::<()>();
         let dummy_req = PermissionRequest {
             request_id: "dummy".to_string(),
             tool_name: "Dummy".to_string(),
@@ -1123,6 +1183,7 @@ mod tests {
             input: serde_json::json!({}),
             decision_reason: None,
             response_tx: dummy_tx,
+            timeout_rx: dummy_timeout_rx,
             triggered_by: poise::serenity_prelude::UserId::new(1),
             cwd: std::path::PathBuf::from("/tmp"),
             additional_dirs: Arc::new(vec![]),
@@ -1381,6 +1442,187 @@ mod tests {
         assert_eq!(writes[0]["type"], "control_response");
         assert_eq!(writes[0]["response"]["response"]["behavior"], "allow");
         assert_eq!(writes[0]["response"]["request_id"], "cr-single");
+        assert!(matches!(result, PermissionsWaitResult::AllResolved { .. }));
+    }
+
+    // ── #293: Timeout tests ──────────────────────────────────────────────────
+
+    /// timeout_auto_deny:
+    /// 5분(300초) 후 응답 없으면 worker 가 auto-deny stdin write + timeout_rx 에 신호 전달.
+    /// tokio::time::pause() + advance(301s) 로 virtual time 으로 트리거.
+    #[tokio::test(start_paused = true)]
+    async fn timeout_auto_deny() {
+        let (mut reader, _reader_write) = make_duplex_reader(&[]).await;
+        let mut line = String::new();
+
+        let (mut stdin_write, mut stdin_read) = tokio::io::duplex(4096);
+        let (permission_tx, mut permission_rx) = tokio::sync::mpsc::channel::<PermissionRequest>(32);
+        let mut cache = PermissionCache::new();
+        let (_queue_tx, mut queue_rx, _interrupt_tx, mut interrupt_rx, queue_size, pending_recalls, ratelimit_tx) = setup_channels!();
+
+        let initial_cr = make_initial_cr("cr-timeout", "Bash");
+
+        // timeout_rx 를 캡처해 신호 수신 여부 확인
+        let (timeout_fired_tx, timeout_fired_rx) = tokio::sync::oneshot::channel::<bool>();
+        let timeout_rx_task = tokio::spawn(async move {
+            if let Some(req) = permission_rx.recv().await {
+                // keep response_tx alive (pending) so the timeout fires
+                let timeout_rx = req.timeout_rx;
+                let fired = timeout_rx.await.is_ok();
+                drop(req.response_tx); // drop after timeout
+                let _ = timeout_fired_tx.send(fired);
+            } else {
+                let _ = timeout_fired_tx.send(false);
+            }
+        });
+
+        // Run wait_for_permissions with a 301s advance — exceeds 300s timeout
+        let project_path = PathBuf::from("/tmp");
+        let additional_dirs: Arc<Vec<PathBuf>> = Arc::new(vec![]);
+        let wait_fut = wait_for_permissions(
+            &mut stdin_write, &mut reader, &mut line, &mut queue_rx, &mut interrupt_rx,
+            &queue_size, &pending_recalls, "test-thread", None, &ratelimit_tx,
+            &mut cache, &permission_tx, initial_cr,
+            &project_path, &additional_dirs,
+        );
+
+        let (result, _) = tokio::join!(wait_fut, async {
+            tokio::time::advance(std::time::Duration::from_secs(301)).await;
+            timeout_rx_task.await.unwrap()
+        });
+        let timeout_fired = timeout_fired_rx.await.unwrap_or(false);
+
+        // timeout_rx 가 Ok(()) — timeout 신호 수신됨
+        assert!(timeout_fired, "timeout_rx must fire Ok(()) on 5-min timeout");
+
+        // stdin 에 deny JSON 기록됨
+        let writes = drain_stdin_writes(&mut stdin_read, 1).await;
+        assert_eq!(writes.len(), 1, "timeout → deny JSON 1개 기록되어야 함");
+        assert_eq!(writes[0]["type"], "control_response");
+        assert_eq!(writes[0]["response"]["response"]["behavior"], "deny");
+        assert_eq!(writes[0]["response"]["request_id"], "cr-timeout");
+        // timeout deny reason 이 아닌 "User did not respond within 5m" 이 기록됨은
+        // resolved arm 의 Deny 분기가 처리하므로, behavior=deny 이면 충분
+        assert!(matches!(result, PermissionsWaitResult::AllResolved { .. }));
+    }
+
+    /// normal_response_within_timeout:
+    /// 1초 후 Allow → timeout 분기 실행 X (timeout_rx 에 신호 없음).
+    #[tokio::test(start_paused = true)]
+    async fn normal_response_within_timeout() {
+        let (mut reader, _reader_write) = make_duplex_reader(&[]).await;
+        let mut line = String::new();
+
+        let (mut stdin_write, mut stdin_read) = tokio::io::duplex(4096);
+        let (permission_tx, mut permission_rx) = tokio::sync::mpsc::channel::<PermissionRequest>(32);
+        let mut cache = PermissionCache::new();
+        let (_queue_tx, mut queue_rx, _interrupt_tx, mut interrupt_rx, queue_size, pending_recalls, ratelimit_tx) = setup_channels!();
+
+        let initial_cr = make_initial_cr("cr-normal", "Bash");
+
+        // handler: 1초 후 Allow 전송
+        let (did_timeout_tx, did_timeout_rx) = tokio::sync::oneshot::channel::<bool>();
+        let handler_task = tokio::spawn(async move {
+            if let Some(req) = permission_rx.recv().await {
+                let timeout_rx = req.timeout_rx;
+                tokio::time::advance(std::time::Duration::from_secs(1)).await;
+                let _ = req.response_tx.send(PermissionDecision::Allow);
+                // timeout_rx 는 Err (sender dropped on normal path)
+                let fired = timeout_rx.await.is_ok();
+                let _ = did_timeout_tx.send(fired);
+            } else {
+                let _ = did_timeout_tx.send(false);
+            }
+        });
+
+        let result = wait_for_permissions(
+            &mut stdin_write, &mut reader, &mut line, &mut queue_rx, &mut interrupt_rx,
+            &queue_size, &pending_recalls, "test-thread", None, &ratelimit_tx,
+            &mut cache, &permission_tx, initial_cr,
+            &PathBuf::from("/tmp"), &Arc::new(vec![]),
+        ).await;
+
+        handler_task.await.unwrap();
+        let did_timeout = did_timeout_rx.await.unwrap_or(true);
+        // 정상 응답 시 timeout_tx 가 drop 되므로 timeout_rx.await → Err → fired = false
+        assert!(!did_timeout, "timeout_rx must not fire on normal response (sender dropped)");
+
+        // allow JSON 기록됨
+        let writes = drain_stdin_writes(&mut stdin_read, 1).await;
+        assert_eq!(writes.len(), 1);
+        assert_eq!(writes[0]["response"]["response"]["behavior"], "allow");
+        assert_eq!(writes[0]["response"]["request_id"], "cr-normal");
+        assert!(matches!(result, PermissionsWaitResult::AllResolved { .. }));
+    }
+
+    /// mid_turn_partial_timeout:
+    /// 5개 pending 중 2개만 timeout, 나머지 3개는 정상 응답.
+    /// → stdin 에 5개 deny/allow JSON, AllResolved 반환.
+    ///
+    /// 설계 노트:
+    /// tokio::join! 으로 wait_for_permissions 와 "helper" future 를 동시 실행.
+    /// helper 는 permission_rx 에서 5개 수집 → cr1/cr3/cr5 즉시 Allow → advance(301s)
+    /// → cr2/cr4 timeout. wait_for_permissions 내부 select! 가 모든 결과를 처리하고 AllResolved.
+    #[tokio::test(start_paused = true)]
+    async fn mid_turn_partial_timeout() {
+        // 4개 추가 CR (initial cr1 + cr2..cr5 = 5개)
+        let cr2 = cr_json_line("cr2", "Write");
+        let cr3 = cr_json_line("cr3", "Edit");
+        let cr4 = cr_json_line("cr4", "Read");
+        let cr5 = cr_json_line("cr5", "Glob");
+        let (mut reader, _reader_write) = make_duplex_reader(&[cr2, cr3, cr4, cr5]).await;
+        let mut line = String::new();
+
+        let (mut stdin_write, mut stdin_read) = tokio::io::duplex(8192);
+        let (permission_tx, mut permission_rx) = tokio::sync::mpsc::channel::<PermissionRequest>(32);
+        let mut cache = PermissionCache::new();
+        let (_queue_tx, mut queue_rx, _interrupt_tx, mut interrupt_rx, queue_size, pending_recalls, ratelimit_tx) = setup_channels!();
+
+        let initial_cr = make_initial_cr("cr1", "Bash");
+        let project_path = PathBuf::from("/tmp");
+        let additional_dirs: Arc<Vec<PathBuf>> = Arc::new(vec![]);
+
+        // handler future: collect 5 CRs, Allow cr1/cr3/cr5, keep cr2/cr4 pending, advance time
+        let handler_fut = async move {
+            let mut reqs: std::collections::HashMap<String, PermissionRequest> = std::collections::HashMap::new();
+            for _ in 0..5 {
+                if let Some(req) = permission_rx.recv().await {
+                    reqs.insert(req.request_id.clone(), req);
+                }
+            }
+            // Allow cr1, cr3, cr5 immediately (time still paused)
+            for rid in ["cr1", "cr3", "cr5"] {
+                if let Some(req) = reqs.remove(rid) {
+                    let _ = req.response_tx.send(PermissionDecision::Allow);
+                }
+            }
+            // Advance time past 5-min timeout — cr2, cr4 futures will fire
+            tokio::time::advance(std::time::Duration::from_secs(301)).await;
+            // Keep reqs alive until advance completes, then drop
+            drop(reqs);
+        };
+
+        let (result, ()) = tokio::join!(
+            wait_for_permissions(
+                &mut stdin_write, &mut reader, &mut line, &mut queue_rx, &mut interrupt_rx,
+                &queue_size, &pending_recalls, "test-thread", None, &ratelimit_tx,
+                &mut cache, &permission_tx, initial_cr,
+                &project_path, &additional_dirs,
+            ),
+            handler_fut,
+        );
+
+        let writes = drain_stdin_writes(&mut stdin_read, 5).await;
+        assert_eq!(writes.len(), 5, "5개 CR → 5개 stdin JSON");
+        let mut by_rid: std::collections::HashMap<&str, &serde_json::Value> = std::collections::HashMap::new();
+        for w in &writes {
+            by_rid.insert(w["response"]["request_id"].as_str().unwrap(), w);
+        }
+        assert_eq!(by_rid["cr1"]["response"]["response"]["behavior"], "allow", "cr1 → allow");
+        assert_eq!(by_rid["cr3"]["response"]["response"]["behavior"], "allow", "cr3 → allow");
+        assert_eq!(by_rid["cr5"]["response"]["response"]["behavior"], "allow", "cr5 → allow");
+        assert_eq!(by_rid["cr2"]["response"]["response"]["behavior"], "deny",  "cr2 → timeout deny");
+        assert_eq!(by_rid["cr4"]["response"]["response"]["behavior"], "deny",  "cr4 → timeout deny");
         assert!(matches!(result, PermissionsWaitResult::AllResolved { .. }));
     }
 }

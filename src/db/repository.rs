@@ -1,6 +1,7 @@
 use sqlx::PgPool;
 
 use super::models::{Project, Session};
+use crate::claude_settings::rule::Scope;
 use crate::error::PidoryError;
 
 // Project CRUD
@@ -200,6 +201,46 @@ pub async fn try_acquire_session(
     Ok(result.rows_affected() > 0)
 }
 
+// User settings CRUD
+
+pub async fn get_user_default_scope(pool: &PgPool, user_id: i64) -> Result<Option<Scope>, PidoryError> {
+    let row: Option<(String,)> =
+        sqlx::query_as("SELECT default_perm_scope FROM user_settings WHERE user_id = $1")
+            .bind(user_id)
+            .fetch_optional(pool)
+            .await
+            .map_err(PidoryError::Db)?;
+    Ok(row.map(|(s,)| Scope::from_db_str(&s)))
+}
+
+pub async fn upsert_user_default_scope(
+    pool: &PgPool,
+    user_id: i64,
+    scope: Scope,
+) -> Result<(), PidoryError> {
+    sqlx::query(
+        "INSERT INTO user_settings (user_id, default_perm_scope) VALUES ($1, $2)
+         ON CONFLICT (user_id) DO UPDATE SET default_perm_scope = EXCLUDED.default_perm_scope",
+    )
+    .bind(user_id)
+    .bind(scope.as_str())
+    .execute(pool)
+    .await
+    .map_err(PidoryError::Db)?;
+    Ok(())
+}
+
+/// 부팅 시 1회 호출: DB 에서 owner 의 default_perm_scope 를 읽어 cache 를 초기화한다.
+pub async fn load_default_scope_from_db(pool: &PgPool, owner_id: i64) {
+    match get_user_default_scope(pool, owner_id).await {
+        Ok(Some(scope)) => crate::claude_settings::rule::set_default_scope_cache(scope),
+        Ok(None) => {}
+        Err(e) => {
+            tracing::warn!("load_default_scope_from_db failed: {}", e);
+        }
+    }
+}
+
 pub async fn reset_running_sessions(pool: &PgPool) -> Result<u64, PidoryError> {
     let result = sqlx::query("UPDATE sessions SET status = 'idle' WHERE status = 'running'")
         .execute(pool)
@@ -346,6 +387,26 @@ mod tests {
         assert!(p.is_none());
         let s = get_session_by_thread(&pool, "nonexistent").await.unwrap();
         assert!(s.is_none());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires TEST_DATABASE_URL"]
+    async fn user_settings_round_trip() {
+        let pool = setup_db().await;
+
+        // No row yet → None
+        let scope = get_user_default_scope(&pool, 12345).await.unwrap();
+        assert!(scope.is_none());
+
+        // Upsert project
+        upsert_user_default_scope(&pool, 12345, Scope::Project).await.unwrap();
+        let scope = get_user_default_scope(&pool, 12345).await.unwrap();
+        assert_eq!(scope, Some(Scope::Project));
+
+        // Upsert global (update)
+        upsert_user_default_scope(&pool, 12345, Scope::Global).await.unwrap();
+        let scope = get_user_default_scope(&pool, 12345).await.unwrap();
+        assert_eq!(scope, Some(Scope::Global));
     }
 
     #[tokio::test]
