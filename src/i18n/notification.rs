@@ -111,4 +111,11 @@ impl Lang {
             Lang::En => format!("❌ File transfer failed: `{}` — {}", path, error),
         }
     }
+
+    pub fn file_send_failed(&self, filename: &str, size: &str, reason: &str) -> String {
+        match self {
+            Lang::Ko => format!("❌ 파일 전송 실패: `{}` ({}) — {}", filename, size, reason),
+            Lang::En => format!("❌ File send failed: `{}` ({}) — {}", filename, size, reason),
+        }
+    }
 }

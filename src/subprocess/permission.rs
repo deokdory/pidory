@@ -23,6 +23,9 @@ pub struct PermissionRequest {
     pub input: serde_json::Value,
     pub decision_reason: Option<String>,
     pub response_tx: tokio::sync::oneshot::Sender<PermissionDecision>,
+    /// Receives `()` when the worker has auto-denied this request due to a 5-minute timeout.
+    /// The permission handler awaits this to disable buttons and append the timeout label.
+    pub timeout_rx: tokio::sync::oneshot::Receiver<()>,
     pub triggered_by: UserId,
     /// Worker session's project directory (used by path_safety check)
     pub cwd: PathBuf,
