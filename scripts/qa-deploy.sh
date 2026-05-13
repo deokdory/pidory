@@ -44,12 +44,10 @@ if [ -f "$HOME/.cargo/env" ]; then
     source "$HOME/.cargo/env"
 fi
 cargo build --release
-# pidory-migrate also rebuild if migrate feature enabled in this branch
+# pidory-migrate도 빌드 (migrate feature 있는 branch만). qa worktree 자체 target/release/에 둠 —
+# pidory-qa.service의 ExecStartPre가 직접 사용. prod의 /usr/local/bin/pidory-migrate 안 건드림 (isolation).
 if grep -q 'name = "pidory-migrate"' Cargo.toml 2>/dev/null; then
     cargo build --bin pidory-migrate --features migrate --release
-    sudo install -o "$(whoami)" -m 0755 \
-        target/release/pidory-migrate \
-        /usr/local/bin/pidory-migrate
 fi
 
 echo "[4/4] Restarting pidory-qa.service..."

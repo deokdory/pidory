@@ -19,14 +19,17 @@ Environment=PATH=__HOME_DIR__/.local/bin:__HOME_DIR__/.cargo/bin:/usr/local/sbin
 # 격리 보장 — pidory-migrate가 prod sqlite (default /var/lib/pidory/pidory.db) 절대 안 봄
 Environment=PIDORY_LEGACY_DB=/var/lib/pidory-qa/pidory.db
 
-EnvironmentFile=-__PROJECT_DIR__/.env.qa
+EnvironmentFile=__PROJECT_DIR__/.env.qa
 EnvironmentFile=/etc/pidory-qa/db.env
-ExecStartPre=/usr/local/bin/pidory-migrate
+# qa worktree 자체 binary — prod의 /usr/local/bin/pidory-migrate와 분리해서 isolation 보장
+ExecStartPre=__PROJECT_DIR__/target/release/pidory-migrate
 
 # Security hardening
 NoNewPrivileges=true
 ProtectSystem=strict
-ReadWritePaths=__HOME_DIR__/claude __HOME_DIR__/.claude /tmp /var/lib/pidory-qa
+ReadWritePaths=__HOME_DIR__/claude __HOME_DIR__/.claude /var/lib/pidory-qa
+# /tmp는 service-private tmpfs (prod와 cross-process 노출 방지)
+PrivateTmp=true
 
 [Install]
 WantedBy=multi-user.target

@@ -140,19 +140,16 @@ echo "  PostgreSQL is running"
 # ---------------------------------------------------------------------------
 echo "[step 5/8] Creating pidory_qa role and database..."
 
-# SQL injection 방지: single quote escape
-ESCAPED_PASSWORD="${DB_PASSWORD//\'/\'\'}"
-
-# Role 생성 또는 password 갱신
-if ! sudo -u postgres psql -v ON_ERROR_STOP=1 <<EOF
-DO \$\$
+# password를 psql -v 변수로 전달 (literal quoting `:'password'` — 수동 escape 불필요, regress 안전)
+if ! sudo -u postgres psql -v ON_ERROR_STOP=1 -v "qa_password=${DB_PASSWORD}" <<'EOF'
+DO $$
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'pidory_qa') THEN
-        CREATE ROLE pidory_qa LOGIN PASSWORD '${ESCAPED_PASSWORD}';
+        EXECUTE format('CREATE ROLE pidory_qa LOGIN PASSWORD %L', :'qa_password');
     ELSE
-        ALTER ROLE pidory_qa WITH LOGIN PASSWORD '${ESCAPED_PASSWORD}';
+        EXECUTE format('ALTER ROLE pidory_qa WITH LOGIN PASSWORD %L', :'qa_password');
     END IF;
-END \$\$;
+END $$;
 EOF
 then
     echo "ERROR: [step 5/8] Failed to create/update pidory_qa role." >&2
@@ -204,12 +201,16 @@ if [ -z "$URL_ESCAPED_PASSWORD" ]; then
     URL_ESCAPED_PASSWORD="$DB_PASSWORD"
 fi
 
-# db.env 작성 (atomic write via install)
-DB_ENV_TMP="$(mktemp)"
+# db.env 진짜 atomic write — temp file을 /etc/pidory-qa 안에 생성 (root:user 0750 보호) 후 mv
+# /tmp 같은 곳에 두면 secret 포함 temp file 누출 위험 + script 중단 시 잔존.
+DB_ENV_TMP="$(mktemp /etc/pidory-qa/.db.env.XXXXXX)"
+trap 'rm -f "$DB_ENV_TMP"' EXIT
+chmod 0640 "$DB_ENV_TMP"
+chown "root:${DEPLOY_USER}" "$DB_ENV_TMP"
 printf 'DATABASE_URL=postgres://pidory_qa:%s@localhost/pidory_qa\n' "$URL_ESCAPED_PASSWORD" \
     > "$DB_ENV_TMP"
-install -m 0640 -o root -g "$DEPLOY_USER" "$DB_ENV_TMP" /etc/pidory-qa/db.env
-rm -f "$DB_ENV_TMP"
+mv -f "$DB_ENV_TMP" /etc/pidory-qa/db.env
+trap - EXIT  # mv 성공 후 cleanup 불필요
 
 echo "  Written: /etc/pidory-qa/db.env (mode 0640, root:${DEPLOY_USER})"
 

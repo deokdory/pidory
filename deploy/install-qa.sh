@@ -64,6 +64,13 @@ fi
 
 # 5. pidory-qa.service 설치 (source worktree의 unit 파일 사용)
 echo "[5/5] Installing pidory-qa.service..."
+# .env.qa placeholder 생성 (EnvironmentFile required로 변경됨 — 파일 부재 시 systemd load 실패)
+# 사용자가 deok-guard inject로 토큰 채울 때까지 빈 파일.
+if [ ! -f "$PROJECT_DIR/.env.qa" ]; then
+    sudo -u "$USER_NAME" touch "$PROJECT_DIR/.env.qa"
+    sudo -u "$USER_NAME" chmod 600 "$PROJECT_DIR/.env.qa"
+fi
+
 sed -e "s|__USER__|$USER_NAME|g" \
     -e "s|__PROJECT_DIR__|$PROJECT_DIR|g" \
     -e "s|__HOME_DIR__|$HOME_DIR|g" \
