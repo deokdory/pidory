@@ -576,4 +576,60 @@ impl Lang {
             Lang::En => "⚠️ Update failed to boot — auto-rolled back.",
         }
     }
+
+    // ── Commands: update preflight ──
+
+    pub fn preflight_label_database_url(&self) -> &'static str {
+        match self {
+            Lang::Ko => "DATABASE_URL 환경변수 또는 /etc/pidory/db.env",
+            Lang::En => "DATABASE_URL env var or /etc/pidory/db.env",
+        }
+    }
+
+    pub fn preflight_label_exec_start_pre(&self) -> &'static str {
+        match self {
+            Lang::Ko => "pidory.service 의 ExecStartPre=/usr/local/bin/pidory-migrate",
+            Lang::En => "ExecStartPre=/usr/local/bin/pidory-migrate in pidory.service",
+        }
+    }
+
+    pub fn preflight_label_migrate_binary(&self) -> &'static str {
+        match self {
+            Lang::Ko => "/usr/local/bin/pidory-migrate 실행 파일",
+            Lang::En => "/usr/local/bin/pidory-migrate executable",
+        }
+    }
+
+    pub fn preflight_label_postgres_connection(&self) -> &'static str {
+        match self {
+            Lang::Ko => "PostgreSQL 연결",
+            Lang::En => "PostgreSQL connection",
+        }
+    }
+
+    pub fn preflight_blocked(&self, missing_labels: &[String]) -> String {
+        let bullet_list = missing_labels
+            .iter()
+            .map(|item| format!("- {}", item))
+            .collect::<Vec<_>>()
+            .join("\n");
+        match self {
+            Lang::Ko => format!(
+                "⚠️ Postgres 셋업 미완 — /update 차단됨\n\n\
+                 이번 버전부터 PostgreSQL 백엔드로 전환됐습니다.\n\
+                 부족한 항목:\n{}\n\n\
+                 SSH 로 한 번 실행해주세요:\n  sudo bash scripts/postgres-setup.sh\n\n\
+                 셋업 완료 후 /update 를 다시 시도하세요.",
+                bullet_list
+            ),
+            Lang::En => format!(
+                "⚠️ Postgres setup incomplete — /update blocked\n\n\
+                 This version uses the PostgreSQL backend.\n\
+                 Missing:\n{}\n\n\
+                 Run this once via SSH:\n  sudo bash scripts/postgres-setup.sh\n\n\
+                 Retry /update after setup completes.",
+                bullet_list
+            ),
+        }
+    }
 }

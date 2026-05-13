@@ -3,6 +3,7 @@ pub mod build;
 pub mod git;
 pub mod lock;
 pub mod marker;
+pub mod preflight;
 pub mod restart;
 pub mod skills;
 pub mod version;
