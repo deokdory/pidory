@@ -43,9 +43,12 @@ if [ ! -f /etc/systemd/system/pidory-qa.service ]; then
     exit 1
 fi
 
-if [ ! -f /usr/local/bin/pidory-migrate ]; then
-    echo "ERROR: /usr/local/bin/pidory-migrate not found." >&2
-    echo "  Please run deploy/install-qa.sh (or wt-deploy.sh with a migrate-enabled branch) first." >&2
+# qa worktree 자체 binary 사용 (prod와 분리). qa-deploy.sh로 migrate-enabled branch deploy 시 빌드됨.
+QA_MIGRATE_BIN=/home/deokdory/claude/projects/deokdory/pidory-qa/target/release/pidory-migrate
+if [ ! -f "$QA_MIGRATE_BIN" ]; then
+    echo "ERROR: $QA_MIGRATE_BIN not found." >&2
+    echo "  Please run qa-deploy.sh with a migrate-enabled branch first:" >&2
+    echo "    bash scripts/qa-deploy.sh 304-postgres-migration" >&2
     exit 1
 fi
 
