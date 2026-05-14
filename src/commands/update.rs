@@ -252,9 +252,7 @@ pub async fn update(
             return Ok(());
         }
     };
-    let backup_dir = std::path::Path::new(&data.config.database.path)
-        .parent()
-        .unwrap_or(std::path::Path::new("."));
+    let backup_dir = std::path::Path::new(&data.config.backup.dir);
     if let Err(e) = std::fs::create_dir_all(backup_dir) {
         update_status(&reply, ctx, &mut last_edit, format!("❌ DB 백업 실패: 백업 디렉토리 생성 실패: {}", e)).await?;
         return Ok(());

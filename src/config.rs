@@ -24,6 +24,8 @@ pub struct Config {
     #[serde(default)]
     pub attachment: AttachmentConfig,
     #[serde(default)]
+    pub backup: BackupConfig,
+    #[serde(default)]
     pub footer: FooterConfig,
 }
 
@@ -86,6 +88,33 @@ impl Default for DatabaseConfig {
 
 fn default_db_path() -> String {
     "pidory.db".to_string()
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct BackupConfig {
+    #[serde(default = "default_backup_dir")]
+    pub dir: String,
+}
+
+impl Default for BackupConfig {
+    fn default() -> Self {
+        Self {
+            dir: default_backup_dir(),
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn default_backup_dir() -> String {
+    match std::env::var("HOME") {
+        Ok(home) if !home.is_empty() => format!("{}/.pidory/backups", home),
+        _ => "./backups".to_string(),
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn default_backup_dir() -> String {
+    "/var/lib/pidory/backups".to_string()
 }
 
 #[derive(Debug, Deserialize)]
@@ -247,6 +276,9 @@ impl Config {
 
         if config.discord.token_env.trim().is_empty() {
             return Err(PidoryError::Config("discord.token_env must not be empty".to_string()));
+        }
+        if config.backup.dir.trim().is_empty() {
+            return Err(PidoryError::Config("backup.dir must not be empty".to_string()));
         }
         // database.path is deprecated; DATABASE_URL env is the authoritative source.
         // Validation removed to avoid spurious errors when [database] section is omitted.
@@ -651,5 +683,77 @@ show_context_percent = true
 "#;
         let config: Config = toml::from_str(toml_str).unwrap();
         assert!(config.footer.show_context_percent);
+    }
+
+    #[test]
+    fn parse_config_with_backup_dir() {
+        let toml_str = r#"
+[discord]
+guild_id = 1
+owner_id = 2
+
+[claude]
+binary_path = "claude"
+
+[response]
+
+[backup]
+dir = "/tmp/test/backups"
+"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.backup.dir, "/tmp/test/backups");
+    }
+
+    #[test]
+    fn parse_config_without_backup_uses_default() {
+        let toml_str = r#"
+[discord]
+guild_id = 1
+owner_id = 2
+
+[claude]
+binary_path = "claude"
+
+[response]
+"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        #[cfg(target_os = "macos")]
+        {
+            let dir = &config.backup.dir;
+            assert!(
+                dir.ends_with("/.pidory/backups") || dir == "./backups",
+                "macOS default 가 ~/.pidory/backups 또는 ./backups 여야 함. actual: {}",
+                dir
+            );
+        }
+        #[cfg(not(target_os = "macos"))]
+        assert_eq!(config.backup.dir, "/var/lib/pidory/backups");
+    }
+
+    #[test]
+    fn reject_empty_backup_dir() {
+        let dir = std::env::temp_dir().join("pidory_test_empty_backup");
+        std::fs::create_dir_all(&dir).ok();
+        let path = dir.join("bad_config.toml");
+        let mut f = std::fs::File::create(&path).unwrap();
+        write!(f, r#"
+[discord]
+guild_id = 1
+owner_id = 2
+[claude]
+binary_path = "claude"
+[response]
+[backup]
+dir = ""
+"#).unwrap();
+        let result = Config::load(path.to_str().unwrap());
+        assert!(result.is_err());
+        let err_msg = format!("{:?}", result.unwrap_err());
+        assert!(
+            err_msg.contains("backup.dir"),
+            "에러 메시지에 'backup.dir' 포함되어야 함. actual: {}",
+            err_msg
+        );
+        std::fs::remove_file(&path).ok();
     }
 }

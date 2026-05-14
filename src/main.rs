@@ -135,9 +135,14 @@ async fn main() -> Result<(), PidoryError> {
             update::marker::RecoveryAction::Normal => {}
             update::marker::RecoveryAction::Rolling { from, to, attempt } => {
                 tracing::warn!("Rolling back: from={} to={} attempt={}", from, to, attempt);
-                let backup_dir = std::path::Path::new(&config.database.path)
-                    .parent()
-                    .unwrap_or(std::path::Path::new("."));
+                let backup_dir = std::path::Path::new(&config.backup.dir);
+                if let Err(e) = std::fs::create_dir_all(backup_dir) {
+                    tracing::error!(
+                        "rollback: backup_dir 생성 실패 {}: {} — DB restore skipped",
+                        backup_dir.display(),
+                        e
+                    );
+                }
                 let backup_path = backup_dir.join("pidory-backup.sql");
                 let database_url = match std::env::var("DATABASE_URL") {
                     Ok(v) => v,
