@@ -10,6 +10,27 @@ pub struct FooterConfig {
     pub show_context_percent: bool,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct TimestampConfig {
+    #[serde(default = "default_timestamp_enabled")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub tz: Option<String>,
+}
+
+impl Default for TimestampConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_timestamp_enabled(),
+            tz: None,
+        }
+    }
+}
+
+fn default_timestamp_enabled() -> bool {
+    true
+}
+
 #[derive(Debug, Deserialize)]
 pub struct Config {
     #[serde(default)]
@@ -25,6 +46,8 @@ pub struct Config {
     pub attachment: AttachmentConfig,
     #[serde(default)]
     pub footer: FooterConfig,
+    #[serde(default)]
+    pub timestamp: TimestampConfig,
 }
 
 #[derive(Debug, Deserialize)]
@@ -632,6 +655,58 @@ binary_path = "claude"
 "#;
         let config: Config = toml::from_str(toml_str).unwrap();
         assert!(!config.footer.show_context_percent);
+    }
+
+    // ── W1-A: TimestampConfig 3 case ────────────────────────────────────────
+
+    #[test]
+    fn timestamp_config_default_enabled_true_tz_none() {
+        // default() → enabled=true, tz=None
+        let cfg = TimestampConfig::default();
+        assert!(cfg.enabled, "default enabled must be true");
+        assert!(cfg.tz.is_none(), "default tz must be None");
+    }
+
+    #[test]
+    fn timestamp_config_enabled_false() {
+        // [timestamp] enabled = false
+        let toml_str = r#"
+[discord]
+guild_id = 123
+owner_id = 456
+
+[claude]
+binary_path = "claude"
+
+[response]
+
+[timestamp]
+enabled = false
+"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert!(!config.timestamp.enabled, "enabled=false must parse correctly");
+        assert!(config.timestamp.tz.is_none(), "tz must be None when omitted");
+    }
+
+    #[test]
+    fn timestamp_config_tz_asia_seoul() {
+        // [timestamp] tz = "Asia/Seoul"
+        let toml_str = r#"
+[discord]
+guild_id = 123
+owner_id = 456
+
+[claude]
+binary_path = "claude"
+
+[response]
+
+[timestamp]
+tz = "Asia/Seoul"
+"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert!(config.timestamp.enabled, "enabled must default to true even when tz is set");
+        assert_eq!(config.timestamp.tz, Some("Asia/Seoul".to_string()));
     }
 
     #[test]

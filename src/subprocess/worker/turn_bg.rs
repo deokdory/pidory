@@ -10,6 +10,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{ChildStdin, ChildStdout};
 use tokio::sync::{Mutex, mpsc};
 
+use crate::config::TimestampConfig;
 use crate::db::repository;
 use crate::handler::formatter;
 use crate::handler::message::{shorten_model_name, format_ctx_suffix};
@@ -48,6 +49,7 @@ pub(super) async fn handle_bg_turn(
     model_name: &mut String,
     project_path: &Path,
     additional_dirs: &Arc<Vec<PathBuf>>,
+    timestamp_config: &TimestampConfig,
 ) {
     let mut used_tools: Vec<String> = Vec::new();
     let mut used_skills: Vec<String> = Vec::new();
@@ -185,6 +187,7 @@ pub(super) async fn handle_bg_turn(
                                     initial_cr,
                                     project_path,
                                     additional_dirs,
+                                    timestamp_config,
                                 ).await;
                                 match result {
                                     PermissionsWaitResult::AllResolved { .. } => {}
@@ -234,7 +237,7 @@ pub(super) async fn handle_bg_turn(
                             continue 'bg_turn;
                         }
                         *current_triggered_by = m.triggered_by;
-                        let inject_line = build_user_message_json(&m.content, &m.downloaded_files, m.reply_context.as_ref(), m.sender_info.as_ref());
+                        let inject_line = build_user_message_json(&m.content, &m.downloaded_files, m.reply_context.as_ref(), m.sender_info.as_ref(), timestamp_config, chrono::Utc::now());
                         if let Err(e) = stdin.write_all(inject_line.as_bytes()).await {
                             tracing::error!("mid-turn stdin write error (bg turn): {}", e);
                             if let Err(e) = repository::update_session_status(db, thread_id, "idle").await {

@@ -10,6 +10,7 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{ChildStdin, ChildStdout};
 use tokio::sync::{Mutex, mpsc};
 
+use crate::config::TimestampConfig;
 use crate::db::repository;
 use crate::handler::session_state::SessionState;
 use crate::i18n::Lang;
@@ -55,6 +56,7 @@ pub(super) async fn handle_between_turns_event(
     model_name: &mut String,
     project_path: &Path,
     additional_dirs: &Arc<Vec<PathBuf>>,
+    timestamp_config: &TimestampConfig,
 ) -> BetweenTurnsAction {
     line.clear();
     tokio::select! {
@@ -126,6 +128,7 @@ pub(super) async fn handle_between_turns_event(
                                 model_name,
                                 project_path,
                                 additional_dirs,
+                                timestamp_config,
                             ).await;
 
                             BetweenTurnsAction::Continue
@@ -147,6 +150,7 @@ pub(super) async fn handle_between_turns_event(
                                 initial_cr,
                                 project_path,
                                 additional_dirs,
+                                timestamp_config,
                             ).await;
                             match result {
                                 PermissionsWaitResult::AllResolved { .. } => BetweenTurnsAction::Continue,

@@ -12,6 +12,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{ChildStdin, ChildStdout};
 use tokio::sync::mpsc;
 
+use crate::config::TimestampConfig;
 use crate::i18n::Lang;
 use crate::ratelimit::RateLimitInfo;
 use super::super::background::BackgroundTaskTracker;
@@ -48,6 +49,7 @@ pub(super) async fn run_active_turn(
     model_name: &mut String,
     project_path: &Path,
     additional_dirs: &Arc<Vec<PathBuf>>,
+    timestamp_config: &TimestampConfig,
 ) -> bool {
     let mut timeout_deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
     let mut soft_timeout_fired = false;
@@ -77,7 +79,7 @@ pub(super) async fn run_active_turn(
                         }
                         *last_activity.lock().unwrap_or_else(|p| p.into_inner()) = Instant::now();
                         *current_triggered_by = m.triggered_by;
-                        let inject_line = build_user_message_json(&m.content, &m.downloaded_files, m.reply_context.as_ref(), m.sender_info.as_ref());
+                        let inject_line = build_user_message_json(&m.content, &m.downloaded_files, m.reply_context.as_ref(), m.sender_info.as_ref(), timestamp_config, chrono::Utc::now());
                         if let Err(e) = stdin.write_all(inject_line.as_bytes()).await {
                             tracing::error!("mid-turn stdin write error: {}", e);
                             break 'turn false;
@@ -179,6 +181,7 @@ pub(super) async fn run_active_turn(
                                         initial_cr,
                                         project_path,
                                         additional_dirs,
+                                        timestamp_config,
                                     ).await;
                                     match result {
                                         PermissionsWaitResult::AllResolved { .. } => {}
@@ -239,7 +242,7 @@ pub(super) async fn run_active_turn(
                                 timeout_secs,
                                 "#36 debug: Soft timeout fired — sending nudge"
                             );
-                            let nudge_line = build_user_message_json("[SYSTEM] No stdout activity for an extended period. A tool may be unresponsive. Check the status of any running tools and recover if needed.", &[], None, None);
+                            let nudge_line = build_user_message_json("[SYSTEM] No stdout activity for an extended period. A tool may be unresponsive. Check the status of any running tools and recover if needed.", &[], None, None, timestamp_config, chrono::Utc::now());
                             if let Err(e) = stdin.write_all(nudge_line.as_bytes()).await {
                                 tracing::error!("nudge write error: {}", e);
                                 break 'turn false;
