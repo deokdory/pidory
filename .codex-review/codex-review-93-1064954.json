@@ -1,1 +1,0 @@
-{"findings":[],"summary":"No actionable issues found in the diff. The change consistently updates result token accounting to include cached input tokens, and the added test matches the new behavior.","files_reviewed":1}
