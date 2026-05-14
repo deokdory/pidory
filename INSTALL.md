@@ -47,6 +47,39 @@ sudo systemctl start pidory
 
 See [Detailed Setup](#detailed-setup) below for a step-by-step walkthrough of each stage.
 
+### macOS Quick Start
+
+For a fresh macOS host with Homebrew available:
+
+```bash
+# 1. Clone the repository
+git clone https://github.com/deokdory/pidory.git
+cd pidory
+
+# 2. Install PostgreSQL via Homebrew and start it
+brew install postgresql@17
+brew services start postgresql@17
+
+# 3. Create the pidory role and database
+createuser -P pidory                          # prompts for a password
+createdb -O pidory pidory
+
+# 4. Write your Discord token and database URL to the project's environment file
+echo 'PIDORY_DISCORD_TOKEN=your_token_here' > .env
+echo "DATABASE_URL=postgres://pidory:your_password@localhost/pidory" >> .env
+
+# 5. Build and install
+bash deploy/install.sh                        # builds binaries, copies plist + skills
+
+# 6. Edit config.toml (guild_id, owner_id, binary_path)
+$EDITOR config.toml
+
+# 7. Start the launchd agent
+launchctl bootstrap gui/$UID ~/Library/LaunchAgents/com.pidory.bot.plist
+```
+
+> **Note for macOS**: The plist installed by `deploy/install.sh` does **not** inject `DATABASE_URL` automatically. Either include it in the project `.env` (read by the binary at startup) or add an `EnvironmentVariables` entry to the plist before bootstrapping. The `.env` approach is simpler and matches Linux behavior.
+
 ---
 
 ## Detailed Setup
@@ -107,6 +140,48 @@ sudo bash scripts/postgres-setup.sh
 ```
 
 > **Note:** This script requires Linux with systemd. macOS users must set up PostgreSQL manually and export `DATABASE_URL` in their environment before running `deploy/install.sh`.
+
+#### macOS Manual Setup
+
+`scripts/postgres-setup.sh` requires `systemctl` and is Linux-only. On macOS, install and configure PostgreSQL manually:
+
+```bash
+# Install PostgreSQL 17 via Homebrew
+brew install postgresql@17
+brew services start postgresql@17
+
+# Verify
+psql -d postgres -c 'SELECT version();'
+
+# Create the pidory role with a password
+createuser -P pidory                          # prompts for password
+
+# Create the pidory database owned by the new role
+createdb -O pidory pidory
+
+# Verify connection
+psql "postgres://pidory:your_password@localhost/pidory" -c 'SELECT 1;'
+```
+
+After this, set `DATABASE_URL` for the bot. Two options:
+
+**Option A — append to `.env` (recommended)**:
+```bash
+echo "DATABASE_URL=postgres://pidory:your_password@localhost/pidory" >> .env
+```
+
+**Option B — inject via the launchd plist**:
+
+After running `deploy/install.sh`, edit `~/Library/LaunchAgents/com.pidory.bot.plist` and add to the `EnvironmentVariables` dict:
+
+```xml
+<key>DATABASE_URL</key>
+<string>postgres://pidory:your_password@localhost/pidory</string>
+```
+
+Then re-bootstrap: `launchctl bootout gui/$UID ~/Library/LaunchAgents/com.pidory.bot.plist && launchctl bootstrap gui/$UID ~/Library/LaunchAgents/com.pidory.bot.plist`
+
+For Linux users, continue with the automated `scripts/postgres-setup.sh` below.
 
 The script performs the following steps automatically:
 1. Installs `postgresql-17` (falls back to `postgresql` if 17 is unavailable)
@@ -273,3 +348,40 @@ v0.7.0 is a breaking change: the database backend switched from SQLite to Postgr
 - Confirm **Message Content Intent** and **Server Members Intent** are enabled in the Bot tab.
 - Confirm `guild_id` in `config.toml` matches your server's ID.
 - Check logs: `journalctl -u pidory -n 50 --no-pager` (Linux) or `tail ~/.pidory/stderr.log` (macOS).
+
+### macOS-specific issues
+
+#### `launchctl bootstrap` fails: "Bootstrap failed: 5: Input/output error"
+
+Stale state is the likely cause. Resolve in this order:
+
+```bash
+launchctl bootout gui/$UID/com.pidory.bot 2>/dev/null
+launchctl bootstrap gui/$UID ~/Library/LaunchAgents/com.pidory.bot.plist
+```
+
+#### `DATABASE_URL not set` on macOS startup
+
+The plist does not inject `DATABASE_URL` by default. Verify which config source is being used:
+
+1. Check the project `.env`: `grep DATABASE_URL .env` (recommended path)
+2. Check the plist: `plutil -p ~/Library/LaunchAgents/com.pidory.bot.plist | grep -A1 DATABASE_URL`
+
+If neither has it, add to `.env` (see "PostgreSQL Setup → macOS Manual Setup" above).
+
+#### PostgreSQL server not running
+
+```bash
+brew services list | grep postgresql
+brew services start postgresql@17
+```
+
+#### Discord bot exits quickly under launchd
+
+Check stderr logs immediately:
+
+```bash
+tail -50 ~/.pidory/stderr.log
+```
+
+Common causes: `claude` binary not in PATH (set `[claude] binary_path` to an absolute path in `config.toml`), malformed `DATABASE_URL`.
