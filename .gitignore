@@ -11,6 +11,7 @@ config.dev.toml
 .pidory/
 .claude/
 .codex-review/
+.claire/
 scripts/dev-deploy.sh
 scripts/wt-deploy.sh
 scripts/prod-deploy.sh

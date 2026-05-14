@@ -1,1 +1,0 @@
-{"findings":[],"summary":"No actionable issues found in the diff: recovering poisoned `last_activity: StdMutex<Instant>` with `unwrap_or_else(|p| p.into_inner())` is reasonable at all 6 call sites, and the observed lock ordering remains consistent (`sessions` -> `last_activity`, with no inverse path found).","files_reviewed":2}
