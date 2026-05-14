@@ -1,5 +1,3 @@
-#![allow(dead_code, unused_variables)]
-
 use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -31,6 +29,34 @@ impl MentionCache {
             cache: Arc::new(RwLock::new(HashMap::new())),
             fetching: Arc::new(Mutex::new(HashSet::new())),
         }
+    }
+
+    /// 새 키를 insert 하기 전 충돌 검사.
+    ///
+    /// 기존 매핑이 다른 user_id 와 있으면 그 매핑을 제거하고 `true` 반환 (insert skip 권장).
+    /// 충돌 없으면 `false` 반환 (insert 진행 OK).
+    ///
+    /// caller 가 write guard 를 이미 갖고 있어야 함 (deadlock 회피).
+    fn check_and_clear_conflict(
+        gcache: &mut GuildMemberCache,
+        new_key: &str,
+        new_uid: UserId,
+        guild_id: GuildId,
+    ) -> bool {
+        if let Some(&existing_uid) = gcache.name_to_id.get(new_key) {
+            if existing_uid != new_uid {
+                gcache.name_to_id.remove(new_key);
+                tracing::warn!(
+                    guild_id = %guild_id,
+                    name = %new_key,
+                    user_a = %existing_uid,
+                    user_b = %new_uid,
+                    "Mention cache name conflict — both mappings removed (ambiguous)"
+                );
+                return true;
+            }
+        }
+        false
     }
 
     /// guild 내 이름으로 user_id 조회.
@@ -83,25 +109,21 @@ impl MentionCache {
             }
         };
 
-        // 5. cache 채움 (우선순위: nick > global_name > username — 역순 insert로 nick last-write)
+        // 5. cache 채움 (충돌 검출 — 동명이인이면 양쪽 모두 제거)
         // NOTE: 모든 키는 NFC 정규화 후 저장. lookup 도 NFC 적용 (한국어 nickname NFD/NFC 불일치 방지).
         let mut gcache = GuildMemberCache::default();
         for m in &members {
-            // username 먼저 (최저 우선순위)
-            if !m.user.name.is_empty() {
-                gcache.name_to_id.insert(nfc(&m.user.name), m.user.id);
-            }
-            // global_name (중간 우선순위)
-            if let Some(g) = &m.user.global_name
-                && !g.is_empty()
-            {
-                gcache.name_to_id.insert(nfc(g), m.user.id);
-            }
-            // nick (최고 우선순위 — last-write로 덮어씀)
-            if let Some(nick) = &m.nick
-                && !nick.is_empty()
-            {
-                gcache.name_to_id.insert(nfc(nick), m.user.id);
+            let candidates = [
+                m.user.name.clone(),
+                m.user.global_name.clone().unwrap_or_default(),
+                m.nick.clone().unwrap_or_default(),
+            ];
+            for cand in candidates.iter().filter(|s| !s.is_empty()) {
+                let key = nfc(cand);
+                if Self::check_and_clear_conflict(&mut gcache, &key, m.user.id, guild_id) {
+                    continue;
+                }
+                gcache.name_to_id.insert(key, m.user.id);
             }
         }
         let result = gcache.name_to_id.get(&nfc(name)).copied();
@@ -118,21 +140,19 @@ impl MentionCache {
         let gcache = guard.entry(guild_id).or_default();
         // 같은 user_id의 stale 키 제거 (nick 변경 처리)
         gcache.name_to_id.retain(|_, v| *v != member.user.id);
-        // username 먼저 (최저 우선순위)
-        if !member.user.name.is_empty() {
-            gcache.name_to_id.insert(nfc(&member.user.name), member.user.id);
-        }
-        // global_name (중간 우선순위)
-        if let Some(g) = &member.user.global_name
-            && !g.is_empty()
-        {
-            gcache.name_to_id.insert(nfc(g), member.user.id);
-        }
-        // nick (최고 우선순위 — last-write로 덮어씀)
-        if let Some(nick) = &member.nick
-            && !nick.is_empty()
-        {
-            gcache.name_to_id.insert(nfc(nick), member.user.id);
+
+        // 각 키를 insert 전에 충돌 검사 (동명이인 → 양쪽 제거)
+        let candidates = [
+            member.user.name.clone(),
+            member.user.global_name.clone().unwrap_or_default(),
+            member.nick.clone().unwrap_or_default(),
+        ];
+        for cand in candidates.iter().filter(|s| !s.is_empty()) {
+            let key = nfc(cand);
+            if Self::check_and_clear_conflict(gcache, &key, member.user.id, guild_id) {
+                continue;
+            }
+            gcache.name_to_id.insert(key, member.user.id);
         }
     }
 
@@ -326,11 +346,15 @@ pub fn mask_mass_mentions(text: &str) -> String {
 // ─── test-only cache helper ───────────────────────────────────────────────────
 #[cfg(test)]
 impl MentionCache {
-    /// 테스트 전용: guild에 name→uid 매핑을 직접 삽입 (NFC 정규화 후 저장).
+    /// 테스트 전용: guild에 name→uid 매핑을 직접 삽입 (NFC 정규화 후 저장, 충돌 검출 포함).
     pub async fn insert_for_test(&self, guild_id: GuildId, name: &str, user_id: UserId) {
         let mut guard = self.cache.write().await;
         let entry = guard.entry(guild_id).or_default();
-        entry.name_to_id.insert(nfc(name), user_id);
+        let key = nfc(name);
+        if Self::check_and_clear_conflict(entry, &key, user_id, guild_id) {
+            return;
+        }
+        entry.name_to_id.insert(key, user_id);
     }
 
     /// 테스트 전용: guild 전체 cache를 한 번에 교체 (NFC 정규화 후 저장).
@@ -659,6 +683,36 @@ mod tests {
     }
 
     // ── NFC normalization ─────────────────────────────────────────────────────
+
+    // ── conflict detection ────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_update_member_conflict_removes_both() {
+        let cache = MentionCache::new();
+        let gid = GuildId::new(50);
+        let uid_a = UserId::new(100);
+        let uid_b = UserId::new(200);
+
+        // A 가 "민수" 로 등록
+        cache.insert_for_test(gid, "민수", uid_a).await;
+        assert_eq!(cache.get_cached(gid, "민수").await, Some(uid_a));
+
+        // B 가 같은 nick "민수" 로 충돌 시도 — 양쪽 다 제거
+        cache.insert_for_test(gid, "민수", uid_b).await;
+        assert_eq!(cache.get_cached(gid, "민수").await, None);
+    }
+
+    #[tokio::test]
+    async fn test_insert_same_user_no_conflict() {
+        // 같은 user 가 자기 이름 다시 등록 — 충돌 아님
+        let cache = MentionCache::new();
+        let gid = GuildId::new(51);
+        let uid = UserId::new(42);
+
+        cache.insert_for_test(gid, "alice", uid).await;
+        cache.insert_for_test(gid, "alice", uid).await; // 동일 user_id
+        assert_eq!(cache.get_cached(gid, "alice").await, Some(uid));
+    }
 
     #[tokio::test]
     async fn test_nfc_decomposed_nick_lookup() {
