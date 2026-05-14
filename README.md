@@ -4,195 +4,121 @@
   <img src="assets/pidory.png" width="256" alt="pidory">
 </p>
 
-**English** | [한국어](README.ko.md)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](./LICENSE)
+[![Rust 2024](https://img.shields.io/badge/rust-2024%20edition-orange.svg)](https://blog.rust-lang.org/2024/10/17/Rust-2024-edition.html)
+[![Version](https://img.shields.io/badge/version-v0.7.0-green.svg)](https://github.com/deokdory/pidory/releases)
 
-Discord ↔ Claude Code CLI bridge. Send messages in a Discord thread and get Claude Code responses — tool permission prompts appear as interactive buttons, and long outputs are split or attached automatically.
+**English** | [한국어](./README.ko.md)
+
+## Overview
+
+pidory is a Discord bot that bridges Discord threads to [Claude Code](https://docs.anthropic.com/en/docs/claude-code) CLI sessions via `stream-json` IPC. Each Discord thread maps to a long-lived Claude Code subprocess — tool permission prompts appear as interactive buttons, file attachments flow bidirectionally, multi-user sender prefixes keep context clear, and rate limit usage is surfaced as bot presence.
+
+**Core values**
+
+- **Per-thread sessions** — isolated Claude Code subprocess per Discord thread, no cross-contamination
+- **Permission buttons** — Allow / Always Allow / Deny rendered as Discord buttons
+- **Bidirectional file attachments** — upload files to Claude Code; receive files back in Discord
+- **Multi-user aware** — sender prefix injected into every message so Claude knows who is talking
 
 ## Features
 
-- **Thread-based conversations** — each thread maps to an independent Claude Code session
-- **Long-lived process** — message queue with mid-turn message injection
-- **Tool permissions** — approve/deny with Discord buttons (Allow / Always Allow / Deny)
-- **Interactive questions** — Claude Code's `AskUserQuestion` rendered as buttons, select menus, or modal text input
-- **File attachments** — upload files from Discord to Claude Code, and Claude Code can send files back to Discord
-- **Reply context** — reply to a Discord message to include it as context in your prompt
-- **Progress indicator** — real-time display of long-running tool executions
-- **Message splitting** — code block-aware splitting for Discord's 2000 char limit, with automatic file attachment fallback
-- **Rate limit monitoring** — bot presence shows current usage %, with configurable threshold alerts
-- **Session lifecycle** — LRU auto-eviction when max sessions reached, idle timeout cleanup
-- **Notification suppression** — streaming intermediate messages sent without push notifications
-- **Multi-language UI** — Korean (default) and English
-
-## Security Model
-
-pidory delegates to Discord's built-in permission system, and sessions are **shared per thread**.
-
-- Anyone who can access the channel where a thread is registered can use the bot (the channel's VIEW_CHANNEL / SEND_MESSAGES permissions act as the gate).
-- Users in the same thread **share the same Claude Code session**. This means:
-  - A tool permission granted as `Always Allow` by one user applies **to the entire session** — subsequent messages from other users in the same thread will be auto-approved for that tool.
-  - `/skill` can be invoked by any member and can run arbitrary Claude Code skills in the session.
-- Administrative commands (`/register`, `/unregister`, `/del`, `/status`, `/list`, `/sessions`) require `MANAGE_GUILD` or `MANAGE_CHANNELS` permissions.
-- `/stop` can only be called by the user who started the current turn (or the `owner_id`).
-- Permission buttons (Allow / Always Allow / Deny) can only be clicked by the user who started the current turn (or the `owner_id`).
-
-**Warning: Multi-user support is still in beta.** This model assumes that users invited to the guild **trust each other**. Only invite people you **genuinely trust** to the server running pidory. Otherwise a malicious user could use the bot to execute arbitrary code, manipulate files, or escalate permissions on behalf of other users.
+- **Thread-based sessions** — each thread maps to an independent Claude Code subprocess
+- **Tool permissions** — Allow / Always Allow / Deny via Discord buttons
+- **File attachments** — upload files to Claude Code from Discord; receive generated files back
+- **Multi-user sender prefix** — sender's display name prepended to every message in multi-user threads
+- **`/update` with pre-flight validation** — bot fetches latest release, rebuilds from source, and restarts the service
+- **i18n** — Korean (default) and English UI; select with `language = "ko"` / `"en"` in config
+- **Rate limit monitoring** — bot presence shows 5h/7d usage %; configurable threshold alerts
+- **`/branch` context fork** — duplicate a session into a new thread with optional context snapshot
+- **`/sleep` session suspend** — pause a session, releasing subprocess resources while preserving thread state
+- **`/skill` invocation** — call any Claude Code skill (slash command) from Discord
+- **Attachment download** — files attached to Discord messages are downloaded to the project directory
+- **PostgreSQL backend** — production-grade persistence; migration path from legacy SQLite included
 
 ## Prerequisites
 
-- Rust 1.85+ (2024 edition)
-- [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code) — requires Anthropic Max subscription
-- Discord Bot Token
-- Linux or macOS
-- PostgreSQL 17 (recommended) or system default — installed automatically by `scripts/postgres-setup.sh` on Linux
+- **Rust 1.85+** (2024 edition)
+- **PostgreSQL 14+** (17 recommended) — `scripts/postgres-setup.sh` handles installation on Linux
+- **[Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code)** — requires an Anthropic Max subscription
+- **Discord Bot Token** — with `MESSAGE CONTENT INTENT` enabled
+- **Linux** (systemd) or **macOS** (launchd)
 
-## Quick Start
+## Install
 
-### 1. Create Discord Bot
+See [INSTALL.md](./INSTALL.md) for step-by-step setup including Discord bot creation, PostgreSQL configuration, and service deployment.
 
-1. Go to https://discord.com/developers/applications → **New Application**
-2. Name it, then go to the **Bot** tab
-3. Click **Reset Token** → copy the token (shown once only)
-4. Under **Privileged Gateway Intents**, enable **MESSAGE CONTENT INTENT**
-5. Go to **OAuth2** → **URL Generator**:
-   - Scopes: `bot`, `applications.commands`
-   - Bot Permissions: `Send Messages`, `Read Message History`, `Add Reactions`, `Manage Messages`, `Manage Channels`, `Create Public Threads`, `Use Slash Commands`, `Embed Links`, `Attach Files`
-6. Open the generated URL and invite the bot to your server
-
-### 2. Get Discord IDs
-
-1. In Discord: **Settings** → **Advanced** → enable **Developer Mode**
-2. Right-click your server icon → **Copy Server ID** → this is `guild_id`
-3. Right-click your own profile → **Copy User ID** → this is `owner_id`
-
-### 3. Clone & Configure
+**Quick path (Linux):**
 
 ```bash
-git clone https://github.com/deokdory/pidory.git
-cd pidory
-cp config.toml.example config.toml
-# Edit config.toml — set guild_id and owner_id
-```
-
-### 4. Set Discord Token
-
-```bash
+git clone https://github.com/deokdory/pidory.git && cd pidory
 echo 'PIDORY_DISCORD_TOKEN=your_token_here' > .env
+bash deploy/install.sh                # build + service + pidory-migrate install
+sudo bash scripts/postgres-setup.sh   # PostgreSQL setup (requires install.sh complete)
+$EDITOR config.toml                   # set guild_id, owner_id
+sudo systemctl start pidory
 ```
 
-### 5. Run
+## Configuration
 
-**Service deployment (recommended — Linux systemd):**
+`config.toml` controls all runtime behavior. Copy `config.toml.example` to `config.toml` and fill in the required fields.
 
-```bash
-./deploy/install.sh                 # builds binary, installs systemd service, installs skills
-sudo bash scripts/postgres-setup.sh # installs PostgreSQL, creates DB, writes /etc/pidory/db.env, restarts service
-```
+### Key sections
 
-That's it. The service starts automatically and connects to PostgreSQL via `DATABASE_URL` in `/etc/pidory/db.env`.
+#### [discord]
 
-**Manual / dev (no service):**
+| Field | Description | Default |
+|-------|-------------|---------|
+| `guild_id` | Your Discord server ID | **required** |
+| `owner_id` | Your Discord user ID (bot owner) | **required** |
+| `token_env` | Env var name for the Discord token | `"PIDORY_DISCORD_TOKEN"` |
+| `notification_channel_id` | Channel ID for rate limit alerts | — |
+| `project_roots` | Root dirs for path autocomplete in `/register` | `[]` |
+| `default_category_id` | Default category for `/new-project` channels | — |
 
-```bash
-# Set DATABASE_URL pointing to your PostgreSQL instance
-export DATABASE_URL=postgres://pidory:<your-password>@localhost/pidory
+#### [claude]
 
-cargo run --release
-```
+| Field | Description | Default |
+|-------|-------------|---------|
+| `binary_path` | Path to the `claude` CLI binary | `"claude"` |
+| `default_disallowed_tools` | Tools blocked by default for new sessions | `[]` |
+| `subprocess_timeout_secs` | Max subprocess runtime (seconds) | `600` |
+| `max_sessions` | Max concurrent sessions | `10` |
+| `idle_timeout_secs` | Idle session timeout in seconds (0 = disabled) | `7200` |
 
-Verify the service is healthy:
+#### [response]
 
-```bash
-sudo systemctl status pidory
-sudo journalctl -u pidory.service -f
-psql -U pidory -d pidory -c 'SELECT count(*) FROM projects'
-```
+| Field | Description | Default |
+|-------|-------------|---------|
+| `max_chunk_length` | Max characters per Discord message | `1900` |
+| `max_chunks` | Chunks before falling back to file attachment | `10` |
 
-## Service Deployment
+#### [attachment]
 
-### Linux (systemd)
+| Field | Description | Default |
+|-------|-------------|---------|
+| `max_file_size_mb` | Max file size per attachment (MB) | `25` |
+| `max_aggregate_size_mb` | Max total attachment size per message (MB) | `50` |
+| `download_timeout_secs` | File download timeout (seconds) | `30` |
 
-```bash
-./deploy/install.sh                  # builds binary, installs service, installs skills
-sudo bash scripts/postgres-setup.sh # sets up PostgreSQL and starts the service
-sudo systemctl status pidory
-journalctl -u pidory.service -f
-```
+#### [ratelimit]
 
-`install.sh` builds the release binary, copies `config.toml.example` if no config exists, installs the service file, enables it on boot, installs the `pidory-migrate` migration binary to `/usr/local/bin/`, and deploys built-in skills to `~/.claude/skills/`.
+| Field | Description | Default |
+|-------|-------------|---------|
+| `update_interval_secs` | Bot presence update interval (seconds) | `60` |
+| `alert_thresholds` | 5h usage % thresholds for alerts | `[50, 80]` |
 
-`postgres-setup.sh` installs PostgreSQL 17 (falls back to system default), creates the `pidory` role and database, writes `DATABASE_URL` to `/etc/pidory/db.env` (mode 600), and restarts the service.
+### Environment variables
 
-### macOS (launchd)
+| Variable | Description |
+|----------|-------------|
+| `PIDORY_DISCORD_TOKEN` | Discord bot token — **never put this in config.toml** |
+| `DATABASE_URL` | PostgreSQL connection string (authoritative source) |
+| `PIDORY_CONFIG` | Path to config.toml (default: `./config.toml`) |
+| `PIDORY_LOCALE` | Override UI locale (`ko` or `en`) |
+| `RUST_LOG` | Log filter (e.g. `pidory=debug,warn`) |
 
-```bash
-./deploy/install.sh
-launchctl load ~/Library/LaunchAgents/com.pidory.bot.plist
-tail -f ~/.pidory/stderr.log
-```
-
-`install.sh` builds the release binary, copies `config.toml.example` if no config exists, installs the service file, enables it on boot, and deploys built-in skills to `~/.claude/skills/`. Note: `postgres-setup.sh` is Linux/systemd only — on macOS, set `DATABASE_URL` manually before running.
-
-## Database (PostgreSQL)
-
-pidory uses PostgreSQL as its database backend. The connection is configured via the `DATABASE_URL` environment variable — **this is the authoritative source**. The `[database] path` field in `config.toml` is deprecated and ignored at runtime.
-
-### DATABASE_URL
-
-On Linux service deployments, `DATABASE_URL` is injected from `/etc/pidory/db.env` (via systemd `EnvironmentFile`). The file is written by `scripts/postgres-setup.sh` and has mode 600 (readable only by the pidory service user).
-
-```
-DATABASE_URL=postgres://pidory:<password>@localhost/pidory
-```
-
-To inspect the value:
-
-```bash
-sudo cat /etc/pidory/db.env
-```
-
-For manual or dev setups, export the variable before running:
-
-```bash
-export DATABASE_URL=postgres://pidory:<your-password>@localhost/pidory
-cargo run --release
-```
-
-You can override the legacy SQLite path with `PIDORY_LEGACY_DB` (default: `/var/lib/pidory/pidory.db`). This is only relevant for the migration binary (`pidory-migrate`), which reads the SQLite source on first-run and imports existing data into PostgreSQL.
-
-### Automatic Migration
-
-pidory uses a two-layer migration safety net:
-
-1. **`pidory-migrate` ExecStartPre** — runs before the service starts. Detects if the PostgreSQL database is empty and performs a one-time, transactional import from the SQLite source. Idempotent: subsequent runs are no-ops.
-2. **`sqlx::migrate!` in `init_pool`** — applies any pending schema migrations at startup. Runs every start, handles version upgrades automatically.
-
-Migration is **roll-forward only**. There is no tool to revert from PostgreSQL back to SQLite.
-
-### PostgreSQL Version
-
-PostgreSQL 17 is recommended. `scripts/postgres-setup.sh` installs `postgresql-17` via apt; if unavailable, it falls back to the system default `postgresql` package. Other versions (14, 15, 16) are expected to work.
-
-### Known Limitation
-
-The self-update rollback path in `update/backup.rs` (`restore_db()`) uses the `sqlite3` CLI and does not support PostgreSQL. This means the automatic database restore during a failed self-update does not function in PostgreSQL environments. Normal operation is unaffected. Manual recovery via `pg_dump` / `psql` is the workaround. A follow-up PR will convert this to a `pg_dump`-based implementation.
-
-## Update
-
-To update an existing installation:
-
-```bash
-cd pidory
-./deploy/update.sh
-```
-
-This will:
-1. Pull latest changes (fast-forward only)
-2. Rebuild the release binary
-3. Sync built-in skills to `~/.claude/skills/`
-
-After update, restart the service:
-- **Linux**: `sudo systemctl restart pidory`
-- **macOS**: `launchctl kickstart -k gui/$(id -u)/com.pidory.bot`
+> **Note:** `[database] path` in `config.toml` is **deprecated** and ignored at runtime. Use `DATABASE_URL` exclusively.
 
 ## Usage
 
@@ -204,138 +130,125 @@ After update, restart the service:
 | `/unregister` | Unregister the project from the current channel | MANAGE_CHANNELS |
 | `/new-project <path> [name]` | Create a new channel + thread for a project | owner only |
 | `/list [channel]` | List active sessions for a channel | MANAGE_CHANNELS |
+| `/status [thread_id]` | Show session status | MANAGE_CHANNELS |
+| `/sessions` | Global session overview (count, idle time, status) | MANAGE_CHANNELS |
 | `/del [thread_id]` | Delete a session (defaults to current thread) | MANAGE_CHANNELS |
-| `/stop` | Stop the current session's Claude Code process | turn starter or owner |
-| `/status [thread_id]` | Show session status (defaults to current thread) | MANAGE_CHANNELS |
-| `/sessions` | Show global session overview (count, idle time, status) | MANAGE_CHANNELS |
-| `/skill <name> [args]` | Send a slash command (e.g. `/commit`) to the Claude Code session | all members |
-| `/branch [context]` | Fork the current session into a new thread with optional context | owner only |
-
-### Session Reset
-
-Type `/clear` or `/new` as a regular message in a thread to reset the session. A confirmation prompt with buttons will appear — click **Confirm** to reset the Claude Code process and start fresh, or **Cancel** to keep the current session.
-
-### Recall
-
-Right-click a message in a thread → **Apps** → **Recall** to recall a queued message that hasn't been delivered to Claude Code yet. If the message has already been sent, recall is not possible.
+| `/stop` | Stop the current turn's Claude Code process | turn starter or owner |
+| `/skill <name> [args]` | Send a skill (e.g. `/commit`) to the Claude Code session | all members |
+| `/recall` | Recall a queued message before it reaches Claude Code | turn starter |
+| `/branch [context]` | Fork session into a new thread with optional context | owner only |
+| `/model <model_name>` | Switch Claude model for the current session | all members |
+| `/sleep` | Suspend the session (release subprocess, preserve thread) | all members |
+| `/update` | Pull latest release, rebuild from source, and restart the service | owner only |
 
 ### Chatting with Claude Code
 
-1. Run `/register /path/to/your/project` in any channel
-2. Start a thread in that channel — each thread is its own Claude Code session
-3. Send messages in the thread to chat with Claude Code
-4. When Claude Code requests tool permissions, respond with the Discord buttons:
-   - **Allow** — allow this once
+1. Run `/register /path/to/project` in any channel
+2. Open a thread in that channel — each thread is an independent Claude Code session
+3. Send messages to interact with Claude Code
+4. When a tool permission prompt appears, click a button:
+   - **Allow** — allow this tool call once
    - **Always Allow** — add to the always-allowed list for this session
    - **Deny** — deny the tool call
 
-### Reply Context
+### Session Reset
 
-Reply to any message in the thread — pidory will extract the replied-to message content and inject it as context into your prompt so Claude Code can see what you're referring to.
+Send `/clear` or `/new` as a plain message in a thread to reset the session. A confirmation prompt appears — click **Confirm** to restart, or **Cancel** to keep the current session.
 
 ### File Attachments
 
-**Uploading files to Claude Code**: Attach files to your Discord message. pidory downloads them to the project directory and includes their paths in the message sent to Claude Code.
+Attach files to a Discord message — pidory downloads them to the project directory and passes their paths to Claude Code. When Claude Code produces output files, they appear as Discord file attachments.
 
-**Receiving files from Claude Code**: When Claude Code sends files back (e.g. images, exports), they appear as Discord file attachments on the bot's message.
+### Reply Context
 
-### Interactive Questions
+Reply to any message in a thread — pidory extracts the replied-to content and injects it as context into your prompt.
 
-When Claude Code asks a question (via `AskUserQuestion`), pidory renders it as an interactive UI:
+## Permission Model
 
-- **2–5 options** → Discord buttons + a free-text button for custom input
-- **6–25 options** → Select menu + a free-text button
-- **Free-text only** → A button that opens a text input modal
+pidory surfaces Claude Code's permission prompts as Discord buttons: **Allow**, **Always Allow**, and **Deny**.
 
-For multi-part questions, all answers are collected before being sent back to Claude Code.
+- **Allow** — grants the tool call for this request only
+- **Always Allow** — adds the tool to the session's always-allowed list; subsequent requests for the same tool are auto-approved without prompting
+- **Deny** — rejects the tool call
 
-### Progress Indicator
+Permission buttons are restricted to the user who started the current turn (or the `owner_id`).
 
-When Claude Code runs a long tool operation, pidory shows a progress indicator message that updates in real-time, showing which tool is currently executing. The indicator pauses when a permission prompt is pending and resumes when resolved.
+### ⚠️ Multi-user beta — Always Allow affects all users in the thread
 
-## Configuration
+Sessions are shared per thread. When one user clicks **Always Allow**, that permission applies to the **entire session** — every subsequent message from any user in the same thread will auto-approve that tool. Only add pidory to servers where all participants genuinely trust each other. A malicious user could exploit Always Allow to execute arbitrary code, manipulate files, or escalate permissions on behalf of other users.
 
-`config.toml` fields (see `config.toml.example`):
+## Upgrading
 
-### [discord]
+### Using `/update` (recommended)
 
-| Field | Description | Default |
-|-------|-------------|---------|
-| `guild_id` | Your Discord server ID | *required* |
-| `owner_id` | Your Discord user ID (bot owner) | *required* |
-| `token_env` | Environment variable name for the Discord token | `"PIDORY_DISCORD_TOKEN"` |
-| `notification_channel_id` | Channel ID for rate limit alerts (optional) | — |
-| `project_roots` | Root directories for path autocomplete in `/register` | `[]` |
-| `default_category_id` | Default category for `/new-project` channels (optional) | — |
+The `/update` slash command (owner only) performs a guided in-place update:
 
-### [claude]
+1. Verifies `DATABASE_URL` is set and reachable
+2. Takes an automatic `pg_dump` backup of the current database
+3. Runs `git fetch` and resets the worktree to the latest release tag
+4. Rebuilds the binary with `cargo build --release`
+5. Schedules a delayed service restart (~30 s) so the response message can be delivered
 
-| Field | Description | Default |
-|-------|-------------|---------|
-| `binary_path` | Path to the `claude` CLI binary | `"claude"` |
-| `default_disallowed_tools` | Tools to block by default for new sessions | `[]` |
-| `subprocess_timeout_secs` | Max time per Claude Code subprocess (seconds) | `600` |
-| `max_sessions` | Max concurrent sessions | `10` |
-| `idle_timeout_secs` | Idle session timeout in seconds (0 to disable) | `7200` |
+For the full `/update` pre-flight checks and rollback behavior, see `INSTALL.md` → "Updating".
 
-### [database]
+### Manual update
 
-> **Deprecated.** `DATABASE_URL` environment variable is the authoritative database configuration source. The `path` field below is kept for backwards compatibility only and is ignored at runtime.
+See [INSTALL.md → Updating](./INSTALL.md#updating) for the manual command sequence.
 
-| Field | Description | Default |
-|-------|-------------|---------|
-| `path` | ~~SQLite database file path~~ (deprecated, ignored) | `"pidory.db"` |
+### SQLite → PostgreSQL migration (v0.7.0 breaking change)
 
-Set `DATABASE_URL` via `/etc/pidory/db.env` (Linux service) or as an environment variable (manual/dev).
+v0.7.0 drops SQLite support entirely. If you are upgrading from v0.6.x, follow the migration guide in [`docs/release-notes/v0.7.0.md`](./docs/release-notes/v0.7.0.md).
 
-### [response]
+The `pidory-migrate` binary (installed to `/usr/local/bin/` by `deploy/install.sh`) handles the one-time data import:
 
-| Field | Description | Default |
-|-------|-------------|---------|
-| `max_chunk_length` | Max characters per Discord message | `1900` |
-| `max_chunks` | Number of chunks before falling back to file attachment | `10` |
-
-### [ratelimit]
-
-| Field | Description | Default |
-|-------|-------------|---------|
-| `update_interval_secs` | Bot presence update interval (seconds) | `60` |
-| `alert_thresholds` | 5h usage % thresholds that trigger alerts | `[50, 80]` |
-
-### [attachment]
-
-| Field | Description | Default |
-|-------|-------------|---------|
-| `max_file_size_mb` | Max file size per attachment (MB) | `25` |
-| `max_aggregate_size_mb` | Max total attachment size per message (MB) | `50` |
-| `download_timeout_secs` | File download timeout (seconds) | `30` |
-
-### language
-
-| Field | Description | Default |
-|-------|-------------|---------|
-| `language` | UI language: `"ko"` or `"en"` | `"ko"` |
-
-The Discord token is read from the `PIDORY_DISCORD_TOKEN` environment variable (or `.env` file) — never put it in `config.toml`.
-
-## Rate Limit Monitoring
-
-pidory displays Claude Code's API rate limit usage as a Discord bot presence (e.g. `Watching 5h: 42%(1h30m) | 7d: 38%`) and sends alerts when thresholds are exceeded. Rate limit data is read from Claude Code's `stream-json` output during active sessions.
-
-### Alert Setup
-
-To receive threshold alerts in a specific channel, set `notification_channel_id` under `[discord]` in `config.toml`.
-
-```toml
-[discord]
-notification_channel_id = "123456789012345678"
-
-[ratelimit]
-alert_thresholds = [50, 80]
+```bash
+# Run automatically as ExecStartPre when the service starts on an empty PostgreSQL DB
+# To run manually:
+pidory-migrate
 ```
 
-When 5-hour usage reaches a configured threshold, an alert is posted to the notification channel.
+Migration is roll-forward only — there is no path back to SQLite.
+
+## Architecture
+
+### Data flow
+
+```
+Discord message
+  → handler::message
+    → SessionManager::send_message (mpsc queue, per-thread worker)
+      → Claude CLI subprocess (stream-json stdin/stdout)
+        → parser::parse_line → StreamEvent
+  → handler::message ← event_rx (mpsc channel)
+→ Discord response
+```
+
+### Module structure
+
+| Module | Responsibility |
+|--------|----------------|
+| `subprocess/session_manager.rs` | Spawns Claude CLI; one worker task per thread. Handles stdin writes, stdout parsing, mid-turn injection, permission flow. |
+| `subprocess/parser/` | Parses JSON lines → `StreamEvent` (Init, Assistant, User, RateLimit, Result, ControlRequest, …); split across `raw.rs`, `events.rs`, etc. |
+| `subprocess/permission.rs` | `PermissionCache` (per-session Always Allow set); `PermissionRequest`/`PermissionDecision` via oneshot channels |
+| `handler/message/` | Routes Discord events to session queues; 500 ms fast-complete check; streams events to Discord; split across `mod.rs`, `event_processor.rs`, `interaction.rs`, etc. |
+| `handler/formatter.rs` | Code-block-aware message splitting at 2000-char limit |
+| `handler/permission_ui.rs` | Builds Allow/Always Allow/Deny button messages; parses `perm:{id}:{action}` custom IDs |
+| `handler/status.rs` | `StatusMessage` — single editable Discord message with tool history (1.5 s rate limit) |
+| `commands/` | Slash commands — all declared with poise, guild-scoped |
+| `db/` | PostgreSQL via sqlx; compile-time checked migrations; atomic session locking via CAS on status column |
+| `i18n/` | Korean / English message catalog; runtime locale selection |
+
+## Contributing
+
+See [CONTRIBUTING.md](./CONTRIBUTING.md). Issues and PRs are welcome — please open an issue first to discuss significant changes.
 
 ## License
 
-MIT
+pidory is licensed under the Apache License, Version 2.0. See [LICENSE](./LICENSE) for the full text.
+
+## Acknowledgements
+
+- [Anthropic](https://www.anthropic.com) — Claude Code CLI and the stream-json protocol
+- [poise](https://github.com/serenity-rs/poise) / [serenity](https://github.com/serenity-rs/serenity) — Discord framework for Rust
+- [sqlx](https://github.com/launchbadge/sqlx) — async PostgreSQL driver with compile-time checked queries
+- [tokio](https://tokio.rs) — async runtime powering the concurrent session worker model

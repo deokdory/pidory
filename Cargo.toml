@@ -1,7 +1,15 @@
 [package]
 name = "pidory"
-version = "0.6.7"
+version = "0.7.0"
 edition = "2024"
+license = "Apache-2.0"
+authors = ["deokdory <deokdory@gmail.com>"]
+repository = "https://github.com/deokdory/pidory"
+homepage = "https://github.com/deokdory/pidory"
+description = "Discord bot bridging threads to Claude Code CLI sessions via stream-json IPC"
+readme = "README.md"
+keywords = ["discord", "claude", "ai", "bot", "automation"]
+categories = ["command-line-utilities"]
 
 [features]
 default = []
