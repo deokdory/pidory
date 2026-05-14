@@ -1,0 +1,14 @@
+Ok(
+    Assistant {
+        content: [
+            ToolUse {
+                id: "t1",
+                name: "Bash",
+                input: Object {
+                    "command": String("echo hi"),
+                },
+            },
+        ],
+        session_id: "abc",
+    },
+)

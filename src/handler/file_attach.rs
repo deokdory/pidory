@@ -17,30 +17,73 @@ const MARKER_SUFFIX: &str = "-->";
 /// Returns `(cleaned_text, vec_of_paths)`. All markers are removed from the
 /// returned text; surrounding whitespace is collapsed but otherwise left
 /// intact.
+///
+/// Markers inside code fences (``` ... ```) or inline backticks (` ... `) are
+/// skipped — they remain in the text as-is and no path is extracted.
 pub fn extract_file_markers(text: &str) -> (String, Vec<String>) {
     let mut paths: Vec<String> = Vec::new();
     let mut cleaned = String::with_capacity(text.len());
-    let mut remaining = text;
 
-    while let Some(start) = remaining.find(MARKER_PREFIX) {
-        // Append everything before the marker
-        cleaned.push_str(&remaining[..start]);
+    let bytes = text.as_bytes();
+    let len = bytes.len();
+    let mut i = 0;
+    let mut in_fence = false;
+    let mut in_inline = false;
 
-        let after_prefix = &remaining[start + MARKER_PREFIX.len()..];
-        if let Some(end) = after_prefix.find(MARKER_SUFFIX) {
-            let path = after_prefix[..end].to_owned();
-            if !path.is_empty() {
-                paths.push(path);
+    while i < len {
+        if in_fence {
+            // Only a ``` triple-tick closes the fence
+            if bytes[i..].starts_with(b"```") {
+                in_fence = false;
+                cleaned.push_str("```");
+                i += 3;
+            } else {
+                let ch = text[i..].chars().next().expect("byte index aligns to char boundary");
+                cleaned.push(ch);
+                i += ch.len_utf8();
             }
-            remaining = &after_prefix[end + MARKER_SUFFIX.len()..];
+        } else if in_inline {
+            // A single ` closes the inline span
+            if bytes[i] == b'`' {
+                in_inline = false;
+                cleaned.push('`');
+                i += 1;
+            } else {
+                let ch = text[i..].chars().next().expect("byte index aligns to char boundary");
+                cleaned.push(ch);
+                i += ch.len_utf8();
+            }
         } else {
-            // Malformed marker — keep as-is and stop searching
-            cleaned.push_str(&remaining[start..]);
-            remaining = "";
+            // Outside fence and inline
+            if bytes[i..].starts_with(b"```") {
+                in_fence = true;
+                cleaned.push_str("```");
+                i += 3;
+            } else if bytes[i] == b'`' {
+                in_inline = true;
+                cleaned.push('`');
+                i += 1;
+            } else if bytes[i..].starts_with(MARKER_PREFIX.as_bytes()) {
+                let after_prefix = i + MARKER_PREFIX.len();
+                if let Some(rel) = bytes[after_prefix..].windows(MARKER_SUFFIX.len()).position(|w| w == MARKER_SUFFIX.as_bytes()) {
+                    let path = &text[after_prefix..after_prefix + rel];
+                    if !path.is_empty() {
+                        paths.push(path.to_owned());
+                    }
+                    i = after_prefix + rel + MARKER_SUFFIX.len();
+                } else {
+                    // Malformed marker — keep as-is and stop searching
+                    cleaned.push_str(&text[i..]);
+                    i = len;
+                }
+            } else {
+                let ch = text[i..].chars().next().expect("byte index aligns to char boundary");
+                cleaned.push(ch);
+                i += ch.len_utf8();
+            }
         }
     }
 
-    cleaned.push_str(remaining);
     (cleaned, paths)
 }
 
@@ -226,6 +269,13 @@ pub async fn send_file_attachments(
                     .allowed_mentions(serenity::CreateAllowedMentions::new());
                 if let Err(e) = channel_id.send_message(ctx, message).await {
                     warn!("Failed to send file attachment for {}: {}", path, e);
+                    let error_content = lang.file_send_failed(&filename, &size_str, &e.to_string());
+                    let fallback = serenity::CreateMessage::new()
+                        .content(error_content)
+                        .allowed_mentions(serenity::CreateAllowedMentions::new());
+                    if let Err(e2) = channel_id.send_message(ctx, fallback).await {
+                        warn!("Failed to send fallback error message for {}: {}", path, e2);
+                    }
                 }
             }
             Err(e) => {
@@ -337,6 +387,89 @@ mod tests {
         let (text, paths) = extract_file_markers(input);
         assert_eq!(text, "<!--pidory:attach:/bad SUFFIX text");
         assert!(paths.is_empty());
+    }
+
+    // ── fence / inline backtick skip tests ──────────────────────────────────
+
+    #[test]
+    fn extract_in_fence_skipped() {
+        // Marker inside a code fence must NOT be extracted; text is preserved.
+        let input = "before\n```\n<!--pidory:attach:/secret.txt-->\n```\nafter";
+        let (text, paths) = extract_file_markers(input);
+        assert!(paths.is_empty(), "expected no paths, got: {:?}", paths);
+        assert!(
+            text.contains("<!--pidory:attach:/secret.txt-->"),
+            "marker should be preserved inside fence, got: {:?}",
+            text
+        );
+    }
+
+    #[test]
+    fn extract_outside_fence_extracted() {
+        // Marker outside the fence is extracted normally; marker inside is not.
+        let input = "<!--pidory:attach:/outside.txt-->```\n<!--pidory:attach:/inside.txt-->\n```";
+        let (text, paths) = extract_file_markers(input);
+        assert_eq!(paths, vec!["/outside.txt"]);
+        assert!(
+            text.contains("<!--pidory:attach:/inside.txt-->"),
+            "inside marker should be preserved, got: {:?}",
+            text
+        );
+    }
+
+    #[test]
+    fn extract_in_inline_backtick_skipped() {
+        // Marker wrapped in inline backtick must NOT be extracted.
+        let input = "see `<!--pidory:attach:/inline.txt-->` for details";
+        let (text, paths) = extract_file_markers(input);
+        assert!(paths.is_empty(), "expected no paths, got: {:?}", paths);
+        assert!(
+            text.contains("<!--pidory:attach:/inline.txt-->"),
+            "marker should be preserved inside inline, got: {:?}",
+            text
+        );
+    }
+
+    #[test]
+    fn extract_fence_open_never_closed() {
+        // Unclosed fence: all markers from the opening ``` onward are skipped.
+        let input = "before ``` <!--pidory:attach:/trapped.txt--> no closing fence";
+        let (text, paths) = extract_file_markers(input);
+        assert!(paths.is_empty(), "expected no paths, got: {:?}", paths);
+        assert!(
+            text.contains("<!--pidory:attach:/trapped.txt-->"),
+            "marker should be preserved, got: {:?}",
+            text
+        );
+    }
+
+    // ── multi-byte UTF-8 preservation tests ─────────────────────────────────
+
+    #[test]
+    fn extract_korean_in_fence_preserved() {
+        // Korean text inside a fence must not be mojibaked — all chars preserved.
+        let input = "```\n안녕 <!--pidory:attach:/x--> 한글\n```";
+        let (text, paths) = extract_file_markers(input);
+        assert!(paths.is_empty(), "expected no paths, got: {:?}", paths);
+        assert!(text.contains("안녕"), "Korean chars lost, got: {:?}", text);
+        assert!(text.contains("한글"), "Korean chars lost, got: {:?}", text);
+        assert!(
+            text.contains("<!--pidory:attach:/x-->"),
+            "marker should be preserved inside fence, got: {:?}",
+            text
+        );
+    }
+
+    #[test]
+    fn extract_multibyte_outside_fence_preserved() {
+        // emoji + Japanese outside a fence: text is passed through intact,
+        // and a marker after them is still extracted.
+        let input = "🎉 日本語テスト <!--pidory:attach:/emoji.txt--> 終わり";
+        let (text, paths) = extract_file_markers(input);
+        assert_eq!(paths, vec!["/emoji.txt"]);
+        assert!(text.contains("🎉"), "emoji lost, got: {:?}", text);
+        assert!(text.contains("日本語テスト"), "Japanese lost, got: {:?}", text);
+        assert!(text.contains("終わり"), "Japanese lost, got: {:?}", text);
     }
 
     // ── prepare_attachment async tests ───────────────────────────────────────

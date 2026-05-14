@@ -1,0 +1,12 @@
+Ok(
+    User {
+        tool_results: [
+            ToolResult {
+                tool_use_id: "t1",
+                content: "hello",
+                is_error: false,
+            },
+        ],
+        session_id: "abc",
+    },
+)

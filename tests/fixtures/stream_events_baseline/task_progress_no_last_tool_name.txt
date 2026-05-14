@@ -1,0 +1,9 @@
+Ok(
+    TaskProgress {
+        task_id: "t1",
+        tool_use_id: "tu1",
+        description: "doing stuff",
+        last_tool_name: None,
+        session_id: "s1",
+    },
+)

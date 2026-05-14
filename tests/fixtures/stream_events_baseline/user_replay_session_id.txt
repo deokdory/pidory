@@ -1,0 +1,7 @@
+Ok(
+    UserReplay {
+        content: "hi",
+        session_id: "my-session",
+        timestamp: None,
+    },
+)

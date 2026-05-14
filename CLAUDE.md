@@ -10,14 +10,16 @@ Discord bot that bridges Discord threads to Claude Code CLI sessions via `stream
 
 ```bash
 cargo build                    # dev build
-cargo run --release            # release run (needs config.toml + PIDORY_DISCORD_TOKEN)
+cargo run --release            # release run (needs config.toml + PIDORY_DISCORD_TOKEN + DATABASE_URL)
 cargo test                     # all tests (unit only, no integration tests)
-cargo test -- --test-threads=1 # if SQLite in-memory tests conflict
+cargo test -- --test-threads=1 # if tests conflict
 ```
 
 Single test: `cargo test <test_name>` (e.g., `cargo test parse_control_request`)
 
-Environment: Rust 2024 edition, stable toolchain. Key deps: poise 0.6 (Discord framework on serenity 0.12), sqlx 0.8 (SQLite), tokio.
+Environment: Rust 2024 edition, stable toolchain. Key deps: poise 0.6 (Discord framework on serenity 0.12), sqlx 0.8 (PostgreSQL), tokio.
+
+`DATABASE_URL` env is required at runtime (e.g. `postgres://pidory:<pw>@localhost/pidory`). On Linux service deployments this comes from `/etc/pidory/db.env` via systemd `EnvironmentFile`.
 
 ## Architecture
 
@@ -50,10 +52,10 @@ Discord ← handler::message ← event_rx (mpsc channel)
   - `session.rs` — `/list`, `/del`, `/status` for session management.
   - `skill.rs` — `/skill <name>` sends `/<skill_name>` to the Claude CLI session. Loads descriptions from `~/.claude/skills/` for autocomplete.
 
-- **`db/`** — SQLite via sqlx with compile-time checked migrations
+- **`db/`** — PostgreSQL via sqlx with compile-time checked migrations
   - Two tables: `projects` (channel_id PK → path) and `sessions` (thread_id PK → channel_id FK, session_id, status).
   - `try_acquire_session` uses atomic UPDATE to prevent concurrent turns on the same thread.
-  - Migrations in `migrations/`. WAL mode enabled at pool init.
+  - Migrations in `migrations/`. Pool initialized via `DATABASE_URL` env.
 
 - **`config.rs`** — TOML config with serde defaults. Loaded from `PIDORY_CONFIG` env or `./config.toml`.
 
@@ -61,11 +63,17 @@ Discord ← handler::message ← event_rx (mpsc channel)
 
 - **Message queue**: Each session has an `mpsc::channel(5)` queue. Primary messages carry an `event_tx` for streaming results back; mid-turn injected messages have `event_tx: None` and are written to stdin without waiting for a result.
 - **Permission flow**: `control_request` from Claude CLI → `PermissionRequest` sent via mpsc → handler creates Discord buttons → button click sends `PermissionDecision` via oneshot → worker writes `control_response` to stdin. `PermissionCache` auto-allows previously "Always Allow"ed tools.
-- **Session status locking**: SQLite `try_acquire_session` (atomic CAS on status column) prevents race conditions when multiple messages arrive for the same thread.
+- **Session status locking**: PostgreSQL `try_acquire_session` (atomic CAS on status column) prevents race conditions when multiple messages arrive for the same thread.
 
 ## Configuration
 
 `config.toml` — see `config.toml.example`. Discord token via `PIDORY_DISCORD_TOKEN` env var (or `.env` file).
+
+`DATABASE_URL` env is the authoritative database source. `config.toml`'s `[database] path` field is **deprecated** — kept for backwards compatibility, ignored at runtime. On Linux service deployments, `DATABASE_URL` is injected from `/etc/pidory/db.env`.
+
+## Privacy / PII Forwarding
+
+멀티유저 스레드 사용 시 참여자의 Discord 식별자(server nickname, global display name, username, user ID snowflake)가 sender prefix 형태로 Claude CLI subprocess에 전달되어 Anthropic API로 송출됨. 현재 owner-only 운영이라 즉시 위험은 없지만, 다른 사용자를 스레드에 참여시키기 전 명시적 동의 / 개인정보 처리방침 검토 필요. (#316 도입)
 
 ## Deployment
 

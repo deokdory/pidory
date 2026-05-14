@@ -27,10 +27,10 @@ pub fn load_skill_descriptions() -> HashMap<String, String> {
             for file in files.flatten() {
                 let path = file.path();
                 if path.extension().and_then(|e| e.to_str()) == Some("md") {
-                    if let Ok(content) = fs::read_to_string(&path) {
-                        if let Some(desc) = parse_frontmatter_description(&content) {
-                            descriptions.insert(skill_name.clone(), desc);
-                        }
+                    if let Ok(content) = fs::read_to_string(&path)
+                        && let Some(desc) = parse_frontmatter_description(&content)
+                    {
+                        descriptions.insert(skill_name.clone(), desc);
                     }
                     break;
                 }
@@ -109,18 +109,18 @@ pub async fn skill(
     Ok(())
 }
 
-async fn autocomplete_skill<'a>(
+async fn autocomplete_skill(
     ctx: Context<'_>,
-    partial: &'a str,
+    partial: &str,
 ) -> Vec<poise::serenity_prelude::AutocompleteChoice> {
     let thread_id = ctx.channel_id().to_string();
     let skills = ctx
         .data()
-        .session_skills
+        .session_states
         .lock()
         .await
         .get(&thread_id)
-        .cloned()
+        .map(|s| s.skills.clone())
         .unwrap_or_default();
 
     let descriptions = &ctx.data().skill_descriptions;

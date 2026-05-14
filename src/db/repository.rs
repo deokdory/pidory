@@ -1,17 +1,18 @@
-use sqlx::SqlitePool;
+use sqlx::PgPool;
 
 use super::models::{Project, Session};
+use crate::claude_settings::rule::Scope;
 use crate::error::PidoryError;
 
 // Project CRUD
 
 pub async fn register_project(
-    pool: &SqlitePool,
+    pool: &PgPool,
     channel_id: &str,
     path: &str,
     name: Option<&str>,
 ) -> Result<Project, PidoryError> {
-    sqlx::query("INSERT INTO projects (channel_id, path, name) VALUES (?, ?, ?)")
+    sqlx::query("INSERT INTO projects (channel_id, path, name) VALUES ($1, $2, $3)")
         .bind(channel_id)
         .bind(path)
         .bind(name)
@@ -25,10 +26,10 @@ pub async fn register_project(
 }
 
 pub async fn unregister_project(
-    pool: &SqlitePool,
+    pool: &PgPool,
     channel_id: &str,
 ) -> Result<(), PidoryError> {
-    sqlx::query("DELETE FROM projects WHERE channel_id = ?")
+    sqlx::query("DELETE FROM projects WHERE channel_id = $1")
         .bind(channel_id)
         .execute(pool)
         .await
@@ -38,10 +39,10 @@ pub async fn unregister_project(
 }
 
 pub async fn get_project_by_channel(
-    pool: &SqlitePool,
+    pool: &PgPool,
     channel_id: &str,
 ) -> Result<Option<Project>, PidoryError> {
-    sqlx::query_as::<_, Project>("SELECT * FROM projects WHERE channel_id = ?")
+    sqlx::query_as::<_, Project>("SELECT * FROM projects WHERE channel_id = $1")
         .bind(channel_id)
         .fetch_optional(pool)
         .await
@@ -49,7 +50,7 @@ pub async fn get_project_by_channel(
 }
 
 #[allow(dead_code)]
-pub async fn list_projects(pool: &SqlitePool) -> Result<Vec<Project>, PidoryError> {
+pub async fn list_projects(pool: &PgPool) -> Result<Vec<Project>, PidoryError> {
     sqlx::query_as::<_, Project>("SELECT * FROM projects ORDER BY created_at DESC")
         .fetch_all(pool)
         .await
@@ -59,11 +60,11 @@ pub async fn list_projects(pool: &SqlitePool) -> Result<Vec<Project>, PidoryErro
 // Session CRUD
 
 pub async fn create_session(
-    pool: &SqlitePool,
+    pool: &PgPool,
     thread_id: &str,
     channel_id: &str,
 ) -> Result<Session, PidoryError> {
-    sqlx::query("INSERT INTO sessions (thread_id, channel_id) VALUES (?, ?)")
+    sqlx::query("INSERT INTO sessions (thread_id, channel_id) VALUES ($1, $2)")
         .bind(thread_id)
         .bind(channel_id)
         .execute(pool)
@@ -76,10 +77,10 @@ pub async fn create_session(
 }
 
 pub async fn get_session_by_thread(
-    pool: &SqlitePool,
+    pool: &PgPool,
     thread_id: &str,
 ) -> Result<Option<Session>, PidoryError> {
-    sqlx::query_as::<_, Session>("SELECT * FROM sessions WHERE thread_id = ?")
+    sqlx::query_as::<_, Session>("SELECT * FROM sessions WHERE thread_id = $1")
         .bind(thread_id)
         .fetch_optional(pool)
         .await
@@ -87,11 +88,11 @@ pub async fn get_session_by_thread(
 }
 
 pub async fn update_session_id(
-    pool: &SqlitePool,
+    pool: &PgPool,
     thread_id: &str,
     session_id: &str,
 ) -> Result<(), PidoryError> {
-    sqlx::query("UPDATE sessions SET session_id = ? WHERE thread_id = ?")
+    sqlx::query("UPDATE sessions SET session_id = $1 WHERE thread_id = $2")
         .bind(session_id)
         .bind(thread_id)
         .execute(pool)
@@ -102,11 +103,11 @@ pub async fn update_session_id(
 }
 
 pub async fn update_session_model(
-    pool: &SqlitePool,
+    pool: &PgPool,
     thread_id: &str,
     model: &str,
 ) -> Result<(), PidoryError> {
-    sqlx::query("UPDATE sessions SET model = ? WHERE thread_id = ?")
+    sqlx::query("UPDATE sessions SET model = $1 WHERE thread_id = $2")
         .bind(model)
         .bind(thread_id)
         .execute(pool)
@@ -117,12 +118,12 @@ pub async fn update_session_model(
 }
 
 pub async fn update_session_status(
-    pool: &SqlitePool,
+    pool: &PgPool,
     thread_id: &str,
     status: &str,
 ) -> Result<(), PidoryError> {
     sqlx::query(
-        "UPDATE sessions SET status = ?, last_active_at = datetime('now') WHERE thread_id = ?",
+        "UPDATE sessions SET status = $1, last_active_at = TO_CHAR(NOW(), 'YYYY-MM-DD HH24:MI:SS') WHERE thread_id = $2",
     )
     .bind(status)
     .bind(thread_id)
@@ -134,10 +135,10 @@ pub async fn update_session_status(
 }
 
 pub async fn update_last_active(
-    pool: &SqlitePool,
+    pool: &PgPool,
     thread_id: &str,
 ) -> Result<(), PidoryError> {
-    sqlx::query("UPDATE sessions SET last_active_at = datetime('now') WHERE thread_id = ?")
+    sqlx::query("UPDATE sessions SET last_active_at = TO_CHAR(NOW(), 'YYYY-MM-DD HH24:MI:SS') WHERE thread_id = $1")
         .bind(thread_id)
         .execute(pool)
         .await
@@ -147,11 +148,11 @@ pub async fn update_last_active(
 }
 
 pub async fn list_sessions_by_channel(
-    pool: &SqlitePool,
+    pool: &PgPool,
     channel_id: &str,
 ) -> Result<Vec<Session>, PidoryError> {
     sqlx::query_as::<_, Session>(
-        "SELECT * FROM sessions WHERE channel_id = ? ORDER BY created_at DESC",
+        "SELECT * FROM sessions WHERE channel_id = $1 ORDER BY created_at DESC",
     )
     .bind(channel_id)
     .fetch_all(pool)
@@ -160,10 +161,10 @@ pub async fn list_sessions_by_channel(
 }
 
 pub async fn delete_session(
-    pool: &SqlitePool,
+    pool: &PgPool,
     thread_id: &str,
 ) -> Result<(), PidoryError> {
-    sqlx::query("DELETE FROM sessions WHERE thread_id = ?")
+    sqlx::query("DELETE FROM sessions WHERE thread_id = $1")
         .bind(thread_id)
         .execute(pool)
         .await
@@ -173,10 +174,10 @@ pub async fn delete_session(
 }
 
 pub async fn delete_sessions_by_channel(
-    pool: &SqlitePool,
+    pool: &PgPool,
     channel_id: &str,
 ) -> Result<(), PidoryError> {
-    sqlx::query("DELETE FROM sessions WHERE channel_id = ?")
+    sqlx::query("DELETE FROM sessions WHERE channel_id = $1")
         .bind(channel_id)
         .execute(pool)
         .await
@@ -186,11 +187,11 @@ pub async fn delete_sessions_by_channel(
 }
 
 pub async fn try_acquire_session(
-    pool: &SqlitePool,
+    pool: &PgPool,
     thread_id: &str,
 ) -> Result<bool, PidoryError> {
     let result = sqlx::query(
-        "UPDATE sessions SET status = 'running', last_active_at = datetime('now') WHERE thread_id = ? AND status != 'running'"
+        "UPDATE sessions SET status = 'running', last_active_at = TO_CHAR(NOW(), 'YYYY-MM-DD HH24:MI:SS') WHERE thread_id = $1 AND status != 'running'"
     )
     .bind(thread_id)
     .execute(pool)
@@ -200,7 +201,47 @@ pub async fn try_acquire_session(
     Ok(result.rows_affected() > 0)
 }
 
-pub async fn reset_running_sessions(pool: &SqlitePool) -> Result<u64, PidoryError> {
+// User settings CRUD
+
+pub async fn get_user_default_scope(pool: &PgPool, user_id: i64) -> Result<Option<Scope>, PidoryError> {
+    let row: Option<(String,)> =
+        sqlx::query_as("SELECT default_perm_scope FROM user_settings WHERE user_id = $1")
+            .bind(user_id)
+            .fetch_optional(pool)
+            .await
+            .map_err(PidoryError::Db)?;
+    Ok(row.map(|(s,)| Scope::from_db_str(&s)))
+}
+
+pub async fn upsert_user_default_scope(
+    pool: &PgPool,
+    user_id: i64,
+    scope: Scope,
+) -> Result<(), PidoryError> {
+    sqlx::query(
+        "INSERT INTO user_settings (user_id, default_perm_scope) VALUES ($1, $2)
+         ON CONFLICT (user_id) DO UPDATE SET default_perm_scope = EXCLUDED.default_perm_scope",
+    )
+    .bind(user_id)
+    .bind(scope.as_str())
+    .execute(pool)
+    .await
+    .map_err(PidoryError::Db)?;
+    Ok(())
+}
+
+/// 부팅 시 1회 호출: DB 에서 owner 의 default_perm_scope 를 읽어 cache 를 초기화한다.
+pub async fn load_default_scope_from_db(pool: &PgPool, owner_id: i64) {
+    match get_user_default_scope(pool, owner_id).await {
+        Ok(Some(scope)) => crate::claude_settings::rule::set_default_scope_cache(scope),
+        Ok(None) => {}
+        Err(e) => {
+            tracing::warn!("load_default_scope_from_db failed: {}", e);
+        }
+    }
+}
+
+pub async fn reset_running_sessions(pool: &PgPool) -> Result<u64, PidoryError> {
     let result = sqlx::query("UPDATE sessions SET status = 'idle' WHERE status = 'running'")
         .execute(pool)
         .await
@@ -212,15 +253,22 @@ pub async fn reset_running_sessions(pool: &SqlitePool) -> Result<u64, PidoryErro
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sqlx::SqlitePool;
+    use sqlx::PgPool;
 
-    async fn setup_db() -> SqlitePool {
-        let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
+    async fn setup_db() -> PgPool {
+        let database_url = std::env::var("TEST_DATABASE_URL")
+            .expect("TEST_DATABASE_URL must be set for db integration tests");
+        let pool = PgPool::connect(&database_url).await.unwrap();
         sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        sqlx::query("TRUNCATE sessions, projects RESTART IDENTITY CASCADE")
+            .execute(&pool)
+            .await
+            .unwrap();
         pool
     }
 
     #[tokio::test]
+    #[ignore = "requires TEST_DATABASE_URL"]
     async fn project_crud() {
         let pool = setup_db().await;
 
@@ -245,6 +293,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires TEST_DATABASE_URL"]
     async fn session_lifecycle() {
         let pool = setup_db().await;
 
@@ -285,6 +334,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires TEST_DATABASE_URL"]
     async fn reset_running_sessions_test() {
         let pool = setup_db().await;
         register_project(&pool, "ch1", "/tmp", None).await.unwrap();
@@ -302,6 +352,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires TEST_DATABASE_URL"]
     async fn duplicate_project_fails() {
         let pool = setup_db().await;
         register_project(&pool, "ch1", "/tmp", None).await.unwrap();
@@ -310,6 +361,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires TEST_DATABASE_URL"]
     async fn try_acquire_session_test() {
         let pool = setup_db().await;
         register_project(&pool, "ch1", "/tmp", None).await.unwrap();
@@ -328,6 +380,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires TEST_DATABASE_URL"]
     async fn get_nonexistent() {
         let pool = setup_db().await;
         let p = get_project_by_channel(&pool, "nonexistent").await.unwrap();
@@ -337,6 +390,27 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires TEST_DATABASE_URL"]
+    async fn user_settings_round_trip() {
+        let pool = setup_db().await;
+
+        // No row yet → None
+        let scope = get_user_default_scope(&pool, 12345).await.unwrap();
+        assert!(scope.is_none());
+
+        // Upsert project
+        upsert_user_default_scope(&pool, 12345, Scope::Project).await.unwrap();
+        let scope = get_user_default_scope(&pool, 12345).await.unwrap();
+        assert_eq!(scope, Some(Scope::Project));
+
+        // Upsert global (update)
+        upsert_user_default_scope(&pool, 12345, Scope::Global).await.unwrap();
+        let scope = get_user_default_scope(&pool, 12345).await.unwrap();
+        assert_eq!(scope, Some(Scope::Global));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires TEST_DATABASE_URL"]
     async fn delete_sessions_by_channel_test() {
         let pool = setup_db().await;
 

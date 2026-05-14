@@ -217,12 +217,12 @@ pub async fn unregister(ctx: Context<'_>) -> Result<(), Error> {
         if let Err(e) = ctx.data().sessions.kill_session(&session.thread_id).await {
             tracing::warn!(thread_id = %session.thread_id, "Failed to kill session during unregister: {}", e);
         }
-        ctx.data().session_skills.lock().await.remove(&session.thread_id);
-        ctx.data().next_step_buttons.lock().await.remove(&session.thread_id);
-        ctx.data().pending_permissions.lock().await.retain(|_, p| p.thread_id != session.thread_id);
-        ctx.data().needs_context.lock().await.remove(&session.thread_id);
-        ctx.data().turn_initiators.lock().await.remove(&session.thread_id);
-        ctx.data().turn_participants.lock().await.remove(&session.thread_id);
+        crate::handler::cleanup::cleanup_session_state(
+            ctx.data(),
+            &session.thread_id,
+            ctx.serenity_context(),
+        )
+        .await;
     }
     repository::delete_sessions_by_channel(&ctx.data().db, &channel_id).await?;
 
@@ -331,7 +331,7 @@ pub async fn new_project(
         Some(id) => id,
         None => {
             let reply = poise::CreateReply::default()
-                .content("❌ Not in a guild")
+                .content(lang.not_in_guild())
                 .ephemeral(true);
             ctx.send(reply).await?;
             return Ok(());

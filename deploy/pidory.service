@@ -13,15 +13,18 @@ RestartSec=10
 
 # Config
 Environment=PIDORY_CONFIG=__PROJECT_DIR__/config.toml
+Environment=HOME=__HOME_DIR__
 Environment=RUST_LOG=info
 Environment=PATH=__HOME_DIR__/.local/bin:__HOME_DIR__/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/snap/bin
 
 EnvironmentFile=-__PROJECT_DIR__/.env
+EnvironmentFile=/etc/pidory/db.env
+ExecStartPre=/usr/local/bin/pidory-migrate
 
 # Security hardening
 NoNewPrivileges=true
 ProtectSystem=strict
-ReadWritePaths=__HOME_DIR__/claude __HOME_DIR__/.claude /tmp
+ReadWritePaths=__HOME_DIR__/claude __HOME_DIR__/.claude /tmp /var/lib/pidory
 
 [Install]
 WantedBy=multi-user.target

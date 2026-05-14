@@ -1,6 +1,7 @@
 mod interaction;
 mod event_processor;
 mod helpers;
+pub(crate) mod interaction_kind;
 
 pub use event_processor::process_turn_events;
 pub(crate) use helpers::format_cli_command;
@@ -48,6 +49,20 @@ pub async fn handle_event(
         FullEvent::ThreadDelete { thread, .. } => {
             handle_thread_closed(ctx, data, &thread.id.to_string()).await
         }
+        FullEvent::GuildMemberAddition { new_member } => {
+            data.mention_cache.update_member(new_member.guild_id, new_member).await;
+            Ok(())
+        }
+        FullEvent::GuildMemberRemoval { guild_id, user, member_data_if_available: _ } => {
+            data.mention_cache.remove_member(*guild_id, user.id).await;
+            Ok(())
+        }
+        FullEvent::GuildMemberUpdate { old_if_available: _, new, event: _ } => {
+            if let Some(member) = new {
+                data.mention_cache.update_member(member.guild_id, member).await;
+            }
+            Ok(())
+        }
         _ => Ok(()),
     }
 }
@@ -57,8 +72,13 @@ async fn handle_thread_closed(ctx: &Context, data: &Data, thread_id: &str) -> Re
         return Ok(());
     }
 
-    if data.turn_participants.lock().await.contains_key(thread_id) {
-        data.archived_threads.lock().await.insert(thread_id.to_string());
+    {
+        let mut guard = data.session_states.lock().await;
+        if let Some(s) = guard.get_mut(thread_id)
+            && !s.turn_participants.is_empty()
+        {
+            s.archived = true;
+        }
     }
 
     if let Err(e) = data.sessions.kill_session(thread_id).await {
@@ -171,10 +191,6 @@ async fn handle_message(
             s
         }
         None => {
-            // 세션 없는 스레드에서 /clear → 무시 (새 세션 생성 안 함)
-            if helpers::is_context_reset_command(&new_message.content) {
-                return Ok(());
-            }
             tracing::info!("Creating new session for thread {}", thread_id);
             is_new_session = true;
             repository::create_session(db, &thread_id, &parent_channel_id).await?
@@ -190,7 +206,16 @@ async fn handle_message(
         None => data.config.claude.default_disallowed_tools.clone(),
     };
 
-    // SessionManager: 세션 생성 또는 기존 재사용
+    // per-thread dispatch 직렬화 lock 획득.
+    // get_or_create + try_acquire_session + (primary turn 시 restart) + send_message 전체를
+    // 같은 lock 안에서 직렬화한다.
+    // AllowAlways 후 두 메시지가 동시 도착해도 순서 보장 (#258, #298):
+    //   M_A: lock 획득 → get_or_create → try_acquire=true → restart consume → respawn → send
+    //   M_B: lock 대기 → get_or_create(새 inner 재사용) → try_acquire=false → restart skip (set 보존)
+    let _dispatch_lock_arc = data.dispatch_locks.get_or_create(&thread_id).await;
+    let _dispatch_guard = _dispatch_lock_arc.lock().await;
+
+    // SessionManager: 세션 생성 또는 기존 재사용 (restart 없이 먼저 확보)
     match data
         .sessions
         .get_or_create(
@@ -206,7 +231,8 @@ async fn handle_message(
             data.pending_permissions.clone(),
             data.pending_question_groups.clone(),
             data.config.discord.owner_id,
-            data.todo_trackers.clone(),
+            crate::subprocess::supervisor::SessionCleanupHandles::from_data(data),
+            data.config.discord.notification_channel_id.map(poise::serenity_prelude::ChannelId::new),
         )
         .await
     {
@@ -217,24 +243,9 @@ async fn handle_message(
                 "Session get_or_create completed"
             );
             if let Some(evicted_tid) = result.evicted_thread_id {
-                data.pending_permissions.lock().await.retain(|_, p| p.thread_id != evicted_tid);
-                data.pending_question_groups.lock().await.retain(|_, g| g.thread_id != evicted_tid);
-                data.session_skills.lock().await.remove(&evicted_tid);
-                data.next_step_buttons.lock().await.remove(&evicted_tid);
-                data.needs_context.lock().await.remove(&evicted_tid);
-                data.turn_initiators.lock().await.remove(&evicted_tid);
-                data.turn_participants.lock().await.remove(&evicted_tid);
-                data.last_tool_name.lock().await.remove(&evicted_tid);
-                data.kick_cooldowns.lock().await.remove(&evicted_tid);
-                data.kick_pending.lock().await.remove(&evicted_tid);
+                cleanup_session_state(data, &evicted_tid, ctx).await;
                 if let Err(e) = repository::update_session_status(db, &evicted_tid, "idle").await {
                     tracing::warn!("Failed to update session status for evicted thread {}: {}", evicted_tid, e);
-                }
-                if let Ok(id) = evicted_tid.parse::<u64>() {
-                    ChannelId::new(id)
-                        .say(ctx, format!("-# ⚠️ {}", lang.session_evicted()))
-                        .await
-                        .ok();
                 }
             }
         }
@@ -248,7 +259,6 @@ async fn handle_message(
         }
     }
 
-    let is_reset_command = helpers::is_context_reset_command(&new_message.content);
     let compact_args = helpers::parse_compact_command(&new_message.content);
     let is_cli_command = compact_args.is_some();
 
@@ -256,20 +266,8 @@ async fn handle_message(
     let acquired = repository::try_acquire_session(db, &thread_id).await?;
 
     if !acquired {
-        // mid-turn /clear: 진행 중인 턴을 조용히 종료시키고 세션 삭제
-        if is_reset_command {
-            data.archived_threads.lock().await.insert(thread_id.clone());
-            let _ = data.sessions.kill_session(&thread_id).await;
-            cleanup_session_state(data, &thread_id, ctx).await;
-            let _ = repository::delete_session(db, &thread_id).await;
-            channel_id
-                .say(ctx, format!("-# ♻️ {}", lang.session_reset()))
-                .await
-                .ok();
-            return Ok(());
-        }
-
         // mid-turn inject: event_tx 없이 전송 (context inject 안 함, needs_context 소비 안 함)
+        // pending_session_restart 의 thread_id 는 그대로 보존 — 다음 primary turn 시 재시도
         let mid_turn_downloaded_files =
             download_message_attachments(
                 &new_message.attachments,
@@ -286,6 +284,8 @@ async fn handle_message(
             new_message.content.clone()
         };
 
+        let sender_info = helpers::build_sender_info(&new_message, compact_args);
+
         let msg = QueuedMessage {
             content,
             channel_id,
@@ -295,20 +295,22 @@ async fn handle_message(
             cancelled: Arc::new(AtomicBool::new(false)),
             downloaded_files: mid_turn_downloaded_files.clone(),
             reply_context: reply_context.clone(),
+            sender_info,
         };
 
         match data.sessions.send_message(&thread_id, msg).await {
             Ok(()) => {
                 // CLI 커맨드가 성공적으로 큐잉된 후에만 flag 세팅
                 if is_cli_command {
-                    data.needs_context.lock().await.insert(thread_id.clone());
+                    data.session_states.lock().await.entry(thread_id.clone()).or_default().needs_context = true;
                 }
                 // mid-turn inject 사용자를 participants에 추가
-                data.turn_participants
+                data.session_states
                     .lock()
                     .await
                     .entry(thread_id.clone())
                     .or_default()
+                    .turn_participants
                     .insert(new_message.author.id);
                 let _ = channel_id
                     .create_reaction(
@@ -343,39 +345,97 @@ async fn handle_message(
         return Ok(());
     }
 
-    // /clear: 세션 kill + cleanup + DB delete
-    if is_reset_command {
-        let _ = data.sessions.kill_session(&thread_id).await;
-        cleanup_session_state(data, &thread_id, ctx).await;
-        let _ = repository::delete_session(db, &thread_id).await;
-        channel_id
-            .say(ctx, format!("-# ♻️ {}", lang.session_reset()))
-            .await
-            .ok();
-        return Ok(());
+    // AllowAlways 성공 후 subprocess restart 예약 처리 — primary turn 시작 시점에만 발동.
+    // dispatch_lock 안에서 실행하여 동시 도착 메시지와의 race 방지 (#298).
+    // mid-turn (acquired=false) 에서는 skip + set 에 thread_id 보존 → 다음 primary turn 시 재시도.
+    // restart 후 get_or_create 재호출: SessionInner 제거 → 새 subprocess spawn (--resume).
+    if data
+        .pending_session_restart
+        .lock()
+        .await
+        .remove(&thread_id)
+    {
+        if let Some(sid) = session.session_id.as_deref() {
+            if let Err(e) = data
+                .sessions
+                .restart_for_settings_reload(&thread_id, sid)
+                .await
+            {
+                tracing::warn!(
+                    thread_id = %thread_id,
+                    error = %e,
+                    "restart_for_settings_reload failed (session may not exist yet); continuing"
+                );
+            }
+            // SessionInner 가 제거됐으므로 같은 dispatch_lock 안에서 즉시 재spawn.
+            match data
+                .sessions
+                .get_or_create(
+                    &thread_id,
+                    &project.path,
+                    session.session_id.as_deref(),
+                    &disallowed_tools,
+                    session.model.as_deref().or(data.config.claude.default_model.as_deref()),
+                    ctx.clone(),
+                    channel_id,
+                    data.db.clone(),
+                    lang,
+                    data.pending_permissions.clone(),
+                    data.pending_question_groups.clone(),
+                    data.config.discord.owner_id,
+                    crate::subprocess::supervisor::SessionCleanupHandles::from_data(data),
+                    data.config.discord.notification_channel_id.map(poise::serenity_prelude::ChannelId::new),
+                )
+                .await
+            {
+                Ok(result) => {
+                    tracing::info!(
+                        thread_id = %thread_id,
+                        evicted = result.evicted_thread_id.as_deref(),
+                        "Session respawned after settings reload restart"
+                    );
+                    if let Some(evicted_tid) = result.evicted_thread_id {
+                        cleanup_session_state(data, &evicted_tid, ctx).await;
+                        if let Err(e) = repository::update_session_status(db, &evicted_tid, "idle").await {
+                            tracing::warn!("Failed to update session status for evicted thread {}: {}", evicted_tid, e);
+                        }
+                    }
+                }
+                Err(e) => {
+                    error!("Failed to respawn session after restart for thread {}: {}", thread_id, e);
+                    channel_id
+                        .say(ctx, format!("❌ {}", lang.session_create_failed(&e)))
+                        .await
+                        .map_err(|e| PidoryError::Discord(Box::new(e)))?;
+                    return Ok(());
+                }
+            }
+        } else {
+            tracing::warn!(
+                thread_id = %thread_id,
+                "pending_session_restart set but session_id is None; skipping restart"
+            );
+        }
     }
 
     // 직접 실행 경로: context inject 판정 (primary 경로만)
     let content = if let Some(args) = compact_args {
         helpers::format_cli_command("compact", args)
     } else {
-        let had_needs_context = data.needs_context.lock().await.remove(&thread_id);
+        let had_needs_context = data.session_states.lock().await
+            .get_mut(&thread_id)
+            .map(|s| std::mem::replace(&mut s.needs_context, false))
+            .unwrap_or(false);
         helpers::build_context_content(&new_message.content, is_new_session, had_needs_context, &guild_channel.name, lang)
     };
 
-    // turn 시작: 이 turn 의 triggering user 를 기록 (permission 위임용)
-    data.turn_initiators
-        .lock()
-        .await
-        .insert(thread_id.clone(), new_message.author.id);
-
-    // turn_participants 초기화: 새 turn 시작 시 author 만 포함
-    data.turn_participants
-        .lock()
-        .await
-        .insert(thread_id.clone(), std::collections::HashSet::from([new_message.author.id]));
-
-    data.last_tool_name.lock().await.remove(&thread_id);
+    // turn 시작: archived tombstone 클리어 (#314) + turn-scoped 필드 초기화 + turn_initiator 기록
+    {
+        let mut guard = data.session_states.lock().await;
+        let s = guard.entry(thread_id.clone()).or_default();
+        s.begin_turn(new_message.author.id);
+        s.turn_initiator = Some(new_message.author.id);
+    }
 
     // 첨부파일 있으면 ⏬ reaction 먼저
     if !new_message.attachments.is_empty() {
@@ -398,6 +458,8 @@ async fn handle_message(
         .await
         .ok();
 
+    let sender_info = helpers::build_sender_info(&new_message, compact_args);
+
     let (event_tx, event_rx) = mpsc::channel::<StreamEvent>(64);
     let msg = QueuedMessage {
         content: content.clone(),
@@ -408,6 +470,7 @@ async fn handle_message(
         cancelled: Arc::new(AtomicBool::new(false)),
         downloaded_files: primary_downloaded_files.clone(),
         reply_context: reply_context.clone(),
+        sender_info,
     };
 
     if let Err(e) = data.sessions.send_message(&thread_id, msg).await {
@@ -428,17 +491,12 @@ async fn handle_message(
 
     // CLI 커맨드가 성공적으로 전송된 후에만 flag 세팅
     if is_cli_command {
-        data.needs_context.lock().await.insert(thread_id.clone());
+        data.session_states.lock().await.entry(thread_id.clone()).or_default().needs_context = true;
     }
 
-    let todo_tracker = {
-        let mut map = data.todo_trackers.lock().await;
-        map.entry(thread_id.clone())
-            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(
-                crate::handler::todo_tracker::TodoTracker::new(channel_id)
-            )))
-            .clone()
-    };
+    // send_message 완료 후 dispatch lock 해제.
+    // process_turn_events는 턴 완료까지 await하므로 반드시 lock 밖에서 실행.
+    drop(_dispatch_guard);
 
     process_turn_events(
         ctx,
@@ -449,15 +507,11 @@ async fn handle_message(
         db,
         data.config.response.max_chunk_length,
         data.config.response.max_chunks,
-        data.session_skills.clone(),
         lang,
         data.config.discord.owner_id,
-        data.turn_participants.clone(),
-        data.archived_threads.clone(),
-        data.last_tool_name.clone(),
-        data.kick_pending.clone(),
-        todo_tracker.clone(),
-        data.next_step_buttons.clone(),
+        data.config.footer.show_context_percent,
+        data.session_states.clone(),
+        data.mention_cache.clone(),
     )
     .await;
 
@@ -475,28 +529,16 @@ pub async fn execute_in_session(
 ) -> Result<(), PidoryError> {
     let db = &data.db;
 
-    let is_reset_command = helpers::is_context_reset_command(content);
+    // per-thread dispatch 직렬화 lock 획득 (try_acquire_session 이전) (#258)
+    let _dispatch_lock_arc = data.dispatch_locks.get_or_create(thread_id).await;
+    let _dispatch_guard = _dispatch_lock_arc.lock().await;
+
     let compact_args = helpers::parse_compact_command(content);
     let is_cli_command = compact_args.is_some();
-
-    let lang = data.config.language;
 
     let acquired = repository::try_acquire_session(db, thread_id).await?;
 
     if !acquired {
-        // mid-turn /clear: 진행 중인 턴을 조용히 종료시키고 세션 삭제
-        if is_reset_command {
-            data.archived_threads.lock().await.insert(thread_id.to_string());
-            let _ = data.sessions.kill_session(thread_id).await;
-            cleanup_session_state(data, thread_id, ctx).await;
-            let _ = repository::delete_session(db, thread_id).await;
-            channel_id
-                .say(ctx, format!("-# ♻️ {}", lang.session_reset()))
-                .await
-                .ok();
-            return Ok(());
-        }
-
         // mid-turn inject: event_tx 없이 전송
         let effective_content = if let Some(args) = compact_args {
             helpers::format_cli_command("compact", args)
@@ -512,37 +554,29 @@ pub async fn execute_in_session(
             cancelled: Arc::new(AtomicBool::new(false)),
             downloaded_files: Vec::new(),
             reply_context: None,
+            sender_info: None,
         };
         data.sessions.send_message(thread_id, msg).await?;
         if is_cli_command {
-            data.needs_context.lock().await.insert(thread_id.to_string());
+            data.session_states.lock().await.entry(thread_id.to_string()).or_default().needs_context = true;
         }
         // mid-turn inject 사용자를 participants에 추가
-        data.turn_participants
+        data.session_states
             .lock()
             .await
             .entry(thread_id.to_string())
             .or_default()
+            .turn_participants
             .insert(triggered_by);
-        return Ok(());
-    }
-
-    // /clear: 세션 kill + cleanup + DB delete
-    if is_reset_command {
-        let _ = data.sessions.kill_session(thread_id).await;
-        cleanup_session_state(data, thread_id, ctx).await;
-        let _ = repository::delete_session(db, thread_id).await;
-        channel_id
-            .say(ctx, format!("-# ♻️ {}", lang.session_reset()))
-            .await
-            .ok();
         return Ok(());
     }
 
     // 직접 실행
     // stale needs_context 정리 (CLI 커맨드가 아닌 경우에만 — CLI 커맨드는 send 후 insert)
-    if !is_cli_command {
-        data.needs_context.lock().await.remove(thread_id);
+    if !is_cli_command
+        && let Some(s) = data.session_states.lock().await.get_mut(thread_id)
+    {
+        s.needs_context = false;
     }
 
     let effective_content = if let Some(args) = compact_args {
@@ -565,15 +599,16 @@ pub async fn execute_in_session(
         cancelled: Arc::new(AtomicBool::new(false)),
         downloaded_files: Vec::new(),
         reply_context: None,
+        sender_info: None,
     };
 
-    // turn_participants 초기화 (skill 직접 실행 경로)
-    data.turn_participants
-        .lock()
-        .await
-        .insert(thread_id.to_string(), std::collections::HashSet::from([triggered_by]));
-
-    data.last_tool_name.lock().await.remove(thread_id);
+    // archived tombstone 클리어 (#314) + turn-scoped 필드 초기화 (skill 직접 실행 경로).
+    // turn_initiator는 skill 경로 정책상 설정하지 않는다.
+    {
+        let mut guard = data.session_states.lock().await;
+        let s = guard.entry(thread_id.to_string()).or_default();
+        s.begin_turn(triggered_by);
+    }
 
     if let Err(e) = data.sessions.send_message(thread_id, msg).await {
         error!("Failed to send message to session {}: {}", thread_id, e);
@@ -585,18 +620,14 @@ pub async fn execute_in_session(
     }
 
     if is_cli_command {
-        data.needs_context.lock().await.insert(thread_id.to_string());
+        data.session_states.lock().await.entry(thread_id.to_string()).or_default().needs_context = true;
     }
 
+    // send_message 완료 후 dispatch lock 해제.
+    // process_turn_events는 턴 완료까지 await하므로 반드시 lock 밖에서 실행.
+    drop(_dispatch_guard);
+
     let thread_id_string = thread_id.to_string();
-    let todo_tracker = {
-        let mut map = data.todo_trackers.lock().await;
-        map.entry(thread_id_string.clone())
-            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(
-                crate::handler::todo_tracker::TodoTracker::new(channel_id)
-            )))
-            .clone()
-    };
 
     process_turn_events(
         ctx,
@@ -607,21 +638,23 @@ pub async fn execute_in_session(
         db,
         data.config.response.max_chunk_length,
         data.config.response.max_chunks,
-        data.session_skills.clone(),
         data.config.language,
         data.config.discord.owner_id,
-        data.turn_participants.clone(),
-        data.archived_threads.clone(),
-        data.last_tool_name.clone(),
-        data.kick_pending.clone(),
-        todo_tracker.clone(),
-        data.next_step_buttons.clone(),
+        data.config.footer.show_context_percent,
+        data.session_states.clone(),
+        data.mention_cache.clone(),
     )
     .await;
 
     if is_cli_command {
-        todo_tracker.lock().await.cleanup(ctx).await;
-        data.todo_trackers.lock().await.remove(&thread_id_string);
+        // cli 명령 종료 시 tracker 폐기 (Present일 때만 take, CheckedOut이면 그쪽이 cleanup 책임)
+        let tracker = {
+            let mut guard = data.session_states.lock().await;
+            guard.get_mut(&thread_id_string).and_then(|s| s.take_present_todo_tracker())
+        };
+        if let Some(mut tracker) = tracker {
+            tracker.cleanup(ctx).await;
+        }
     }
 
     Ok(())
@@ -656,7 +689,7 @@ async fn download_message_attachments(
 
 #[cfg(test)]
 mod tests {
-    use super::helpers::{build_context_content, format_cli_command, format_ctx_suffix, is_context_reset_command};
+    use super::helpers::{build_context_content, format_cli_command, format_ctx_suffix};
     use crate::i18n::Lang;
 
     #[test]
@@ -674,13 +707,6 @@ mod tests {
     }
 
     #[test]
-    fn no_inject_on_new_command() {
-        let result = build_context_content("/new", true, false, "스레드", Lang::Ko);
-        assert!(!result.contains("<system-reminder>"));
-        assert_eq!(result, "/new");
-    }
-
-    #[test]
     fn no_inject_normal_message() {
         let result = build_context_content("일반 메시지", false, false, "스레드", Lang::Ko);
         assert!(!result.contains("<system-reminder>"));
@@ -688,47 +714,14 @@ mod tests {
     }
 
     #[test]
-    fn new_command_case_insensitive() {
-        let result = build_context_content("/New", true, false, "스레드", Lang::Ko);
-        assert!(!result.contains("<system-reminder>"));
-    }
-
-    #[test]
-    fn no_inject_on_clear_command() {
-        let result = build_context_content("/clear", true, false, "스레드", Lang::Ko);
-        assert!(!result.contains("<system-reminder>"));
-        assert_eq!(result, "/clear");
-    }
-
-    #[test]
-    fn clear_command_case_insensitive() {
-        let result = build_context_content("/Clear", true, false, "스레드", Lang::Ko);
-        assert!(!result.contains("<system-reminder>"));
-    }
-
-    #[test]
     fn test_format_ctx_suffix() {
-        assert_eq!(format_ctx_suffix(26150, 1000000), " · ctx:2%");
-        assert_eq!(format_ctx_suffix(420000, 1000000), " · ctx:42%");
-        assert_eq!(format_ctx_suffix(0, 0), "");
-        assert_eq!(format_ctx_suffix(100, 0), "");
-        assert_eq!(format_ctx_suffix(1000000, 1000000), " · ctx:100%");
-    }
-
-    #[test]
-    fn context_reset_command_new() {
-        assert!(is_context_reset_command("/new"));
-        assert!(is_context_reset_command("/New"));
-        assert!(is_context_reset_command("/NEW"));
-        assert!(is_context_reset_command("  /new  "));
-    }
-
-    #[test]
-    fn context_reset_command_clear() {
-        assert!(is_context_reset_command("/clear"));
-        assert!(is_context_reset_command("/Clear"));
-        assert!(is_context_reset_command("/CLEAR"));
-        assert!(is_context_reset_command("  /clear  "));
+        assert_eq!(format_ctx_suffix(26150, 1000000, true), " · ctx:2%");
+        assert_eq!(format_ctx_suffix(420000, 1000000, true), " · ctx:42%");
+        assert_eq!(format_ctx_suffix(0, 0, true), "");
+        assert_eq!(format_ctx_suffix(100, 0, true), "");
+        assert_eq!(format_ctx_suffix(1000000, 1000000, true), " · ctx:100%");
+        assert_eq!(format_ctx_suffix(26150, 1000000, false), "");
+        assert_eq!(format_ctx_suffix(420000, 1000000, false), "");
     }
 
     #[test]
@@ -771,12 +764,4 @@ mod tests {
         );
     }
 
-    #[test]
-    fn context_reset_command_rejects_others() {
-        assert!(!is_context_reset_command("hello"));
-        assert!(!is_context_reset_command("/help"));
-        assert!(!is_context_reset_command("/newbie"));
-        assert!(!is_context_reset_command("/clearance"));
-        assert!(!is_context_reset_command(""));
-    }
 }

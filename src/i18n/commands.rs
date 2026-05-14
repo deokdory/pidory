@@ -12,7 +12,7 @@ impl Lang {
 
     pub fn status_error(&self, err: &str) -> String {
         match self {
-            Lang::Ko => format!("오류 — {}", err),
+            Lang::Ko => format!("오류가 발생했습니다 — {}", err),
             Lang::En => format!("Error — {}", err),
         }
     }
@@ -63,7 +63,7 @@ impl Lang {
 
     pub fn path_not_exist(&self, path: &str) -> String {
         match self {
-            Lang::Ko => format!("경로가 존재하지 않습니다: `{}`", path),
+            Lang::Ko => format!("경로가 존재하지 않아요: `{}`", path),
             Lang::En => format!("Path does not exist: `{}`", path),
         }
     }
@@ -71,7 +71,7 @@ impl Lang {
     pub fn already_registered(&self, path: &str) -> String {
         match self {
             Lang::Ko => format!(
-                "이 채널은 이미 `{}`에 등록되어 있습니다. `/unregister`를 먼저 실행하세요.",
+                "이 채널은 이미 `{}`에 등록되어 있어요. `/unregister`를 먼저 실행해주세요.",
                 path
             ),
             Lang::En => format!(
@@ -83,21 +83,21 @@ impl Lang {
 
     pub fn registered(&self, path: &str) -> String {
         match self {
-            Lang::Ko => format!("`{}`이(가) 이 채널에 등록되었습니다", path),
+            Lang::Ko => format!("`{}`이(가) 이 채널에 등록됐어요", path),
             Lang::En => format!("Registered `{}` to this channel", path),
         }
     }
 
     pub fn not_registered(&self) -> &'static str {
         match self {
-            Lang::Ko => "이 채널에 등록된 프로젝트가 없습니다",
+            Lang::Ko => "이 채널에 등록된 프로젝트가 없어요",
             Lang::En => "No project registered to this channel",
         }
     }
 
     pub fn unregistered(&self) -> &'static str {
         match self {
-            Lang::Ko => "이 채널에서 프로젝트 등록이 해제되었습니다",
+            Lang::Ko => "이 채널에서 프로젝트 등록이 해제됐어요",
             Lang::En => "Unregistered project from this channel",
         }
     }
@@ -106,7 +106,7 @@ impl Lang {
 
     pub fn no_active_sessions_short(&self) -> &'static str {
         match self {
-            Lang::Ko => "활성 세션 없음",
+            Lang::Ko => "활성 세션이 없어요",
             Lang::En => "No active sessions",
         }
     }
@@ -127,7 +127,7 @@ impl Lang {
 
     pub fn no_session_in_thread(&self) -> &'static str {
         match self {
-            Lang::Ko => "이 스레드에 활성 세션이 없습니다",
+            Lang::Ko => "이 스레드에 활성 세션이 없어요",
             Lang::En => "No active session in this thread",
         }
     }
@@ -141,28 +141,28 @@ impl Lang {
 
     pub fn interrupt_failed(&self, err: &impl std::fmt::Display) -> String {
         match self {
-            Lang::Ko => format!("중단 실패: {}", err),
+            Lang::Ko => format!("턴을 중단하지 못했어요: {}", err),
             Lang::En => format!("Interrupt failed: {}", err),
         }
     }
 
     pub fn kicked(&self) -> &'static str {
         match self {
-            Lang::Ko => "턴을 중단하고 재시작합니다",
+            Lang::Ko => "턴을 중단하고 다시 시작할게요",
             Lang::En => "Turn interrupted, restarting",
         }
     }
 
     pub fn kick_no_active_turn(&self) -> &'static str {
         match self {
-            Lang::Ko => "진행 중인 턴이 없습니다",
+            Lang::Ko => "진행 중인 턴이 없어요",
             Lang::En => "No active turn",
         }
     }
 
     pub fn kick_timeout(&self) -> &'static str {
         match self {
-            Lang::Ko => "인터럽트 타임아웃: 세션이 응답하지 않습니다",
+            Lang::Ko => "인터럽트 타임아웃: 세션이 응답하지 않아요",
             Lang::En => "Interrupt timeout: session not responding",
         }
     }
@@ -189,42 +189,42 @@ impl Lang {
 
     pub fn kick_natural_completion(&self) -> &'static str {
         match self {
-            Lang::Ko => "턴이 이미 완료되어 재시작하지 않습니다",
+            Lang::Ko => "턴이 이미 완료돼서 다시 시작하지 않아요",
             Lang::En => "Turn already completed, skipping restart",
         }
     }
 
     pub fn kick_error_state(&self) -> &'static str {
         match self {
-            Lang::Ko => "세션이 에러 상태입니다. 재시작하지 않습니다",
+            Lang::Ko => "세션이 에러 상태예요. 다시 시작하지 않아요",
             Lang::En => "Session in error state, skipping restart",
         }
     }
 
     pub fn kick_preempted(&self) -> &'static str {
         match self {
-            Lang::Ko => "다른 메시지가 먼저 처리되어 재시작하지 않습니다",
+            Lang::Ko => "다른 메시지가 먼저 처리돼서 다시 시작하지 않아요",
             Lang::En => "Another message was processed first, skipping restart",
         }
     }
 
     pub fn not_in_thread(&self) -> &'static str {
         match self {
-            Lang::Ko => "스레드가 아닙니다. 스레드 ID를 직접 입력하세요.",
+            Lang::Ko => "스레드가 아니에요. 스레드 ID를 직접 입력해주세요.",
             Lang::En => "Not in a thread. Provide a thread ID explicitly.",
         }
     }
 
     pub fn no_session_found(&self, tid: &str) -> String {
         match self {
-            Lang::Ko => format!("스레드 `{}`에 세션이 없습니다", tid),
+            Lang::Ko => format!("스레드 `{}`에 세션이 없어요", tid),
             Lang::En => format!("No session found for thread `{}`", tid),
         }
     }
 
     pub fn session_deleted(&self) -> &'static str {
         match self {
-            Lang::Ko => "세션이 삭제되었습니다",
+            Lang::Ko => "세션이 삭제됐어요",
             Lang::En => "Session deleted",
         }
     }
@@ -314,14 +314,14 @@ impl Lang {
 
     pub fn session_slept(&self) -> &'static str {
         match self {
-            Lang::Ko => "세션을 슬립 상태로 전환했습니다. 메시지를 보내면 자동으로 재개됩니다.",
+            Lang::Ko => "세션을 잠시 재웠어요. 메시지를 보내면 자동으로 다시 깨어나요.",
             Lang::En => "Session put to sleep. Send a message to resume.",
         }
     }
 
     pub fn sleep_turn_active(&self) -> &'static str {
         match self {
-            Lang::Ko => "턴이 진행 중입니다. 완료 후 다시 시도하세요.",
+            Lang::Ko => "턴이 진행 중이에요. 완료된 후에 다시 시도해주세요.",
             Lang::En => "A turn is active. Please try again after it completes.",
         }
     }
@@ -330,7 +330,7 @@ impl Lang {
 
     pub fn model_changed(&self, from: &str, to: &str) -> String {
         match self {
-            Lang::Ko => format!("모델 변경: {} → {} (다음 메시지부터 적용)", from, to),
+            Lang::Ko => format!("모델을 변경했어요: {} → {} (다음 메시지부터 적용돼요)", from, to),
             Lang::En => format!("Model changed: {} → {} (applies from next message)", from, to),
         }
     }
@@ -344,14 +344,14 @@ impl Lang {
 
     pub fn model_turn_active(&self) -> &'static str {
         match self {
-            Lang::Ko => "턴 진행 중에는 모델을 변경할 수 없습니다",
+            Lang::Ko => "턴 진행 중에는 모델을 변경할 수 없어요",
             Lang::En => "Cannot change model during an active turn",
         }
     }
 
     pub fn model_invalid(&self, name: &str) -> String {
         match self {
-            Lang::Ko => format!("지원하지 않는 모델입니다: {}", name),
+            Lang::Ko => format!("지원하지 않는 모델이에요: {}", name),
             Lang::En => format!("Unsupported model: {}", name),
         }
     }
@@ -360,14 +360,14 @@ impl Lang {
 
     pub fn new_project_created(&self, channel: &str, path: &str) -> String {
         match self {
-            Lang::Ko => format!("채널 <#{}> 이(가) `{}`에 생성되고 등록되었습니다", channel, path),
+            Lang::Ko => format!("채널 <#{}>이(가) `{}`에 생성되고 등록됐어요", channel, path),
             Lang::En => format!("Channel <#{}> created and registered to `{}`", channel, path),
         }
     }
 
     pub fn channel_name_invalid(&self) -> &'static str {
         match self {
-            Lang::Ko => "유효하지 않은 채널 이름입니다 (2-100자, 영문/숫자/하이픈)",
+            Lang::Ko => "유효하지 않은 채널 이름이에요 (2-100자, 영문/숫자/하이픈)",
             Lang::En => "Invalid channel name (2-100 chars, alphanumeric/hyphen only)",
         }
     }
@@ -381,28 +381,28 @@ impl Lang {
 
     pub fn channel_create_failed(&self) -> &'static str {
         match self {
-            Lang::Ko => "채널 생성에 실패했습니다. 봇에 'Manage Channels' 권한이 있는지 확인하세요.",
-            Lang::En => "Failed to create channel. Please check that the bot has the 'Manage Channels' permission.",
+            Lang::Ko => "채널을 만들지 못했어요. 봇에 'Manage Channels' 권한이 있는지 확인해주세요.",
+            Lang::En => "Couldn't create the channel. Make sure the bot has the 'Manage Channels' permission.",
         }
     }
 
     pub fn path_not_in_roots(&self, path: &str) -> String {
         match self {
-            Lang::Ko => format!("`{}`은(는) 허용된 project_roots 안에 없습니다", path),
+            Lang::Ko => format!("`{}`은(는) 허용된 project_roots 안에 없어요", path),
             Lang::En => format!("`{}` is not within any allowed project_roots", path),
         }
     }
 
     pub fn category_not_found(&self) -> &'static str {
         match self {
-            Lang::Ko => "지정된 카테고리를 찾을 수 없습니다",
+            Lang::Ko => "지정된 카테고리를 찾을 수 없어요",
             Lang::En => "Specified category not found",
         }
     }
 
     pub fn channel_created_but_register_failed(&self, channel: &str) -> String {
         match self {
-            Lang::Ko => format!("채널 <#{}>이(가) 생성되었지만 등록에 실패했습니다. `/register`를 수동으로 실행하세요.", channel),
+            Lang::Ko => format!("채널 <#{}>이(가) 생성됐지만 등록에 실패했어요. `/register`를 수동으로 실행해주세요.", channel),
             Lang::En => format!("Channel <#{}> was created but registration failed. Run `/register` manually.", channel),
         }
     }
@@ -411,57 +411,57 @@ impl Lang {
 
     pub fn branch_not_in_thread(&self) -> &'static str {
         match self {
-            Lang::Ko => "스레드 안에서만 사용 가능합니다",
+            Lang::Ko => "스레드 안에서만 사용할 수 있어요",
             Lang::En => "This command can only be used inside a thread",
         }
     }
 
     pub fn branch_no_project(&self) -> &'static str {
         match self {
-            Lang::Ko => "이 채널에 등록된 프로젝트가 없습니다",
+            Lang::Ko => "이 채널에 등록된 프로젝트가 없어요",
             Lang::En => "No project registered for this channel",
         }
     }
 
     pub fn branch_no_session(&self) -> &'static str {
         match self {
-            Lang::Ko => "이 스레드에 활성 세션이 없습니다",
+            Lang::Ko => "이 스레드에 활성 세션이 없어요",
             Lang::En => "No active session in this thread",
         }
     }
 
     pub fn branch_session_busy(&self) -> &'static str {
         match self {
-            Lang::Ko => "세션이 작업 중입니다. 완료 후 다시 시도해주세요",
+            Lang::Ko => "세션이 작업 중이에요. 완료된 후에 다시 시도해주세요",
             Lang::En => "Session is busy. Please try again after it completes",
         }
     }
 
     pub fn branch_no_slot(&self, reason: &str) -> String {
         match self {
-            Lang::Ko => format!("세션 슬롯이 부족합니다: {}. 잠시 후 다시 시도해주세요", reason),
+            Lang::Ko => format!("세션 슬롯이 부족해요: {}. 잠시 후에 다시 시도해주세요", reason),
             Lang::En => format!("No session slot available: {}. Please try again later", reason),
         }
     }
 
     pub fn branch_summary_failed(&self) -> &'static str {
         match self {
-            Lang::Ko => "요약 생성에 실패했습니다",
-            Lang::En => "Failed to generate summary",
+            Lang::Ko => "요약을 만들지 못했어요",
+            Lang::En => "Couldn't generate the summary",
         }
     }
 
     pub fn branch_thread_created(&self, thread_mention: &str) -> String {
         match self {
-            Lang::Ko => format!("새 스레드가 생성되었습니다: {}", thread_mention),
+            Lang::Ko => format!("새 스레드를 만들었어요: {}", thread_mention),
             Lang::En => format!("New thread created: {}", thread_mention),
         }
     }
 
     pub fn branch_thread_create_failed(&self) -> &'static str {
         match self {
-            Lang::Ko => "스레드 생성에 실패했습니다",
-            Lang::En => "Failed to create thread",
+            Lang::Ko => "스레드를 만들지 못했어요",
+            Lang::En => "Couldn't create the thread",
         }
     }
 
@@ -474,8 +474,8 @@ impl Lang {
 
     pub fn branch_ready(&self, mention: &str) -> String {
         match self {
-            Lang::Ko => format!("✅ 세션이 준비되었습니다. {} 메시지를 보내면 작업을 시작합니다.", mention),
-            Lang::En => format!("✅ Session is ready. {} Send a message to start working.", mention),
+            Lang::Ko => format!("✅ 세션 준비됐어요, {}. 메시지를 보내주시면 작업을 시작할게요.", mention),
+            Lang::En => format!("✅ Session is ready, {}. Send a message to start working.", mention),
         }
     }
 
@@ -488,6 +488,155 @@ impl Lang {
                     format!("Summarize the current conversation and work context for handoff to a new session.\nFocus especially on: {}\n\nRespond ONLY with a JSON object, no other text. Do NOT use any tools.\n{{\"title\": \"short descriptive title for the new thread (max 50 chars, Korean if conversation is in Korean)\", \"summary\": \"comprehensive summary of current project state, ongoing work, key decisions, and relevant file paths (max 2000 chars)\"}}", extra_context)
                 }
             }
+        }
+    }
+
+    // ── Commands: agent ──
+
+    pub fn agent_autocomplete_more(&self, count: usize) -> String {
+        match self {
+            Lang::Ko => format!(
+                "\u{22ef} 외 {}개 (클릭하지 마시고 이름을 입력해서 필터링해 주세요)",
+                count
+            ),
+            Lang::En => format!(
+                "\u{22ef} {} more (please type the name to filter instead of clicking)",
+                count
+            ),
+        }
+    }
+
+    pub fn agent_not_found(&self, name: &str) -> String {
+        match self {
+            Lang::Ko => format!(
+                "❌ '{}' 에이전트를 목록에서 찾지 못했습니다.\n- 이름 철자를 확인해 주세요\n- 또는 강제 실행하려면 `force:true`를 추가해 주세요",
+                name
+            ),
+            Lang::En => format!(
+                "❌ Agent '{}' was not found in the list.\n- Please verify the spelling\n- Or add `force:true` to execute anyway",
+                name
+            ),
+        }
+    }
+
+    pub fn not_in_guild(&self) -> &'static str {
+        match self {
+            Lang::Ko => "❌ 길드에서만 사용할 수 있어요",
+            Lang::En => "❌ Can only be used in a guild",
+        }
+    }
+
+    // ── Commands: update ──
+
+    pub fn update_in_progress(&self) -> &'static str {
+        match self {
+            Lang::Ko => "⏳ 업데이트 진행 중...",
+            Lang::En => "⏳ Update in progress...",
+        }
+    }
+
+    pub fn update_already_latest(&self, version: &str) -> String {
+        match self {
+            Lang::Ko => format!("✅ 이미 최신 버전 v{}예요.", version),
+            Lang::En => format!("✅ Already on latest v{}.", version),
+        }
+    }
+
+    pub fn update_dirty_tree(&self) -> &'static str {
+        match self {
+            Lang::Ko => "❌ 작업 트리에 커밋되지 않은 변경이 있어요. 먼저 정리해주세요.",
+            Lang::En => "❌ Working tree has uncommitted changes. Clean up first.",
+        }
+    }
+
+    pub fn update_active_turns(&self, threads: &[String]) -> String {
+        let joined = threads.join(", ");
+        match self {
+            Lang::Ko => format!(
+                "❌ 활성 턴이 있습니다: {}\n`force:true`로 강제 진행 가능합니다.",
+                joined
+            ),
+            Lang::En => format!(
+                "❌ Active turns in: {}\nUse `force:true` to override.",
+                joined
+            ),
+        }
+    }
+
+    pub fn update_build_failed(&self, stderr_tail: &str) -> String {
+        match self {
+            Lang::Ko => format!("❌ 빌드 실패:\n```\n{}\n```", stderr_tail),
+            Lang::En => format!("❌ Build failed:\n```\n{}\n```", stderr_tail),
+        }
+    }
+
+    pub fn update_complete(&self, version: &str) -> String {
+        match self {
+            Lang::Ko => format!("✅ v{} 빌드 완료. 30초 후 재시작합니다.", version),
+            Lang::En => format!("✅ v{} built. Restarting in 30 seconds.", version),
+        }
+    }
+
+    pub fn update_rollback(&self) -> &'static str {
+        match self {
+            Lang::Ko => "⚠️ 업데이트 후 부팅 실패로 자동 롤백됨.",
+            Lang::En => "⚠️ Update failed to boot — auto-rolled back.",
+        }
+    }
+
+    // ── Commands: update preflight ──
+
+    pub fn preflight_label_database_url(&self) -> &'static str {
+        match self {
+            Lang::Ko => "DATABASE_URL 환경변수 또는 /etc/pidory/db.env",
+            Lang::En => "DATABASE_URL env var or /etc/pidory/db.env",
+        }
+    }
+
+    pub fn preflight_label_exec_start_pre(&self) -> &'static str {
+        match self {
+            Lang::Ko => "pidory.service 의 ExecStartPre=/usr/local/bin/pidory-migrate",
+            Lang::En => "ExecStartPre=/usr/local/bin/pidory-migrate in pidory.service",
+        }
+    }
+
+    pub fn preflight_label_migrate_binary(&self) -> &'static str {
+        match self {
+            Lang::Ko => "/usr/local/bin/pidory-migrate 실행 파일",
+            Lang::En => "/usr/local/bin/pidory-migrate executable",
+        }
+    }
+
+    pub fn preflight_label_postgres_connection(&self) -> &'static str {
+        match self {
+            Lang::Ko => "PostgreSQL 연결",
+            Lang::En => "PostgreSQL connection",
+        }
+    }
+
+    pub fn preflight_blocked(&self, missing_labels: &[String]) -> String {
+        let bullet_list = missing_labels
+            .iter()
+            .map(|item| format!("- {}", item))
+            .collect::<Vec<_>>()
+            .join("\n");
+        match self {
+            Lang::Ko => format!(
+                "⚠️ Postgres 셋업 미완 — /update 차단됨\n\n\
+                 이번 버전부터 PostgreSQL 백엔드로 전환됐습니다.\n\
+                 부족한 항목:\n{}\n\n\
+                 SSH 로 한 번 실행해주세요:\n  sudo bash scripts/postgres-setup.sh\n\n\
+                 셋업 완료 후 /update 를 다시 시도하세요.",
+                bullet_list
+            ),
+            Lang::En => format!(
+                "⚠️ Postgres setup incomplete — /update blocked\n\n\
+                 This version uses the PostgreSQL backend.\n\
+                 Missing:\n{}\n\n\
+                 Run this once via SSH:\n  sudo bash scripts/postgres-setup.sh\n\n\
+                 Retry /update after setup completes.",
+                bullet_list
+            ),
         }
     }
 }

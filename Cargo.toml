@@ -1,24 +1,52 @@
 [package]
 name = "pidory"
-version = "0.6.3"
+version = "0.7.0"
 edition = "2024"
+license = "Apache-2.0"
+authors = ["deokdory <deokdory@gmail.com>"]
+repository = "https://github.com/deokdory/pidory"
+homepage = "https://github.com/deokdory/pidory"
+description = "Discord bot bridging threads to Claude Code CLI sessions via stream-json IPC"
+readme = "README.md"
+keywords = ["discord", "claude", "ai", "bot", "automation"]
+categories = ["command-line-utilities"]
+
+[features]
+default = []
+migrate = ["sqlx/sqlite"]
+
+[[bin]]
+name = "pidory-migrate"
+path = "src/bin/migrate.rs"
+required-features = ["migrate"]
 
 [dependencies]
+anyhow = "1"
 futures-util = "0.3"
 poise = "0.6"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 serenity = { version = "0.12", default-features = false, features = ["client", "gateway", "model", "cache"] }
-sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite"] }
+sqlx = { version = "0.8", features = ["runtime-tokio", "postgres"] }
 tokio = { version = "1", features = ["full"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
 tracing = "0.1"
+url = "2"
+percent-encoding = "2"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 thiserror = "2"
 bytes = "1"
 comfy-table = { version = "7", default-features = false }
+sha2 = "0.11"
+libc = "0.2"
+shlex = "1"
+regex = "1"
+unicode-normalization = "0.1"
+
 
 [dev-dependencies]
+filetime = "0.2"
 tempfile = "3"
+tokio-test = "0.4"

@@ -4,6 +4,12 @@ use std::fs;
 use crate::error::PidoryError;
 use crate::i18n::Lang;
 
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct FooterConfig {
+    #[serde(default)]
+    pub show_context_percent: bool,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct Config {
     #[serde(default)]
@@ -17,6 +23,8 @@ pub struct Config {
     pub release: ReleaseConfig,
     #[serde(default)]
     pub attachment: AttachmentConfig,
+    #[serde(default)]
+    pub footer: FooterConfig,
 }
 
 #[derive(Debug, Deserialize)]
@@ -240,9 +248,8 @@ impl Config {
         if config.discord.token_env.trim().is_empty() {
             return Err(PidoryError::Config("discord.token_env must not be empty".to_string()));
         }
-        if config.database.path.trim().is_empty() {
-            return Err(PidoryError::Config("database.path must not be empty".to_string()));
-        }
+        // database.path is deprecated; DATABASE_URL env is the authoritative source.
+        // Validation removed to avoid spurious errors when [database] section is omitted.
 
         config.discord.project_roots = normalize_project_roots(&config.discord.project_roots)?;
 
@@ -290,6 +297,7 @@ binary_path = "claude"
         assert_eq!(config.attachment.download_timeout_secs, 30);
         assert!(config.discord.project_roots.is_empty());
         assert!(config.discord.default_category_id.is_none());
+        assert!(!config.footer.show_context_percent);
     }
 
     #[test]
@@ -402,7 +410,9 @@ binary_path = "claude"
     }
 
     #[test]
-    fn reject_empty_db_path() {
+    fn empty_db_path_now_allowed() {
+        // database.path is deprecated; DATABASE_URL env is the authoritative source.
+        // An empty path no longer causes a config error.
         let dir = std::env::temp_dir().join("pidory_test_empty_db");
         std::fs::create_dir_all(&dir).ok();
         let path = dir.join("bad_config.toml");
@@ -418,7 +428,7 @@ path = ""
 [response]
 "#).unwrap();
         let result = Config::load(path.to_str().unwrap());
-        assert!(result.is_err());
+        assert!(result.is_ok());
         std::fs::remove_file(&path).ok();
     }
 
@@ -592,7 +602,7 @@ binary_path = "claude"
     #[test]
     fn normalize_nonexistent_path_kept() {
         let path = "/nonexistent-path-xyz-12345".to_string();
-        let result = normalize_project_roots(&[path.clone()]).unwrap();
+        let result = normalize_project_roots(std::slice::from_ref(&path)).unwrap();
         assert_eq!(result, vec![path]);
     }
 
@@ -606,5 +616,40 @@ binary_path = "claude"
     fn normalize_root_slash_preserved() {
         let result = normalize_project_roots(&["/".to_string()]).unwrap();
         assert_eq!(result, vec!["/"]);
+    }
+
+    #[test]
+    fn parse_config_without_footer_defaults_off() {
+        let toml_str = r#"
+[discord]
+guild_id = 123
+owner_id = 456
+
+[claude]
+binary_path = "claude"
+
+[response]
+"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert!(!config.footer.show_context_percent);
+    }
+
+    #[test]
+    fn parse_config_with_footer_show_context_percent_true() {
+        let toml_str = r#"
+[discord]
+guild_id = 123
+owner_id = 456
+
+[claude]
+binary_path = "claude"
+
+[response]
+
+[footer]
+show_context_percent = true
+"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert!(config.footer.show_context_percent);
     }
 }

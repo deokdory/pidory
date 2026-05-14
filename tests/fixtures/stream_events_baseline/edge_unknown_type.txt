@@ -1,0 +1,8 @@
+Ok(
+    Unknown {
+        raw: Object {
+            "session_id": String("abc"),
+            "type": String("stream_event"),
+        },
+    },
+)

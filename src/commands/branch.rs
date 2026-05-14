@@ -9,6 +9,7 @@ use crate::{Context, Data, Error};
 use crate::db::repository;
 use crate::error::PidoryError;
 use crate::handler::formatter;
+use crate::handler::session_state::SessionState;
 use crate::subprocess::parser::{ContentBlock, StreamEvent};
 use crate::subprocess::session_manager::QueuedMessage;
 
@@ -110,6 +111,11 @@ pub async fn branch(
     }
 
     // 6. 세션 acquire (running이면 거절)
+    //    per-thread dispatch 직렬화 lock — try_acquire_session ~ send_message 까지
+    //    (#258) 다른 진입점(handle_message 등)과의 primary/mid-turn 역전 race 방지
+    let _source_dispatch_lock_arc = data.dispatch_locks.get_or_create(&thread_id).await;
+    let _source_dispatch_guard = _source_dispatch_lock_arc.lock().await;
+
     let acquired = repository::try_acquire_session(db, &thread_id).await?;
     if !acquired {
         ctx.send(
@@ -145,7 +151,8 @@ pub async fn branch(
             data.pending_permissions.clone(),
             data.pending_question_groups.clone(),
             data.config.discord.owner_id,
-            data.todo_trackers.clone(),
+            crate::subprocess::supervisor::SessionCleanupHandles::from_data(data),
+            data.config.discord.notification_channel_id.map(poise::serenity_prelude::ChannelId::new),
         )
         .await
     {
@@ -173,6 +180,7 @@ pub async fn branch(
         cancelled: Arc::new(AtomicBool::new(false)),
         downloaded_files: Vec::new(),
         reply_context: None,
+        sender_info: None,
     };
 
     if let Err(e) = data.sessions.send_message(&thread_id, summary_msg).await {
@@ -184,6 +192,11 @@ pub async fn branch(
         .await?;
         return Err(e);
     }
+
+    // send_message enqueue 완료 — dispatch lock 해제.
+    // 이후 응답 수집 await는 턴 진행 중이므로 lock 밖에서 실행 (동일 스레드 다른 메시지는
+    // session status='running' 이라 자연스럽게 mid-turn inject 경로로 진입)
+    drop(_source_dispatch_guard);
 
     // 응답 수집 (Discord에 출력하지 않음)
     let timeout = data.config.claude.subprocess_timeout_secs;
@@ -308,7 +321,8 @@ pub async fn branch(
             data.pending_permissions.clone(),
             data.pending_question_groups.clone(),
             data.config.discord.owner_id,
-            data.todo_trackers.clone(),
+            crate::subprocess::supervisor::SessionCleanupHandles::from_data(data),
+            data.config.discord.notification_channel_id.map(poise::serenity_prelude::ChannelId::new),
         )
         .await
     {
@@ -339,6 +353,11 @@ pub async fn branch(
     };
 
     // 새 세션 acquire — 실패 시 invariant violation, cleanup 후 abort
+    // per-thread dispatch 직렬화 lock — 방금 만든 스레드에 gateway가 메시지를
+    // 미리 전달할 가능성(드뭄)에 대비해 try_acquire_session ~ send_message 보호 (#258)
+    let _new_dispatch_lock_arc = data.dispatch_locks.get_or_create(&new_thread_id).await;
+    let _new_dispatch_guard = _new_dispatch_lock_arc.lock().await;
+
     let new_acquired = repository::try_acquire_session(db, &new_thread_id).await?;
     if !new_acquired {
         tracing::error!("Failed to acquire newly created session {}", new_thread_id);
@@ -361,6 +380,7 @@ pub async fn branch(
         cancelled: Arc::new(AtomicBool::new(false)),
         downloaded_files: Vec::new(),
         reply_context: None,
+        sender_info: None,
     };
 
     if let Err(e) = data.sessions.send_message(&new_thread_id, new_msg).await {
@@ -373,6 +393,10 @@ pub async fn branch(
         .await?;
         return Ok(());
     }
+
+    // send_message 완료 — 새 스레드 dispatch lock 해제.
+    // 이후 drain_initial_turn / process_turn_events는 lock 밖에서 실행.
+    drop(_new_dispatch_guard);
 
     // ── Phase C: 확인 + 새 세션 응답 스트리밍 ──
 
@@ -392,7 +416,7 @@ pub async fn branch(
         new_event_rx,
         &new_thread_id,
         db,
-        data.session_skills.clone(),
+        data.session_states.clone(),
         drain_timeout,
     )
     .await
@@ -431,9 +455,8 @@ async fn cleanup_orphaned_thread(
         tracing::debug!("cleanup: kill_session {}: {} (may not exist yet)", thread_id, e);
     }
 
-    // 2. 인메모리 tracking 정리
-    data.turn_initiators.lock().await.remove(thread_id);
-    data.turn_participants.lock().await.remove(thread_id);
+    // 2. 인메모리 tracking 정리 (pending_*, session_states, dispatch_locks 포함)
+    crate::handler::cleanup::cleanup_session_state(data, thread_id, serenity_ctx).await;
 
     // 3. DB 세션 삭제
     if let Err(e) = repository::delete_session(&data.db, thread_id).await {
@@ -456,8 +479,8 @@ async fn cleanup_orphaned_thread(
 async fn drain_initial_turn(
     mut event_rx: mpsc::Receiver<StreamEvent>,
     thread_id: &str,
-    db: &sqlx::SqlitePool,
-    session_skills: Arc<tokio::sync::Mutex<std::collections::HashMap<String, Vec<String>>>>,
+    db: &sqlx::PgPool,
+    session_states: Arc<tokio::sync::Mutex<std::collections::HashMap<String, SessionState>>>,
     timeout_secs: u64,
 ) -> Result<(), PidoryError> {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
@@ -468,7 +491,7 @@ async fn drain_initial_turn(
                 match event {
                     Some(StreamEvent::Init { skills, .. }) => {
                         if !skills.is_empty() {
-                            session_skills.lock().await.insert(thread_id.to_string(), skills.clone());
+                            session_states.lock().await.entry(thread_id.to_string()).or_default().skills = skills.clone();
                         }
                     }
                     Some(StreamEvent::Result { session_id, is_error, .. }) => {

@@ -1,0 +1,8 @@
+[Unit]
+Description=pidory delayed restart (30s sleep then restart pidory.service)
+Documentation=file://__PROJECT_DIR__/.claude/skills/prod-deploy/SKILL.md
+
+[Service]
+Type=oneshot
+ExecStartPre=/bin/sleep 30
+ExecStart=/bin/systemctl restart pidory.service

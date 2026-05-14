@@ -18,8 +18,11 @@ max_sessions = 10             # 동시 세션 상한
 idle_timeout_secs = 7200      # 유휴 세션 타임아웃 (초), 0 to disable
 # default_model = "sonnet"    # opus | sonnet | haiku | claude-sonnet-4-6
 
+# [database] path is DEPRECATED — DATABASE_URL env is the authoritative source.
+# Keep this section for backwards compatibility only.
+# Set DATABASE_URL in /etc/pidory/db.env (Linux service) or as an env variable.
 [database]
-path = "pidory.db"            # SQLite DB 경로
+path = "pidory.db"            # deprecated, ignored
 
 [response]
 max_chunk_length = 1900       # Discord 2000자 여유분
@@ -29,3 +32,6 @@ max_chunks = 10               # 초과 시 파일 첨부
 # max_file_size_mb = 25         # 파일 1개 최대 크기 (MB) [기본: 25 / Nitro: 500 / Nitro Basic: 50]
 # max_aggregate_size_mb = 50    # 메시지당 첨부파일 총 크기 합계 (MB) [기본: 50]
 # download_timeout_secs = 30    # 다운로드 타임아웃 (초) [기본: 30 / 대용량(500MB)은 300 이상 권장]
+
+# [footer]
+# show_context_percent = false  # 턴 완료 footer에 ctx 사용률(%) 표시 (default: false)

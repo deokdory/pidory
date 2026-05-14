@@ -1,0 +1,6 @@
+Ok(
+    Assistant {
+        content: [],
+        session_id: "abc",
+    },
+)

@@ -489,6 +489,405 @@ pub(crate) fn convert_html_details(text: &str) -> String {
     result
 }
 
+pub fn format_duration(ms: u64) -> String {
+    if ms < 1000 {
+        format!("{}ms", ms)
+    } else if ms < 60_000 {
+        format!("{:.1}s", ms as f64 / 1000.0)
+    } else {
+        let minutes = ms / 60_000;
+        let seconds = (ms % 60_000) / 1000;
+        format!("{}m{}s", minutes, seconds)
+    }
+}
+
+pub fn format_cost(usd: f64) -> String {
+    if usd <= 0.0 {
+        String::new()
+    } else {
+        format!("${:.2}", usd)
+    }
+}
+
+pub fn format_tokens(input: u64, output: u64) -> String {
+    let total = input + output;
+    if total == 0 {
+        return String::new();
+    }
+    let formatted = if total >= 1_000_000 {
+        format!("{:.1}M", total as f64 / 1_000_000.0)
+    } else if total >= 1_000 {
+        format!("{:.1}k", total as f64 / 1_000.0)
+    } else {
+        format!("{}", total)
+    };
+    format!("{} tok", formatted)
+}
+
+/// 성공 시 Discord에 result를 표시하지 않는 도구 목록
+pub fn is_noise_tool(tool_name: Option<&str>) -> bool {
+    matches!(tool_name, Some("Read" | "Grep" | "Glob" | "Write" | "Edit" | "MultiEdit" | "WebSearch" | "WebFetch" | "TodoWrite"))
+}
+
+fn todo_status_icon(status: &str) -> &'static str {
+    match status {
+        "completed" => "✅",
+        "in_progress" => "🔄",
+        _ => "⬜",
+    }
+}
+
+fn todo_embed_color(todos: &[&serde_json::Value]) -> u32 {
+    let has_in_progress = todos.iter().any(|t| {
+        t.get("status").and_then(|s| s.as_str()) == Some("in_progress")
+    });
+    let all_completed = todos.iter().all(|t| {
+        t.get("status").and_then(|s| s.as_str()) == Some("completed")
+    });
+
+    if all_completed {
+        0x2ECC71u32
+    } else if has_in_progress {
+        0x3498DBu32
+    } else {
+        0x95A5A6u32
+    }
+}
+
+fn escape_markdown(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        if matches!(ch, '~' | '*' | '_') {
+            out.push('\\');
+        }
+        out.push(ch);
+    }
+    out
+}
+
+fn render_todo_line(todo: &serde_json::Value) -> String {
+    let status = todo.get("status").and_then(|s| s.as_str()).unwrap_or("pending");
+    let content = todo.get("content").and_then(|s| s.as_str()).unwrap_or("");
+    let icon = todo_status_icon(status);
+    match status {
+        "completed" => format!("{} ~~{}~~", icon, escape_markdown(content)),
+        "in_progress" => format!("{} **{}**", icon, escape_markdown(content)),
+        _ => format!("{} {}", icon, escape_markdown(content)),
+    }
+}
+
+pub fn format_todo_embed(input: &serde_json::Value) -> Option<CreateEmbed> {
+    let todos = input.get("todos")?.as_array()?;
+    if todos.is_empty() {
+        return None;
+    }
+
+    let todos_refs: Vec<&serde_json::Value> = todos.iter().collect();
+    let color = todo_embed_color(&todos_refs);
+
+    let done = todos_refs
+        .iter()
+        .filter(|t| t.get("status").and_then(|s| s.as_str()) == Some("completed"))
+        .count();
+    let total = todos_refs.len();
+
+    // Separate into three buckets preserving original order
+    let in_progress: Vec<&serde_json::Value> = todos_refs
+        .iter()
+        .copied()
+        .filter(|t| t.get("status").and_then(|s| s.as_str()) == Some("in_progress"))
+        .collect();
+    let pending: Vec<&serde_json::Value> = todos_refs
+        .iter()
+        .copied()
+        .filter(|t| {
+            !matches!(
+                t.get("status").and_then(|s| s.as_str()),
+                Some("completed") | Some("in_progress")
+            )
+        })
+        .collect();
+    let completed: Vec<&serde_json::Value> = todos_refs
+        .iter()
+        .copied()
+        .filter(|t| t.get("status").and_then(|s| s.as_str()) == Some("completed"))
+        .collect();
+
+    // Fold completed items: show at most last 3 + "+N more completed" suffix
+    const COMPLETED_SHOW: usize = 3;
+    let (shown_completed, hidden_completed) = if completed.len() > COMPLETED_SHOW {
+        let hidden = completed.len() - COMPLETED_SHOW;
+        (&completed[hidden..], hidden)
+    } else {
+        (completed.as_slice(), 0)
+    };
+
+    // Build ordered lines: in_progress → pending → completed (folded)
+    let mut lines: Vec<String> = Vec::new();
+    for t in &in_progress {
+        lines.push(render_todo_line(t));
+    }
+    for t in &pending {
+        lines.push(render_todo_line(t));
+    }
+    for t in shown_completed {
+        lines.push(render_todo_line(t));
+    }
+    if hidden_completed > 0 {
+        lines.push(format!("  ... +{} more completed", hidden_completed));
+    }
+
+    // Build description with 4096-char hard truncation
+    const MAX_DESC: usize = 4096;
+    let mut description = String::new();
+    let mut truncated_count = 0usize;
+    let total_lines = lines.len();
+
+    for (i, line) in lines.iter().enumerate() {
+        let candidate = if description.is_empty() {
+            line.clone()
+        } else {
+            format!("{}\n{}", description, line)
+        };
+
+        if candidate.chars().count() <= MAX_DESC {
+            description = candidate;
+        } else {
+            truncated_count = total_lines - i;
+            break;
+        }
+    }
+
+    if truncated_count > 0 {
+        let suffix = format!("\n... +{} more items", truncated_count);
+        let available = MAX_DESC.saturating_sub(suffix.chars().count());
+        if description.chars().count() > available {
+            description = description.chars().take(available).collect();
+        }
+        description.push_str(&suffix);
+    }
+
+    let description = format!("\n{}\n", description);
+
+    let embed = CreateEmbed::new()
+        .color(color)
+        .title(format!("Tasks · {}/{}", done, total))
+        .description(description);
+
+    Some(embed)
+}
+
+/// Bash command max display length. Discord message limit (2000 chars) minus
+/// markdown overhead (~100 chars) for a safe margin.
+const BASH_COMMAND_DISPLAY_LIMIT: usize = 1800;
+
+pub fn format_tool_use(name: &str, input: &serde_json::Value) -> String {
+    match name {
+        "Bash" => {
+            let command = input
+                .get("command")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let display = if command.chars().count() > BASH_COMMAND_DISPLAY_LIMIT {
+                let s: String = command.chars().take(BASH_COMMAND_DISPLAY_LIMIT).collect();
+                format!("{}…", s)
+            } else {
+                command.to_string()
+            };
+            format!("-# 🔧 **Bash**\n```\n{}\n```", display)
+        }
+        "Edit" => {
+            let file_path = input
+                .get("file_path")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            format!("-# 🔧 **Edit** {}", file_path)
+        }
+        "Read" => {
+            let file_path = input
+                .get("file_path")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            format!("-# 🔧 **Read** {}", file_path)
+        }
+        "Write" => {
+            let file_path = input
+                .get("file_path")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            format!("-# 🔧 **Write** {}", file_path)
+        }
+        "Grep" => {
+            let pattern = input
+                .get("pattern")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            format!("-# 🔧 **Grep** {}", pattern)
+        }
+        "Glob" => {
+            let pattern = input
+                .get("pattern")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            format!("-# 🔧 **Glob** {}", pattern)
+        }
+        "MultiEdit" => {
+            let file_path = input
+                .get("file_path")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            format!("-# 🔧 **MultiEdit** {}", file_path)
+        }
+        "WebSearch" => {
+            let query = input
+                .get("query")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            format!("-# 🔧 **WebSearch** {}", query)
+        }
+        "WebFetch" => {
+            let url = input
+                .get("url")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            format!("-# 🔧 **WebFetch** {}", url)
+        }
+        "TodoWrite" => {
+            String::new()  // embed로 처리됨, 일반 메시지 불필요
+        }
+        "Skill" => {
+            let skill_name = input
+                .get("skill")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if skill_name.is_empty() {
+                "-# 🔧 **Skill**".to_string()
+            } else {
+                format!("-# 🔧 **Skill** {}", skill_name)
+            }
+        }
+        _ => format!("-# 🔧 **{}**", name),
+    }
+}
+
+pub fn format_tool_result_with_name(result: &ToolResult, tool_name: Option<&str>, lang: Lang) -> Option<String> {
+    if result.content.is_empty() {
+        return None;
+    }
+
+    const TRUNCATE_LEN: usize = 500;
+
+    let is_short = !result.content.contains('\n') && result.content.chars().count() <= 200;
+
+    if is_short {
+        let prefix = if result.is_error { "❌ " } else { "" };
+        return Some(format!("-# {}{}", prefix, result.content));
+    }
+
+    let prefix = if result.is_error { "❌ " } else { "" };
+
+    let is_edit = tool_name == Some("Edit") || tool_name == Some("Write") || tool_name == Some("MultiEdit");
+    let fence = if is_edit { "```diff" } else { "```" };
+
+    let body = if result.content.chars().count() <= TRUNCATE_LEN {
+        format!("{}\n{}\n```", fence, result.content)
+    } else {
+        let truncated: String = result.content.chars().take(TRUNCATE_LEN).collect();
+        format!("{}\n{}\n```\n{}", fence, truncated, lang.truncated_suffix())
+    };
+
+    Some(format!("{}{}", prefix, body))
+}
+
+pub async fn send_response(
+    ctx: &serenity::Context,
+    channel_id: serenity::ChannelId,
+    text: &str,
+    max_chunk_len: usize,
+    max_chunks: usize,
+    lang: Lang,
+    mention_cache: &crate::handler::mention::MentionCache,
+) -> Result<(), PidoryError> {
+    // guild_id 추출 (DM이면 None)
+    let guild_id = channel_id
+        .to_channel(&ctx.http)
+        .await
+        .ok()
+        .and_then(|ch| ch.guild())
+        .map(|gc| gc.guild_id);
+
+    // mention 치환 + 화이트리스트 추출
+    let (processed_text, whitelist) =
+        crate::handler::mention::parse_and_replace(text, guild_id, mention_cache, ctx).await;
+
+    let chunks = split_message(&processed_text, max_chunk_len);
+
+    let am = || {
+        serenity::CreateAllowedMentions::new()
+            .everyone(false)
+            .all_roles(false)
+            .users(whitelist.clone())
+    };
+
+    if chunks.len() <= max_chunks {
+        for (i, chunk) in chunks.iter().enumerate() {
+            let msg = serenity::CreateMessage::new()
+                .content(chunk)
+                .allowed_mentions(am());
+            channel_id.send_message(ctx, msg).await?;
+            if i + 1 < chunks.len() {
+                sleep(Duration::from_millis(200)).await;
+            }
+        }
+    } else {
+        // Send the first max_chunks chunks
+        for chunk in chunks.iter().take(max_chunks) {
+            let msg = serenity::CreateMessage::new()
+                .content(chunk)
+                .allowed_mentions(am());
+            channel_id.send_message(ctx, msg).await?;
+            sleep(Duration::from_millis(200)).await;
+        }
+
+        // Collect the remainder into a file attachment
+        let remainder = chunks[max_chunks..].join("\n");
+        let attachment = serenity::CreateAttachment::bytes(
+            remainder.into_bytes(),
+            "response_overflow.txt",
+        );
+        let message = serenity::CreateMessage::new()
+            .content(lang.response_continues())
+            .add_file(attachment)
+            .allowed_mentions(am());
+        channel_id.send_message(ctx, message).await?;
+    }
+
+    Ok(())
+}
+
+
+/// Discord에 메시지를 전송한다. reply_to가 있으면 reply로 전송, 없으면 일반 전송.
+/// 향후 reply 기능 활성화 시 사용.
+#[allow(dead_code)]
+pub async fn send_reply(
+    ctx: &serenity::Context,
+    channel_id: serenity::ChannelId,
+    content: &str,
+    reply_to: Option<serenity::MessageId>,
+) -> Result<serenity::Message, serenity::Error> {
+    if let Some(msg_id) = reply_to {
+        let message = CreateMessage::new()
+            .content(content)
+            .reference_message((channel_id, msg_id))
+            // TODO(reply-activate): fail_if_not_exists(false) 추가 필요.
+            // serenity API 확인 후 reply 기능 활성화 시 처리.
+            .allowed_mentions(CreateAllowedMentions::new());
+        channel_id.send_message(ctx, message).await
+    } else {
+        channel_id.say(ctx, content).await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -929,7 +1328,7 @@ mod tests {
 
     #[test]
     fn test_todo_embed_color_all_completed() {
-        let todos = vec![
+        let todos = [
             serde_json::json!({"id": "1", "content": "a", "status": "completed"}),
             serde_json::json!({"id": "2", "content": "b", "status": "completed"}),
         ];
@@ -939,7 +1338,7 @@ mod tests {
 
     #[test]
     fn test_todo_embed_color_has_in_progress() {
-        let todos = vec![
+        let todos = [
             serde_json::json!({"id": "1", "content": "a", "status": "completed"}),
             serde_json::json!({"id": "2", "content": "b", "status": "in_progress"}),
         ];
@@ -949,7 +1348,7 @@ mod tests {
 
     #[test]
     fn test_todo_embed_color_all_pending() {
-        let todos = vec![
+        let todos = [
             serde_json::json!({"id": "1", "content": "a", "status": "pending"}),
             serde_json::json!({"id": "2", "content": "b", "status": "pending"}),
         ];
@@ -1165,377 +1564,5 @@ mod tests {
         let input = "before <details><summary>T</summary>content</details> after";
         let result = convert_html_details(input);
         assert_eq!(result, "before\n**T**\n> content\nafter");
-    }
-}
-
-pub fn format_duration(ms: u64) -> String {
-    if ms < 1000 {
-        format!("{}ms", ms)
-    } else if ms < 60_000 {
-        format!("{:.1}s", ms as f64 / 1000.0)
-    } else {
-        let minutes = ms / 60_000;
-        let seconds = (ms % 60_000) / 1000;
-        format!("{}m{}s", minutes, seconds)
-    }
-}
-
-pub fn format_cost(usd: f64) -> String {
-    if usd <= 0.0 {
-        String::new()
-    } else {
-        format!("${:.2}", usd)
-    }
-}
-
-pub fn format_tokens(input: u64, output: u64) -> String {
-    let total = input + output;
-    if total == 0 {
-        return String::new();
-    }
-    let formatted = if total >= 1_000_000 {
-        format!("{:.1}M", total as f64 / 1_000_000.0)
-    } else if total >= 1_000 {
-        format!("{:.1}k", total as f64 / 1_000.0)
-    } else {
-        format!("{}", total)
-    };
-    format!("{} tok", formatted)
-}
-
-/// 성공 시 Discord에 result를 표시하지 않는 도구 목록
-pub fn is_noise_tool(tool_name: Option<&str>) -> bool {
-    matches!(tool_name, Some("Read" | "Grep" | "Glob" | "Write" | "Edit" | "MultiEdit" | "WebSearch" | "WebFetch" | "TodoWrite"))
-}
-
-fn todo_status_icon(status: &str) -> &'static str {
-    match status {
-        "completed" => "✅",
-        "in_progress" => "🔄",
-        _ => "⬜",
-    }
-}
-
-fn todo_embed_color(todos: &[&serde_json::Value]) -> u32 {
-    let has_in_progress = todos.iter().any(|t| {
-        t.get("status").and_then(|s| s.as_str()) == Some("in_progress")
-    });
-    let all_completed = todos.iter().all(|t| {
-        t.get("status").and_then(|s| s.as_str()) == Some("completed")
-    });
-
-    if all_completed {
-        0x2ECC71u32
-    } else if has_in_progress {
-        0x3498DBu32
-    } else {
-        0x95A5A6u32
-    }
-}
-
-fn escape_markdown(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for ch in s.chars() {
-        if matches!(ch, '~' | '*' | '_') {
-            out.push('\\');
-        }
-        out.push(ch);
-    }
-    out
-}
-
-fn render_todo_line(todo: &serde_json::Value) -> String {
-    let status = todo.get("status").and_then(|s| s.as_str()).unwrap_or("pending");
-    let content = todo.get("content").and_then(|s| s.as_str()).unwrap_or("");
-    let icon = todo_status_icon(status);
-    match status {
-        "completed" => format!("{} ~~{}~~", icon, escape_markdown(content)),
-        "in_progress" => format!("{} **{}**", icon, escape_markdown(content)),
-        _ => format!("{} {}", icon, escape_markdown(content)),
-    }
-}
-
-pub fn format_todo_embed(input: &serde_json::Value) -> Option<CreateEmbed> {
-    let todos = input.get("todos")?.as_array()?;
-    if todos.is_empty() {
-        return None;
-    }
-
-    let todos_refs: Vec<&serde_json::Value> = todos.iter().collect();
-    let color = todo_embed_color(&todos_refs);
-
-    let done = todos_refs
-        .iter()
-        .filter(|t| t.get("status").and_then(|s| s.as_str()) == Some("completed"))
-        .count();
-    let total = todos_refs.len();
-
-    // Separate into three buckets preserving original order
-    let in_progress: Vec<&serde_json::Value> = todos_refs
-        .iter()
-        .copied()
-        .filter(|t| t.get("status").and_then(|s| s.as_str()) == Some("in_progress"))
-        .collect();
-    let pending: Vec<&serde_json::Value> = todos_refs
-        .iter()
-        .copied()
-        .filter(|t| {
-            !matches!(
-                t.get("status").and_then(|s| s.as_str()),
-                Some("completed") | Some("in_progress")
-            )
-        })
-        .collect();
-    let completed: Vec<&serde_json::Value> = todos_refs
-        .iter()
-        .copied()
-        .filter(|t| t.get("status").and_then(|s| s.as_str()) == Some("completed"))
-        .collect();
-
-    // Fold completed items: show at most last 3 + "+N more completed" suffix
-    const COMPLETED_SHOW: usize = 3;
-    let (shown_completed, hidden_completed) = if completed.len() > COMPLETED_SHOW {
-        let hidden = completed.len() - COMPLETED_SHOW;
-        (&completed[hidden..], hidden)
-    } else {
-        (completed.as_slice(), 0)
-    };
-
-    // Build ordered lines: in_progress → pending → completed (folded)
-    let mut lines: Vec<String> = Vec::new();
-    for t in &in_progress {
-        lines.push(render_todo_line(t));
-    }
-    for t in &pending {
-        lines.push(render_todo_line(t));
-    }
-    for t in shown_completed {
-        lines.push(render_todo_line(t));
-    }
-    if hidden_completed > 0 {
-        lines.push(format!("  ... +{} more completed", hidden_completed));
-    }
-
-    // Build description with 4096-char hard truncation
-    const MAX_DESC: usize = 4096;
-    let mut description = String::new();
-    let mut truncated_count = 0usize;
-    let total_lines = lines.len();
-
-    for (i, line) in lines.iter().enumerate() {
-        let candidate = if description.is_empty() {
-            line.clone()
-        } else {
-            format!("{}\n{}", description, line)
-        };
-
-        if candidate.chars().count() <= MAX_DESC {
-            description = candidate;
-        } else {
-            truncated_count = total_lines - i;
-            break;
-        }
-    }
-
-    if truncated_count > 0 {
-        let suffix = format!("\n... +{} more items", truncated_count);
-        let available = MAX_DESC.saturating_sub(suffix.chars().count());
-        if description.chars().count() > available {
-            description = description.chars().take(available).collect();
-        }
-        description.push_str(&suffix);
-    }
-
-    let description = format!("\n{}\n", description);
-
-    let embed = CreateEmbed::new()
-        .color(color)
-        .title(format!("Tasks · {}/{}", done, total))
-        .description(description);
-
-    Some(embed)
-}
-
-/// Bash command max display length. Discord message limit (2000 chars) minus
-/// markdown overhead (~100 chars) for a safe margin.
-const BASH_COMMAND_DISPLAY_LIMIT: usize = 1800;
-
-pub fn format_tool_use(name: &str, input: &serde_json::Value) -> String {
-    match name {
-        "Bash" => {
-            let command = input
-                .get("command")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            let display = if command.chars().count() > BASH_COMMAND_DISPLAY_LIMIT {
-                let s: String = command.chars().take(BASH_COMMAND_DISPLAY_LIMIT).collect();
-                format!("{}…", s)
-            } else {
-                command.to_string()
-            };
-            format!("-# 🔧 **Bash**\n```\n{}\n```", display)
-        }
-        "Edit" => {
-            let file_path = input
-                .get("file_path")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            format!("-# 🔧 **Edit** {}", file_path)
-        }
-        "Read" => {
-            let file_path = input
-                .get("file_path")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            format!("-# 🔧 **Read** {}", file_path)
-        }
-        "Write" => {
-            let file_path = input
-                .get("file_path")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            format!("-# 🔧 **Write** {}", file_path)
-        }
-        "Grep" => {
-            let pattern = input
-                .get("pattern")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            format!("-# 🔧 **Grep** {}", pattern)
-        }
-        "Glob" => {
-            let pattern = input
-                .get("pattern")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            format!("-# 🔧 **Glob** {}", pattern)
-        }
-        "MultiEdit" => {
-            let file_path = input
-                .get("file_path")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            format!("-# 🔧 **MultiEdit** {}", file_path)
-        }
-        "WebSearch" => {
-            let query = input
-                .get("query")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            format!("-# 🔧 **WebSearch** {}", query)
-        }
-        "WebFetch" => {
-            let url = input
-                .get("url")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            format!("-# 🔧 **WebFetch** {}", url)
-        }
-        "TodoWrite" => {
-            String::new()  // embed로 처리됨, 일반 메시지 불필요
-        }
-        "Skill" => {
-            let skill_name = input
-                .get("skill")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            if skill_name.is_empty() {
-                format!("-# 🔧 **Skill**")
-            } else {
-                format!("-# 🔧 **Skill** {}", skill_name)
-            }
-        }
-        _ => format!("-# 🔧 **{}**", name),
-    }
-}
-
-pub fn format_tool_result_with_name(result: &ToolResult, tool_name: Option<&str>, lang: Lang) -> Option<String> {
-    if result.content.is_empty() {
-        return None;
-    }
-
-    const TRUNCATE_LEN: usize = 500;
-
-    let is_short = !result.content.contains('\n') && result.content.chars().count() <= 200;
-
-    if is_short {
-        let prefix = if result.is_error { "❌ " } else { "" };
-        return Some(format!("-# {}{}", prefix, result.content));
-    }
-
-    let prefix = if result.is_error { "❌ " } else { "" };
-
-    let is_edit = tool_name == Some("Edit") || tool_name == Some("Write") || tool_name == Some("MultiEdit");
-    let fence = if is_edit { "```diff" } else { "```" };
-
-    let body = if result.content.chars().count() <= TRUNCATE_LEN {
-        format!("{}\n{}\n```", fence, result.content)
-    } else {
-        let truncated: String = result.content.chars().take(TRUNCATE_LEN).collect();
-        format!("{}\n{}\n```\n{}", fence, truncated, lang.truncated_suffix())
-    };
-
-    Some(format!("{}{}", prefix, body))
-}
-
-pub async fn send_response(
-    ctx: &serenity::Context,
-    channel_id: serenity::ChannelId,
-    text: &str,
-    max_chunk_len: usize,
-    max_chunks: usize,
-    lang: Lang,
-) -> Result<(), PidoryError> {
-    let chunks = split_message(text, max_chunk_len);
-
-    if chunks.len() <= max_chunks {
-        for (i, chunk) in chunks.iter().enumerate() {
-            channel_id.say(ctx, chunk).await?;
-            if i + 1 < chunks.len() {
-                sleep(Duration::from_millis(200)).await;
-            }
-        }
-    } else {
-        // Send the first max_chunks chunks
-        for chunk in chunks.iter().take(max_chunks) {
-            channel_id.say(ctx, chunk).await?;
-            sleep(Duration::from_millis(200)).await;
-        }
-
-        // Collect the remainder into a file attachment
-        let remainder = chunks[max_chunks..].join("\n");
-        let attachment = serenity::CreateAttachment::bytes(
-            remainder.into_bytes(),
-            "response_overflow.txt",
-        );
-        let message = serenity::CreateMessage::new()
-            .content(lang.response_continues())
-            .add_file(attachment);
-        channel_id.send_message(ctx, message).await?;
-    }
-
-    Ok(())
-}
-
-
-/// Discord에 메시지를 전송한다. reply_to가 있으면 reply로 전송, 없으면 일반 전송.
-/// 향후 reply 기능 활성화 시 사용.
-#[allow(dead_code)]
-pub async fn send_reply(
-    ctx: &serenity::Context,
-    channel_id: serenity::ChannelId,
-    content: &str,
-    reply_to: Option<serenity::MessageId>,
-) -> Result<serenity::Message, serenity::Error> {
-    if let Some(msg_id) = reply_to {
-        let message = CreateMessage::new()
-            .content(content)
-            .reference_message((channel_id, msg_id))
-            // TODO(reply-activate): fail_if_not_exists(false) 추가 필요.
-            // serenity API 확인 후 reply 기능 활성화 시 처리.
-            .allowed_mentions(CreateAllowedMentions::new());
-        channel_id.send_message(ctx, message).await
-    } else {
-        channel_id.say(ctx, content).await
     }
 }

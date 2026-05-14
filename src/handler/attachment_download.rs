@@ -297,6 +297,7 @@ pub async fn download_attachments(
 
 // ── write_stream_to_file ─────────────────────────────────────────────────────
 
+#[allow(dead_code)]
 enum WriteStreamOutcome {
     Done { written: u64 },
     TooLarge { written: u64 },

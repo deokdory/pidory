@@ -1,0 +1,1 @@
+{"type":"control_request","request_id":"e5c3058b-6794-4a0d-b445-7729855cb810","request":{"subtype":"can_use_tool","tool_name":"Write","input":{"file_path":"/tmp/test.txt","content":"hello"},"permission_suggestions":[],"decision_reason":"Path is outside allowed working directories","tool_use_id":"toolu_01BKN27SrcApvHEMYi7A1ik4"}}

@@ -1,9 +1,12 @@
+pub mod agent;
 pub mod branch;
 pub mod model;
+pub mod permissions;
 pub mod recall;
 pub mod register;
 pub mod session;
 pub mod skill;
+pub mod update;
 
 use crate::{Data, Error};
 
@@ -18,9 +21,14 @@ pub fn all_commands() -> Vec<poise::Command<Data, Error>> {
         session::stop(),
         session::kick(),
         session::sleep(),
+        session::clear(),
+        session::new(),
         skill::skill(),
+        agent::agent(),
         model::model(),
         recall::recall(),
         branch::branch(),
+        update::update(),
+        permissions::permissions(),
     ]
 }
