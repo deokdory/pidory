@@ -1,5 +1,6 @@
 use std::fmt;
-use std::path::Path;
+use std::io;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use futures_util::TryStreamExt as _;
@@ -131,6 +132,116 @@ pub fn validate_url(url: &str) -> bool {
         || url.starts_with("https://media.discordapp.net/")
 }
 
+// ── resolve_collision_free_dest ───────────────────────────────────────────────
+
+/// Inner implementation — `cap` controls the maximum n value in the suffix retry loop.
+///
+/// Returns the first non-existing path. Uses `create_new(true)` as a race-safe
+/// existence probe; the placeholder file is removed before returning so that the
+/// actual downloader can open it again with `create_new(true)`.
+///
+/// Separated from the public wrapper for testability (callers can pass a small cap).
+async fn resolve_collision_free_dest_with_cap(
+    canonical_dir: &Path,
+    message_id: u64,
+    sanitized: &str,
+    cap: u32,
+) -> Result<PathBuf, io::Error> {
+    // First attempt: no suffix — {message_id}_{sanitized}
+    let base_name = format!("{}_{}", message_id, sanitized);
+    let first = canonical_dir.join(&base_name);
+
+    // Quick existence check before trying create_new(true)
+    match tokio::fs::try_exists(&first).await {
+        Ok(false) => {
+            // Attempt to create with create_new(true) — race-safe existence probe
+            match tokio::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&first)
+                .await
+            {
+                Ok(_file) => {
+                    // Drop the file handle, then remove placeholder so the caller's
+                    // write_stream_to_file can create_new(true) on the same path.
+                    drop(_file);
+                    let _ = tokio::fs::remove_file(&first).await;
+                    return Ok(first);
+                }
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                    // Lost the race — fall through to retry loop
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(true) => {
+            // Already exists — fall through to retry loop
+        }
+        Err(e) => return Err(e),
+    }
+
+    // Decompose sanitized into stem + extension for suffix insertion
+    let raw = Path::new(sanitized);
+    let stem = raw
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let ext = raw
+        .extension()
+        .map(|e| format!(".{}", e.to_string_lossy()))
+        .unwrap_or_default();
+
+    for n in 2..=cap {
+        // Pattern: {message_id}_{stem}_{n}{ext}
+        let candidate_name = if stem.is_empty() {
+            format!("{}__{}{}", message_id, n, ext)
+        } else {
+            format!("{}_{}_{}{}", message_id, stem, n, ext)
+        };
+        let candidate = canonical_dir.join(&candidate_name);
+
+        match tokio::fs::try_exists(&candidate).await {
+            Ok(false) => {
+                match tokio::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&candidate)
+                    .await
+                {
+                    Ok(_file) => {
+                        drop(_file);
+                        let _ = tokio::fs::remove_file(&candidate).await;
+                        return Ok(candidate);
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+                    Err(e) => return Err(e),
+                }
+            }
+            Ok(true) => continue,
+            Err(e) => return Err(e),
+        }
+    }
+
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        format!("too many collisions for {}", base_name),
+    ))
+}
+
+/// Returns the first non-existing dest_path by appending `_2`, `_3`, ... suffix.
+///
+/// - First attempt: `{canonical_dir}/{message_id}_{sanitized}` (no suffix)
+/// - On collision: `{canonical_dir}/{message_id}_{stem}_{n}{ext}` for n=2..=999
+/// - Cap: 999 total attempts (first + 998 retries). Returns `Err` if exhausted.
+/// - Uses `create_new(true)` to guard against TOCTOU races.
+async fn resolve_collision_free_dest(
+    canonical_dir: &Path,
+    message_id: u64,
+    sanitized: &str,
+) -> Result<PathBuf, io::Error> {
+    resolve_collision_free_dest_with_cap(canonical_dir, message_id, sanitized, 999).await
+}
+
 // ── download_attachments ─────────────────────────────────────────────────────
 
 /// Downloads Discord attachments to `{project_path}/.pidory/downloads/{thread_id}/`.
@@ -223,8 +334,15 @@ pub async fn download_attachments(
         }
 
         let sanitized = sanitize_filename(&filename);
-        let dest_filename = format!("{}_{}", message_id, sanitized);
-        let dest_path = canonical_dir.join(&dest_filename);
+        let dest_path = match resolve_collision_free_dest(&canonical_dir, message_id, &sanitized)
+            .await
+        {
+            Ok(p) => p,
+            Err(e) => {
+                errors.push(DownloadError::IoError { filename, source: e });
+                continue;
+            }
+        };
 
         // HTTP request
         let resp = match client.get(&attachment.url).send().await {
@@ -288,7 +406,7 @@ pub async fn download_attachments(
             continue;
         }
 
-        tracing::debug!("downloaded attachment: {} -> {}", filename, dest_filename);
+        tracing::debug!("downloaded attachment: {} -> {}", filename, dest_path.display());
         paths.push(canonical.to_string_lossy().into_owned());
     }
 
@@ -517,5 +635,100 @@ mod tests {
         assert!(matches!(outcome, WriteStreamOutcome::Done { written: 200 }));
         assert!(path.exists(), "file should exist");
         let _ = tokio::fs::remove_file(&path).await;
+    }
+
+    // ── resolve_collision_free_dest tests ────────────────────────────────────
+
+    /// Case 1: no collision → returns original name {msg_id}_image.png
+    #[tokio::test]
+    async fn collision_free_no_collision() {
+        let dir = tempfile::tempdir().unwrap();
+        let result =
+            resolve_collision_free_dest(dir.path(), 42, "image.png")
+                .await
+                .unwrap();
+        assert_eq!(
+            result.file_name().unwrap().to_string_lossy(),
+            "42_image.png"
+        );
+        // helper must NOT leave placeholder behind
+        assert!(!result.exists(), "no placeholder file should remain");
+    }
+
+    /// Case 2: _2 already exists → returns _3
+    #[tokio::test]
+    async fn collision_free_skip_to_3() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path();
+
+        // Pre-create: 42_image.png and 42_image_2.png
+        std::fs::write(path.join("42_image.png"), b"").unwrap();
+        std::fs::write(path.join("42_image_2.png"), b"").unwrap();
+
+        // cap=5 is more than enough
+        let result =
+            resolve_collision_free_dest_with_cap(path, 42, "image.png", 5)
+                .await
+                .unwrap();
+        assert_eq!(
+            result.file_name().unwrap().to_string_lossy(),
+            "42_image_3.png"
+        );
+        assert!(!result.exists(), "no placeholder file should remain");
+    }
+
+    /// Case 3: cap exhausted → Err (use cap=3 so we only need 4 dummy files)
+    #[tokio::test]
+    async fn collision_free_cap_exceeded() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path();
+
+        // Pre-create: base + _2 + _3 (cap=3 means n goes 2..=3, first attempt + 2 retries = 3 total)
+        std::fs::write(path.join("1_image.png"), b"").unwrap();
+        std::fs::write(path.join("1_image_2.png"), b"").unwrap();
+        std::fs::write(path.join("1_image_3.png"), b"").unwrap();
+
+        let result =
+            resolve_collision_free_dest_with_cap(path, 1, "image.png", 3).await;
+        assert!(result.is_err(), "should return Err when cap is exhausted");
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("too many collisions"), "error message: {}", msg);
+    }
+
+    /// Case 4: no extension (e.g. README) → collision yields README_2
+    #[tokio::test]
+    async fn collision_free_no_extension() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path();
+
+        // Pre-create base
+        std::fs::write(path.join("7_README"), b"").unwrap();
+
+        let result =
+            resolve_collision_free_dest_with_cap(path, 7, "README", 5)
+                .await
+                .unwrap();
+        assert_eq!(
+            result.file_name().unwrap().to_string_lossy(),
+            "7_README_2"
+        );
+        assert!(!result.exists());
+    }
+
+    /// Case 5: empty sanitized name → pattern still works (base = "{msg_id}_", collision → "__{n}")
+    #[tokio::test]
+    async fn collision_free_empty_sanitized() {
+        let dir = tempfile::tempdir().unwrap();
+        // No pre-existing files — should succeed on first attempt
+        let result =
+            resolve_collision_free_dest_with_cap(dir.path(), 99, "", 5)
+                .await
+                .unwrap();
+        // First attempt filename is "99_"
+        assert_eq!(
+            result.file_name().unwrap().to_string_lossy(),
+            "99_"
+        );
+        assert!(!result.exists());
     }
 }
