@@ -1,5 +1,6 @@
 use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
+use std::fmt::Write as _;
 use std::sync::Arc;
 
 use poise::serenity_prelude::{Context, GuildId, Member, UserId};
@@ -59,17 +60,29 @@ impl MentionCache {
         false
     }
 
-    /// guild 내 이름으로 user_id 조회.
-    pub async fn lookup(&self, guild_id: GuildId, name: &str, ctx: &Context) -> Option<UserId> {
-        // 1. cache hit check (read guard, drop before await)
+    /// guild 의 keys (length-desc) + name_to_id snapshot 을 단일 read lock 으로 추출.
+    /// cache miss 면 None. keys 와 map 이 동일 cache version 보장 (TOCTOU 차단).
+    pub async fn snapshot(&self, guild_id: GuildId) -> Option<(Vec<String>, HashMap<String, UserId>)> {
+        let guard = self.cache.read().await;
+        guard.get(&guild_id).map(|g| {
+            let mut keys: Vec<String> = g.name_to_id.keys().cloned().collect();
+            keys.sort_by_key(|k| Reverse(k.len()));
+            (keys, g.name_to_id.clone())
+        })
+    }
+
+    /// guild members 를 lazy fetch (cache 가 비어있을 때만).
+    /// 이미 cache 있거나 다른 task 가 fetch 중이면 즉시 반환.
+    /// 결과는 반환하지 않음 — 호출자가 snapshot() 으로 재시도.
+    pub async fn ensure_fetched(&self, guild_id: GuildId, ctx: &Context) {
+        // cache hit check (read guard, drop before await)
         {
             let guard = self.cache.read().await;
-            if let Some(gcache) = guard.get(&guild_id) {
-                return gcache.name_to_id.get(&nfc(name)).copied();
+            if guard.contains_key(&guild_id) {
+                return;
             }
         }
-
-        // 2. single-flight: 이미 fetch 중이면 None 반환
+        // single-flight check
         let should_fetch = {
             let mut fg = self.fetching.lock().await;
             if fg.contains(&guild_id) {
@@ -79,19 +92,17 @@ impl MentionCache {
                 true
             }
         };
-
         if !should_fetch {
-            return None;
+            return;
         }
 
-        // 3. lazy fetch (5초 timeout)
+        // lazy fetch (5초 timeout)
         let fetch_result = tokio::time::timeout(
             std::time::Duration::from_secs(5),
             guild_id.members(&ctx.http, None, None),
         )
         .await;
 
-        // 4. single-flight 해제 (성공/실패 무관)
         {
             let mut fg = self.fetching.lock().await;
             fg.remove(&guild_id);
@@ -101,16 +112,15 @@ impl MentionCache {
             Ok(Ok(members)) => members,
             Ok(Err(e)) => {
                 warn!("guild {} members fetch failed: {}", guild_id, e);
-                return None;
+                return;
             }
             Err(_) => {
                 warn!("guild {} members fetch timeout", guild_id);
-                return None;
+                return;
             }
         };
 
-        // 5. cache 채움 (충돌 검출 — 동명이인이면 양쪽 모두 제거)
-        // NOTE: 모든 키는 NFC 정규화 후 저장. lookup 도 NFC 적용 (한국어 nickname NFD/NFC 불일치 방지).
+        // cache 채움 (충돌 검출 적용)
         let mut gcache = GuildMemberCache::default();
         for m in &members {
             let candidates = [
@@ -126,12 +136,10 @@ impl MentionCache {
                 gcache.name_to_id.insert(key, m.user.id);
             }
         }
-        let result = gcache.name_to_id.get(&nfc(name)).copied();
         {
             let mut guard = self.cache.write().await;
             guard.insert(guild_id, gcache);
         }
-        result
     }
 
     /// 멤버 정보를 캐시에 반영 (nick/display/username 모두 등록).
@@ -165,7 +173,8 @@ impl MentionCache {
     }
 
     /// guild의 cache 키 목록을 length-desc 정렬해 반환. cache miss면 None.
-    pub async fn keys_by_length_desc(&self, guild_id: GuildId) -> Option<Vec<String>> {
+    #[cfg(test)]
+    pub(crate) async fn keys_by_length_desc(&self, guild_id: GuildId) -> Option<Vec<String>> {
         let guard = self.cache.read().await;
         guard.get(&guild_id).map(|g| {
             let mut keys: Vec<String> = g.name_to_id.keys().cloned().collect();
@@ -197,35 +206,32 @@ pub async fn parse_and_replace(
         return (masked, vec![]);
     };
 
-    // 3. cache 키 length-desc 정렬된 Vec 추출 (read lock 짧게)
-    let keys_by_len = match cache.keys_by_length_desc(guild_id).await {
-        Some(keys) => keys,
+    // 3. 단일 read lock 으로 keys + map snapshot (TOCTOU 방지)
+    let snapshot = match cache.snapshot(guild_id).await {
+        Some(s) => s,
         None => {
-            // cache miss — lookup으로 fetch 트리거 (결과 무시, 다음 메시지부터 hit)
-            let _ = cache.lookup(guild_id, "__trigger_fetch__", ctx).await;
-            return (masked, vec![]);
+            // cache miss — fetch 트리거 후 재시도
+            cache.ensure_fetched(guild_id, ctx).await;
+            match cache.snapshot(guild_id).await {
+                Some(s) => s,
+                // fetch 실패 (timeout/err) — 텍스트 유지
+                None => return (masked, vec![]),
+            }
         }
     };
+    let (keys_by_len, name_to_id) = snapshot;
 
-    // 4. cache snapshot → HashMap 추출 (read lock 짧게)
-    let name_to_id: HashMap<String, UserId> = {
-        let guard = cache.cache.read().await;
-        guard
-            .get(&guild_id)
-            .map(|g| g.name_to_id.clone())
-            .unwrap_or_default()
-    };
-
-    // 5. 순수 로직 위임 (masked를 NFC로 정규화 — cache 키와 일관)
-    let masked_nfc = nfc(&masked);
-    let (body, whitelist) = replace_mentions_with_map(&masked_nfc, &keys_by_len, &name_to_id);
+    // 4. 순수 로직 위임 — 본문은 원본 그대로, candidate 만 NFC 비교
+    let (body, whitelist) = replace_mentions_with_map(&masked, &keys_by_len, &name_to_id);
     (body, whitelist)
 }
 
 /// 순수 로직 — cache 없이 텍스트 치환.
 /// `masked`: mass mention 마스킹이 이미 적용된 텍스트.
-/// `keys_by_len`: length-desc 정렬된 이름 키 목록.
+/// `keys_by_len`: length-desc 정렬된 이름 키 목록 (NFC 정규화된 cache key).
 /// `name_to_id`: 이름 → UserId 맵.
+///
+/// 본문은 원본 byte 그대로 출력에 반영. NFC 비교는 @ 뒤 candidate 에만 적용.
 pub(crate) fn replace_mentions_with_map(
     masked: &str,
     keys_by_len: &[String],
@@ -260,7 +266,7 @@ pub(crate) fn replace_mentions_with_map(
             i += 1;
             continue;
         }
-        // 코드 블록 안: 그대로 통과
+        // 코드 블록 안: 그대로 통과 (원본 byte 보존)
         if in_triple || in_inline {
             let ch_len = utf8_char_len(&bytes[i..]);
             result.push_str(
@@ -269,33 +275,59 @@ pub(crate) fn replace_mentions_with_map(
             i += ch_len;
             continue;
         }
-        // @ 발견 → longest match 시도
+        // @ 발견 → longest match 시도 (candidate NFC 비교, 원본 byte range 소비)
         if bytes[i] == b'@' {
             let rest = &masked[i + 1..];
-            let mut matched: Option<UserId> = None;
-            let mut matched_key_len = 0usize;
+            let mut matched: Option<(UserId, usize)> = None;
 
             for key in keys_by_len {
-                if rest.starts_with(key.as_str()) {
+                // rest 의 prefix bytes 를 하나씩 늘리면서 NFC(rest[..n]) 를 계산.
+                // NFC 결과가 key 와 일치하는 시점의 n 이 소비할 원본 byte 수.
+                // 한국어 NFD 자모(초/중/종성 분리) 처럼 여러 UTF-8 char 가 하나의
+                // NFC 음절로 합쳐지는 경우를 정확히 처리하기 위해
+                // 전체 누적 NFC 를 매 char 마다 재계산한다.
+                let key_char_count = key.chars().count();
+                let mut orig_bytes = 0usize;
+                let mut found_bytes: Option<usize> = None;
+
+                for ch in rest.chars() {
+                    orig_bytes += ch.len_utf8();
+                    let nfc_so_far: String = rest[..orig_bytes].nfc().collect();
+                    let nfc_chars = nfc_so_far.chars().count();
+
+                    if nfc_chars == key_char_count {
+                        if nfc_so_far == *key {
+                            found_bytes = Some(orig_bytes);
+                        }
+                        // nfc_chars 가 key_char_count 와 같지만 매치 안 됐을 때:
+                        // NFD 자모가 더 추가되면 조합이 바뀔 수 있으므로 계속 진행.
+                        // 그러나 nfc_chars > key_char_count 가 되면 종료.
+                    } else if nfc_chars > key_char_count {
+                        // 이미 key 보다 많은 chars — 이 key 는 매치 불가
+                        break;
+                    }
+                    // nfc_chars < key_char_count — 계속 consume
+                }
+
+                if let Some(byte_len) = found_bytes {
                     if let Some(&uid) = name_to_id.get(key.as_str()) {
-                        matched = Some(uid);
-                        matched_key_len = key.len();
-                        break; // length-desc이므로 첫 match가 longest
+                        matched = Some((uid, byte_len));
+                        break; // length-desc 이므로 첫 match 가 longest
                     }
                 }
             }
 
-            if let Some(uid) = matched {
-                result.push_str(&format!("<@{}>", uid));
+            if let Some((uid, byte_len)) = matched {
+                write!(result, "<@{}>", uid).expect("String write never fails");
                 whitelist.push(uid);
-                i += 1 + matched_key_len;
+                i += 1 + byte_len;
             } else {
                 result.push('@');
                 i += 1;
             }
             continue;
         }
-        // 일반 char
+        // 일반 char — 원본 그대로
         let ch_len = utf8_char_len(&bytes[i..]);
         result.push_str(
             std::str::from_utf8(&bytes[i..i + ch_len]).unwrap_or("\u{FFFD}"),
@@ -724,5 +756,41 @@ mod tests {
         // NFD-decomposed jamo 로 lookup — 내부에서 NFC 정규화 후 비교 → hit
         let nfd = "\u{1103}\u{1165}\u{11A8}\u{1103}\u{1169}\u{11AF}";
         assert_eq!(cache.get_cached(gid, nfd).await, Some(uid));
+    }
+
+    // ── w3: NFC 비교는 candidate 만, 코드 블록 원본 보존 ─────────────────────
+
+    #[test]
+    fn test_nfc_preserves_codeblock_content() {
+        // 코드 블록 안 NFD 한국어가 원본 그대로 보존되는지
+        let mut map = HashMap::new();
+        map.insert("덕돌".to_string(), UserId::new(42));
+        let keys = keys_desc(&map);
+
+        // NFD-decomposed "덕돌"
+        let nfd = "\u{1103}\u{1165}\u{11A8}\u{1103}\u{1169}\u{11AF}";
+        let input = format!("@덕돌 보고 ```\n변수 {} 사용\n```", nfd);
+        let (out, wl) = replace_mentions_with_map(&input, &keys, &map);
+
+        // 본문 @덕돌 매치 (NFC 비교)
+        assert!(out.contains("<@42> 보고"));
+        // 코드 블록 안 NFD 보존 (NFC 변환 X)
+        assert!(out.contains(nfd));
+        assert_eq!(wl, vec![UserId::new(42)]);
+    }
+
+    #[test]
+    fn test_nfc_match_with_nfd_input() {
+        // 본문에 NFD 입력 → NFC cache 와 매치
+        let mut map = HashMap::new();
+        map.insert("덕돌".to_string(), UserId::new(42));
+        let keys = keys_desc(&map);
+
+        // NFD-decomposed "덕돌"
+        let nfd = "\u{1103}\u{1165}\u{11A8}\u{1103}\u{1169}\u{11AF}";
+        let input = format!("@{} 안녕", nfd);
+        let (out, wl) = replace_mentions_with_map(&input, &keys, &map);
+        assert!(out.starts_with("<@42> 안녕"));
+        assert_eq!(wl, vec![UserId::new(42)]);
     }
 }
