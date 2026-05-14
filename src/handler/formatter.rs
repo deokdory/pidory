@@ -806,12 +806,35 @@ pub async fn send_response(
     max_chunk_len: usize,
     max_chunks: usize,
     lang: Lang,
+    mention_cache: &crate::handler::mention::MentionCache,
 ) -> Result<(), PidoryError> {
-    let chunks = split_message(text, max_chunk_len);
+    // guild_id 추출 (DM이면 None)
+    let guild_id = channel_id
+        .to_channel(&ctx.http)
+        .await
+        .ok()
+        .and_then(|ch| ch.guild())
+        .map(|gc| gc.guild_id);
+
+    // mention 치환 + 화이트리스트 추출
+    let (processed_text, whitelist) =
+        crate::handler::mention::parse_and_replace(text, guild_id, mention_cache, ctx).await;
+
+    let chunks = split_message(&processed_text, max_chunk_len);
+
+    let am = || {
+        serenity::CreateAllowedMentions::new()
+            .everyone(false)
+            .all_roles(false)
+            .users(whitelist.clone())
+    };
 
     if chunks.len() <= max_chunks {
         for (i, chunk) in chunks.iter().enumerate() {
-            channel_id.say(ctx, chunk).await?;
+            let msg = serenity::CreateMessage::new()
+                .content(chunk)
+                .allowed_mentions(am());
+            channel_id.send_message(ctx, msg).await?;
             if i + 1 < chunks.len() {
                 sleep(Duration::from_millis(200)).await;
             }
@@ -819,7 +842,10 @@ pub async fn send_response(
     } else {
         // Send the first max_chunks chunks
         for chunk in chunks.iter().take(max_chunks) {
-            channel_id.say(ctx, chunk).await?;
+            let msg = serenity::CreateMessage::new()
+                .content(chunk)
+                .allowed_mentions(am());
+            channel_id.send_message(ctx, msg).await?;
             sleep(Duration::from_millis(200)).await;
         }
 
@@ -831,7 +857,8 @@ pub async fn send_response(
         );
         let message = serenity::CreateMessage::new()
             .content(lang.response_continues())
-            .add_file(attachment);
+            .add_file(attachment)
+            .allowed_mentions(am());
         channel_id.send_message(ctx, message).await?;
     }
 

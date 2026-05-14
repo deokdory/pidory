@@ -49,6 +49,20 @@ pub async fn handle_event(
         FullEvent::ThreadDelete { thread, .. } => {
             handle_thread_closed(ctx, data, &thread.id.to_string()).await
         }
+        FullEvent::GuildMemberAddition { new_member } => {
+            data.mention_cache.update_member(new_member.guild_id, new_member).await;
+            Ok(())
+        }
+        FullEvent::GuildMemberRemoval { guild_id, user, member_data_if_available: _ } => {
+            data.mention_cache.remove_member(*guild_id, user.id).await;
+            Ok(())
+        }
+        FullEvent::GuildMemberUpdate { old_if_available: _, new, event: _ } => {
+            if let Some(member) = new {
+                data.mention_cache.update_member(member.guild_id, member).await;
+            }
+            Ok(())
+        }
         _ => Ok(()),
     }
 }
@@ -497,6 +511,7 @@ async fn handle_message(
         data.config.discord.owner_id,
         data.config.footer.show_context_percent,
         data.session_states.clone(),
+        data.mention_cache.clone(),
     )
     .await;
 
@@ -627,6 +642,7 @@ pub async fn execute_in_session(
         data.config.discord.owner_id,
         data.config.footer.show_context_percent,
         data.session_states.clone(),
+        data.mention_cache.clone(),
     )
     .await;
 

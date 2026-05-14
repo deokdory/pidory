@@ -199,6 +199,7 @@ pub async fn process_turn_events(
     owner_id: u64,
     show_context_percent: bool,
     session_states: Arc<tokio::sync::Mutex<HashMap<String, SessionState>>>,
+    mention_cache: Arc<crate::handler::mention::MentionCache>,
 ) {
     // 0. 이전 턴의 next-step 버튼 비활성화
     if let Some(prev_msg_id) = session_states.lock().await.get_mut(thread_id).and_then(|s| s.next_step_button.take()) {
@@ -540,7 +541,7 @@ pub async fn process_turn_events(
 
         let (response, file_paths) = formatter::format_response(&events, lang);
         let send_ok = if !response.trim().is_empty() {
-            match formatter::send_response(ctx, channel_id, &response, max_chunk_length, max_chunks, lang)
+            match formatter::send_response(ctx, channel_id, &response, max_chunk_length, max_chunks, lang, &mention_cache)
                 .await
             {
                 Ok(()) => true,

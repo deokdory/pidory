@@ -469,6 +469,7 @@ pub async fn kick(
     let config = Arc::clone(&data.config);
     let session_states = Arc::clone(&data.session_states);
     let dispatch_locks = Arc::clone(&data.dispatch_locks);
+    let mention_cache = Arc::clone(&data.mention_cache);
     let author_id = ctx.author().id;
     let mut ctx_rx = data.ctx_watch.subscribe();
 
@@ -587,6 +588,7 @@ pub async fn kick(
                         config.discord.owner_id,
                         config.footer.show_context_percent,
                         session_states.clone(),
+                        mention_cache.clone(),
                     )
                     .await;
 
