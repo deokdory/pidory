@@ -10,4 +10,4 @@ First public release under Apache-2.0 license. See [docs/release-notes/v0.7.0.md
 
 ## [0.6.7] and earlier
 
-This changelog file was introduced at v0.7.0. For prior release notes, see git history and GitHub releases.
+This changelog file was introduced at v0.7.0. For prior release notes, see the [GitHub Releases page](https://github.com/deokdory/pidory/releases) and `git log`.

@@ -30,27 +30,33 @@ Violations may be reported to the maintainers at deokdory@gmail.com.
 
 ## Conventional Commits
 
-Commit messages follow the pattern:
+This project uses a project-specific variant of Conventional Commits with an issue prefix:
 
 ```
-<type>: <description>
+#<issue> <type>: <description>
 ```
+
+The `#<issue>` prefix is required for every commit (not just PR merges) and lets the issue tracker auto-link references. PR merge commits append `(#<PR>)` automatically: `#<issue> <type>: <description> (#<PR>)`.
 
 Examples:
-- `feat: add /sleep command`
-- `fix: prevent duplicate permission prompts`
-- `refactor: extract parser into separate module`
-- `chore: bump version to v0.6.8`
-- `docs: update README architecture section`
-- `test: add unit tests for formatter split_message`
-
-PR merge commits use the format `#<issue> <type>: <description> (#<pr>)`.
+- `#42 feat: add /sleep command`
+- `#107 fix: prevent duplicate permission prompts`
+- `#231 refactor: extract parser into separate module`
+- `#260 chore: bump version to v0.6.8`
+- `#250 docs: update README architecture section`
+- `#175 test: add unit tests for formatter split_message`
 
 Allowed types: `feat`, `fix`, `refactor`, `chore`, `docs`, `test`.
 
-Korean descriptions are welcome — keep the English type prefix:
+Korean descriptions are welcome — keep the English type prefix and the `#<issue>` number at the start:
 
 ```
-feat: /sleep 커맨드 추가 — 세션 일시 중단
-fix: 권한 프롬프트 중복 발생 방지
+#42 feat: /sleep 커맨드 추가 — 세션 일시 중단
+#107 fix: 권한 프롬프트 중복 발생 방지
+```
+
+If a commit does not relate to a tracked issue (rare — typically only release-prep chores), the issue prefix may be omitted:
+
+```
+chore: bump version to v0.7.0
 ```

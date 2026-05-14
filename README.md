@@ -6,7 +6,7 @@
 
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](./LICENSE)
 [![Rust 2024](https://img.shields.io/badge/rust-2024%20edition-orange.svg)](https://blog.rust-lang.org/2024/10/17/Rust-2024-edition.html)
-[![Version](https://img.shields.io/badge/version-v0.6.7-green.svg)](https://github.com/deokdory/pidory/releases)
+[![Version](https://img.shields.io/badge/version-v0.7.0-green.svg)](https://github.com/deokdory/pidory/releases)
 
 **English** | [한국어](./README.ko.md)
 
@@ -27,7 +27,7 @@ pidory is a Discord bot that bridges Discord threads to [Claude Code](https://do
 - **Tool permissions** — Allow / Always Allow / Deny via Discord buttons
 - **File attachments** — upload files to Claude Code from Discord; receive generated files back
 - **Multi-user sender prefix** — sender's display name prepended to every message in multi-user threads
-- **`/update` with pre-flight validation** — bot fetches latest release, verifies binary integrity before swapping
+- **`/update` with pre-flight validation** — bot fetches latest release, rebuilds from source, and restarts the service
 - **i18n** — Korean (default) and English UI; select with `language = "ko"` / `"en"` in config
 - **Rate limit monitoring** — bot presence shows 5h/7d usage %; configurable threshold alerts
 - **`/branch` context fork** — duplicate a session into a new thread with optional context snapshot
@@ -51,8 +51,12 @@ See [INSTALL.md](./INSTALL.md) for step-by-step setup including Discord bot crea
 **Quick path (Linux):**
 
 ```bash
-sudo bash scripts/postgres-setup.sh   # install PostgreSQL, create DB, write /etc/pidory/db.env
-bash deploy/install.sh                # build binary, install systemd service, deploy skills
+git clone https://github.com/deokdory/pidory.git && cd pidory
+echo 'PIDORY_DISCORD_TOKEN=your_token_here' > .env
+bash deploy/install.sh                # build + service + pidory-migrate install
+sudo bash scripts/postgres-setup.sh   # PostgreSQL setup (requires install.sh complete)
+$EDITOR config.toml                   # set guild_id, owner_id
+sudo systemctl start pidory
 ```
 
 ## Configuration
@@ -135,7 +139,7 @@ bash deploy/install.sh                # build binary, install systemd service, d
 | `/branch [context]` | Fork session into a new thread with optional context | owner only |
 | `/model <model_name>` | Switch Claude model for the current session | all members |
 | `/sleep` | Suspend the session (release subprocess, preserve thread) | all members |
-| `/update` | Pull latest release, verify, and hot-swap the binary | owner only |
+| `/update` | Pull latest release, rebuild from source, and restart the service | owner only |
 
 ### Chatting with Claude Code
 
@@ -169,19 +173,27 @@ pidory surfaces Claude Code's permission prompts as Discord buttons: **Allow**, 
 
 Permission buttons are restricted to the user who started the current turn (or the `owner_id`).
 
-> **Warning: Multi-user beta — Always Allow affects all users in the thread.**
->
-> Sessions are shared per thread. When one user clicks **Always Allow**, that permission applies to the **entire session** — every subsequent message from any user in the same thread will auto-approve that tool. Only add pidory to servers where all participants genuinely trust each other. A malicious user could exploit Always Allow to execute arbitrary code, manipulate files, or escalate permissions on behalf of other users.
+### ⚠️ Multi-user beta — Always Allow affects all users in the thread
+
+Sessions are shared per thread. When one user clicks **Always Allow**, that permission applies to the **entire session** — every subsequent message from any user in the same thread will auto-approve that tool. Only add pidory to servers where all participants genuinely trust each other. A malicious user could exploit Always Allow to execute arbitrary code, manipulate files, or escalate permissions on behalf of other users.
 
 ## Upgrading
 
 ### Using `/update` (recommended)
 
-The `/update` slash command (owner only) performs a guided self-update:
+The `/update` slash command (owner only) performs a guided in-place update:
 
-1. Fetches the latest release tag from GitHub
-2. Downloads the release binary and verifies its checksum
-3. Hot-swaps the running binary and restarts the service
+1. Verifies `DATABASE_URL` is set and reachable
+2. Takes an automatic `pg_dump` backup of the current database
+3. Runs `git fetch` and resets the worktree to the latest release tag
+4. Rebuilds the binary with `cargo build --release`
+5. Schedules a delayed service restart (~30 s) so the response message can be delivered
+
+For the full `/update` pre-flight checks and rollback behavior, see `INSTALL.md` → "Updating".
+
+### Manual update
+
+See [INSTALL.md → Updating](./INSTALL.md#updating) for the manual command sequence.
 
 ### SQLite → PostgreSQL migration (v0.7.0 breaking change)
 
@@ -216,9 +228,9 @@ Discord message
 | Module | Responsibility |
 |--------|----------------|
 | `subprocess/session_manager.rs` | Spawns Claude CLI; one worker task per thread. Handles stdin writes, stdout parsing, mid-turn injection, permission flow. |
-| `subprocess/parser.rs` | Parses JSON lines → `StreamEvent` (Init, Assistant, User, RateLimit, Result, ControlRequest, …) |
+| `subprocess/parser/` | Parses JSON lines → `StreamEvent` (Init, Assistant, User, RateLimit, Result, ControlRequest, …); split across `raw.rs`, `events.rs`, etc. |
 | `subprocess/permission.rs` | `PermissionCache` (per-session Always Allow set); `PermissionRequest`/`PermissionDecision` via oneshot channels |
-| `handler/message.rs` | Routes Discord events to session queues; 500 ms fast-complete check; streams events to Discord |
+| `handler/message/` | Routes Discord events to session queues; 500 ms fast-complete check; streams events to Discord; split across `mod.rs`, `event_processor.rs`, `interaction.rs`, etc. |
 | `handler/formatter.rs` | Code-block-aware message splitting at 2000-char limit |
 | `handler/permission_ui.rs` | Builds Allow/Always Allow/Deny button messages; parses `perm:{id}:{action}` custom IDs |
 | `handler/status.rs` | `StatusMessage` — single editable Discord message with tool history (1.5 s rate limit) |

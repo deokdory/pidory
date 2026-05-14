@@ -29,14 +29,14 @@ For an existing PostgreSQL installation on a fresh Linux host:
 git clone https://github.com/deokdory/pidory.git
 cd pidory
 
-# 2. Set up PostgreSQL (creates role, database, and /etc/pidory/db.env)
-sudo bash scripts/postgres-setup.sh
-
-# 3. Write your Discord token
+# 2. Write your Discord token
 echo 'PIDORY_DISCORD_TOKEN=your_token_here' > .env
 
-# 4. Install binaries and service
+# 3. Install binaries and service (builds pidory-migrate, writes systemd unit)
 bash deploy/install.sh
+
+# 4. Set up PostgreSQL (creates role, database, and /etc/pidory/db.env)
+sudo bash scripts/postgres-setup.sh
 
 # 5. Edit config.toml (guild_id, owner_id, binary_path)
 $EDITOR config.toml
@@ -64,7 +64,41 @@ See [Detailed Setup](#detailed-setup) below for a step-by-step walkthrough of ea
 6. Use the generated URL to invite the bot to your server.
 7. Note your server's **Guild ID** (right-click server icon → Copy Server ID — requires Developer Mode).
 
-### 3.2 PostgreSQL Setup
+### 3.2 Repository and Environment
+
+```bash
+# Clone
+git clone https://github.com/deokdory/pidory.git
+cd pidory
+
+# Copy example config
+cp config.toml.example config.toml
+
+# Write Discord token
+echo 'PIDORY_DISCORD_TOKEN=your_token_here' > .env
+```
+
+Edit `config.toml` to set at minimum:
+- `[discord] guild_id` — your Discord server ID
+- `[discord] owner_id` — your Discord user ID
+
+### 3.3 Run the Installer
+
+```bash
+bash deploy/install.sh
+```
+
+The installer performs six steps:
+1. **Build** — `cargo build --release` + `cargo build --bin pidory-migrate --features migrate --release`
+2. **Check .env** — warns if `PIDORY_DISCORD_TOKEN` is missing
+3. **Initialize config.toml** — copies from example if absent; auto-detects `claude` binary path
+4. **Install pidory-migrate** — copies to `/usr/local/bin/pidory-migrate`; creates `/etc/pidory/` directory
+5. **Install skills** — copies `skills/` to `~/.claude/skills/`
+6. **Install service** — writes and enables the systemd unit (Linux) or launchd plist (macOS)
+
+### 3.4 PostgreSQL Setup
+
+> **Prerequisites**: This step requires `bash deploy/install.sh` to have completed successfully. The script will refuse to proceed if `/etc/systemd/system/pidory.service` or `/usr/local/bin/pidory-migrate` are missing.
 
 Run the automated setup script as root. This installs PostgreSQL if needed, creates the `pidory` role and database, and writes `DATABASE_URL` to `/etc/pidory/db.env` (mode `0640`):
 
@@ -86,41 +120,6 @@ To use a specific password instead of a generated one:
 ```bash
 PIDORY_DB_PASSWORD=my_password sudo bash scripts/postgres-setup.sh
 ```
-
-### 3.3 Repository and Environment
-
-```bash
-# Clone
-git clone https://github.com/deokdory/pidory.git
-cd pidory
-
-# Copy example config
-cp config.toml.example config.toml
-
-# Write Discord token
-echo 'PIDORY_DISCORD_TOKEN=your_token_here' > .env
-```
-
-Edit `config.toml` to set at minimum:
-- `[discord] guild_id` — your Discord server ID
-- `[discord] owner_id` — your Discord user ID
-
-### 3.4 Run the Installer
-
-```bash
-bash deploy/install.sh
-```
-
-The installer performs six steps:
-1. **Build** — `cargo build --release` + `cargo build --bin pidory-migrate --features migrate --release`
-2. **Check .env** — warns if `PIDORY_DISCORD_TOKEN` is missing
-3. **Initialize config.toml** — copies from example if absent; auto-detects `claude` binary path
-4. **Install pidory-migrate** — copies to `/usr/local/bin/pidory-migrate`; creates `/etc/pidory/` directory
-5. **Install skills** — copies `skills/` to `~/.claude/skills/`
-6. **Install service** — writes and enables the systemd unit (Linux) or launchd plist (macOS)
-
-> **Before running**, ensure `scripts/postgres-setup.sh` has already written `/etc/pidory/db.env`.
-> On macOS, set `DATABASE_URL` as an environment variable before running the installer — the plist does not include it by default.
 
 ### 3.5 Start the Service
 
