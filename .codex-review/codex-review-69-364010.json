@@ -1,1 +1,0 @@
-{"findings":[],"summary":"No blocking issues found in the diff; the new `tracing::warn!` calls preserve behavior and include both `channel_id` and error details, though using structured error fields would be a minor observability improvement.","files_reviewed":1}

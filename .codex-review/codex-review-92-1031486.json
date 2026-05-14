@@ -1,1 +1,0 @@
-{"findings":[],"summary":"No issues found in this diff; the ctx% fix is narrowly scoped, preserves existing async/Discord behavior, avoids unwrap misuse, and safely falls back when cache fields are absent.","files_reviewed":3}
