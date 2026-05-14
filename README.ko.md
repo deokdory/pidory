@@ -238,9 +238,9 @@ Discord 메시지
 | `db/` | sqlx를 통한 PostgreSQL; 컴파일 타임 검증 마이그레이션; status 컬럼 CAS를 통한 세션 잠금 |
 | `i18n/` | 한국어 / 영어 메시지 카탈로그; 런타임 로케일 선택 |
 
-## 기여하기
+## 이슈
 
-[CONTRIBUTING.md](./CONTRIBUTING.md)를 참고해 주세요. 이슈와 PR을 환영해요 — 큰 변경사항은 먼저 이슈를 열어 논의해 주세요.
+버그 리포트와 기능 요청은 [GitHub Issues](https://github.com/deokdory/pidory/issues)에서 환영해요. 현재의 기여 정책은 [CONTRIBUTING.md](./CONTRIBUTING.md)를 참고해 주세요.
 
 ## 라이선스
 
