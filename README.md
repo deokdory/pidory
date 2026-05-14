@@ -238,9 +238,9 @@ Discord message
 | `db/` | PostgreSQL via sqlx; compile-time checked migrations; atomic session locking via CAS on status column |
 | `i18n/` | Korean / English message catalog; runtime locale selection |
 
-## Contributing
+## Issues
 
-See [CONTRIBUTING.md](./CONTRIBUTING.md). Issues and PRs are welcome — please open an issue first to discuss significant changes.
+Bug reports and feature requests are welcome on [GitHub Issues](https://github.com/deokdory/pidory/issues). See [CONTRIBUTING.md](./CONTRIBUTING.md) for the current contribution policy.
 
 ## License
 

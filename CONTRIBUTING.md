@@ -1,20 +1,19 @@
 # Contributing to pidory
 
-Thank you for your interest in contributing to pidory!
+## Contribution Policy
 
-## Code of Conduct
+**pidory is not currently accepting external pull requests.**
 
-This project follows the [Contributor Covenant v2.1](https://www.contributor-covenant.org/version/2/1/code_of_conduct/).
-All participants are expected to maintain a harassment-free experience for everyone, regardless of age, body size, disability, ethnicity, gender identity, level of experience, nationality, personal appearance, race, religion, or sexual identity and orientation.
-Violations may be reported to the maintainers at deokdory@gmail.com.
+This is a personal hobby project maintained by a single owner. External code contributions cannot be reviewed and merged at this time — not because your ideas aren't welcome, but because the review bandwidth simply isn't there.
 
-## How to Contribute
+**Bug reports and feature requests are very welcome:**
 
-1. **Open an issue** — Search existing issues first. If none match, open a new one describing the bug or feature request.
-2. **Fork and branch** — Fork the repository and create a branch named `<issue#>-<short-slug>` (e.g., `42-fix-permission-cache`). This naming is enforced by a git hook.
-3. **Write code** — Keep changes focused on the issue scope. Run `cargo clippy` and ensure there are no new warnings. Do not run `cargo fmt` globally — format only files you touch.
-4. **Open a PR to `develop`** — All feature and fix PRs target the `develop` branch. Fill in the PR template and link the related issue.
-5. **Review and merge** — A maintainer will review the PR. Address feedback and push updates to the same branch.
+- File issues at https://github.com/deokdory/pidory/issues — please search existing issues before opening a new one.
+- Include as much context as possible: pidory version, environment (OS, Discord setup), reproduction steps, and relevant logs or error messages.
+
+This policy may change in the future as the project evolves. Until then, issue-based feedback is genuinely the most useful way to help.
+
+The Branch Policy and Conventional Commits sections below are project-internal conventions enforced by git hooks — documented here for maintainers and any future contributors.
 
 ## Branch Policy
 
