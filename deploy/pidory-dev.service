@@ -10,6 +10,7 @@ WorkingDirectory=__PROJECT_DIR__
 ExecStart=__PROJECT_DIR__/target/release/pidory
 Restart=on-failure
 RestartSec=10
+RestartPreventExitStatus=2
 
 # Config — dev
 Environment=PIDORY_CONFIG=__PROJECT_DIR__/config.dev.toml
