@@ -15,15 +15,38 @@ if ! git diff --quiet || ! git diff --cached --quiet; then
 fi
 
 # 2. Git pull
-echo "[1/3] Pulling latest changes..."
+echo "[1/4] Pulling latest changes..."
+OLD_HEAD=$(git rev-parse HEAD)
 git pull --ff-only || { echo "ERROR: Fast-forward pull failed. Resolve manually."; exit 1; }
 
-# 3. Build
-echo "[2/3] Building release binary..."
-cargo build --release
+# 3. Check for systemd unit drift
+echo "[2/4] Checking systemd unit drift..."
 
-# 4. Sync skills
-echo "[3/3] Syncing skills..."
+if [ "$OLD_HEAD" = "$(git rev-parse HEAD)" ]; then
+    echo "  ✅ No new commits — nothing to check."
+elif git diff --name-only "$OLD_HEAD"..HEAD 2>/dev/null | grep -qE '^deploy/(pidory(-delayed-restart|-dev)?\.service|com\.pidory\.bot\.plist)$'; then
+    echo "  ❌ systemd unit files changed in this pull."
+    echo "     update.sh does NOT update systemd units."
+    echo "     Run 'bash deploy/install.sh' instead to apply unit changes."
+    exit 1
+else
+    echo "  ✅ No systemd unit changes detected."
+fi
+
+# 4. Build
+echo "[3/4] Building release binary..."
+cargo build --release
+cargo build --bin pidory-migrate --features migrate --release
+
+# Install updated pidory-migrate binary (required for v0.7.1+ migrations)
+USER_NAME="${SUDO_USER:-$USER}"
+sudo install -o "$USER_NAME" -m 0755 \
+    "$PROJECT_DIR/target/release/pidory-migrate" \
+    /usr/local/bin/pidory-migrate
+echo "  Installed pidory-migrate → /usr/local/bin/pidory-migrate"
+
+# 5. Sync skills
+echo "  Syncing skills..."
 SKILLS_TARGET="$HOME/.claude/skills"
 if [ -d "$PROJECT_DIR/skills" ]; then
     mkdir -p "$SKILLS_TARGET"
@@ -37,7 +60,26 @@ if [ -d "$PROJECT_DIR/skills" ]; then
     shopt -u nullglob dotglob
 fi
 
-# 5. Restart guidance
+# 6. Pre-flight migration verification
+echo "[4/4] Pre-flight migration verification..."
+
+DB_ENV_FILE="/etc/pidory/db.env"
+if [ ! -f "$DB_ENV_FILE" ]; then
+    echo "  ⚠️  $DB_ENV_FILE not found — skipping migration check."
+    if [ -t 0 ] && [ -t 1 ]; then
+        read -p "  Press Enter to acknowledge..." _
+    fi
+else
+    if bash "$PROJECT_DIR/scripts/pidory-migrate.sh"; then
+        echo "  ✅ Migration verified."
+    else
+        RC=$?
+        echo "  ❌ Migration verification failed (exit $RC)."
+        exit "$RC"
+    fi
+fi
+
+# 7. Restart guidance
 echo ""
 echo "=== Update complete ==="
 if [ "$OS" = "Darwin" ]; then
