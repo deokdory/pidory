@@ -33,6 +33,8 @@ impl ReactionStatus {
 
 const ALL_EMOJIS: &[&str] = &["🔄", "✅", "❌", "⏰", "📨", "⛔", "⏬", "⏳"];
 
+/// Clears all bot reactions then sets one. Use for state-machine transitions
+/// (Running → Done) where the prior reaction must be replaced.
 pub async fn set_reaction(
     ctx: &Context,
     channel_id: ChannelId,
@@ -60,6 +62,32 @@ pub async fn set_reaction(
             message_id = %message_id,
             status = ?status,
             "set_reaction failed: {e}"
+        );
+        return Err(e);
+    }
+
+    Ok(())
+}
+
+/// Adds a reaction WITHOUT clearing existing bot reactions. Use for one-shot
+/// signals like mid-turn inject feedback where clearing isn't needed.
+pub async fn add_reaction(
+    ctx: &Context,
+    channel_id: ChannelId,
+    message_id: MessageId,
+    status: ReactionStatus,
+) -> Result<(), PidoryError> {
+    let reaction = ReactionType::Unicode(status.emoji().to_string());
+    if let Err(e) = channel_id
+        .create_reaction(ctx, message_id, reaction)
+        .await
+        .map_err(PidoryError::from)
+    {
+        warn!(
+            channel_id = %channel_id,
+            message_id = %message_id,
+            status = ?status,
+            "add_reaction failed: {e}"
         );
         return Err(e);
     }

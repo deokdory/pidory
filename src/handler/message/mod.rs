@@ -313,13 +313,13 @@ async fn handle_message(
                     .or_default()
                     .turn_participants
                     .insert(new_message.author.id);
-                emoji::set_reaction(ctx, channel_id, msg_id, ReactionStatus::InjectQueued).await.ok();
+                emoji::add_reaction(ctx, channel_id, msg_id, ReactionStatus::InjectQueued).await.ok();
             }
             Err(e) if e.to_string().contains("queue full") => {
                 for path in &mid_turn_downloaded_files {
                     let _ = tokio::fs::remove_file(path).await;
                 }
-                emoji::set_reaction(ctx, channel_id, msg_id, ReactionStatus::QueueFull).await.ok();
+                emoji::add_reaction(ctx, channel_id, msg_id, ReactionStatus::QueueFull).await.ok();
                 channel_id
                     .say(ctx, format!("❌ {}", lang.queue_full()))
                     .await
@@ -330,7 +330,7 @@ async fn handle_message(
                 for path in &mid_turn_downloaded_files {
                     let _ = tokio::fs::remove_file(path).await;
                 }
-                emoji::set_reaction(ctx, channel_id, msg_id, ReactionStatus::Error).await.ok();
+                emoji::add_reaction(ctx, channel_id, msg_id, ReactionStatus::Error).await.ok();
                 channel_id
                     .say(ctx, format!("❌ {}", lang.error_with(&e)))
                     .await
