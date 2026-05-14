@@ -3,6 +3,9 @@
 *.db
 *.db-shm
 *.db-wal
+*.db.backup
+pidory-backup.sql
+pidory.db.backup*
 config.toml
 config.dev.toml
 .env

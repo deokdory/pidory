@@ -24,6 +24,14 @@ idle_timeout_secs = 7200      # 유휴 세션 타임아웃 (초), 0 to disable
 [database]
 path = "pidory.db"            # deprecated, ignored
 
+# [backup] dir 는 /update 와 rollback 의 DB backup 위치.
+# 기본값:
+#   Linux:  /var/lib/pidory/backups
+#   macOS:  $HOME/.pidory/backups
+# 명시값을 주려면 아래 주석을 해제:
+# [backup]
+# dir = "/var/lib/pidory/backups"
+
 [response]
 max_chunk_length = 1900       # Discord 2000자 여유분
 max_chunks = 10               # 초과 시 파일 첨부

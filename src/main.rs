@@ -135,28 +135,42 @@ async fn main() -> Result<(), PidoryError> {
             update::marker::RecoveryAction::Normal => {}
             update::marker::RecoveryAction::Rolling { from, to, attempt } => {
                 tracing::warn!("Rolling back: from={} to={} attempt={}", from, to, attempt);
-                let backup_dir = std::path::Path::new(&config.database.path)
-                    .parent()
-                    .unwrap_or(std::path::Path::new("."));
+                let backup_dir_buf = config.resolve_backup_dir();
+                let backup_dir = backup_dir_buf.as_path();
+                let mut can_restore_db = true;
+                if let Err(e) = std::fs::create_dir_all(backup_dir) {
+                    tracing::error!(
+                        "rollback: backup_dir 생성 실패 {}: {}",
+                        backup_dir.display(),
+                        e
+                    );
+                    can_restore_db = false;
+                }
                 let backup_path = backup_dir.join("pidory-backup.sql");
                 let database_url = match std::env::var("DATABASE_URL") {
-                    Ok(v) => v,
-                    Err(_) => {
-                        tracing::error!("DATABASE_URL missing during rollback — DB restore skipped");
+                    Ok(v) if !v.is_empty() => v,
+                    _ => {
+                        tracing::error!("rollback: DATABASE_URL missing — DB restore skipped");
+                        can_restore_db = false;
                         String::new()
                     }
                 };
-                let mut restore_failed = false;
+                if can_restore_db && !backup_path.is_file() {
+                    tracing::error!(
+                        "rollback: backup file absent {} — DB restore skipped",
+                        backup_path.display()
+                    );
+                    can_restore_db = false;
+                }
+                let mut restore_failed = !can_restore_db;
                 if let Err(e) = update::backup::restore_binary(worktree) {
                     tracing::error!("restore_binary failed: {:?}", e);
                     restore_failed = true;
                 }
-                if !database_url.is_empty() {
-                    if let Err(e) = update::backup::restore_db(&database_url, &backup_path) {
-                        tracing::error!("restore_db failed: {:?}", e);
-                        restore_failed = true;
-                    }
-                } else {
+                if can_restore_db
+                    && let Err(e) = update::backup::restore_db(&database_url, &backup_path)
+                {
+                    tracing::error!("restore_db failed: {:?}", e);
                     restore_failed = true;
                 }
                 let rollback_marker = worktree.join("target").join("release").join(".update-rolled-back");
