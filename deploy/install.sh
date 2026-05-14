@@ -10,13 +10,13 @@ OS="$(uname -s)"
 echo "=== pidory deployment ($OS) ==="
 
 # 1. Build
-echo "[1/6] Building release binaries..."
+echo "[1/7] Building release binaries..."
 cd "$PROJECT_DIR"
 cargo build --release
 cargo build --bin pidory-migrate --features migrate --release
 
 # 2. Check .env
-echo "[2/6] Checking environment..."
+echo "[2/7] Checking environment..."
 if [ ! -f "$PROJECT_DIR/.env" ]; then
     echo "WARNING: .env not found."
     echo "Create it with: echo 'PIDORY_DISCORD_TOKEN=your_token' > $PROJECT_DIR/.env"
@@ -24,11 +24,11 @@ fi
 
 # 3. Copy config if not exists + detect claude CLI path
 if [ ! -f "$PROJECT_DIR/config.toml" ]; then
-    echo "[3/6] Creating config.toml from example..."
+    echo "[3/7] Creating config.toml from example..."
     cp "$PROJECT_DIR/config.toml.example" "$PROJECT_DIR/config.toml"
     echo "IMPORTANT: Edit config.toml with your Discord guild_id and owner_id"
 else
-    echo "[3/6] config.toml already exists, skipping"
+    echo "[3/7] config.toml already exists, skipping"
 fi
 
 # Detect claude CLI absolute path and inject into config.toml
@@ -42,7 +42,7 @@ else
 fi
 
 # 4. Install pidory-migrate binary
-echo "[4/6] Installing pidory-migrate..."
+echo "[4/7] Installing pidory-migrate..."
 sudo install -o "$USER_NAME" -m 0755 \
     "$PROJECT_DIR/target/release/pidory-migrate" \
     /usr/local/bin/pidory-migrate
@@ -59,7 +59,7 @@ if [ -f /etc/pidory/db.env ]; then
 fi
 
 # 5. Install skills
-echo "[5/6] Installing skills..."
+echo "[5/7] Installing skills..."
 SKILLS_TARGET="$HOME/.claude/skills"
 if [ -d "$PROJECT_DIR/skills" ]; then
     mkdir -p "$SKILLS_TARGET"
@@ -76,7 +76,7 @@ else
 fi
 
 # 6. Install service
-echo "[6/6] Installing service..."
+echo "[6/7] Installing service..."
 
 if [ "$OS" = "Darwin" ]; then
     # macOS — launchd
@@ -132,6 +132,27 @@ else
     echo "Start:   sudo systemctl start pidory"
     echo "Status:  sudo systemctl status pidory"
     echo "Logs:    journalctl -u pidory -f"
+fi
+
+# 7. Pre-flight migration verification
+echo "[7/7] Pre-flight migration verification..."
+
+DB_ENV_FILE="/etc/pidory/db.env"
+if [ ! -f "$DB_ENV_FILE" ]; then
+    echo "  ⚠️  $DB_ENV_FILE not found — skipping migration check."
+    echo "     Run 'bash scripts/postgres-setup.sh' first, then re-run install.sh."
+    if [ -t 0 ] && [ -t 1 ]; then
+        read -p "  Press Enter to acknowledge and continue..." _
+    fi
+else
+    if bash "$PROJECT_DIR/scripts/pidory-migrate.sh"; then
+        echo "  ✅ Migration verified successfully."
+    else
+        RC=$?
+        echo "  ❌ Migration verification failed (exit $RC)."
+        echo "     Fix the migration error before starting the service."
+        exit "$RC"
+    fi
 fi
 
 echo ""
