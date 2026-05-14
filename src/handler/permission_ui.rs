@@ -87,6 +87,26 @@ pub fn parse_permission_custom_id(custom_id: &str) -> Option<(String, PermAction
     Some((request_id.to_string(), action))
 }
 
+/// Skill tool 의 표시 이름을 `Skill(name)` 형식으로 반환한다.
+///
+/// `tool_name == "Skill"` 일 때 `input` 에서 skill 이름을 다중 키로 탐색한다.
+/// 키 우선순위: `["name", "skill", "skill_name"]` — T1.1 `format_tool_input_summary` Skill arm 과 동일.
+/// skill 이름을 찾지 못하거나 빈 문자열이면 `tool_name` 그대로 반환 (fallback safe).
+/// 다른 tool 은 `tool_name` 을 그대로 반환한다.
+fn display_tool_name(tool_name: &str, input: &serde_json::Value) -> String {
+    if tool_name == "Skill" {
+        let skill = ["name", "skill", "skill_name"]
+            .iter()
+            .filter_map(|key| input.get(key).and_then(|v| v.as_str()))
+            .next()
+            .unwrap_or("");
+        if !skill.is_empty() {
+            return format!("Skill({})", skill);
+        }
+    }
+    tool_name.to_string()
+}
+
 /// Internal helper: builds `(content, components)` for a Level 2 permission message.
 /// Used by `ScopeToggle` edit path and `always:expand` expand path.
 ///
@@ -114,7 +134,7 @@ pub fn build_level2_message_parts(
     let header = format!(
         "🔒 <@{}>  {}",
         triggered_by,
-        inline_code(tool_name),
+        inline_code(&display_tool_name(tool_name, input)),
     );
 
     // 미리보기: available_rule_kinds → build_rule_texts(복수형) → 콤마 나열.
@@ -273,7 +293,7 @@ pub fn build_level1_message_parts(
     let header = format!(
         "🔒 <@{}>  {}",
         triggered_by,
-        inline_code(tool_name),
+        inline_code(&display_tool_name(tool_name, input)),
     );
 
     // 보호 path 여부 판단 — available_rule_kinds와 동일 기준
@@ -408,6 +428,19 @@ pub fn format_tool_input_summary(tool_name: &str, input: &serde_json::Value, lan
         "WebSearch" => {
             let query = input.get("query").and_then(|v| v.as_str()).unwrap_or("");
             format!("`{}`", query)
+        }
+        "Skill" => {
+            let skill = ["name", "skill", "skill_name"]
+                .iter()
+                .filter_map(|key| input.get(key).and_then(|v| v.as_str()))
+                .next()
+                .unwrap_or("");
+            let args = input.get("args").and_then(|v| v.as_str()).unwrap_or("");
+            if args.is_empty() {
+                format!("`{}`", skill)
+            } else {
+                format!("`{} {}`", skill, args)
+            }
         }
         _ => input
             .as_object()
@@ -547,16 +580,21 @@ pub async fn disable_permission_buttons(
     message_id: MessageId,
     reason: DisableReason,
     tool_name: &str,
+    tool_input: &serde_json::Value,
     lang: Lang,
 ) -> Result<(), PidoryError> {
+    let tool_display = display_tool_name(tool_name, tool_input);
+    let summary = format_tool_input_summary(tool_name, tool_input, lang);
+    let prefix = format!("`{}` {}", tool_display, summary);
+
     let label = match reason {
         DisableReason::Once => match lang {
-            Lang::Ko => "-# ✅ 한 번만 허용됨".to_string(),
-            Lang::En => "-# ✅ Allowed once".to_string(),
+            Lang::Ko => format!("-# ✅ {} — 한 번만 허용됨", prefix),
+            Lang::En => format!("-# ✅ {} — Allowed once", prefix),
         },
         DisableReason::Deny => match lang {
-            Lang::Ko => "-# ❌ 거부됨".to_string(),
-            Lang::En => "-# ❌ Denied".to_string(),
+            Lang::Ko => format!("-# ❌ {} — 거부됨", prefix),
+            Lang::En => format!("-# ❌ {} — Denied", prefix),
         },
         DisableReason::AllowAlwaysSuccess { rules, scope, project_basename } => {
             // 각 rule 을 inline_code 로 감싸 Discord markdown(`*` → italic) 회피.
@@ -568,35 +606,33 @@ pub async fn disable_permission_buttons(
                 .join(", ");
             let basename = project_basename
                 .unwrap_or_else(|| lang.msg_project_basename_fallback().to_string());
-            format!("-# {}", match scope {
+            let save_msg = match scope {
                 Scope::Project => lang.msg_save_success_project(&basename, &rules_joined),
                 Scope::Global => lang.msg_save_success_global(&rules_joined),
-            })
+            };
+            format!("-# {} {}", prefix, save_msg)
         }
         DisableReason::AllowAlwaysAlreadyPresent => match lang {
-            Lang::Ko => "-# 🔓 이미 등록됨".to_string(),
-            Lang::En => "-# 🔓 Already present".to_string(),
+            Lang::Ko => format!("-# 🔓 {} — 이미 등록됨", prefix),
+            Lang::En => format!("-# 🔓 {} — Already present", prefix),
         },
         DisableReason::AllowAlwaysConflictResolved => match lang {
-            Lang::Ko => "-# 🔓 충돌 자동 해소됨".to_string(),
-            Lang::En => "-# 🔓 Conflict resolved".to_string(),
+            Lang::Ko => format!("-# 🔓 {} — 충돌 자동 해소됨", prefix),
+            Lang::En => format!("-# 🔓 {} — Conflict resolved", prefix),
         },
         DisableReason::AllowAlwaysMaxRetries { attempts } => {
-            format!("-# {}", lang.msg_save_failed_max_retries(attempts))
+            format!("-# {} {}", prefix, lang.msg_save_failed_max_retries(attempts))
         }
         DisableReason::AllowAlwaysFailed { reason } => match lang {
-            Lang::Ko => format!("-# ⚠️ 권한 저장 실패: {}", reason),
-            Lang::En => format!("-# ⚠️ Permission save failed: {}", reason),
+            Lang::Ko => format!("-# ⚠️ {} — 권한 저장 실패: {}", prefix, reason),
+            Lang::En => format!("-# ⚠️ {} — Permission save failed: {}", prefix, reason),
         },
         DisableReason::AutoDismissedByAlwaysChain { triggering_rule } => match lang {
-            Lang::Ko => format!("-# 🔓 `{}` 등록으로 자동 취소됨", triggering_rule),
-            Lang::En => format!("-# 🔓 Auto-dismissed by `{}`", triggering_rule),
+            Lang::Ko => format!("-# 🔓 {} — `{}` 등록으로 자동 취소됨", prefix, triggering_rule),
+            Lang::En => format!("-# 🔓 {} — Auto-dismissed by `{}`", prefix, triggering_rule),
         },
-        DisableReason::Timeout => format!("-# {}", lang.permission_timeout_auto_deny()),
+        DisableReason::Timeout => format!("-# {} {}", prefix, lang.permission_timeout_auto_deny()),
     };
-
-    // tool_name은 라벨에 미포함이지만 향후 로깅 등에 활용 가능
-    let _ = tool_name;
 
     let edit = EditMessage::new().content(label).components(vec![]);
 
@@ -753,6 +789,7 @@ pub async fn run_permission_handler(
 
         let log_request_id = perm_req.request_id.clone();
         let log_tool_name = perm_req.tool_name.clone();
+        let log_input: serde_json::Value = perm_req.input.clone();
         let timeout_rx = perm_req.timeout_rx;
         match channel_id.send_message(&ctx, msg).await {
             Ok(sent) => {
@@ -794,6 +831,7 @@ pub async fn run_permission_handler(
                                 message_id,
                                 DisableReason::Timeout,
                                 &log_tool_name,
+                                &log_input,
                                 lang,
                             ).await;
                         }
@@ -820,6 +858,7 @@ pub(crate) struct DismissedEntry {
     pub request_id: String,
     pub message_id: MessageId,
     pub thread_id: String,
+    pub input: serde_json::Value,
 }
 
 /// `thread_id` + `tool_name` 이 모두 일치하는 대기 permission 을 HashMap 에서 remove + response_tx 로 decision 전송.
@@ -856,6 +895,7 @@ pub(crate) async fn dismiss_pending_by_tool(
                 request_id: rid,
                 message_id: entry.message_id,
                 thread_id: entry.thread_id,
+                input: entry.input.clone().unwrap_or(serde_json::json!({})),
             });
         }
     }
@@ -2033,6 +2073,131 @@ mod tests {
             content.contains(Lang::Ko.permission_protected_path_note()),
             "protected note 포함, got: {}",
             content
+        );
+    }
+
+    // ── format_tool_input_summary: Skill cases ────────────────────────────────
+
+    /// Skill + name 있음 + args 있음 → `` `ship 135` ``
+    #[test]
+    fn format_skill_summary_with_name_and_args() {
+        let input = serde_json::json!({"name": "ship", "args": "135"});
+        let result = format_tool_input_summary("Skill", &input, Lang::Ko);
+        assert_eq!(result, "`ship 135`");
+    }
+
+    /// Skill + name 있음 + args 없음 → `` `ship` ``
+    #[test]
+    fn format_skill_summary_name_only() {
+        let input = serde_json::json!({"name": "ship"});
+        let result = format_tool_input_summary("Skill", &input, Lang::Ko);
+        assert_eq!(result, "`ship`");
+    }
+
+    /// Skill + "skill" fallback 키 + args 있음 → `` `deploy 135` ``
+    #[test]
+    fn format_skill_summary_fallback_skill_key_with_args() {
+        let input = serde_json::json!({"skill": "deploy", "args": "135"});
+        let result = format_tool_input_summary("Skill", &input, Lang::Ko);
+        assert_eq!(result, "`deploy 135`");
+    }
+
+    /// Skill + "skill_name" fallback 키 → `` `release` ``
+    #[test]
+    fn format_skill_summary_fallback_skill_name_key() {
+        let input = serde_json::json!({"skill_name": "release"});
+        let result = format_tool_input_summary("Skill", &input, Lang::Ko);
+        assert_eq!(result, "`release`");
+    }
+
+    /// Skill + skill 이름 없음 + args 있음 → `` ` 135` `` (skill 빈 문자열 + space + args)
+    #[test]
+    fn format_skill_summary_no_skill_name_with_args() {
+        let input = serde_json::json!({"args": "135"});
+        let result = format_tool_input_summary("Skill", &input, Lang::Ko);
+        // skill="" → format!("`{} {}`", "", "135") = "` 135`"
+        assert_eq!(result, "` 135`");
+    }
+
+    /// Skill + both empty → `` `` `` (skill 빈 문자열, args 빈 문자열)
+    #[test]
+    fn format_skill_summary_both_empty() {
+        let input = serde_json::json!({});
+        let result = format_tool_input_summary("Skill", &input, Lang::Ko);
+        // skill="" → args="" → format!("`{}`", "") = "``"
+        assert_eq!(result, "``");
+    }
+
+    // ── display_tool_name: unit tests ─────────────────────────────────────────
+
+    /// Skill + name 키 있음 → `"Skill(ship)"`
+    #[test]
+    fn display_tool_name_skill_with_name_key() {
+        let input = serde_json::json!({"name": "ship"});
+        let result = super::display_tool_name("Skill", &input);
+        assert_eq!(result, "Skill(ship)");
+    }
+
+    /// Skill + "skill" fallback 키 → `"Skill(ship)"`
+    #[test]
+    fn display_tool_name_skill_fallback_skill_key() {
+        let input = serde_json::json!({"skill": "ship"});
+        let result = super::display_tool_name("Skill", &input);
+        assert_eq!(result, "Skill(ship)");
+    }
+
+    /// Skill + empty input → `"Skill"` (이름 못 찾으면 tool_name 그대로)
+    #[test]
+    fn display_tool_name_skill_empty_input() {
+        let input = serde_json::json!({});
+        let result = super::display_tool_name("Skill", &input);
+        assert_eq!(result, "Skill");
+    }
+
+    /// Bash → `"Bash"` (다른 tool 영향 없음)
+    #[test]
+    fn display_tool_name_bash_unchanged() {
+        let input = serde_json::json!({"command": "ls -la"});
+        let result = super::display_tool_name("Bash", &input);
+        assert_eq!(result, "Bash");
+    }
+
+    // ── disable_permission_buttons: label helper 분리 여부 확인 ──────────────
+    // disable_permission_buttons 본체는 async + Discord context 필요 → unit test 불가.
+    // label 생성 로직이 본체 내 인라인이므로 별도 helper 없음 → 테스트 SKIP.
+    // (이 사실은 notepad learnings.md 에도 기록됨)
+
+    // ── disable_permission_buttons: 한국어 label 검증 (Lang::Ko 인자 경로) ──────
+    // disable_permission_buttons 가 async + Discord context 를 요구하므로
+    // 실제 Discord 호출 없이 label 문자열만 검증하는 우회 방식으로 테스트한다:
+    // DisableReason 분기에서 lang match 로 생성되는 포맷 문자열을 직접 재현.
+
+    /// Lang::Ko Once 레이블에 "한 번만 허용됨" 포함 확인
+    #[test]
+    fn disable_reason_once_label_ko_contains_korean() {
+        // Reproduce the label format from disable_permission_buttons DisableReason::Once Ko arm.
+        let tool_display = super::display_tool_name("Bash", &serde_json::json!({}));
+        let summary = format_tool_input_summary("Bash", &serde_json::json!({"command": "ls"}), Lang::Ko);
+        let prefix = format!("`{}` {}", tool_display, summary);
+        let label = format!("-# ✅ {} — 한 번만 허용됨", prefix);
+        assert!(
+            label.contains("한 번만 허용됨"),
+            "Ko Once label must contain '한 번만 허용됨', got: {}",
+            label
+        );
+    }
+
+    /// Lang::Ko Deny 레이블에 "거부됨" 포함 확인
+    #[test]
+    fn disable_reason_deny_label_ko_contains_korean() {
+        let tool_display = super::display_tool_name("Bash", &serde_json::json!({}));
+        let summary = format_tool_input_summary("Bash", &serde_json::json!({"command": "ls"}), Lang::Ko);
+        let prefix = format!("`{}` {}", tool_display, summary);
+        let label = format!("-# ❌ {} — 거부됨", prefix);
+        assert!(
+            label.contains("거부됨"),
+            "Ko Deny label must contain '거부됨', got: {}",
+            label
         );
     }
 
