@@ -1,5 +1,10 @@
+use std::collections::HashSet;
+use std::sync::{LazyLock, Mutex};
+
 use chrono::TimeZone;
 use poise::serenity_prelude::Message;
+
+static WARNED_TZ: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
 
 use crate::i18n::Lang;
 use crate::subprocess::session_manager::{SenderInfo, sanitize_sender_text};
@@ -20,9 +25,13 @@ pub(crate) fn format_timestamp_label(now: chrono::DateTime<chrono::Utc>, tz_over
                     local.format("%Y-%m-%d %H:%M %Z").to_string()
                 }
                 Err(_) => {
-                    tracing::warn!("format_timestamp_label: unknown IANA tz {:?}, falling back to Local", name);
-                    let local = chrono::Local::now().with_timezone(&chrono::Local);
-                    now.with_timezone(&local.timezone()).format("%Y-%m-%d %H:%M %Z").to_string()
+                    {
+                        let mut warned = WARNED_TZ.lock().unwrap_or_else(|p| p.into_inner());
+                        if warned.insert(name.to_string()) {
+                            tracing::warn!("format_timestamp_label: unknown IANA tz {:?}, falling back to Local", name);
+                        }
+                    }
+                    now.with_timezone(&chrono::Local).format("%Y-%m-%d %H:%M %Z").to_string()
                 }
             }
         }
@@ -393,6 +402,15 @@ mod tests {
         // 형식 검증: "%Y-%m-%d %H:%M %Z" — 반드시 날짜 패턴 포함
         assert!(!result.is_empty(), "fallback must produce non-empty string");
         assert!(result.contains("2026-05-14"), "fallback must contain the date");
+    }
+
+    #[test]
+    fn format_timestamp_label_invalid_iana_warns_once() {
+        // 같은 invalid name으로 2회 호출 → 결과 동일, panic 없음
+        let r1 = format_timestamp_label(fixed_utc(), Some("Invalid/Once"));
+        let r2 = format_timestamp_label(fixed_utc(), Some("Invalid/Once"));
+        assert!(!r1.is_empty());
+        assert_eq!(r1, r2);
     }
 
     #[test]

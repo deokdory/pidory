@@ -44,7 +44,7 @@ libc = "0.2"
 shlex = "1"
 regex = "1"
 unicode-normalization = "0.1"
-chrono = { version = "0.4", features = ["serde"] }
+chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
 chrono-tz = "0.10"
 
 
