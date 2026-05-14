@@ -60,25 +60,33 @@ cd pidory
 brew install postgresql@17
 brew services start postgresql@17
 
+# 2a. Make PostgreSQL client commands available (postgresql@17 is keg-only)
+export PATH="$(brew --prefix postgresql@17)/bin:$PATH"
+
 # 3. Create the pidory role and database
 createuser -P pidory                          # prompts for a password
 createdb -O pidory pidory
 
-# 4. Write your Discord token and database URL to the project's environment file
+# 4. Write your Discord token to the project env file
 echo 'PIDORY_DISCORD_TOKEN=your_token_here' > .env
-echo "DATABASE_URL=postgres://pidory:your_password@localhost/pidory" >> .env
 
-# 5. Build and install
+# 5. Build and install (writes the launchd plist with the token)
 bash deploy/install.sh                        # builds binaries, copies plist + skills
 
-# 6. Edit config.toml (guild_id, owner_id, binary_path)
+# 6. Add DATABASE_URL to the launchd plist
+#    deploy/install.sh wrote ~/Library/LaunchAgents/com.pidory.bot.plist with
+#    only PIDORY_DISCORD_TOKEN. macOS launchd does not auto-load .env, so
+#    DATABASE_URL must be added to the plist's EnvironmentVariables dict.
+#    See "Detailed Setup → 3.4 PostgreSQL Setup → macOS Manual Setup → Option A".
+
+# 7. Edit config.toml (guild_id, owner_id, binary_path)
 $EDITOR config.toml
 
-# 7. Start the launchd agent
+# 8. Start the launchd agent
 launchctl bootstrap gui/$UID ~/Library/LaunchAgents/com.pidory.bot.plist
 ```
 
-> **Note for macOS**: The plist installed by `deploy/install.sh` does **not** inject `DATABASE_URL` automatically. Either include it in the project `.env` (read by the binary at startup) or add an `EnvironmentVariables` entry to the plist before bootstrapping. The `.env` approach is simpler and matches Linux behavior.
+> **Important on macOS**: Unlike Linux (where systemd reads `.env` via `EnvironmentFile`), macOS launchd does **not** auto-load `.env`. `DATABASE_URL` **must** be added to the plist `EnvironmentVariables` dict — see Manual Setup below for the exact edit.
 
 ---
 
@@ -150,6 +158,9 @@ sudo bash scripts/postgres-setup.sh
 brew install postgresql@17
 brew services start postgresql@17
 
+# postgresql@17 is keg-only — add its bin/ to PATH for psql/createuser/createdb
+export PATH="$(brew --prefix postgresql@17)/bin:$PATH"
+
 # Verify
 psql -d postgres -c 'SELECT version();'
 
@@ -163,14 +174,9 @@ createdb -O pidory pidory
 psql "postgres://pidory:your_password@localhost/pidory" -c 'SELECT 1;'
 ```
 
-After this, set `DATABASE_URL` for the bot. Two options:
+After this, set `DATABASE_URL` for the launchd agent. **The plist edit is required** because pidory reads `DATABASE_URL` directly via `std::env::var`, and macOS launchd does not auto-load `.env`:
 
-**Option A — append to `.env` (recommended)**:
-```bash
-echo "DATABASE_URL=postgres://pidory:your_password@localhost/pidory" >> .env
-```
-
-**Option B — inject via the launchd plist**:
+**Option A (recommended for service deployment) — inject via the launchd plist**:
 
 After running `deploy/install.sh`, edit `~/Library/LaunchAgents/com.pidory.bot.plist` and add to the `EnvironmentVariables` dict:
 
@@ -179,7 +185,23 @@ After running `deploy/install.sh`, edit `~/Library/LaunchAgents/com.pidory.bot.p
 <string>postgres://pidory:your_password@localhost/pidory</string>
 ```
 
-Then re-bootstrap: `launchctl bootout gui/$UID ~/Library/LaunchAgents/com.pidory.bot.plist && launchctl bootstrap gui/$UID ~/Library/LaunchAgents/com.pidory.bot.plist`
+Then re-bootstrap (tolerant sequence — first boot may not have a previous registration):
+
+```bash
+launchctl bootout gui/$UID/com.pidory.bot 2>/dev/null || true
+launchctl bootstrap gui/$UID ~/Library/LaunchAgents/com.pidory.bot.plist
+```
+
+**Option B (foreground / dev only) — export via shell**:
+
+For `cargo run --release` outside of launchd:
+
+```bash
+export DATABASE_URL="postgres://pidory:your_password@localhost/pidory"
+cargo run --release
+```
+
+The `.env` file approach (which works on Linux because systemd reads it via `EnvironmentFile`) does **not** work for macOS launchd because launchd does not auto-load env files. Adding `DATABASE_URL` to `.env` will silently be ignored by the bot when started via `launchctl`.
 
 For Linux users, continue with the automated `scripts/postgres-setup.sh` below.
 
@@ -362,12 +384,13 @@ launchctl bootstrap gui/$UID ~/Library/LaunchAgents/com.pidory.bot.plist
 
 #### `DATABASE_URL not set` on macOS startup
 
-The plist does not inject `DATABASE_URL` by default. Verify which config source is being used:
+The plist does not inject `DATABASE_URL` by default. Check the plist:
 
-1. Check the project `.env`: `grep DATABASE_URL .env` (recommended path)
-2. Check the plist: `plutil -p ~/Library/LaunchAgents/com.pidory.bot.plist | grep -A1 DATABASE_URL`
+```bash
+plutil -p ~/Library/LaunchAgents/com.pidory.bot.plist | grep -A1 DATABASE_URL
+```
 
-If neither has it, add to `.env` (see "PostgreSQL Setup → macOS Manual Setup" above).
+If it is missing, add it to the plist's `EnvironmentVariables` dict (see "PostgreSQL Setup → macOS Manual Setup → Option A" above). Adding `DATABASE_URL` to `.env` does **not** help — macOS launchd does not auto-load env files.
 
 #### PostgreSQL server not running
 
