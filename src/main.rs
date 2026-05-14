@@ -89,6 +89,8 @@ pub struct Data {
     /// Claude CLI 가 settings.local.json 을 핫 리로드하지 않으므로
     /// 새 subprocess 가 settings 를 다시 읽어 룰 매칭이 올바르게 동작한다.
     pub pending_session_restart: Arc<Mutex<HashSet<String>>>,
+    /// guild 멤버 nick/display/username → user_id 역방향 캐시 (@name mention 파싱용).
+    pub mention_cache: Arc<handler::mention::MentionCache>,
 }
 
 #[tokio::main]
@@ -459,6 +461,7 @@ async fn main() -> Result<(), PidoryError> {
                     agent_descriptions,
                     ctx_watch: ctx_tx,
                     pending_session_restart: Arc::new(Mutex::new(HashSet::new())),
+                    mention_cache: Arc::new(handler::mention::MentionCache::new()),
                 })
             })
         })
@@ -466,7 +469,8 @@ async fn main() -> Result<(), PidoryError> {
 
     let intents = serenity::GatewayIntents::GUILD_MESSAGES
         | serenity::GatewayIntents::MESSAGE_CONTENT
-        | serenity::GatewayIntents::GUILDS;
+        | serenity::GatewayIntents::GUILDS
+        | serenity::GatewayIntents::GUILD_MEMBERS;
 
     let mut client = serenity::ClientBuilder::new(token, intents)
         .framework(framework)

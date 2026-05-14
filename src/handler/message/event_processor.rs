@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use poise::serenity_prelude::{ChannelId, Context, CreateMessage, MessageFlags, MessageId, UserId};
+use poise::serenity_prelude::{ChannelId, Context, CreateAllowedMentions, CreateMessage, GuildId, MessageFlags, MessageId, UserId};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::error;
@@ -78,7 +78,19 @@ async fn send_summary_with_buttons(
     }
 }
 
-pub(super) async fn say_silent(ctx: &Context, channel_id: ChannelId, content: impl Into<String>) {
+fn default_deny_mentions() -> CreateAllowedMentions {
+    CreateAllowedMentions::new()
+        .everyone(false)
+        .all_roles(false)
+        .users(Vec::<UserId>::new())
+}
+
+pub(super) async fn say_silent(
+    ctx: &Context,
+    channel_id: ChannelId,
+    content: impl Into<String>,
+    allowed_mentions: CreateAllowedMentions,
+) {
     let text = content.into();
     let chunks = if text.chars().count() > DISCORD_MSG_LIMIT {
         formatter::split_message(&text, DISCORD_MSG_LIMIT)
@@ -88,7 +100,8 @@ pub(super) async fn say_silent(ctx: &Context, channel_id: ChannelId, content: im
     for chunk in chunks {
         let msg = CreateMessage::new()
             .content(chunk)
-            .flags(MessageFlags::SUPPRESS_NOTIFICATIONS);
+            .flags(MessageFlags::SUPPRESS_NOTIFICATIONS)
+            .allowed_mentions(allowed_mentions.clone());
         if let Err(e) = channel_id.send_message(ctx, msg).await {
             tracing::warn!(%channel_id, "Failed to send message to Discord: {}", e);
         }
@@ -107,6 +120,8 @@ pub(super) async fn send_event_to_discord(
     lang: Lang,
     session_states: &Arc<tokio::sync::Mutex<HashMap<String, SessionState>>>,
     thread_id: &str,
+    mention_cache: &crate::handler::mention::MentionCache,
+    guild_id: Option<GuildId>,
 ) {
     match event {
         StreamEvent::Assistant { content, .. } => {
@@ -117,9 +132,21 @@ pub(super) async fn send_event_to_discord(
                         if !clean_text.trim().is_empty() {
                             let table_converted = formatter::convert_markdown_tables(&clean_text);
                             let converted = formatter::convert_html_details(&table_converted);
-                            let chunks = formatter::split_message(&converted, max_chunk_length);
+
+                            // mention 치환 + 화이트리스트 추출
+                            let (processed, whitelist) =
+                                crate::handler::mention::parse_and_replace(
+                                    &converted, guild_id, mention_cache, ctx,
+                                ).await;
+
+                            let am = CreateAllowedMentions::new()
+                                .everyone(false)
+                                .all_roles(false)
+                                .users(whitelist);
+
+                            let chunks = formatter::split_message(&processed, max_chunk_length);
                             for chunk in chunks {
-                                say_silent(ctx, channel_id, chunk).await;
+                                say_silent(ctx, channel_id, chunk, am.clone()).await;
                             }
                         }
                         if !file_paths.is_empty()
@@ -154,7 +181,7 @@ pub(super) async fn send_event_to_discord(
                             let formatted = formatter::format_tool_use(name, input);
                             let chunks = formatter::split_message(&formatted, max_chunk_length);
                             for chunk in chunks {
-                                say_silent(ctx, channel_id, chunk).await;
+                                say_silent(ctx, channel_id, chunk, default_deny_mentions()).await;
                             }
                         }
                     }
@@ -170,13 +197,13 @@ pub(super) async fn send_event_to_discord(
                     continue;
                 }
                 if let Some(formatted) = formatter::format_tool_result_with_name(result, tool_name, lang) {
-                    say_silent(ctx, channel_id, formatted).await;
+                    say_silent(ctx, channel_id, formatted, default_deny_mentions()).await;
                 }
             }
         }
         StreamEvent::RateLimit { status, .. } => {
             if status == "rate_limited" {
-                say_silent(ctx, channel_id, lang.rate_limit_reached()).await;
+                say_silent(ctx, channel_id, lang.rate_limit_reached(), default_deny_mentions()).await;
             } else if status != "allowed" && !status.is_empty() {
                 tracing::warn!(status, "Unknown rate limit status");
             }
@@ -199,6 +226,7 @@ pub async fn process_turn_events(
     owner_id: u64,
     show_context_percent: bool,
     session_states: Arc<tokio::sync::Mutex<HashMap<String, SessionState>>>,
+    mention_cache: Arc<crate::handler::mention::MentionCache>,
 ) {
     // 0. 이전 턴의 next-step 버튼 비활성화
     if let Some(prev_msg_id) = session_states.lock().await.get_mut(thread_id).and_then(|s| s.next_step_button.take()) {
@@ -265,10 +293,18 @@ pub async fn process_turn_events(
     let mut used_tools: Vec<String> = Vec::new();
     let mut used_skills: Vec<String> = Vec::new();
 
+    // guild_id는 streaming path 전에 한 번만 추출
+    let guild_id_opt: Option<GuildId> = channel_id
+        .to_channel(&ctx.http)
+        .await
+        .ok()
+        .and_then(|ch| ch.guild())
+        .map(|gc| gc.guild_id);
+
     if !fast_complete {
         // 버퍼링된 이벤트 먼저 전송
         for event in &events {
-            send_event_to_discord(ctx, channel_id, event, &mut tool_use_names, &mut used_tools, &mut used_skills, max_chunk_length, lang, &session_states, thread_id).await;
+            send_event_to_discord(ctx, channel_id, event, &mut tool_use_names, &mut used_tools, &mut used_skills, max_chunk_length, lang, &session_states, thread_id, &mention_cache, guild_id_opt).await;
         }
 
         // Progress indicator 초기화
@@ -312,7 +348,7 @@ pub async fn process_turn_events(
                             typing_paused.store(progress.is_active(), Ordering::Relaxed);
 
                             // 기존 이벤트 처리
-                            send_event_to_discord(ctx, channel_id, &stream_event, &mut tool_use_names, &mut used_tools, &mut used_skills, max_chunk_length, lang, &session_states, thread_id).await;
+                            send_event_to_discord(ctx, channel_id, &stream_event, &mut tool_use_names, &mut used_tools, &mut used_skills, max_chunk_length, lang, &session_states, thread_id, &mention_cache, guild_id_opt).await;
 
                             if stream_event.is_result() {
                                 got_result = true;
@@ -540,7 +576,7 @@ pub async fn process_turn_events(
 
         let (response, file_paths) = formatter::format_response(&events, lang);
         let send_ok = if !response.trim().is_empty() {
-            match formatter::send_response(ctx, channel_id, &response, max_chunk_length, max_chunks, lang)
+            match formatter::send_response(ctx, channel_id, &response, max_chunk_length, max_chunks, lang, &mention_cache)
                 .await
             {
                 Ok(()) => true,

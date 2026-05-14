@@ -5,6 +5,7 @@ pub mod discord_notifier;
 pub mod emoji;
 pub mod file_attach;
 pub mod formatter;
+pub mod mention;
 pub mod message;
 pub mod next_step_ui;
 pub mod permission_ui;
