@@ -272,6 +272,11 @@ pub fn build_rule_texts(tool: &str, input: &serde_json::Value, kind: RuleKind) -
 /// assert_eq!(split_bash_subcommands("echo hi | cat"), vec!["echo hi", "cat"]);
 /// assert_eq!(split_bash_subcommands(r#"echo "a | b""#), vec![r#"echo "a | b""#]);
 /// ```
+///
+/// # Visibility
+/// `pub` (not `pub(crate)`) — pidory 는 binary crate 라 visibility 가 사실상 동등.
+/// caller 모듈의 `#![allow(dead_code)]` 가 rustc 의 dead_code lint chain 추적을 깨뜨려서
+/// `pub(crate)` 로 두면 실제 호출 중에도 false-positive unused warning 발생.
 pub fn split_bash_subcommands(cmd: &str) -> Vec<String> {
     let trimmed = cmd.trim();
     if trimmed.is_empty() {
@@ -445,6 +450,13 @@ fn is_ip(host: &str) -> bool {
 /// # MCP tools
 /// MCP tools (`mcp__server__tool`) only support the bare Tool kind (no parentheses).
 /// Parenthesized form like `mcp__server__tool(*)` is invalid (returns false).
+///
+/// # Visibility
+/// `pub` (not `pub(crate)`) — pidory 는 binary crate 라 visibility 가 사실상 동등.
+/// caller 모듈 (`subprocess/permission.rs`, `handler/permission_ui.rs`) 의
+/// `#![allow(dead_code)]` 가 rustc 의 dead_code lint chain 추적을 깨뜨려서
+/// `pub(crate)` 로 두면 실제 호출 중에도 false-positive unused warning 발생.
+/// `split_bash_subcommands` 와 동일 패턴 (plan 의도는 `pub(crate)`, 기술 제약 회피).
 pub fn rule_matches(rule: &str, tool: &str, input: &serde_json::Value) -> bool {
     // MCP tool: parenthesized form is invalid; only bare tool name (exact) is valid.
     if tool.starts_with("mcp__") {
