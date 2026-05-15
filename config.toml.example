@@ -48,11 +48,5 @@ max_chunks = 10               # 초과 시 파일 첨부
 # enabled = true                # sender 레이블에 타임스탬프 표시 (default: true)
 # tz = "Asia/Seoul"             # IANA 타임존 (없으면 Local 폴백)
 
-[permission]
-# 권한 응답 타임아웃 (초). 사용자가 Discord 권한 버튼을 누르지 않으면
-# 이 시간 후 자동 deny 처리됨.
-# 0 = 비활성 (무한 대기). owner 가 자리 비울 때 봇 작업이 중단되지 않게 하려면 0 권장.
-# 단, 0 으로 두면 idle_timeout_secs 가 도달하기 전까지 권한 future 가
-# 메모리에 잔존함 — 운영 시 idle_timeout_secs 와 함께 검토할 것.
-# default: 300 (5분)
-response_timeout_secs = 300
+# [permission]
+# response_timeout_secs = 300   # 권한 응답 타임아웃 (초). 0 = 비활성 (무한 대기) [기본: 300]
