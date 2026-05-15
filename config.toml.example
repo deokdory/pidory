@@ -43,3 +43,7 @@ max_chunks = 10               # 초과 시 파일 첨부
 
 # [footer]
 # show_context_percent = false  # 턴 완료 footer에 ctx 사용률(%) 표시 (default: false)
+
+# [timestamp]
+# enabled = true                # sender 레이블에 타임스탬프 표시 (default: true)
+# tz = "Asia/Seoul"             # IANA 타임존 (없으면 Local 폴백)

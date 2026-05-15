@@ -13,6 +13,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 use tokio::sync::{Mutex, mpsc, mpsc::error::TrySendError};
 
 use crate::claude_settings::rule::{RuleKind, Scope};
+use crate::config::TimestampConfig;
 use crate::ratelimit::RateLimitInfo;
 use crate::subprocess::parser::{StreamEvent, build_control_response_allow, build_control_response_deny, build_control_response_ask_answer};
 use crate::subprocess::permission::{PermissionCache, PermissionDecision, PermissionRequest};
@@ -147,6 +148,7 @@ pub(super) async fn wait_for_permissions<W, R>(
     initial_cr: InitialControlRequest,
     project_path: &Path,
     additional_dirs: &Arc<Vec<PathBuf>>,
+    timestamp_config: &TimestampConfig,
 ) -> PermissionsWaitResult
 where
     W: tokio::io::AsyncWrite + Unpin,
@@ -289,7 +291,7 @@ where
                             tracing::info!(thread_id = %thread_id, msg_id = %m.message_id, "Message recalled, skipping");
                             continue;
                         }
-                        let inject_line = build_user_message_json(&m.content, &m.downloaded_files, m.reply_context.as_ref(), m.sender_info.as_ref());
+                        let inject_line = build_user_message_json(&m.content, &m.downloaded_files, m.reply_context.as_ref(), m.sender_info.as_ref(), timestamp_config, chrono::Utc::now());
                         if let Err(e) = stdin.write_all(inject_line.as_bytes()).await {
                             tracing::error!("mid-turn stdin write error (wait_for_permissions): {}", e);
                             return PermissionsWaitResult::Interrupted;
@@ -905,6 +907,7 @@ mod tests {
             &queue_size, &pending_recalls, "test-thread", None, &ratelimit_tx,
             &mut cache, &permission_tx, initial_cr,
             &PathBuf::from("/tmp"), &Arc::new(vec![]),
+            &crate::config::TimestampConfig::default(),
         ).await;
 
         let received_ids = collect_task.await.unwrap();
@@ -941,6 +944,7 @@ mod tests {
             &queue_size, &pending_recalls, "test-thread", None, &ratelimit_tx,
             &mut cache, &permission_tx, initial_cr,
             &PathBuf::from("/tmp"), &Arc::new(vec![]),
+            &crate::config::TimestampConfig::default(),
         ).await;
         handler_task.await.unwrap();
 
@@ -983,6 +987,7 @@ mod tests {
             &queue_size, &pending_recalls, "test-thread", None, &ratelimit_tx,
             &mut cache, &permission_tx, initial_cr,
             &PathBuf::from("/tmp"), &Arc::new(vec![]),
+            &crate::config::TimestampConfig::default(),
         ).await;
         handler_task.await.unwrap();
 
@@ -1037,6 +1042,7 @@ mod tests {
             &queue_size, &pending_recalls, "test-thread", None, &ratelimit_tx,
             &mut cache, &permission_tx, initial_cr,
             &PathBuf::from("/tmp"), &Arc::new(vec![]),
+            &crate::config::TimestampConfig::default(),
         ).await;
         handler_task.await.unwrap();
 
@@ -1081,6 +1087,7 @@ mod tests {
             &queue_size, &pending_recalls, "test-thread", None, &ratelimit_tx,
             &mut cache, &permission_tx, initial_cr,
             &PathBuf::from("/tmp"), &Arc::new(vec![]),
+            &crate::config::TimestampConfig::default(),
         ).await;
         interrupt_task.await.unwrap();
 
@@ -1120,6 +1127,7 @@ mod tests {
             &queue_size, &pending_recalls, "test-thread", None, &ratelimit_tx,
             &mut cache, &permission_tx, initial_cr,
             &PathBuf::from("/tmp"), &Arc::new(vec![]),
+            &crate::config::TimestampConfig::default(),
         ).await;
         handler_task.await.unwrap();
 
@@ -1153,6 +1161,7 @@ mod tests {
             &queue_size, &pending_recalls, "test-thread", None, &ratelimit_tx,
             &mut cache, &permission_tx, initial_cr,
             &PathBuf::from("/tmp"), &Arc::new(vec![]),
+            &crate::config::TimestampConfig::default(),
         ).await;
 
         assert!(
@@ -1198,6 +1207,7 @@ mod tests {
             &queue_size, &pending_recalls, "test-thread", None, &ratelimit_tx,
             &mut cache, &permission_tx, initial_cr,
             &PathBuf::from("/tmp"), &Arc::new(vec![]),
+            &crate::config::TimestampConfig::default(),
         ).await;
 
         let writes = drain_stdin_writes(&mut stdin_read, 1).await;
@@ -1238,6 +1248,7 @@ mod tests {
             &queue_size, &pending_recalls, "test-thread", None, &ratelimit_tx,
             &mut cache, &permission_tx, initial_cr,
             &PathBuf::from("/tmp"), &Arc::new(vec![]),
+            &crate::config::TimestampConfig::default(),
         ).await;
         handler_task.await.unwrap();
 
@@ -1281,6 +1292,7 @@ mod tests {
             &queue_size, &pending_recalls, "test-thread", None, &ratelimit_tx,
             &mut cache, &permission_tx, initial_cr,
             Path::new("/tmp"), &Arc::new(vec![]),
+            &crate::config::TimestampConfig::default(),
         ).await;
 
         assert!(matches!(result, PermissionsWaitResult::AllResolved { .. }));
@@ -1328,6 +1340,7 @@ mod tests {
             &queue_size, &pending_recalls, "test-thread", None, &ratelimit_tx,
             &mut cache, &permission_tx, initial_cr,
             Path::new("/tmp"), &Arc::new(vec![]),
+            &crate::config::TimestampConfig::default(),
         ).await;
 
         assert!(matches!(result, PermissionsWaitResult::AllResolved { .. }));
@@ -1365,12 +1378,14 @@ mod tests {
         };
 
         let test_additional_dirs1: Arc<Vec<PathBuf>> = Arc::new(vec![]);
+        let ts_cfg1 = crate::config::TimestampConfig::default();
         let (result1, _) = tokio::join!(
             wait_for_permissions(
                 &mut stdin_write, &mut reader1, &mut line, &mut queue_rx, &mut interrupt_rx,
                 &queue_size, &pending_recalls, "test-thread", None, &ratelimit_tx,
                 &mut cache, &permission_tx, initial_cr1,
                 Path::new("/tmp"), &test_additional_dirs1,
+                &ts_cfg1,
             ),
             respond_task,
         );
@@ -1388,6 +1403,7 @@ mod tests {
             &queue_size, &pending_recalls, "test-thread", None, &ratelimit_tx,
             &mut cache, &permission_tx, initial_cr2,
             Path::new("/tmp"), &Arc::new(vec![]),
+            &crate::config::TimestampConfig::default(),
         ).await;
         assert!(matches!(result2, PermissionsWaitResult::AllResolved { .. }), "2nd call must AllResolved (cache hit)");
 
@@ -1434,6 +1450,7 @@ mod tests {
             &queue_size, &pending_recalls, "test-thread", None, &ratelimit_tx,
             &mut cache, &permission_tx, initial_cr,
             &PathBuf::from("/tmp"), &Arc::new(vec![]),
+            &crate::config::TimestampConfig::default(),
         ).await;
         handler_task.await.unwrap();
 
@@ -1479,11 +1496,13 @@ mod tests {
         // Run wait_for_permissions with a 301s advance — exceeds 300s timeout
         let project_path = PathBuf::from("/tmp");
         let additional_dirs: Arc<Vec<PathBuf>> = Arc::new(vec![]);
+        let ts_cfg = crate::config::TimestampConfig::default();
         let wait_fut = wait_for_permissions(
             &mut stdin_write, &mut reader, &mut line, &mut queue_rx, &mut interrupt_rx,
             &queue_size, &pending_recalls, "test-thread", None, &ratelimit_tx,
             &mut cache, &permission_tx, initial_cr,
             &project_path, &additional_dirs,
+            &ts_cfg,
         );
 
         let (result, _) = tokio::join!(wait_fut, async {
@@ -1540,6 +1559,7 @@ mod tests {
             &queue_size, &pending_recalls, "test-thread", None, &ratelimit_tx,
             &mut cache, &permission_tx, initial_cr,
             &PathBuf::from("/tmp"), &Arc::new(vec![]),
+            &crate::config::TimestampConfig::default(),
         ).await;
 
         handler_task.await.unwrap();
@@ -1602,12 +1622,14 @@ mod tests {
             drop(reqs);
         };
 
+        let ts_cfg = crate::config::TimestampConfig::default();
         let (result, ()) = tokio::join!(
             wait_for_permissions(
                 &mut stdin_write, &mut reader, &mut line, &mut queue_rx, &mut interrupt_rx,
                 &queue_size, &pending_recalls, "test-thread", None, &ratelimit_tx,
                 &mut cache, &permission_tx, initial_cr,
                 &project_path, &additional_dirs,
+                &ts_cfg,
             ),
             handler_fut,
         );

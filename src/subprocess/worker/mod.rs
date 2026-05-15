@@ -5,11 +5,13 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Mutex as StdMutex;
 use std::time::Instant;
 
+
 use poise::serenity_prelude::{ChannelId, Context, MessageId, UserId};
 use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::process::{ChildStdin, ChildStdout};
 use tokio::sync::{Mutex, mpsc};
 
+use crate::config::TimestampConfig;
 use crate::handler::session_state::SessionState;
 use crate::i18n::Lang;
 use crate::ratelimit::RateLimitInfo;
@@ -63,6 +65,7 @@ pub(super) struct SessionWorker {
     timeout_secs: u64,
     lang: Lang,
     show_context_percent: bool,
+    timestamp_config: TimestampConfig,
     // Permission path context
     pub(super) project_path: PathBuf,
     pub(super) additional_dirs: Arc<Vec<PathBuf>>,
@@ -89,6 +92,7 @@ impl SessionWorker {
         lang: Lang,
         owner_id: u64,
         show_context_percent: bool,
+        timestamp_config: TimestampConfig,
         pending_recalls: Arc<tokio::sync::Mutex<HashMap<MessageId, (String, Arc<AtomicBool>)>>>,
         ratelimit_tx: tokio::sync::watch::Sender<RateLimitInfo>,
         session_states: Arc<Mutex<HashMap<String, SessionState>>>,
@@ -120,6 +124,7 @@ impl SessionWorker {
             timeout_secs,
             lang,
             show_context_percent,
+            timestamp_config,
             project_path,
             additional_dirs,
         }
@@ -151,6 +156,7 @@ impl SessionWorker {
             timeout_secs,
             lang,
             show_context_percent,
+            ref timestamp_config,
             ref project_path,
             ref additional_dirs,
             ..
@@ -183,6 +189,7 @@ impl SessionWorker {
                 &mut model_name,
                 project_path,
                 additional_dirs,
+                timestamp_config,
             ).await;
 
             match action {
@@ -202,7 +209,8 @@ impl SessionWorker {
                     // 현재 turn 의 triggered_by 업데이트
                     *current_triggered_by = msg.triggered_by;
 
-                    let json_line = build_user_message_json(&msg.content, &msg.downloaded_files, msg.reply_context.as_ref(), msg.sender_info.as_ref());
+                    let now = chrono::Utc::now();
+                    let json_line = build_user_message_json(&msg.content, &msg.downloaded_files, msg.reply_context.as_ref(), msg.sender_info.as_ref(), timestamp_config, now);
                     if let Err(e) = stdin.write_all(json_line.as_bytes()).await {
                         tracing::error!("stdin write error for thread {}: {}", thread_id, e);
                         break;
@@ -245,6 +253,7 @@ impl SessionWorker {
                         &mut model_name,
                         project_path,
                         additional_dirs,
+                        timestamp_config,
                     ).await;
 
                     // 'turn loop 종료 후 항상 리셋 (정상/비정상 모든 break 경로 커버)

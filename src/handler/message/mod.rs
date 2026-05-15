@@ -5,6 +5,7 @@ pub(crate) mod interaction_kind;
 
 pub use event_processor::process_turn_events;
 pub(crate) use helpers::format_cli_command;
+pub(crate) use helpers::format_timestamp_label;
 pub(crate) use helpers::shorten_model_name;
 pub(crate) use helpers::format_ctx_suffix;
 
@@ -312,18 +313,13 @@ async fn handle_message(
                     .or_default()
                     .turn_participants
                     .insert(new_message.author.id);
-                let _ = channel_id
-                    .create_reaction(
-                        ctx,
-                        msg_id,
-                        poise::serenity_prelude::ReactionType::Unicode("📨".to_string()),
-                    )
-                    .await;
+                emoji::add_reaction(ctx, channel_id, msg_id, ReactionStatus::InjectQueued).await.ok();
             }
             Err(e) if e.to_string().contains("queue full") => {
                 for path in &mid_turn_downloaded_files {
                     let _ = tokio::fs::remove_file(path).await;
                 }
+                emoji::add_reaction(ctx, channel_id, msg_id, ReactionStatus::QueueFull).await.ok();
                 channel_id
                     .say(ctx, format!("❌ {}", lang.queue_full()))
                     .await
@@ -334,6 +330,7 @@ async fn handle_message(
                 for path in &mid_turn_downloaded_files {
                     let _ = tokio::fs::remove_file(path).await;
                 }
+                emoji::add_reaction(ctx, channel_id, msg_id, ReactionStatus::Error).await.ok();
                 channel_id
                     .say(ctx, format!("❌ {}", lang.error_with(&e)))
                     .await

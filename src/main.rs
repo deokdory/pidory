@@ -286,6 +286,7 @@ async fn main() -> Result<(), PidoryError> {
                 let sessions = Arc::new(SessionManager::new(
                     Arc::new(config.claude.clone()),
                     config.footer.clone(),
+                    config.timestamp.clone(),
                     config.claude.max_sessions,
                     ratelimit_tx.clone(),
                     session_count_tx.clone(),

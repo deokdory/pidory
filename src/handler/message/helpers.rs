@@ -1,7 +1,46 @@
+use std::collections::HashSet;
+use std::sync::{LazyLock, Mutex};
+
+use chrono::TimeZone;
 use poise::serenity_prelude::Message;
 
 use crate::i18n::Lang;
 use crate::subprocess::session_manager::{SenderInfo, sanitize_sender_text};
+
+static WARNED_TZ: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
+
+/// UTC datetime를 지정 IANA 타임존(또는 Local)으로 변환해 "%Y-%m-%d %H:%M %Z" 형식 반환.
+///
+/// - `tz_override` 가 Some(name) 이면 `chrono_tz::Tz::from_str(name)` 으로 파싱.
+///   실패 시 `tracing::warn!` + Local 폴백.
+/// - `tz_override` 가 None 이면 Local 폴백.
+/// - `now` 는 반드시 인자로 받아야 한다 (테스트 결정성 보장).
+pub(crate) fn format_timestamp_label(now: chrono::DateTime<chrono::Utc>, tz_override: Option<&str>) -> String {
+    use std::str::FromStr;
+    match tz_override {
+        Some(name) => {
+            match chrono_tz::Tz::from_str(name) {
+                Ok(tz) => {
+                    let local = tz.from_utc_datetime(&now.naive_utc());
+                    local.format("%Y-%m-%d %H:%M %Z").to_string()
+                }
+                Err(_) => {
+                    {
+                        let mut warned = WARNED_TZ.lock().unwrap_or_else(|p| p.into_inner());
+                        if warned.insert(name.to_string()) {
+                            tracing::warn!("format_timestamp_label: unknown IANA tz {:?}, falling back to Local", name);
+                        }
+                    }
+                    now.with_timezone(&chrono::Local).format("%Y-%m-%d %H:%M %Z").to_string()
+                }
+            }
+        }
+        None => {
+            let local = now.with_timezone(&chrono::Local);
+            local.format("%Y-%m-%d %H:%M %Z").to_string()
+        }
+    }
+}
 
 fn escape_xml(s: &str) -> String {
     s.replace('&', "&amp;")
@@ -340,4 +379,45 @@ mod tests {
     }
 
     // --- sanitize 함수 자체 테스트는 subprocess::session_manager::sanitize_tests 모듈 참조 ---
+
+    // ── W1-A: format_timestamp_label 3 case ─────────────────────────────────
+
+    fn fixed_utc() -> chrono::DateTime<chrono::Utc> {
+        use chrono::TimeZone;
+        chrono::Utc.with_ymd_and_hms(2026, 5, 14, 12, 0, 0).unwrap()
+    }
+
+    #[test]
+    fn format_timestamp_label_valid_iana_asia_seoul() {
+        // Asia/Seoul = UTC+9, 2026-05-14 12:00 UTC → 2026-05-14 21:00 KST
+        let result = format_timestamp_label(fixed_utc(), Some("Asia/Seoul"));
+        assert!(result.starts_with("2026-05-14 21:00"), "must have Seoul-local time");
+        assert!(result.contains("KST"), "must include KST timezone abbreviation");
+    }
+
+    #[test]
+    fn format_timestamp_label_invalid_iana_falls_back_to_local() {
+        // 잘못된 tz → warn + Local fallback. 패닉 없음 + 결과는 비어있지 않음.
+        let result = format_timestamp_label(fixed_utc(), Some("Invalid/Tz"));
+        // 형식 검증: "%Y-%m-%d %H:%M %Z" — 반드시 날짜 패턴 포함
+        assert!(!result.is_empty(), "fallback must produce non-empty string");
+        assert!(result.contains("2026-05-14"), "fallback must contain the date");
+    }
+
+    #[test]
+    fn format_timestamp_label_invalid_iana_warns_once() {
+        // 같은 invalid name으로 2회 호출 → 결과 동일, panic 없음
+        let r1 = format_timestamp_label(fixed_utc(), Some("Invalid/Once"));
+        let r2 = format_timestamp_label(fixed_utc(), Some("Invalid/Once"));
+        assert!(!r1.is_empty());
+        assert_eq!(r1, r2);
+    }
+
+    #[test]
+    fn format_timestamp_label_none_tz_uses_local() {
+        // tz_override=None → Local 폴백. 패닉 없음 + 결과는 비어있지 않음.
+        let result = format_timestamp_label(fixed_utc(), None);
+        assert!(!result.is_empty(), "Local fallback must produce non-empty string");
+        assert!(result.contains("2026-05-14"), "must contain the date");
+    }
 }
