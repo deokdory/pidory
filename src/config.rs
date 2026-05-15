@@ -50,6 +50,8 @@ pub struct Config {
     pub footer: FooterConfig,
     #[serde(default)]
     pub timestamp: TimestampConfig,
+    #[serde(default)]
+    pub permission: PermissionConfig,
 }
 
 #[derive(Debug, Deserialize)]
@@ -183,6 +185,24 @@ fn default_release_check_interval_secs() -> u64 {
 
 fn default_release_last_tag_file() -> String {
     "/tmp/pidory-last-release.txt".to_string()
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct PermissionConfig {
+    #[serde(default = "default_permission_response_timeout")]
+    pub response_timeout_secs: u64,
+}
+
+impl Default for PermissionConfig {
+    fn default() -> Self {
+        Self {
+            response_timeout_secs: default_permission_response_timeout(),
+        }
+    }
+}
+
+fn default_permission_response_timeout() -> u64 {
+    300
 }
 
 #[derive(Debug, Deserialize)]
@@ -898,6 +918,24 @@ path = "/opt/legacy/pidory.db"
         let config: Config = toml::from_str(toml_str).unwrap();
         let resolved = config.resolve_backup_dir();
         assert_eq!(resolved.to_str().unwrap(), "/opt/legacy");
+    }
+
+    /// config_default_300:
+    /// [permission] 섹션 없이 파싱 시 response_timeout_secs 기본값이 300.
+    #[test]
+    fn config_default_300() {
+        let toml_str = r#"
+[discord]
+guild_id = 123
+owner_id = 456
+
+[claude]
+binary_path = "claude"
+
+[response]
+"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.permission.response_timeout_secs, 300);
     }
 
     #[test]

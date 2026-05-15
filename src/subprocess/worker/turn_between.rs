@@ -57,6 +57,7 @@ pub(super) async fn handle_between_turns_event(
     project_path: &Path,
     additional_dirs: &Arc<Vec<PathBuf>>,
     timestamp_config: &TimestampConfig,
+    permission_response_timeout_secs: u64,
 ) -> BetweenTurnsAction {
     line.clear();
     tokio::select! {
@@ -129,6 +130,7 @@ pub(super) async fn handle_between_turns_event(
                                 project_path,
                                 additional_dirs,
                                 timestamp_config,
+                                permission_response_timeout_secs,
                             ).await;
 
                             BetweenTurnsAction::Continue
@@ -151,6 +153,7 @@ pub(super) async fn handle_between_turns_event(
                                 project_path,
                                 additional_dirs,
                                 timestamp_config,
+                                permission_response_timeout_secs,
                             ).await;
                             match result {
                                 PermissionsWaitResult::AllResolved { .. } => BetweenTurnsAction::Continue,

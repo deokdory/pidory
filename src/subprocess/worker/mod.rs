@@ -66,6 +66,7 @@ pub(super) struct SessionWorker {
     lang: Lang,
     show_context_percent: bool,
     timestamp_config: TimestampConfig,
+    permission_response_timeout_secs: u64,
     // Permission path context
     pub(super) project_path: PathBuf,
     pub(super) additional_dirs: Arc<Vec<PathBuf>>,
@@ -93,6 +94,7 @@ impl SessionWorker {
         owner_id: u64,
         show_context_percent: bool,
         timestamp_config: TimestampConfig,
+        permission_response_timeout_secs: u64,
         pending_recalls: Arc<tokio::sync::Mutex<HashMap<MessageId, (String, Arc<AtomicBool>)>>>,
         ratelimit_tx: tokio::sync::watch::Sender<RateLimitInfo>,
         session_states: Arc<Mutex<HashMap<String, SessionState>>>,
@@ -125,6 +127,7 @@ impl SessionWorker {
             lang,
             show_context_percent,
             timestamp_config,
+            permission_response_timeout_secs,
             project_path,
             additional_dirs,
         }
@@ -157,6 +160,7 @@ impl SessionWorker {
             lang,
             show_context_percent,
             ref timestamp_config,
+            permission_response_timeout_secs,
             ref project_path,
             ref additional_dirs,
             ..
@@ -190,6 +194,7 @@ impl SessionWorker {
                 project_path,
                 additional_dirs,
                 timestamp_config,
+                permission_response_timeout_secs,
             ).await;
 
             match action {
@@ -254,6 +259,7 @@ impl SessionWorker {
                         project_path,
                         additional_dirs,
                         timestamp_config,
+                        permission_response_timeout_secs,
                     ).await;
 
                     // 'turn loop 종료 후 항상 리셋 (정상/비정상 모든 break 경로 커버)
