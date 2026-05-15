@@ -744,10 +744,71 @@ async fn handle_allow_always(
             // Claude CLI 가 settings.local.json 을 핫 리로드하지 않으므로
             // 다음 user message 도착 시 subprocess 를 --resume 으로 재시작 예약.
             // Added / AlreadyPresent / ConflictResolved 세 outcome 모두 동일 처리.
-            data.pending_session_restart
-                .lock()
-                .await
-                .insert(thread_id.clone());
+            //
+            // scope 에 따라 영향 받는 모든 active thread 를 일괄 등록.
+            // Project scope → 같은 프로젝트 경로의 active sessions 전체.
+            // Global scope → 모든 active sessions.
+            // DB 쿼리 실패 시 자기 thread 만 fallback 등록 (우아한 degrade).
+            let affected_threads: Vec<String> = match scope {
+                Scope::Project => {
+                    match repository::list_threads_for_project_path(&data.db, &project.path)
+                        .await
+                    {
+                        Ok(ids) => ids,
+                        Err(e) => {
+                            tracing::warn!(
+                                error = %e,
+                                thread_id = %thread_id,
+                                "list_threads_for_project_path failed; fallback to self-only"
+                            );
+                            vec![thread_id.clone()]
+                        }
+                    }
+                }
+                Scope::Global => {
+                    match repository::list_all_active_threads(&data.db).await {
+                        Ok(ids) => ids,
+                        Err(e) => {
+                            tracing::warn!(
+                                error = %e,
+                                thread_id = %thread_id,
+                                "list_all_active_threads failed; fallback to self-only"
+                            );
+                            vec![thread_id.clone()]
+                        }
+                    }
+                }
+            };
+            {
+                let count = affected_threads.len();
+                if matches!(scope, Scope::Global) {
+                    if count >= 10 {
+                        tracing::warn!(
+                            affected = count,
+                            scope = "Global",
+                            "Global scope restart triggered — broad blast radius"
+                        );
+                    } else {
+                        tracing::info!(
+                            affected = count,
+                            scope = "Global",
+                            "Global scope restart triggered"
+                        );
+                    }
+                } else {
+                    tracing::info!(
+                        affected = count,
+                        project = %project.path,
+                        "Project scope restart triggered"
+                    );
+                }
+            }
+            {
+                let mut pending_restart = data.pending_session_restart.lock().await;
+                for tid in &affected_threads {
+                    pending_restart.insert(tid.clone());
+                }
+            }
 
             // c1 fix (확장): RuleKind::Tool 은 tool_name 완전 일치 dismiss (rule_str=None).
             // Exact/Prefix/Domain 은 각 rule 로 매칭되는 pending 도 dismiss (rule_str=Some(rule)).
