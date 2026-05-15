@@ -314,16 +314,8 @@ pub async fn download_attachments(
         }
 
         let sanitized = sanitize_filename(&filename);
-        let (dest_path, dest_file) =
-            match resolve_and_open(&canonical_dir, message_id, &sanitized).await {
-                Ok(pair) => pair,
-                Err(e) => {
-                    errors.push(DownloadError::IoError { filename, source: e });
-                    continue;
-                }
-            };
 
-        // HTTP request
+        // HTTP request first — only claim a slot after success is confirmed.
         let resp = match client.get(&attachment.url).send().await {
             Ok(r) => match r.error_for_status() {
                 Ok(r) => r,
@@ -337,6 +329,16 @@ pub async fn download_attachments(
                 continue;
             }
         };
+
+        // HTTP success confirmed — now atomically claim the slot.
+        let (dest_path, dest_file) =
+            match resolve_and_open(&canonical_dir, message_id, &sanitized).await {
+                Ok(pair) => pair,
+                Err(e) => {
+                    errors.push(DownloadError::IoError { filename, source: e });
+                    continue;
+                }
+            };
 
         // dest_file was opened with create_new(true) in resolve_and_open — no TOCTOU window.
         match write_stream_to_file(resp.bytes_stream(), dest_file, &dest_path, max_file_size).await {
