@@ -4,10 +4,10 @@ use std::sync::{LazyLock, Mutex};
 use chrono::TimeZone;
 use poise::serenity_prelude::Message;
 
-static WARNED_TZ: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
-
 use crate::i18n::Lang;
 use crate::subprocess::session_manager::{SenderInfo, sanitize_sender_text};
+
+static WARNED_TZ: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
 
 /// UTC datetime를 지정 IANA 타임존(또는 Local)으로 변환해 "%Y-%m-%d %H:%M %Z" 형식 반환.
 ///
