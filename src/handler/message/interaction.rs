@@ -278,6 +278,7 @@ async fn handle_permission(
             let pending = data.pending_permissions.lock().await.remove(&request_id);
             if let Some(p) = pending {
                 let tool_name = p.tool_name.clone();
+                let tool_input = p.input.clone().unwrap_or(serde_json::json!({}));
                 let message_id = p.message_id;
                 tracing::info!(request_id = %request_id, action = "once", "permission button clicked");
                 let _ = p.response_tx.send(PermissionDecision::Allow);
@@ -287,6 +288,7 @@ async fn handle_permission(
                     message_id,
                     DisableReason::Once,
                     &tool_name,
+                    &tool_input,
                     lang,
                 )
                 .await;
@@ -297,6 +299,7 @@ async fn handle_permission(
             let pending = data.pending_permissions.lock().await.remove(&request_id);
             if let Some(p) = pending {
                 let tool_name = p.tool_name.clone();
+                let tool_input = p.input.clone().unwrap_or(serde_json::json!({}));
                 let message_id = p.message_id;
                 tracing::info!(request_id = %request_id, action = "deny", "permission button clicked");
                 let _ = p.response_tx.send(PermissionDecision::Deny);
@@ -306,6 +309,7 @@ async fn handle_permission(
                     message_id,
                     DisableReason::Deny,
                     &tool_name,
+                    &tool_input,
                     lang,
                 )
                 .await;
@@ -497,13 +501,14 @@ async fn handle_allow_always(
         message_id: poise::serenity_prelude::MessageId,
         response_tx: tokio::sync::oneshot::Sender<PermissionDecision>,
         tool_name: &str,
+        tool_input: &serde_json::Value,
         reason: DisableReason,
         lang: Lang,
         log_reason: &str,
     ) {
         tracing::warn!(tool_name = %tool_name, reason = log_reason, "AllowAlways failed; sending Deny");
         let _ = response_tx.send(PermissionDecision::Deny);
-        let _ = disable_permission_buttons(ctx, channel_id, message_id, reason, tool_name, lang)
+        let _ = disable_permission_buttons(ctx, channel_id, message_id, reason, tool_name, tool_input, lang)
             .await;
     }
 
@@ -538,6 +543,7 @@ async fn handle_allow_always(
             message_id,
             pending.response_tx,
             &tool_name,
+            &input,
             DisableReason::AllowAlwaysFailed {
                 reason: "rule_kind mismatch".into(),
             },
@@ -565,6 +571,7 @@ async fn handle_allow_always(
                 message_id,
                 pending.response_tx,
                 &tool_name,
+                &input,
                 DisableReason::AllowAlwaysFailed {
                     reason: "session not found".into(),
                 },
@@ -586,6 +593,7 @@ async fn handle_allow_always(
                 message_id,
                 pending.response_tx,
                 &tool_name,
+                &input,
                 DisableReason::AllowAlwaysFailed {
                     reason: format!("DB error: {}", e),
                 },
@@ -605,6 +613,7 @@ async fn handle_allow_always(
                 message_id,
                 pending.response_tx,
                 &tool_name,
+                &input,
                 DisableReason::AllowAlwaysFailed {
                     reason: "project not registered".into(),
                 },
@@ -626,6 +635,7 @@ async fn handle_allow_always(
                 message_id,
                 pending.response_tx,
                 &tool_name,
+                &input,
                 DisableReason::AllowAlwaysFailed {
                     reason: format!("DB error: {}", e),
                 },
@@ -652,6 +662,7 @@ async fn handle_allow_always(
                 message_id,
                 pending.response_tx,
                 &tool_name,
+                &input,
                 DisableReason::AllowAlwaysFailed {
                     reason: "HOME env not set; cannot resolve global settings".into(),
                 },
@@ -733,14 +744,79 @@ async fn handle_allow_always(
             // Claude CLI 가 settings.local.json 을 핫 리로드하지 않으므로
             // 다음 user message 도착 시 subprocess 를 --resume 으로 재시작 예약.
             // Added / AlreadyPresent / ConflictResolved 세 outcome 모두 동일 처리.
-            data.pending_session_restart
-                .lock()
-                .await
-                .insert(thread_id.clone());
+            //
+            // scope 에 따라 영향 받는 모든 active thread 를 일괄 등록.
+            // Project scope → 같은 프로젝트 경로의 active sessions 전체.
+            // Global scope → 모든 active sessions.
+            // DB 쿼리 실패 시 자기 thread 만 fallback 등록 (우아한 degrade).
+            let affected_threads: Vec<String> = match scope {
+                Scope::Project => {
+                    match repository::list_threads_for_project_path(&data.db, &project.path)
+                        .await
+                    {
+                        Ok(ids) => ids,
+                        Err(e) => {
+                            tracing::warn!(
+                                error = %e,
+                                thread_id = %thread_id,
+                                "list_threads_for_project_path failed; fallback to self-only"
+                            );
+                            vec![thread_id.clone()]
+                        }
+                    }
+                }
+                Scope::Global => {
+                    match repository::list_all_active_threads(&data.db).await {
+                        Ok(ids) => ids,
+                        Err(e) => {
+                            tracing::warn!(
+                                error = %e,
+                                thread_id = %thread_id,
+                                "list_all_active_threads failed; fallback to self-only"
+                            );
+                            vec![thread_id.clone()]
+                        }
+                    }
+                }
+            };
+            {
+                let count = affected_threads.len();
+                if matches!(scope, Scope::Global) {
+                    if count >= 10 {
+                        tracing::warn!(
+                            affected = count,
+                            scope = "Global",
+                            "Global scope restart triggered — broad blast radius"
+                        );
+                    } else {
+                        tracing::info!(
+                            affected = count,
+                            scope = "Global",
+                            "Global scope restart triggered"
+                        );
+                    }
+                } else {
+                    tracing::info!(
+                        affected = count,
+                        project = %project.path,
+                        "Project scope restart triggered"
+                    );
+                }
+            }
+            {
+                let mut pending_restart = data.pending_session_restart.lock().await;
+                for tid in &affected_threads {
+                    pending_restart.insert(tid.clone());
+                }
+            }
 
-            // c1 fix: RuleKind::Tool 일 때만 같은 tool 의 다른 pending 자동 dismiss.
-            // Exact/Prefix/Domain 은 더 좁은 매칭이라 다른 명령까지 통과시키면 권한 누출.
-            if matches!(rule_kind, RuleKind::Tool) {
+            // c1 fix (확장): RuleKind::Tool 은 tool_name 완전 일치 dismiss (rule_str=None).
+            // Exact/Prefix/Domain 은 각 rule 로 매칭되는 pending 도 dismiss (rule_str=Some(rule)).
+            let dismiss_rule_str: Option<String> = match rule_kind {
+                RuleKind::Tool => None,
+                _ => rules.first().cloned(),
+            };
+            {
                 let dismissed = dismiss_pending_by_tool(
                     &data.pending_permissions,
                     &thread_id,
@@ -750,10 +826,11 @@ async fn handle_allow_always(
                         scope: scope.clone(),
                     },
                     request_id,
+                    dismiss_rule_str.as_deref(),
                 )
                 .await;
                 // dismiss 된 메시지들도 disable (AutoDismissedByAlwaysChain)
-                // triggering_rule: 첫 번째 rule (Tool 은 단일 rule)
+                // triggering_rule: 첫 번째 rule
                 let triggering_rule = rules.first().cloned().unwrap_or_default();
                 for d in &dismissed {
                     let _ = disable_permission_buttons(
@@ -764,6 +841,7 @@ async fn handle_allow_always(
                             triggering_rule: triggering_rule.clone(),
                         },
                         &tool_name,
+                        &d.input,
                         lang,
                     )
                     .await;
@@ -772,7 +850,7 @@ async fn handle_allow_always(
                         request_id = %d.request_id,
                         tool_name = %tool_name,
                         triggering_rule = %triggering_rule,
-                        "permission auto-dismissed by AllowAlways(Tool) chain"
+                        "permission auto-dismissed by AllowAlways chain"
                     );
                 }
             }
@@ -799,6 +877,7 @@ async fn handle_allow_always(
                 message_id,
                 disable_reason,
                 &tool_name,
+                &input,
                 lang,
             )
             .await;
@@ -842,6 +921,7 @@ async fn handle_allow_always(
                 message_id,
                 disable_reason,
                 &tool_name,
+                &input,
                 lang,
             )
             .await;

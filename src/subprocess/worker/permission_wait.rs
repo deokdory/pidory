@@ -12,7 +12,7 @@ use poise::serenity_prelude::{MessageId, UserId};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 use tokio::sync::{Mutex, mpsc, mpsc::error::TrySendError};
 
-use crate::claude_settings::rule::{RuleKind, Scope};
+use crate::claude_settings::rule::{RuleKind, Scope, build_rule_texts};
 use crate::ratelimit::RateLimitInfo;
 use crate::subprocess::parser::{StreamEvent, build_control_response_allow, build_control_response_deny, build_control_response_ask_answer};
 use crate::subprocess::permission::{PermissionCache, PermissionDecision, PermissionRequest};
@@ -61,7 +61,10 @@ async fn write_permission_response(
             if matches!(rule_kind, RuleKind::Tool) {
                 permission_cache.add_always_allow(&tool_name);
             } else {
-                permission_cache.clear_tool(&tool_name);
+                let rules = build_rule_texts(&tool_name, input, rule_kind.clone());
+                for rule in rules {
+                    permission_cache.add_rule(rule);
+                }
             }
             tracing::info!(request_id = %request_id, behavior = "always_allow", tool_name = %tool_name, rule_kind = ?rule_kind, "control_response written");
             Ok(false)
@@ -168,7 +171,7 @@ where
         let rid = initial_cr.request_id.clone();
         let tool_name = initial_cr.tool_name.clone();
 
-        if permission_cache.is_always_allowed(&tool_name) {
+        if permission_cache.matches(&tool_name, &initial_cr.input) {
             tracing::info!(thread_id = %thread_id, request_id = %rid, tool_name = %tool_name, "cache hit, auto-allow");
             let resp = build_control_response_allow(&rid, &initial_cr.input);
             if let Err(e) = stdin.write_all(resp.as_bytes()).await {
@@ -335,7 +338,7 @@ where
                                 let tname = tool_name.clone();
                                 tracing::info!(thread_id = %thread_id, request_id = %rid, tool_name = %tname, "control_request received");
 
-                                if permission_cache.is_always_allowed(&tname) {
+                                if permission_cache.matches(&tname, input) {
                                     tracing::info!(thread_id = %thread_id, request_id = %rid, tool_name = %tname, "cache hit, auto-allow");
                                     let resp = build_control_response_allow(&rid, input);
                                     if let Err(e) = stdin.write_all(resp.as_bytes()).await {
@@ -468,15 +471,19 @@ where
                             let r = stdin.write_all(resp.as_bytes()).await;
                             if r.is_ok() {
                                 let _ = stdin.flush().await;
-                                // NP12-E: settings.json 이 source of truth. Tool kind 만 turn-local mirror
-                                // (Bash(*) 처럼 input 무관한 매칭 규칙) → 같은 turn 내 같은 tool 재호출 시
-                                // cache hit 으로 auto-allow. Exact/Prefix/Domain 은 input-dependent 이라
-                                // tool name 단위 cache 로 정확히 표현 불가 → clear_tool (기존 동작 유지).
-                                // pending_session_restart 가 다음 user message 시 cache 를 자연 폐기시킴.
+                                // NP12: settings.json 이 source of truth.
+                                // interaction.rs 가 settings 쓰기 성공 시에만 AllowAlways 결정을 송신 → 이
+                                // 분기 진입 자체가 settings 성공을 보장 (mirror 원칙).
+                                // Tool kind: add_always_allow (tool name 단위, input 무관 매칭 — Bash(*) 등).
+                                // Exact/Prefix/Domain: build_rule_texts 로 rule string 재빌드 → add_rule
+                                // (input-dependent 매칭; 같은 turn 내 같은 input 재호출 시 cache hit).
                                 if matches!(rule_kind, RuleKind::Tool) {
                                     permission_cache.add_always_allow(tool_name);
                                 } else {
-                                    permission_cache.clear_tool(tool_name);
+                                    let rules = build_rule_texts(tool_name, input, rule_kind.clone());
+                                    for rule in rules {
+                                        permission_cache.add_rule(rule);
+                                    }
                                 }
                             }
                             tracing::info!(thread_id = %thread_id, request_id = %rid, tool_name = %tool_name, behavior = "always_allow", rule_kind = ?rule_kind, "control_response written");
@@ -599,7 +606,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn write_permission_response_always_allow_invalidates_cache() {
+    async fn write_permission_response_always_allow_exact_adds_rule() {
         let mut stdin = spawn_cat_stdin().await;
         let mut cache = PermissionCache::new();
 
@@ -621,7 +628,10 @@ mod tests {
         )
         .await;
         assert!(!result.unwrap(), "AllowAlways must return Ok(false)");
-        assert!(!cache.is_always_allowed("Bash"), "cache must be invalidated (settings.json is now source of truth)");
+        // T2.4: Exact kind → add_rule (clear_tool 호출 X). allowed_tools 유지 + allowed_rules 추가.
+        assert!(cache.is_always_allowed("Bash"), "allowed_tools must remain (only add_rule called)");
+        // rule 이 추가되어 matches 는 해당 input 에 대해 true
+        assert!(cache.matches("Bash", &serde_json::json!({"command": "echo hi"})), "rule must match the exact input");
     }
 
     #[tokio::test]

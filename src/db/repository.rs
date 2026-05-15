@@ -241,6 +241,33 @@ pub async fn load_default_scope_from_db(pool: &PgPool, owner_id: i64) {
     }
 }
 
+pub async fn list_threads_for_project_path(
+    pool: &PgPool,
+    path: &str,
+) -> Result<Vec<String>, PidoryError> {
+    let rows: Vec<(String,)> = sqlx::query_as(
+        "SELECT s.thread_id FROM sessions s \
+         INNER JOIN projects p ON s.channel_id = p.channel_id \
+         WHERE p.path = $1 AND s.status = 'active'",
+    )
+    .bind(path)
+    .fetch_all(pool)
+    .await
+    .map_err(PidoryError::Db)?;
+
+    Ok(rows.into_iter().map(|(id,)| id).collect())
+}
+
+pub async fn list_all_active_threads(pool: &PgPool) -> Result<Vec<String>, PidoryError> {
+    let rows: Vec<(String,)> =
+        sqlx::query_as("SELECT thread_id FROM sessions WHERE status = 'active'")
+            .fetch_all(pool)
+            .await
+            .map_err(PidoryError::Db)?;
+
+    Ok(rows.into_iter().map(|(id,)| id).collect())
+}
+
 pub async fn reset_running_sessions(pool: &PgPool) -> Result<u64, PidoryError> {
     let result = sqlx::query("UPDATE sessions SET status = 'idle' WHERE status = 'running'")
         .execute(pool)
