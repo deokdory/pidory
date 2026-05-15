@@ -248,7 +248,7 @@ pub async fn list_threads_for_project_path(
     let rows: Vec<(String,)> = sqlx::query_as(
         "SELECT s.thread_id FROM sessions s \
          INNER JOIN projects p ON s.channel_id = p.channel_id \
-         WHERE p.path = $1 AND s.status = 'active'",
+         WHERE p.path = $1 AND s.status IN ('idle', 'running')",
     )
     .bind(path)
     .fetch_all(pool)
@@ -260,7 +260,7 @@ pub async fn list_threads_for_project_path(
 
 pub async fn list_all_active_threads(pool: &PgPool) -> Result<Vec<String>, PidoryError> {
     let rows: Vec<(String,)> =
-        sqlx::query_as("SELECT thread_id FROM sessions WHERE status = 'active'")
+        sqlx::query_as("SELECT thread_id FROM sessions WHERE status IN ('idle', 'running') LIMIT 500")
             .fetch_all(pool)
             .await
             .map_err(PidoryError::Db)?;

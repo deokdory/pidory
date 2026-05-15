@@ -66,10 +66,14 @@ impl PermissionCache {
         self.allowed_tools.insert(tool_name.to_string());
     }
 
-    pub fn add_rule(&mut self, rule_str: String) {
-        if !self.allowed_rules.iter().any(|r| r == &rule_str) {
-            self.allowed_rules.push(rule_str);
+    /// rule_str 을 추가한다. 중복이면 추가하지 않는다.
+    /// 반환: 새로 삽입되면 `true`, 중복이면 `false`.
+    pub fn add_rule(&mut self, rule_str: String) -> bool {
+        if self.allowed_rules.iter().any(|r| r == &rule_str) {
+            return false;
         }
+        self.allowed_rules.push(rule_str);
+        true
     }
 
     pub fn clear(&mut self) {
@@ -214,21 +218,11 @@ mod tests {
 
     #[test]
     fn add_rule_dedup_prevents_duplicate_push() {
-        // 중복 add_rule: 동일 rule 두 번 호출 시 중복 매칭이 아닌 단일 동작 확인
-        // (allowed_rules private — indirect: matches 결과가 한 번이나 두 번 추가 후 동일)
         let mut cache = PermissionCache::new();
-        cache.add_rule("Bash(*)".to_string());
-        cache.add_rule("Bash(*)".to_string());
-
-        // matches 결과로 중복 여부 간접 확인 (두 번 추가해도 여전히 true 하나)
+        assert!(cache.add_rule("Bash(*)".to_string()), "first add returns true");
+        assert!(!cache.add_rule("Bash(*)".to_string()), "duplicate add returns false");
+        // 실제로 하나만 저장되었는지 matches 로 확인
         assert!(cache.matches("Bash", &serde_json::json!({"command": "anything"})));
-
-        // clear 후 다시 확인 — 단일 rule 이 제거되면 false
-        let mut cache2 = PermissionCache::new();
-        cache2.add_rule("Bash(*)".to_string());
-        cache2.add_rule("Bash(*)".to_string());
-        cache2.clear();
-        assert!(!cache2.matches("Bash", &serde_json::json!({"command": "anything"})));
     }
 
     #[test]

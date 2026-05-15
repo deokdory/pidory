@@ -445,8 +445,7 @@ fn is_ip(host: &str) -> bool {
 /// # MCP tools
 /// MCP tools (`mcp__server__tool`) only support the bare Tool kind (no parentheses).
 /// Parenthesized form like `mcp__server__tool(*)` is invalid (returns false).
-#[allow(dead_code)]
-pub(crate) fn rule_matches(rule: &str, tool: &str, input: &serde_json::Value) -> bool {
+pub fn rule_matches(rule: &str, tool: &str, input: &serde_json::Value) -> bool {
     // MCP tool: parenthesized form is invalid; only bare tool name (exact) is valid.
     if tool.starts_with("mcp__") {
         // bare form: rule == tool (exact match, no parens)
@@ -506,16 +505,24 @@ pub(crate) fn rule_matches(rule: &str, tool: &str, input: &serde_json::Value) ->
             return false;
         }
         let cmd = input.get("command").and_then(|v| v.as_str()).unwrap_or("");
-        // Whitespace-boundary prefix match:
-        // cmd must equal prefix OR start with `prefix ` (with a space after)
-        return cmd == prefix || cmd.starts_with(&format!("{} ", prefix));
+        // Compound command: split sub-commands and check if any sub matches the prefix.
+        // Consistent with build_rule_texts which generates per-sub-command rules.
+        let subs = split_bash_subcommands(cmd);
+        return subs.iter().any(|sub| {
+            // Whitespace-boundary prefix match:
+            // sub must equal prefix OR start with `prefix ` (with a space after)
+            sub == prefix || sub.starts_with(&format!("{} ", prefix))
+        });
     }
 
     // Exact kind: strict equality on the relevant input field
     match tool {
         "Bash" => {
             let cmd = input.get("command").and_then(|v| v.as_str()).unwrap_or("");
-            cmd == inner
+            // Compound command: split sub-commands and check if any sub matches exactly.
+            // Consistent with build_rule_texts which generates per-sub-command rules.
+            let subs = split_bash_subcommands(cmd);
+            subs.iter().any(|sub| sub == inner)
         }
         "Read" | "Edit" | "Write" | "MultiEdit" => {
             // Path namespace: rule_tool must equal tool (already checked above)

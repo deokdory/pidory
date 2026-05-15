@@ -865,9 +865,10 @@ pub(crate) struct DismissedEntry {
 /// `pending_permissions` 는 모든 세션이 공유하는 global 맵이므로 반드시 thread_id 로 격리해야 cross-session dismiss 를 막을 수 있다.
 /// AskUserQuestion 은 제외 (sub-request id 패턴 `{rid}__q{idx}` 은 tool_name 이 "AskUserQuestion" 이므로 자연 배제).
 ///
-/// `rule_str`:
-/// - `None` → 기존 Tool kind 동작: `tool_name` + `thread_id` 완전 일치 필터.
-/// - `Some(rule)` → rule 매칭 동작: `thread_id` 일치 + `rule_matches(rule, p.tool_name, &p.input)` 로 판정.
+/// `rule_strs`:
+/// - `&[]` (empty) → 기존 Tool kind 동작: `tool_name` + `thread_id` 완전 일치 필터.
+/// - non-empty → rule 매칭 동작: `thread_id` 일치 + 하나 이상의 rule 이 `rule_matches` 로 판정.
+///   Exact/Prefix/Domain 케이스에서 compound command 등 multi-rule 을 모두 전달한다.
 ///
 /// 반환: 실제로 dismiss 된 entry 들의 메시지 메타정보 (buttons disable 용).
 pub(crate) async fn dismiss_pending_by_tool(
@@ -876,12 +877,13 @@ pub(crate) async fn dismiss_pending_by_tool(
     tool_name: &str,
     decision: PermissionDecision,
     exclude_request_id: &str,
-    rule_str: Option<&str>,
+    rule_strs: &[&str],
 ) -> Vec<DismissedEntry> {
     if tool_name == "AskUserQuestion" {
         return Vec::new();
     }
 
+    let empty_input = serde_json::Value::Object(Default::default());
     let mut map = pending_permissions.lock().await;
     let matched_ids: Vec<String> = map
         .iter()
@@ -889,12 +891,11 @@ pub(crate) async fn dismiss_pending_by_tool(
             if p.thread_id != thread_id || rid.as_str() == exclude_request_id {
                 return false;
             }
-            match rule_str {
-                None => p.tool_name == tool_name,
-                Some(rule) => {
-                    let input = p.input.as_ref().cloned().unwrap_or(serde_json::json!({}));
-                    rule_matches(rule, &p.tool_name, &input)
-                }
+            if rule_strs.is_empty() {
+                p.tool_name == tool_name
+            } else {
+                let input = p.input.as_ref().unwrap_or(&empty_input);
+                rule_strs.iter().any(|rule| rule_matches(rule, &p.tool_name, input))
             }
         })
         .map(|(rid, _)| rid.clone())
@@ -1213,7 +1214,7 @@ mod tests {
             "WebFetch",
             PermissionDecision::Allow,
             "nonexistent",
-            None,
+            &[],
         )
         .await;
 
@@ -1252,7 +1253,7 @@ mod tests {
             "WebFetch",
             PermissionDecision::Allow,
             "1",
-            None,
+            &[],
         )
         .await;
 
@@ -1290,7 +1291,7 @@ mod tests {
             "AskUserQuestion",
             PermissionDecision::Allow,
             "nonexistent",
-            None,
+            &[],
         )
         .await;
 
@@ -1329,7 +1330,7 @@ mod tests {
                 scope: crate::claude_settings::rule::Scope::Project,
             },
             "nonexistent",
-            None,
+            &[],
         )
         .await;
 
@@ -1367,7 +1368,7 @@ mod tests {
             "WebFetch",
             PermissionDecision::Allow,
             "a1",
-            None,
+            &[],
         )
         .await;
 
@@ -2129,11 +2130,15 @@ mod tests {
     }
 
     /// Skill + skill 이름 없음 + args 있음 → `` ` 135` `` (skill 빈 문자열 + space + args)
+    ///
+    /// edge case: skill 이름 부재 시 args 만 표시. 실제 prod 발생 가능성 낮음
+    /// (Claude CLI 가 skill 호출 시 name 키 항상 포함). 의도된 fallback 동작.
     #[test]
     fn format_skill_summary_no_skill_name_with_args() {
         let input = serde_json::json!({"args": "135"});
         let result = format_tool_input_summary("Skill", &input, Lang::Ko);
         // skill="" → format!("`{} {}`", "", "135") = "` 135`"
+        // leading space 는 의도된 동작 — skill name 부재 시 name 자리가 빈 문자열이 됨.
         assert_eq!(result, "` 135`");
     }
 

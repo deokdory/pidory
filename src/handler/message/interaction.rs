@@ -779,6 +779,12 @@ async fn handle_allow_always(
                     }
                 }
             };
+            let affected_threads = if affected_threads.is_empty() {
+                tracing::warn!(thread_id = %thread_id, "active threads query returned empty; falling back to self-only");
+                vec![thread_id.clone()]
+            } else {
+                affected_threads
+            };
             {
                 let count = affected_threads.len();
                 if matches!(scope, Scope::Global) {
@@ -810,11 +816,11 @@ async fn handle_allow_always(
                 }
             }
 
-            // c1 fix (확장): RuleKind::Tool 은 tool_name 완전 일치 dismiss (rule_str=None).
-            // Exact/Prefix/Domain 은 각 rule 로 매칭되는 pending 도 dismiss (rule_str=Some(rule)).
-            let dismiss_rule_str: Option<String> = match rule_kind {
-                RuleKind::Tool => None,
-                _ => rules.first().cloned(),
+            // RuleKind::Tool → &[] (tool_name 완전 일치 dismiss).
+            // Exact/Prefix/Domain → rules 전체 전달 (compound command 등 multi-rule 모두 dismiss).
+            let dismiss_rule_strs: Vec<&str> = match rule_kind {
+                RuleKind::Tool => Vec::new(),
+                _ => rules.iter().map(|r| r.as_str()).collect(),
             };
             {
                 let dismissed = dismiss_pending_by_tool(
@@ -826,7 +832,7 @@ async fn handle_allow_always(
                         scope: scope.clone(),
                     },
                     request_id,
-                    dismiss_rule_str.as_deref(),
+                    dismiss_rule_strs.as_slice(),
                 )
                 .await;
                 // dismiss 된 메시지들도 disable (AutoDismissedByAlwaysChain)
