@@ -428,6 +428,111 @@ fn is_ip(host: &str) -> bool {
     IpAddr::from_str(host).is_ok()
 }
 
+/// Checks whether a permission rule matches a tool call.
+///
+/// Rule format: `"<ToolName>(<inner>)"` or `"<ToolName>"` (Tool kind — MCP only).
+///
+/// # Supported rule kinds
+/// - **Tool**: `Bash(*)` — matches any input for `Bash` tool. Inner must be `*` or empty.
+/// - **Exact**: `Edit(/abs/foo.rs)`, `Skill(ship)`, `Bash(npm install)` — input key strict equality.
+/// - **Prefix**: `Bash(npm *)` — `input.command` starts with `npm ` (whitespace boundary).
+/// - **Domain**: `WebFetch(domain:example.com)` — host of `input.url` equals `example.com`.
+///
+/// # Path namespace
+/// `Read`/`Write`/`Edit`/`MultiEdit` are separate namespaces;
+/// `Read(/x)` does not match a `Write` tool call.
+///
+/// # MCP tools
+/// MCP tools (`mcp__server__tool`) only support the bare Tool kind (no parentheses).
+/// Parenthesized form like `mcp__server__tool(*)` is invalid (returns false).
+#[allow(dead_code)]
+pub(crate) fn rule_matches(rule: &str, tool: &str, input: &serde_json::Value) -> bool {
+    // MCP tool: parenthesized form is invalid; only bare tool name (exact) is valid.
+    if tool.starts_with("mcp__") {
+        // bare form: rule == tool (exact match, no parens)
+        // parenthesized form: invalid → false
+        return if rule.contains('(') { false } else { rule == tool };
+    }
+
+    // Parse rule into (tool_name, inner) by splitting at first '('
+    let (rule_tool, inner_opt) = match rule.find('(') {
+        Some(pos) => {
+            // Must end with ')'
+            if !rule.ends_with(')') {
+                return false;
+            }
+            let rule_tool = &rule[..pos];
+            let inner = &rule[pos + 1..rule.len() - 1];
+            (rule_tool, Some(inner))
+        }
+        None => {
+            // Bare tool name — only valid for MCP (handled above); invalid for native tools
+            return false;
+        }
+    };
+
+    // Tool name must match
+    if rule_tool != tool {
+        return false;
+    }
+
+    let inner = match inner_opt {
+        Some(i) => i,
+        None => return false,
+    };
+
+    // Tool kind: inner is `*` or empty → matches any input for this tool
+    if inner == "*" || inner.is_empty() {
+        return true;
+    }
+
+    // Domain kind: `WebFetch(domain:<host>)`
+    if tool == "WebFetch" {
+        if let Some(host_pattern) = inner.strip_prefix("domain:") {
+            let url = input.get("url").and_then(|v| v.as_str()).unwrap_or("");
+            return match parse_host(url) {
+                Some(host) => host == host_pattern,
+                None => false,
+            };
+        }
+        // WebFetch with non-domain inner → treat as exact (URL exact, unsupported) → false
+        return false;
+    }
+
+    // Prefix kind: inner ends with ` *` (space + wildcard)
+    if let Some(prefix) = inner.strip_suffix(" *") {
+        // Only Bash supports prefix matching
+        if tool != "Bash" {
+            return false;
+        }
+        let cmd = input.get("command").and_then(|v| v.as_str()).unwrap_or("");
+        // Whitespace-boundary prefix match:
+        // cmd must equal prefix OR start with `prefix ` (with a space after)
+        return cmd == prefix || cmd.starts_with(&format!("{} ", prefix));
+    }
+
+    // Exact kind: strict equality on the relevant input field
+    match tool {
+        "Bash" => {
+            let cmd = input.get("command").and_then(|v| v.as_str()).unwrap_or("");
+            cmd == inner
+        }
+        "Read" | "Edit" | "Write" | "MultiEdit" => {
+            // Path namespace: rule_tool must equal tool (already checked above)
+            let file_path = input.get("file_path").and_then(|v| v.as_str()).unwrap_or("");
+            file_path == inner
+        }
+        "Skill" => {
+            let name = skill_name(input).unwrap_or_default();
+            name == inner
+        }
+        _ => {
+            // Unknown tool: input schema unknown → no exact match
+            false
+        }
+    }
+}
+
 /// Claude Code Skill tool 의 input 에서 skill name 을 추출한다.
 ///
 /// Claude Code Skill tool 의 input field 우선순위:
@@ -905,5 +1010,64 @@ mod tests {
             &[],
         );
         assert_eq!(kinds, vec![]);
+    }
+
+    // rule_matches 직접 호출 테스트 — dead_code 경고 해소 겸 회귀 안전망
+
+    #[test]
+    fn rule_matches_exact_edit_hit() {
+        assert!(rule_matches(
+            "Edit(/tmp/foo.rs)",
+            "Edit",
+            &json!({"file_path": "/tmp/foo.rs"})
+        ));
+    }
+
+    #[test]
+    fn rule_matches_exact_edit_miss() {
+        assert!(!rule_matches(
+            "Edit(/tmp/foo.rs)",
+            "Edit",
+            &json!({"file_path": "/tmp/bar.rs"})
+        ));
+    }
+
+    #[test]
+    fn rule_matches_prefix_bash_hits() {
+        assert!(rule_matches("Bash(npm *)", "Bash", &json!({"command": "npm test"})));
+        assert!(rule_matches("Bash(npm *)", "Bash", &json!({"command": "npm install"})));
+    }
+
+    #[test]
+    fn rule_matches_prefix_bash_misses() {
+        assert!(!rule_matches("Bash(npm *)", "Bash", &json!({"command": "npx test"})));
+        assert!(!rule_matches("Bash(npm *)", "Bash", &json!({"command": "npmtest"})));
+    }
+
+    #[test]
+    fn rule_matches_domain_webfetch() {
+        assert!(rule_matches(
+            "WebFetch(domain:example.com)",
+            "WebFetch",
+            &json!({"url": "https://example.com/page"})
+        ));
+        assert!(!rule_matches(
+            "WebFetch(domain:example.com)",
+            "WebFetch",
+            &json!({"url": "https://evil.com/page"})
+        ));
+    }
+
+    #[test]
+    fn rule_matches_path_namespace_isolation() {
+        // Read rule 은 Write 호출에 매칭 X
+        assert!(rule_matches("Read(/x)", "Read", &json!({"file_path": "/x"})));
+        assert!(!rule_matches("Read(/x)", "Write", &json!({"file_path": "/x"})));
+    }
+
+    #[test]
+    fn rule_matches_mcp_bare_hit_parens_miss() {
+        assert!(rule_matches("mcp__pidory__skill", "mcp__pidory__skill", &json!({})));
+        assert!(!rule_matches("mcp__pidory__skill(*)", "mcp__pidory__skill", &json!({})));
     }
 }

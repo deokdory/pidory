@@ -749,9 +749,13 @@ async fn handle_allow_always(
                 .await
                 .insert(thread_id.clone());
 
-            // c1 fix: RuleKind::Tool 일 때만 같은 tool 의 다른 pending 자동 dismiss.
-            // Exact/Prefix/Domain 은 더 좁은 매칭이라 다른 명령까지 통과시키면 권한 누출.
-            if matches!(rule_kind, RuleKind::Tool) {
+            // c1 fix (확장): RuleKind::Tool 은 tool_name 완전 일치 dismiss (rule_str=None).
+            // Exact/Prefix/Domain 은 각 rule 로 매칭되는 pending 도 dismiss (rule_str=Some(rule)).
+            let dismiss_rule_str: Option<String> = match rule_kind {
+                RuleKind::Tool => None,
+                _ => rules.first().cloned(),
+            };
+            {
                 let dismissed = dismiss_pending_by_tool(
                     &data.pending_permissions,
                     &thread_id,
@@ -761,10 +765,11 @@ async fn handle_allow_always(
                         scope: scope.clone(),
                     },
                     request_id,
+                    dismiss_rule_str.as_deref(),
                 )
                 .await;
                 // dismiss 된 메시지들도 disable (AutoDismissedByAlwaysChain)
-                // triggering_rule: 첫 번째 rule (Tool 은 단일 rule)
+                // triggering_rule: 첫 번째 rule
                 let triggering_rule = rules.first().cloned().unwrap_or_default();
                 for d in &dismissed {
                     let _ = disable_permission_buttons(
@@ -784,7 +789,7 @@ async fn handle_allow_always(
                         request_id = %d.request_id,
                         tool_name = %tool_name,
                         triggering_rule = %triggering_rule,
-                        "permission auto-dismissed by AllowAlways(Tool) chain"
+                        "permission auto-dismissed by AllowAlways chain"
                     );
                 }
             }

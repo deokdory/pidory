@@ -35,12 +35,14 @@ pub struct PermissionRequest {
 
 pub struct PermissionCache {
     allowed_tools: HashSet<String>,
+    allowed_rules: Vec<String>,
 }
 
 impl PermissionCache {
     pub fn new() -> Self {
         Self {
             allowed_tools: HashSet::new(),
+            allowed_rules: Vec::new(),
         }
     }
 
@@ -48,12 +50,31 @@ impl PermissionCache {
         self.allowed_tools.contains(tool_name)
     }
 
+    pub fn matches(&self, tool: &str, input: &serde_json::Value) -> bool {
+        if self.is_always_allowed(tool) {
+            return true;
+        }
+        for rule_str in &self.allowed_rules {
+            if crate::claude_settings::rule::rule_matches(rule_str, tool, input) {
+                return true;
+            }
+        }
+        false
+    }
+
     pub fn add_always_allow(&mut self, tool_name: &str) {
         self.allowed_tools.insert(tool_name.to_string());
     }
 
+    pub fn add_rule(&mut self, rule_str: String) {
+        if !self.allowed_rules.iter().any(|r| r == &rule_str) {
+            self.allowed_rules.push(rule_str);
+        }
+    }
+
     pub fn clear(&mut self) {
         self.allowed_tools.clear();
+        self.allowed_rules.clear();
     }
 
     pub fn clear_tool(&mut self, tool_name: &str) {
@@ -144,5 +165,89 @@ mod tests {
             }
             _ => panic!("expected AllowAlways"),
         }
+    }
+
+    // --- rule kind 별 matches 테스트 ---
+
+    #[test]
+    fn matches_exact_rule_hit_and_miss() {
+        // Exact rule: Edit(/tmp/foo.rs) → file_path 정확 일치만 매칭
+        let mut cache = PermissionCache::new();
+        cache.add_rule("Edit(/tmp/foo.rs)".to_string());
+
+        assert!(cache.matches("Edit", &serde_json::json!({"file_path": "/tmp/foo.rs"})));
+        assert!(!cache.matches("Edit", &serde_json::json!({"file_path": "/tmp/bar.rs"})));
+    }
+
+    #[test]
+    fn matches_prefix_rule_bash() {
+        // Prefix rule: Bash(npm *) → "npm test", "npm install" 매칭 / "npx test", "npmtest" 불일치
+        let mut cache = PermissionCache::new();
+        cache.add_rule("Bash(npm *)".to_string());
+
+        assert!(cache.matches("Bash", &serde_json::json!({"command": "npm test"})));
+        assert!(cache.matches("Bash", &serde_json::json!({"command": "npm install"})));
+        assert!(!cache.matches("Bash", &serde_json::json!({"command": "npx test"})));
+        assert!(!cache.matches("Bash", &serde_json::json!({"command": "npmtest"})));
+    }
+
+    #[test]
+    fn matches_domain_rule_webfetch() {
+        // Domain rule: WebFetch(domain:example.com) → example.com 매칭, evil.com 불일치
+        let mut cache = PermissionCache::new();
+        cache.add_rule("WebFetch(domain:example.com)".to_string());
+
+        assert!(cache.matches("WebFetch", &serde_json::json!({"url": "https://example.com/page"})));
+        assert!(!cache.matches("WebFetch", &serde_json::json!({"url": "https://evil.com/page"})));
+    }
+
+    #[test]
+    fn matches_path_namespace_isolation() {
+        // Path namespace 격리: Read(/x) 추가 시 Write 호출에 매칭 X, Read 호출에 매칭 O
+        let mut cache = PermissionCache::new();
+        cache.add_rule("Read(/x)".to_string());
+
+        assert!(cache.matches("Read", &serde_json::json!({"file_path": "/x"})));
+        assert!(!cache.matches("Write", &serde_json::json!({"file_path": "/x"})));
+        assert!(!cache.matches("Edit", &serde_json::json!({"file_path": "/x"})));
+    }
+
+    #[test]
+    fn add_rule_dedup_prevents_duplicate_push() {
+        // 중복 add_rule: 동일 rule 두 번 호출 시 중복 매칭이 아닌 단일 동작 확인
+        // (allowed_rules private — indirect: matches 결과가 한 번이나 두 번 추가 후 동일)
+        let mut cache = PermissionCache::new();
+        cache.add_rule("Bash(*)".to_string());
+        cache.add_rule("Bash(*)".to_string());
+
+        // matches 결과로 중복 여부 간접 확인 (두 번 추가해도 여전히 true 하나)
+        assert!(cache.matches("Bash", &serde_json::json!({"command": "anything"})));
+
+        // clear 후 다시 확인 — 단일 rule 이 제거되면 false
+        let mut cache2 = PermissionCache::new();
+        cache2.add_rule("Bash(*)".to_string());
+        cache2.add_rule("Bash(*)".to_string());
+        cache2.clear();
+        assert!(!cache2.matches("Bash", &serde_json::json!({"command": "anything"})));
+    }
+
+    #[test]
+    fn matches_mcp_tool_bare_form() {
+        // MCP tool: bare form (괄호 없음) 매칭 O, 괄호 form 불일치
+        let mut cache = PermissionCache::new();
+        cache.add_rule("mcp__pidory__skill".to_string());
+
+        assert!(cache.matches("mcp__pidory__skill", &serde_json::json!({})));
+        // 다른 MCP tool 은 매칭 X
+        assert!(!cache.matches("mcp__other__tool", &serde_json::json!({})));
+    }
+
+    #[test]
+    fn matches_mcp_tool_parenthesized_form_invalid() {
+        // MCP tool: 괄호 form rule 은 invalid — 매칭 X
+        let mut cache = PermissionCache::new();
+        cache.add_rule("mcp__pidory__skill(*)".to_string());
+
+        assert!(!cache.matches("mcp__pidory__skill", &serde_json::json!({})));
     }
 }

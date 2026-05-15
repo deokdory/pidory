@@ -12,7 +12,7 @@ use tracing::warn;
 
 use crate::claude_settings::danger::classify_command;
 use crate::claude_settings::rule::{
-    RuleKind, Scope, available_rule_kinds, build_rule_texts, default_scope,
+    RuleKind, Scope, available_rule_kinds, build_rule_texts, default_scope, rule_matches,
 };
 use crate::error::PidoryError;
 use crate::handler::formatter::inline_code;
@@ -864,6 +864,11 @@ pub(crate) struct DismissedEntry {
 /// `thread_id` + `tool_name` 이 모두 일치하는 대기 permission 을 HashMap 에서 remove + response_tx 로 decision 전송.
 /// `pending_permissions` 는 모든 세션이 공유하는 global 맵이므로 반드시 thread_id 로 격리해야 cross-session dismiss 를 막을 수 있다.
 /// AskUserQuestion 은 제외 (sub-request id 패턴 `{rid}__q{idx}` 은 tool_name 이 "AskUserQuestion" 이므로 자연 배제).
+///
+/// `rule_str`:
+/// - `None` → 기존 Tool kind 동작: `tool_name` + `thread_id` 완전 일치 필터.
+/// - `Some(rule)` → rule 매칭 동작: `thread_id` 일치 + `rule_matches(rule, p.tool_name, &p.input)` 로 판정.
+///
 /// 반환: 실제로 dismiss 된 entry 들의 메시지 메타정보 (buttons disable 용).
 pub(crate) async fn dismiss_pending_by_tool(
     pending_permissions: &Arc<Mutex<HashMap<String, crate::PendingPermission>>>,
@@ -871,6 +876,7 @@ pub(crate) async fn dismiss_pending_by_tool(
     tool_name: &str,
     decision: PermissionDecision,
     exclude_request_id: &str,
+    rule_str: Option<&str>,
 ) -> Vec<DismissedEntry> {
     if tool_name == "AskUserQuestion" {
         return Vec::new();
@@ -880,9 +886,16 @@ pub(crate) async fn dismiss_pending_by_tool(
     let matched_ids: Vec<String> = map
         .iter()
         .filter(|(rid, p)| {
-            p.tool_name == tool_name
-                && p.thread_id == thread_id
-                && rid.as_str() != exclude_request_id
+            if p.thread_id != thread_id || rid.as_str() == exclude_request_id {
+                return false;
+            }
+            match rule_str {
+                None => p.tool_name == tool_name,
+                Some(rule) => {
+                    let input = p.input.as_ref().cloned().unwrap_or(serde_json::json!({}));
+                    rule_matches(rule, &p.tool_name, &input)
+                }
+            }
         })
         .map(|(rid, _)| rid.clone())
         .collect();
@@ -1200,6 +1213,7 @@ mod tests {
             "WebFetch",
             PermissionDecision::Allow,
             "nonexistent",
+            None,
         )
         .await;
 
@@ -1238,6 +1252,7 @@ mod tests {
             "WebFetch",
             PermissionDecision::Allow,
             "1",
+            None,
         )
         .await;
 
@@ -1275,6 +1290,7 @@ mod tests {
             "AskUserQuestion",
             PermissionDecision::Allow,
             "nonexistent",
+            None,
         )
         .await;
 
@@ -1313,6 +1329,7 @@ mod tests {
                 scope: crate::claude_settings::rule::Scope::Project,
             },
             "nonexistent",
+            None,
         )
         .await;
 
@@ -1350,6 +1367,7 @@ mod tests {
             "WebFetch",
             PermissionDecision::Allow,
             "a1",
+            None,
         )
         .await;
 
