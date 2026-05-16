@@ -50,3 +50,9 @@ max_chunks = 10               # 초과 시 파일 첨부
 
 # [permission]
 # response_timeout_secs = 300   # 권한 응답 타임아웃 (초). 0 = 비활성 (무한 대기) [기본: 300]
+
+# [mention]
+# expose_user_id = true         # @멘션 prefix에 user ID snowflake 포함 여부 (default: true)
+# heuristic_enabled = false     # 그 사람/방금 같은 맥락 추론 멘션. 기본 off — 켜도 plain-text-only, 자동 ping 안 함 (default: false)
+# cache_ttl_secs = 300          # 로스터(멤버 목록) 캐시 TTL (초) (default: 300)
+# korean_match_mode = "suffix_strip"  # 한국어 호칭접미(씨/님/아/야 등) strip 후 매칭 (default: "suffix_strip")

@@ -153,6 +153,7 @@ pub async fn branch(
             data.config.discord.owner_id,
             crate::subprocess::supervisor::SessionCleanupHandles::from_data(data),
             data.config.discord.notification_channel_id.map(poise::serenity_prelude::ChannelId::new),
+            data.config.mention.expose_user_id,
         )
         .await
     {
@@ -323,6 +324,7 @@ pub async fn branch(
             data.config.discord.owner_id,
             crate::subprocess::supervisor::SessionCleanupHandles::from_data(data),
             data.config.discord.notification_channel_id.map(poise::serenity_prelude::ChannelId::new),
+            data.config.mention.expose_user_id,
         )
         .await
     {

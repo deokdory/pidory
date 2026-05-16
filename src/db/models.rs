@@ -1,5 +1,6 @@
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use sqlx::FromRow;
+use sqlx::{types::Json, FromRow};
 
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
 pub struct Project {
@@ -19,4 +20,15 @@ pub struct Session {
     pub created_at: String,
     pub last_active_at: Option<String>,
     pub model: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+pub struct MemberRoster {
+    pub guild_id: i64,
+    pub user_id: i64,
+    pub username: String,
+    pub global_name: Option<String>,
+    pub guild_nickname: Option<String>,
+    pub aliases: Json<Vec<String>>,
+    pub updated_at: DateTime<Utc>,
 }

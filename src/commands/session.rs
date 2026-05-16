@@ -470,6 +470,7 @@ pub async fn kick(
     let session_states = Arc::clone(&data.session_states);
     let dispatch_locks = Arc::clone(&data.dispatch_locks);
     let mention_cache = Arc::clone(&data.mention_cache);
+    let roster_cache = Arc::clone(&data.roster_cache);
     let author_id = ctx.author().id;
     let mut ctx_rx = data.ctx_watch.subscribe();
 
@@ -588,6 +589,7 @@ pub async fn kick(
                         config.footer.show_context_percent,
                         session_states.clone(),
                         mention_cache.clone(),
+                        roster_cache.clone(),
                     )
                     .await;
 

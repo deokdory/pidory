@@ -7,6 +7,7 @@ mod db;
 mod error;
 mod handler;
 mod i18n;
+mod mention;
 mod ratelimit;
 mod release;
 mod subprocess;
@@ -91,6 +92,8 @@ pub struct Data {
     pub pending_session_restart: Arc<Mutex<HashSet<String>>>,
     /// guild 멤버 nick/display/username → user_id 역방향 캐시 (@name mention 파싱용).
     pub mention_cache: Arc<handler::mention::MentionCache>,
+    /// guild member SoT 캐시 — @name resolution 및 roster 증분 갱신용.
+    pub roster_cache: Arc<mention::roster::RosterCache>,
 }
 
 #[tokio::main]
@@ -464,6 +467,11 @@ async fn main() -> Result<(), PidoryError> {
                     });
                 }
 
+                let roster_cache = Arc::new(mention::roster::RosterCache::new(
+                    config.mention.cache_ttl_secs,
+                    config.mention.heuristic_enabled,
+                    config.mention.korean_match_mode.clone(),
+                ));
                 Ok(Data {
                     config,
                     db,
@@ -478,6 +486,7 @@ async fn main() -> Result<(), PidoryError> {
                     ctx_watch: ctx_tx,
                     pending_session_restart: Arc::new(Mutex::new(HashSet::new())),
                     mention_cache: Arc::new(handler::mention::MentionCache::new()),
+                    roster_cache,
                 })
             })
         })

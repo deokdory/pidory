@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -7,6 +7,8 @@ use poise::serenity_prelude::{ChannelId, Context, CreateAllowedMentions, CreateM
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::error;
+
+use crate::mention::roster::{RosterCache, RosterSnapshot};
 
 /// turn_participants를 mention 문자열로 직렬화한다.
 /// lock guard 안에서 `format!`/`Vec` 할당이 누적되지 않도록 UserId만 lock 안에서 추출하고
@@ -122,6 +124,8 @@ pub(super) async fn send_event_to_discord(
     thread_id: &str,
     mention_cache: &crate::handler::mention::MentionCache,
     guild_id: Option<GuildId>,
+    roster_snapshot: Option<&RosterSnapshot>,
+    scope: Option<&HashSet<UserId>>,
 ) {
     match event {
         StreamEvent::Assistant { content, .. } => {
@@ -133,10 +137,10 @@ pub(super) async fn send_event_to_discord(
                             let table_converted = formatter::convert_markdown_tables(&clean_text);
                             let converted = formatter::convert_html_details(&table_converted);
 
-                            // mention 치환 + 화이트리스트 추출
+                            // mention 치환 + 화이트리스트 추출 (roster 경로 우선)
                             let (processed, whitelist) =
                                 crate::handler::mention::parse_and_replace(
-                                    &converted, guild_id, mention_cache, ctx,
+                                    &converted, guild_id, mention_cache, ctx, roster_snapshot, scope,
                                 ).await;
 
                             let am = CreateAllowedMentions::new()
@@ -227,6 +231,7 @@ pub async fn process_turn_events(
     show_context_percent: bool,
     session_states: Arc<tokio::sync::Mutex<HashMap<String, SessionState>>>,
     mention_cache: Arc<crate::handler::mention::MentionCache>,
+    roster_cache: Arc<RosterCache>,
 ) {
     // 0. 이전 턴의 next-step 버튼 비활성화
     if let Some(prev_msg_id) = session_states.lock().await.get_mut(thread_id).and_then(|s| s.next_step_button.take()) {
@@ -254,6 +259,25 @@ pub async fn process_turn_events(
             }
         }
     });
+
+    // 2. turn 단위 roster snapshot + scope 초기화 (member-leave race 방어)
+    // guild_id 는 채널 조회로 확정. DM/실패 시 None.
+    let guild_id_opt: Option<GuildId> = channel_id
+        .to_channel(&ctx.http)
+        .await
+        .ok()
+        .and_then(|ch| ch.guild())
+        .map(|gc| gc.guild_id);
+
+    // snapshot: turn 고정 (반복 호출로 race 유발 금지)
+    let roster_snapshot = if let Some(guild_id) = guild_id_opt {
+        Some(roster_cache.snapshot(guild_id, db).await)
+    } else {
+        None
+    };
+
+    // scope: A∪C 하이브리드 (thread_id = channel_id in Discord thread context)
+    let scope = roster_cache.channel_scope(channel_id, &ctx.http).await;
 
     // 3. 500ms 빠른 완료 감지
     let mut events: Vec<StreamEvent> = Vec::new();
@@ -293,18 +317,14 @@ pub async fn process_turn_events(
     let mut used_tools: Vec<String> = Vec::new();
     let mut used_skills: Vec<String> = Vec::new();
 
-    // guild_id는 streaming path 전에 한 번만 추출
-    let guild_id_opt: Option<GuildId> = channel_id
-        .to_channel(&ctx.http)
-        .await
-        .ok()
-        .and_then(|ch| ch.guild())
-        .map(|gc| gc.guild_id);
+    // roster 참조 (snapshot + scope)
+    let snapshot_ref = roster_snapshot.as_ref();
+    let scope_ref = &scope;
 
     if !fast_complete {
         // 버퍼링된 이벤트 먼저 전송
         for event in &events {
-            send_event_to_discord(ctx, channel_id, event, &mut tool_use_names, &mut used_tools, &mut used_skills, max_chunk_length, lang, &session_states, thread_id, &mention_cache, guild_id_opt).await;
+            send_event_to_discord(ctx, channel_id, event, &mut tool_use_names, &mut used_tools, &mut used_skills, max_chunk_length, lang, &session_states, thread_id, &mention_cache, guild_id_opt, snapshot_ref, Some(scope_ref)).await;
         }
 
         // Progress indicator 초기화
@@ -348,7 +368,7 @@ pub async fn process_turn_events(
                             typing_paused.store(progress.is_active(), Ordering::Relaxed);
 
                             // 기존 이벤트 처리
-                            send_event_to_discord(ctx, channel_id, &stream_event, &mut tool_use_names, &mut used_tools, &mut used_skills, max_chunk_length, lang, &session_states, thread_id, &mention_cache, guild_id_opt).await;
+                            send_event_to_discord(ctx, channel_id, &stream_event, &mut tool_use_names, &mut used_tools, &mut used_skills, max_chunk_length, lang, &session_states, thread_id, &mention_cache, guild_id_opt, snapshot_ref, Some(scope_ref)).await;
 
                             if stream_event.is_result() {
                                 got_result = true;
@@ -576,7 +596,7 @@ pub async fn process_turn_events(
 
         let (response, file_paths) = formatter::format_response(&events, lang);
         let send_ok = if !response.trim().is_empty() {
-            match formatter::send_response(ctx, channel_id, &response, max_chunk_length, max_chunks, lang, &mention_cache)
+            match formatter::send_response(ctx, channel_id, &response, max_chunk_length, max_chunks, lang, &mention_cache, guild_id_opt, snapshot_ref, Some(scope_ref))
                 .await
             {
                 Ok(()) => true,

@@ -807,18 +807,13 @@ pub async fn send_response(
     max_chunks: usize,
     lang: Lang,
     mention_cache: &crate::handler::mention::MentionCache,
+    guild_id: Option<serenity::GuildId>,
+    roster_snapshot: Option<&crate::mention::roster::RosterSnapshot>,
+    scope: Option<&std::collections::HashSet<serenity::UserId>>,
 ) -> Result<(), PidoryError> {
-    // guild_id 추출 (DM이면 None)
-    let guild_id = channel_id
-        .to_channel(&ctx.http)
-        .await
-        .ok()
-        .and_then(|ch| ch.guild())
-        .map(|gc| gc.guild_id);
-
-    // mention 치환 + 화이트리스트 추출
+    // mention 치환 + 화이트리스트 추출 (roster 경로 우선)
     let (processed_text, whitelist) =
-        crate::handler::mention::parse_and_replace(text, guild_id, mention_cache, ctx).await;
+        crate::handler::mention::parse_and_replace(text, guild_id, mention_cache, ctx, roster_snapshot, scope).await;
 
     let chunks = split_message(&processed_text, max_chunk_len);
 

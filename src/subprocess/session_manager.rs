@@ -247,6 +247,7 @@ impl SessionManager {
         owner_id: u64,
         mut cleanup_handles: crate::subprocess::supervisor::SessionCleanupHandles,
         notification_channel: Option<poise::serenity_prelude::ChannelId>,
+        expose_user_id: bool,
     ) -> Result<SessionCreateResult, PidoryError> {
         // pending_recalls는 SessionManager 소유 — 호출자 placeholder를 실제 Arc로 덮어쓴다.
         cleanup_handles.pending_recalls = Arc::clone(&self.pending_recalls);
@@ -297,7 +298,7 @@ impl SessionManager {
             cmd.arg("--disallowedTools").arg(disallowed_tools.join(","));
         }
 
-        let system_context_payload = lang.session_context(thread_id, &channel_id.to_string());
+        let system_context_payload = lang.session_context(thread_id, &channel_id.to_string(), expose_user_id);
         cmd.arg("--append-system-prompt").arg(system_context_payload);
 
         let resolved = crate::claude_settings::resolve_settings(std::path::Path::new(project_path));

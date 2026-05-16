@@ -11,6 +11,41 @@ pub struct FooterConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+pub struct MentionConfig {
+    #[serde(default = "default_mention_expose_user_id")]
+    pub expose_user_id: bool,
+    #[serde(default)]
+    pub heuristic_enabled: bool,
+    #[serde(default = "default_mention_cache_ttl_secs")]
+    pub cache_ttl_secs: u64,
+    #[serde(default = "default_mention_korean_match_mode")]
+    pub korean_match_mode: String,
+}
+
+impl Default for MentionConfig {
+    fn default() -> Self {
+        Self {
+            expose_user_id: default_mention_expose_user_id(),
+            heuristic_enabled: false,
+            cache_ttl_secs: default_mention_cache_ttl_secs(),
+            korean_match_mode: default_mention_korean_match_mode(),
+        }
+    }
+}
+
+fn default_mention_expose_user_id() -> bool {
+    true
+}
+
+fn default_mention_cache_ttl_secs() -> u64 {
+    300
+}
+
+fn default_mention_korean_match_mode() -> String {
+    "suffix_strip".to_string()
+}
+
+#[derive(Debug, Clone, Deserialize)]
 pub struct TimestampConfig {
     #[serde(default = "default_timestamp_enabled")]
     pub enabled: bool,
@@ -52,6 +87,8 @@ pub struct Config {
     pub timestamp: TimestampConfig,
     #[serde(default)]
     pub permission: PermissionConfig,
+    #[serde(default)]
+    pub mention: MentionConfig,
 }
 
 #[derive(Debug, Deserialize)]
