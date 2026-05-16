@@ -23,7 +23,7 @@ use std::time::{Duration, Instant};
 use poise::serenity_prelude::{ChannelId, GuildId, Http, UserId};
 use sqlx::PgPool;
 use tokio::sync::RwLock;
-use tracing::warn;
+use tracing::{debug, warn};
 use unicode_normalization::UnicodeNormalization;
 
 use crate::db::roster as db_roster;
@@ -62,6 +62,27 @@ pub struct RosterSnapshot {
 }
 
 impl RosterSnapshot {
+    /// Returns `true` when the snapshot contains no roster entries.
+    ///
+    /// Used by callers to detect an uninitialized roster and fall back to
+    /// the `MentionCache` path rather than silently skipping all substitutions.
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Test-only constructor: build a snapshot from a list of entries.
+    ///
+    /// Allows unit tests in other modules (`handler::mention`) to construct
+    /// a populated snapshot without going through `RosterCache` + DB.
+    #[cfg(test)]
+    pub(crate) fn for_test(entries: Vec<RosterEntry>, heuristic_enabled: bool, korean_match_mode: &str) -> Self {
+        RosterSnapshot {
+            entries: entries.into_iter().map(|e| (e.user_id, e)).collect(),
+            heuristic_enabled,
+            korean_match_mode: korean_match_mode.to_string(),
+        }
+    }
+
     /// Resolve a raw name string to a UserId, constrained to `scope`.
     ///
     /// Resolution order:
@@ -230,6 +251,25 @@ impl RosterCache {
             .insert(user_id);
     }
 
+    /// Remove a thread's speaker set from the in-memory cache.
+    ///
+    /// Should be called when a session is deleted or a thread is closed to prevent
+    /// unbounded accumulation of speaker sets over long bot uptimes.
+    ///
+    /// # Caller responsibilities
+    ///
+    /// This method only removes the speaker set (scope C). It does **not** touch the
+    /// guild roster cache, because `speakers` stores per-thread data whereas
+    /// `guilds` stores per-guild data and there is no thread→guild mapping here.
+    ///
+    /// **Call sites that should invoke this method:**
+    /// - `commands::session` `/del` handler — when a session is explicitly deleted.
+    /// - `handler::message` thread-delete gateway event — when Discord closes a thread.
+    pub async fn forget_thread(&self, thread_id: ChannelId) {
+        let mut guard = self.speakers.write().await;
+        guard.speakers.remove(&thread_id.get());
+    }
+
     // ── Channel scope (A ∪ C) ─────────────────────────────────────────────
 
     /// Compute the channel scope for a thread: A (thread members) ∪ C (speakers).
@@ -355,8 +395,18 @@ impl RosterCache {
         let mut guard = self.guilds.write().await;
         if let Some(cache) = guard.get_mut(&guild_id) {
             cache.entries.insert(entry.user_id, entry);
+        } else {
+            // Guild cache not yet loaded — skipping in-memory upsert.
+            // The entry will be visible after the next `snapshot()` call triggers
+            // `ensure_loaded`, which reloads from DB (where the caller must have
+            // already persisted the entry via `db::roster::upsert_member`).
+            debug!(
+                guild_id = %guild_id,
+                user_id = %entry.user_id,
+                "upsert_entry: guild cache not loaded — skipping in-memory update; \
+                 entry will appear on next snapshot reload"
+            );
         }
-        // If the cache for this guild isn't loaded yet, we skip (will be loaded lazily).
     }
 
     /// Remove a member from the in-memory cache.
@@ -954,6 +1004,56 @@ mod tests {
         assert_eq!(speakers.len(), 2);
         assert!(speakers.contains(&uid(1)));
         assert!(speakers.contains(&uid(2)));
+    }
+
+    // ── forget_thread ─────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn forget_thread_removes_speakers() {
+        let cache = RosterCache::new(300, false, "suffix_strip".to_string());
+        let thread = ChannelId::new(30);
+        let other_thread = ChannelId::new(31);
+
+        // Record speakers in two threads
+        cache.record_speaker(thread, uid(1)).await;
+        cache.record_speaker(thread, uid(2)).await;
+        cache.record_speaker(other_thread, uid(3)).await;
+
+        // Forget one thread
+        cache.forget_thread(thread).await;
+
+        let guard = cache.speakers.read().await;
+        // The forgotten thread's speakers must be gone
+        assert!(!guard.speakers.contains_key(&30));
+        // The other thread must be unaffected
+        assert!(guard.speakers.contains_key(&31));
+        assert!(guard.speakers.get(&31).unwrap().contains(&uid(3)));
+    }
+
+    #[tokio::test]
+    async fn forget_thread_noop_when_no_speakers() {
+        // forget_thread on a thread with no recorded speakers must not panic
+        let cache = RosterCache::new(300, false, "suffix_strip".to_string());
+        let thread = ChannelId::new(99);
+        cache.forget_thread(thread).await; // should not panic
+        let guard = cache.speakers.read().await;
+        assert!(!guard.speakers.contains_key(&99));
+    }
+
+    #[tokio::test]
+    async fn forget_thread_record_after_forget() {
+        // After forget, re-recording on the same thread should work normally
+        let cache = RosterCache::new(300, false, "suffix_strip".to_string());
+        let thread = ChannelId::new(40);
+        cache.record_speaker(thread, uid(10)).await;
+        cache.forget_thread(thread).await;
+        cache.record_speaker(thread, uid(20)).await;
+
+        let guard = cache.speakers.read().await;
+        let speakers = guard.speakers.get(&40).unwrap();
+        assert!(!speakers.contains(&uid(10)), "old speaker should be gone after forget");
+        assert!(speakers.contains(&uid(20)), "new speaker should be recorded");
+        assert_eq!(speakers.len(), 1);
     }
 
     // ── upsert_entry / remove_entry ───────────────────────────────────────────

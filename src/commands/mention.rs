@@ -1,9 +1,9 @@
 use poise::serenity_prelude as serenity;
+use sqlx::types::Json;
 
-use crate::mention::roster::RosterEntry;
+use crate::mention::roster::{nfc, RosterEntry};
 use crate::{Context, Error};
 use crate::db::models::MemberRoster;
-use crate::db::roster as db_roster;
 
 // ─── Conflict detection ───────────────────────────────────────────────────────
 
@@ -35,37 +35,43 @@ pub(crate) enum AliasConflict {
 /// `self-user` rows are skipped in the cross-user alias check (a) but NOT in the
 /// name-field check (b): if target's own username happens to equal the alias,
 /// that is still rejected to maintain unambiguous name resolution.
+///
+/// All comparisons are performed on NFC-normalized strings to match
+/// `RosterSnapshot::resolve` behavior (which also NFC-normalizes before comparing).
 pub(crate) fn check_alias_conflict(
     all_members: &[MemberRoster],
     target_user_id: i64,
     alias: &str,
 ) -> AliasConflict {
+    // Normalize alias to NFC once — consistent with RosterSnapshot::resolve
+    let alias_nfc = nfc(alias);
+
     // (a) alias registered to a *different* user?
     for member in all_members {
         if member.user_id == target_user_id {
             continue;
         }
-        if member.aliases.0.iter().any(|a| a == alias) {
+        if member.aliases.0.iter().any(|a| nfc(a) == alias_nfc) {
             return AliasConflict::OtherUserAlias { owner_id: member.user_id };
         }
     }
 
     // (b) alias collides with any member's name fields (all members, incl. self)?
     for member in all_members {
-        if member.username == alias {
+        if nfc(&member.username) == alias_nfc {
             return AliasConflict::Username { owner_id: member.user_id };
         }
-        if member.global_name.as_deref() == Some(alias) {
+        if member.global_name.as_deref().map(nfc).as_deref() == Some(alias_nfc.as_str()) {
             return AliasConflict::GlobalName { owner_id: member.user_id };
         }
-        if member.guild_nickname.as_deref() == Some(alias) {
+        if member.guild_nickname.as_deref().map(nfc).as_deref() == Some(alias_nfc.as_str()) {
             return AliasConflict::GuildNickname { owner_id: member.user_id };
         }
     }
 
     // (c) same user already has this alias?
     for member in all_members {
-        if member.user_id == target_user_id && member.aliases.0.iter().any(|a| a == alias) {
+        if member.user_id == target_user_id && member.aliases.0.iter().any(|a| nfc(a) == alias_nfc) {
             return AliasConflict::SelfDuplicate;
         }
     }
@@ -112,8 +118,8 @@ pub async fn add(
     let guild_id_i64 = guild_id.get() as i64;
     let user_id_i64 = user.id.get() as i64;
 
-    // alias 정규화 (앞뒤 공백 제거)
-    let alias = alias.trim().to_string();
+    // alias 정규화: 앞뒤 공백 제거 후 NFC 정규화 (resolver와 동일한 canonical form)
+    let alias = nfc(alias.trim());
 
     if alias.is_empty() {
         ctx.send(
@@ -125,14 +131,43 @@ pub async fn add(
         return Ok(());
     }
 
-    // 기존 멤버 row 조회
-    let existing = db_roster::get_member(&data.db, guild_id_i64, user_id_i64).await?;
+    // ── advisory lock + 검증 + 쓰기를 단일 트랜잭션으로 직렬화 ─────────────────
+    //
+    // pg_advisory_xact_lock(guild_id) 으로 guild 별 alias mutation 을 직렬화한다.
+    // lock 은 트랜잭션 종료 시 자동 해제되므로 별도 unlock 불필요.
+    let mut tx = data.db.begin().await?;
 
-    // 충돌 검사: 같은 guild 내 모든 멤버 목록 가져오기
-    let all_members = db_roster::list_guild_members(&data.db, guild_id_i64).await?;
+    // guild_id 기준 advisory lock 획득 (동일 guild 내 동시 add 직렬화)
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(guild_id_i64)
+        .execute(&mut *tx)
+        .await?;
+
+    // 기존 멤버 row 조회 (tx 안에서)
+    let existing: Option<MemberRoster> = sqlx::query_as::<_, MemberRoster>(
+        "SELECT guild_id, user_id, username, global_name, guild_nickname, aliases, updated_at
+         FROM member_roster
+         WHERE guild_id = $1 AND user_id = $2",
+    )
+    .bind(guild_id_i64)
+    .bind(user_id_i64)
+    .fetch_optional(&mut *tx)
+    .await?;
+
+    // 충돌 검사: 같은 guild 내 모든 멤버 목록 가져오기 (tx 안에서, lock 이후)
+    let all_members: Vec<MemberRoster> = sqlx::query_as::<_, MemberRoster>(
+        "SELECT guild_id, user_id, username, global_name, guild_nickname, aliases, updated_at
+         FROM member_roster
+         WHERE guild_id = $1
+         ORDER BY user_id ASC",
+    )
+    .bind(guild_id_i64)
+    .fetch_all(&mut *tx)
+    .await?;
 
     match check_alias_conflict(&all_members, user_id_i64, &alias) {
         AliasConflict::OtherUserAlias { owner_id } => {
+            tx.rollback().await?;
             ctx.send(
                 poise::CreateReply::default()
                     .content(format!(
@@ -145,6 +180,7 @@ pub async fn add(
             return Ok(());
         }
         AliasConflict::Username { owner_id } => {
+            tx.rollback().await?;
             ctx.send(
                 poise::CreateReply::default()
                     .content(format!(
@@ -157,6 +193,7 @@ pub async fn add(
             return Ok(());
         }
         AliasConflict::GlobalName { owner_id } => {
+            tx.rollback().await?;
             ctx.send(
                 poise::CreateReply::default()
                     .content(format!(
@@ -169,6 +206,7 @@ pub async fn add(
             return Ok(());
         }
         AliasConflict::GuildNickname { owner_id } => {
+            tx.rollback().await?;
             ctx.send(
                 poise::CreateReply::default()
                     .content(format!(
@@ -181,6 +219,7 @@ pub async fn add(
             return Ok(());
         }
         AliasConflict::SelfDuplicate => {
+            tx.rollback().await?;
             ctx.send(
                 poise::CreateReply::default()
                     .content(format!(
@@ -213,19 +252,30 @@ pub async fn add(
         }
     };
 
+    // NFC-canonical alias 저장 (resolve 와 정합)
     aliases.push(alias.clone());
 
-    // DB upsert (기존 값 보존)
-    db_roster::upsert_member(
-        &data.db,
-        guild_id_i64,
-        user_id_i64,
-        &username,
-        global_name.as_deref(),
-        guild_nickname.as_deref(),
-        &aliases,
+    // DB upsert (tx 안에서 직접 실행 — advisory lock 범위 유지)
+    sqlx::query(
+        "INSERT INTO member_roster (guild_id, user_id, username, global_name, guild_nickname, aliases, updated_at)
+         VALUES ($1, $2, $3, $4, $5, $6, NOW())
+         ON CONFLICT (guild_id, user_id) DO UPDATE SET
+             username       = EXCLUDED.username,
+             global_name    = EXCLUDED.global_name,
+             guild_nickname = EXCLUDED.guild_nickname,
+             aliases        = EXCLUDED.aliases,
+             updated_at     = NOW()",
     )
+    .bind(guild_id_i64)
+    .bind(user_id_i64)
+    .bind(&username)
+    .bind(global_name.as_deref())
+    .bind(guild_nickname.as_deref())
+    .bind(Json(&aliases))
+    .execute(&mut *tx)
     .await?;
+
+    tx.commit().await?;
 
     // in-memory cache 갱신
     let new_entry = RosterEntry {
@@ -356,6 +406,56 @@ mod tests {
         ];
         // target IS user 100; "ali" belongs to themselves → must be SelfDuplicate, not OtherUserAlias
         let result = check_alias_conflict(&members, 100, "ali");
+        assert_eq!(result, AliasConflict::SelfDuplicate);
+    }
+
+    // ⑧ NFC 충돌 감지: 분해형(NFD) alias 가 완성형(NFC) alias 와 충돌해야 함
+    #[test]
+    fn conflict_nfc_decomposed_vs_composed_alias() {
+        // "가" NFC (완성형 U+AC00)
+        let composed = "\u{AC00}";
+        // "가" NFD (분해형: ㄱ U+1100 + ㅏ U+1161)
+        let decomposed = "\u{1100}\u{1161}";
+
+        // alice 가 완성형 "가" alias 를 이미 보유
+        let members = vec![
+            make_member(100, "alice", None, None, &[composed]),
+            make_member(200, "bob", None, None, &[]),
+        ];
+        // bob 이 분해형 "가" alias 추가 시도 → NFC 후 동일 → OtherUserAlias
+        let result = check_alias_conflict(&members, 200, decomposed);
+        assert_eq!(result, AliasConflict::OtherUserAlias { owner_id: 100 });
+    }
+
+    // ⑨ NFC 충돌 감지: 분해형 alias 가 완성형 username 과 충돌해야 함
+    #[test]
+    fn conflict_nfc_decomposed_alias_vs_composed_username() {
+        // alice 의 username 이 완성형 "가나"
+        let composed_username = "\u{AC00}\u{B098}"; // "가나"
+        // 분해형 "가나"
+        let decomposed = "\u{1100}\u{1161}\u{1102}\u{1161}"; // NFD of "가나"
+
+        let members = vec![
+            make_member(100, composed_username, None, None, &[]),
+            make_member(200, "bob", None, None, &[]),
+        ];
+        // bob 이 분해형 "가나" alias 추가 시도 → NFC 후 alice username 과 충돌
+        let result = check_alias_conflict(&members, 200, decomposed);
+        assert_eq!(result, AliasConflict::Username { owner_id: 100 });
+    }
+
+    // ⑩ NFC 충돌 감지: SelfDuplicate — 분해형으로 재등록 시도
+    #[test]
+    fn conflict_nfc_self_duplicate_decomposed() {
+        // alice 가 완성형 "나" alias 를 보유
+        let composed = "\u{B098}"; // "나"
+        let decomposed = "\u{1102}\u{1161}"; // NFD of "나"
+
+        let members = vec![
+            make_member(100, "alice", None, None, &[composed]),
+        ];
+        // 분해형으로 동일 alias 재등록 시도 → SelfDuplicate
+        let result = check_alias_conflict(&members, 100, decomposed);
         assert_eq!(result, AliasConflict::SelfDuplicate);
     }
 }

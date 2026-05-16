@@ -1,26 +1,28 @@
-use sqlx::{types::Json, PgPool};
+use sqlx::PgPool;
 
 use super::models::MemberRoster;
 use crate::error::PidoryError;
 
-/// guild member 를 upsert (insert or update) 한다.
-pub async fn upsert_member(
+/// guild member 를 upsert 하되 aliases 컬럼은 건드리지 않는다.
+///
+/// gateway 이벤트(GuildMemberAdd / GuildMemberUpdate) 전용.
+/// INSERT 시에만 aliases 가 DEFAULT `'[]'` 로 초기화되고,
+/// ON CONFLICT DO UPDATE 에서 aliases 는 기존 값을 그대로 유지한다.
+pub async fn upsert_member_preserve_aliases(
     pool: &PgPool,
     guild_id: i64,
     user_id: i64,
     username: &str,
     global_name: Option<&str>,
     guild_nickname: Option<&str>,
-    aliases: &[String],
 ) -> Result<(), PidoryError> {
     sqlx::query(
         "INSERT INTO member_roster (guild_id, user_id, username, global_name, guild_nickname, aliases, updated_at)
-         VALUES ($1, $2, $3, $4, $5, $6, NOW())
+         VALUES ($1, $2, $3, $4, $5, '[]'::jsonb, NOW())
          ON CONFLICT (guild_id, user_id) DO UPDATE SET
              username       = EXCLUDED.username,
              global_name    = EXCLUDED.global_name,
              guild_nickname = EXCLUDED.guild_nickname,
-             aliases        = EXCLUDED.aliases,
              updated_at     = NOW()",
     )
     .bind(guild_id)
@@ -28,7 +30,6 @@ pub async fn upsert_member(
     .bind(username)
     .bind(global_name)
     .bind(guild_nickname)
-    .bind(Json(aliases))
     .execute(pool)
     .await
     .map_err(PidoryError::Db)?;
@@ -103,68 +104,15 @@ mod tests {
         pool
     }
 
-    /// aliases JSONB round-trip: upsert with aliases → get_member → aliases preserved.
-    #[tokio::test]
-    #[ignore = "requires TEST_DATABASE_URL"]
-    async fn alias_jsonb_round_trip() {
-        let pool = setup_db().await;
-
-        let aliases = vec!["jm".to_string(), "재민".to_string()];
-        upsert_member(&pool, 1, 100, "jaemin", Some("JaeMin"), Some("재민닉"), &aliases)
-            .await
-            .unwrap();
-
-        let row = get_member(&pool, 1, 100).await.unwrap().unwrap();
-        assert_eq!(row.username, "jaemin");
-        assert_eq!(row.global_name, Some("JaeMin".to_string()));
-        assert_eq!(row.guild_nickname, Some("재민닉".to_string()));
-        assert_eq!(row.aliases.0, aliases);
-    }
-
-    /// upsert twice → second call updates fields including aliases.
-    #[tokio::test]
-    #[ignore = "requires TEST_DATABASE_URL"]
-    async fn alias_jsonb_upsert_update() {
-        let pool = setup_db().await;
-
-        // initial insert
-        upsert_member(&pool, 1, 200, "alice", None, None, &["ali".to_string()])
-            .await
-            .unwrap();
-
-        // update: new aliases list
-        let new_aliases = vec!["ali".to_string(), "alicia".to_string()];
-        upsert_member(&pool, 1, 200, "alice", None, None, &new_aliases)
-            .await
-            .unwrap();
-
-        let row = get_member(&pool, 1, 200).await.unwrap().unwrap();
-        assert_eq!(row.aliases.0, new_aliases);
-    }
-
-    /// empty aliases round-trip: upsert with [] → get_member → aliases is [].
-    #[tokio::test]
-    #[ignore = "requires TEST_DATABASE_URL"]
-    async fn alias_jsonb_empty_round_trip() {
-        let pool = setup_db().await;
-
-        upsert_member(&pool, 1, 300, "bob", None, None, &[])
-            .await
-            .unwrap();
-
-        let row = get_member(&pool, 1, 300).await.unwrap().unwrap();
-        assert!(row.aliases.0.is_empty());
-    }
-
     /// list_guild_members returns all members for a guild ordered by user_id.
     #[tokio::test]
     #[ignore = "requires TEST_DATABASE_URL"]
     async fn list_guild_members_ordered() {
         let pool = setup_db().await;
 
-        upsert_member(&pool, 2, 30, "charlie", None, None, &[]).await.unwrap();
-        upsert_member(&pool, 2, 10, "alice", None, None, &[]).await.unwrap();
-        upsert_member(&pool, 2, 20, "bob", None, None, &[]).await.unwrap();
+        upsert_member_preserve_aliases(&pool, 2, 30, "charlie", None, None).await.unwrap();
+        upsert_member_preserve_aliases(&pool, 2, 10, "alice", None, None).await.unwrap();
+        upsert_member_preserve_aliases(&pool, 2, 20, "bob", None, None).await.unwrap();
 
         let rows = list_guild_members(&pool, 2).await.unwrap();
         assert_eq!(rows.len(), 3);
@@ -174,13 +122,63 @@ mod tests {
         assert_eq!(rows[2].user_id, 30);
     }
 
+    /// upsert_member_preserve_aliases: 기존 aliases 보존하며 username 등만 갱신.
+    #[tokio::test]
+    #[ignore = "requires TEST_DATABASE_URL"]
+    async fn preserve_aliases_on_gateway_upsert() {
+        let pool = setup_db().await;
+
+        // 초기 insert: aliases 없이 삽입 후 직접 SQL로 aliases 설정
+        upsert_member_preserve_aliases(&pool, 10, 1001, "alice", Some("Alice"), None)
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE member_roster SET aliases = $1::jsonb WHERE guild_id = $2 AND user_id = $3",
+        )
+        .bind(r#"["별명A","별명B"]"#)
+        .bind(10_i64)
+        .bind(1001_i64)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // gateway upsert: username/guild_nickname 변경, aliases 미전달
+        upsert_member_preserve_aliases(&pool, 10, 1001, "alice_new", Some("AliceNew"), Some("앨리스"))
+            .await
+            .unwrap();
+
+        let row = get_member(&pool, 10, 1001).await.unwrap().unwrap();
+        // username/guild_nickname 갱신 확인
+        assert_eq!(row.username, "alice_new");
+        assert_eq!(row.global_name, Some("AliceNew".to_string()));
+        assert_eq!(row.guild_nickname, Some("앨리스".to_string()));
+        // aliases 보존 확인 — 덮어쓰지 않음
+        let expected = vec!["별명A".to_string(), "별명B".to_string()];
+        assert_eq!(row.aliases.0, expected);
+    }
+
+    /// upsert_member_preserve_aliases: 신규 INSERT 시 aliases 는 빈 배열.
+    #[tokio::test]
+    #[ignore = "requires TEST_DATABASE_URL"]
+    async fn preserve_aliases_new_member_empty_aliases() {
+        let pool = setup_db().await;
+
+        upsert_member_preserve_aliases(&pool, 10, 2001, "bob", None, None)
+            .await
+            .unwrap();
+
+        let row = get_member(&pool, 10, 2001).await.unwrap().unwrap();
+        assert_eq!(row.username, "bob");
+        assert!(row.aliases.0.is_empty());
+    }
+
     /// delete_member removes the member; get_member returns None afterwards.
     #[tokio::test]
     #[ignore = "requires TEST_DATABASE_URL"]
     async fn delete_member_test() {
         let pool = setup_db().await;
 
-        upsert_member(&pool, 3, 400, "dave", None, None, &[]).await.unwrap();
+        upsert_member_preserve_aliases(&pool, 3, 400, "dave", None, None).await.unwrap();
         let row = get_member(&pool, 3, 400).await.unwrap();
         assert!(row.is_some());
 

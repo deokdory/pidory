@@ -75,8 +75,9 @@ pub async fn handle_event(
 
 /// Gateway helper: guild member 를 roster DB + in-memory cache 에 upsert.
 ///
-/// 기존 aliases 를 먼저 DB 에서 조회해 보존한다 (upsert SQL 이 aliases 를 덮어쓰므로).
-/// DB 조회 실패 시에도 aliases=[] 로 fallback — member 기본 정보는 기록된다.
+/// aliases 컬럼은 SQL 레벨에서 절대 덮어쓰지 않는다 (`upsert_member_preserve_aliases` 사용).
+/// DB 쓰기 성공 후 cache 갱신 시 aliases 를 DB 에서 읽는다.
+/// cache 읽기 실패 시 `invalidate` 로 다음 snapshot 리로드에 위임 — DB 의 aliases 는 보존됨.
 /// 이 함수는 turn 처리 경로가 아닌 gateway 이벤트 핸들러에서만 호출된다.
 async fn upsert_roster_member(
     data: &Data,
@@ -89,37 +90,42 @@ async fn upsert_roster_member(
     let guild_id_i64 = guild_id.get() as i64;
     let user_id_i64 = user_id.get() as i64;
 
-    // 기존 aliases 보존: DB에서 현재 row를 조회.
-    let existing_aliases: Vec<String> = match db_roster::get_member(&data.db, guild_id_i64, user_id_i64).await {
-        Ok(Some(row)) => row.aliases.0,
-        Ok(None) => Vec::new(),
-        Err(e) => {
-            warn!("roster get_member failed for user {}: {}. Upserting with empty aliases.", user_id, e);
-            Vec::new()
-        }
-    };
-
-    if let Err(e) = db_roster::upsert_member(
+    // aliases 를 건드리지 않는 upsert — DB 정확성 최우선.
+    if let Err(e) = db_roster::upsert_member_preserve_aliases(
         &data.db,
         guild_id_i64,
         user_id_i64,
         username,
         global_name,
         guild_nickname,
-        &existing_aliases,
     ).await {
-        warn!("roster upsert_member failed for user {}: {}", user_id, e);
+        warn!("roster upsert_member_preserve_aliases failed for user {}: {}", user_id, e);
         return;
     }
 
-    let entry = RosterEntry {
-        user_id,
-        username: username.to_string(),
-        global_name: global_name.map(str::to_string),
-        guild_nickname: guild_nickname.map(str::to_string),
-        aliases: existing_aliases,
-    };
-    data.roster_cache.upsert_entry(guild_id, entry).await;
+    // cache 갱신: DB 에서 현재 aliases 읽어 RosterEntry 구성.
+    // 읽기 실패 시 invalidate — 다음 snapshot 리로드 시 DB 값이 반영됨.
+    match db_roster::get_member(&data.db, guild_id_i64, user_id_i64).await {
+        Ok(Some(row)) => {
+            let entry = RosterEntry {
+                user_id,
+                username: username.to_string(),
+                global_name: global_name.map(str::to_string),
+                guild_nickname: guild_nickname.map(str::to_string),
+                aliases: row.aliases.0,
+            };
+            data.roster_cache.upsert_entry(guild_id, entry).await;
+        }
+        Ok(None) => {
+            // INSERT 직후 조회 불발 — 드문 경우. invalidate 로 다음 리로드에 위임.
+            warn!("roster get_member returned None after upsert for user {}; invalidating cache", user_id);
+            data.roster_cache.invalidate(guild_id).await;
+        }
+        Err(e) => {
+            warn!("roster get_member failed for user {} after upsert: {}; invalidating cache", user_id, e);
+            data.roster_cache.invalidate(guild_id).await;
+        }
+    }
 }
 
 /// Gateway helper: guild member 를 roster DB + in-memory cache 에서 hard delete (PII 완전 삭제).
@@ -162,6 +168,10 @@ async fn handle_thread_closed(ctx: &Context, data: &Data, thread_id: &str) -> Re
     }
 
     cleanup_session_state(data, thread_id, ctx).await;
+
+    if let Ok(id) = thread_id.parse::<u64>() {
+        data.roster_cache.forget_thread(ChannelId::new(id)).await;
+    }
 
     tracing::info!(thread_id = %thread_id, "Session killed due to thread archive/delete");
 
