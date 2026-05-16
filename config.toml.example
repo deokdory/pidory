@@ -47,3 +47,6 @@ max_chunks = 10               # 초과 시 파일 첨부
 # [timestamp]
 # enabled = true                # sender 레이블에 타임스탬프 표시 (default: true)
 # tz = "Asia/Seoul"             # IANA 타임존 (없으면 Local 폴백)
+
+# [permission]
+# response_timeout_secs = 300   # 권한 응답 타임아웃 (초). 0 = 비활성 (무한 대기) [기본: 300]

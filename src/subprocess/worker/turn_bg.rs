@@ -50,6 +50,7 @@ pub(super) async fn handle_bg_turn(
     project_path: &Path,
     additional_dirs: &Arc<Vec<PathBuf>>,
     timestamp_config: &TimestampConfig,
+    permission_response_timeout_secs: u64,
 ) {
     let mut used_tools: Vec<String> = Vec::new();
     let mut used_skills: Vec<String> = Vec::new();
@@ -188,6 +189,7 @@ pub(super) async fn handle_bg_turn(
                                     project_path,
                                     additional_dirs,
                                     timestamp_config,
+                                    permission_response_timeout_secs,
                                 ).await;
                                 match result {
                                     PermissionsWaitResult::AllResolved { .. } => {}

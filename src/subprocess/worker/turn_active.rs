@@ -50,6 +50,7 @@ pub(super) async fn run_active_turn(
     project_path: &Path,
     additional_dirs: &Arc<Vec<PathBuf>>,
     timestamp_config: &TimestampConfig,
+    permission_response_timeout_secs: u64,
 ) -> bool {
     let mut timeout_deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
     let mut soft_timeout_fired = false;
@@ -182,6 +183,7 @@ pub(super) async fn run_active_turn(
                                         project_path,
                                         additional_dirs,
                                         timestamp_config,
+                                        permission_response_timeout_secs,
                                     ).await;
                                     match result {
                                         PermissionsWaitResult::AllResolved { .. } => {}
