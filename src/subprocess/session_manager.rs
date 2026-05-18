@@ -234,7 +234,6 @@ impl SessionManager {
     pub async fn get_or_create(
         &self,
         thread_id: &str,
-        thread_name: &str,
         project_path: &str,
         session_id: Option<&str>,
         disallowed_tools: &[String],
@@ -298,7 +297,7 @@ impl SessionManager {
             cmd.arg("--disallowedTools").arg(disallowed_tools.join(","));
         }
 
-        let system_context_payload = lang.session_context(thread_name, thread_id);
+        let system_context_payload = lang.session_context(thread_id);
         cmd.arg("--append-system-prompt").arg(system_context_payload);
 
         let resolved = crate::claude_settings::resolve_settings(std::path::Path::new(project_path));

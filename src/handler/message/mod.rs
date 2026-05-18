@@ -216,7 +216,6 @@ async fn handle_message(
         .sessions
         .get_or_create(
             &thread_id,
-            &guild_channel.name,
             &project.path,
             session.session_id.as_deref(),
             &disallowed_tools,
@@ -360,7 +359,6 @@ async fn handle_message(
                 .sessions
                 .get_or_create(
                     &thread_id,
-                    &guild_channel.name,
                     &project.path,
                     session.session_id.as_deref(),
                     &disallowed_tools,

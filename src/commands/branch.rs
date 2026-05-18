@@ -140,7 +140,6 @@ pub async fn branch(
         .sessions
         .get_or_create(
             &thread_id,
-            &source_thread_name,
             &project.path,
             session.session_id.as_deref(),
             &disallowed_tools,
@@ -311,7 +310,6 @@ pub async fn branch(
         .sessions
         .get_or_create(
             &new_thread_id,
-            &new_thread.name,
             &project.path,
             None, // 새 세션 — session_id 없음
             &disallowed_tools,
