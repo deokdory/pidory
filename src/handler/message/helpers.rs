@@ -4,7 +4,6 @@ use std::sync::{LazyLock, Mutex};
 use chrono::TimeZone;
 use poise::serenity_prelude::Message;
 
-use crate::i18n::Lang;
 use crate::subprocess::session_manager::{SenderInfo, sanitize_sender_text};
 
 static WARNED_TZ: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
@@ -173,21 +172,6 @@ pub(super) fn build_sender_info(message: &Message, compact_args: Option<Option<&
     })
 }
 
-/// 순수 함수: context inject 판정 및 content 생성
-pub(super) fn build_context_content(
-    content: &str,
-    is_new_session: bool,
-    had_needs_context: bool,
-    thread_name: &str,
-    lang: Lang,
-) -> String {
-    if is_new_session || had_needs_context {
-        let context = lang.session_context(thread_name);
-        format!("{}\n\n{}", context, content)
-    } else {
-        content.to_string()
-    }
-}
 
 #[cfg(test)]
 mod tests {

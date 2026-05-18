@@ -297,6 +297,9 @@ impl SessionManager {
             cmd.arg("--disallowedTools").arg(disallowed_tools.join(","));
         }
 
+        let system_context_payload = lang.session_context(thread_id, &channel_id.to_string());
+        cmd.arg("--append-system-prompt").arg(system_context_payload);
+
         let resolved = crate::claude_settings::resolve_settings(std::path::Path::new(project_path));
 
         cmd.current_dir(project_path)

@@ -100,28 +100,30 @@ mod tests {
 
     #[test]
     fn session_context_ko() {
-        let ctx = Lang::Ko.session_context("버그 수정");
+        let ctx = Lang::Ko.session_context("1234567890", "9876543210");
         assert!(ctx.starts_with("<system-reminder>"));
         assert!(ctx.ends_with("</system-reminder>"));
         assert!(ctx.contains("pidory"));
-        assert!(ctx.contains("버그 수정"));
+        assert!(ctx.contains("1234567890"));
+        assert!(ctx.contains("9876543210"));
         assert!(ctx.contains("pidory-toss"));
     }
 
     #[test]
     fn session_context_en() {
-        let ctx = Lang::En.session_context("fix bug");
+        let ctx = Lang::En.session_context("1234567890", "9876543210");
         assert!(ctx.starts_with("<system-reminder>"));
         assert!(ctx.ends_with("</system-reminder>"));
         assert!(ctx.contains("pidory"));
-        assert!(ctx.contains("fix bug"));
+        assert!(ctx.contains("1234567890"));
+        assert!(ctx.contains("9876543210"));
         assert!(ctx.contains("pidory-toss"));
     }
 
     #[test]
     fn session_context_langs_differ() {
-        let ko = Lang::Ko.session_context("test");
-        let en = Lang::En.session_context("test");
+        let ko = Lang::Ko.session_context("1234567890", "9876543210");
+        let en = Lang::En.session_context("1234567890", "9876543210");
         assert_ne!(ko, en);
     }
 }

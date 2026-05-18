@@ -532,7 +532,6 @@ pub async fn kick(
                     let serenity_ctx = ctx_rx.borrow_and_update().clone();
 
                     if let Some(s) = session_states.lock().await.get_mut(&thread_id) {
-                        s.needs_context = false;
                         s.last_tool_name = None; // S1: stale tool name 방지
                     }
 

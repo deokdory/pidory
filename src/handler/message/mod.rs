@@ -185,15 +185,10 @@ async fn handle_message(
     };
 
     // 세션 DB 확인/생성
-    let is_new_session;
     let session = match repository::get_session_by_thread(db, &thread_id).await? {
-        Some(s) => {
-            is_new_session = false;
-            s
-        }
+        Some(s) => s,
         None => {
             tracing::info!("Creating new session for thread {}", thread_id);
-            is_new_session = true;
             repository::create_session(db, &thread_id, &parent_channel_id).await?
         }
     };
@@ -261,13 +256,12 @@ async fn handle_message(
     }
 
     let compact_args = helpers::parse_compact_command(&new_message.content);
-    let is_cli_command = compact_args.is_some();
 
     // 원자적 acquire: running이 아닌 경우에만 running으로 전환
     let acquired = repository::try_acquire_session(db, &thread_id).await?;
 
     if !acquired {
-        // mid-turn inject: event_tx 없이 전송 (context inject 안 함, needs_context 소비 안 함)
+        // mid-turn inject: event_tx 없이 전송
         // pending_session_restart 의 thread_id 는 그대로 보존 — 다음 primary turn 시 재시도
         let mid_turn_downloaded_files =
             download_message_attachments(
@@ -301,10 +295,6 @@ async fn handle_message(
 
         match data.sessions.send_message(&thread_id, msg).await {
             Ok(()) => {
-                // CLI 커맨드가 성공적으로 큐잉된 후에만 flag 세팅
-                if is_cli_command {
-                    data.session_states.lock().await.entry(thread_id.clone()).or_default().needs_context = true;
-                }
                 // mid-turn inject 사용자를 participants에 추가
                 data.session_states
                     .lock()
@@ -415,15 +405,11 @@ async fn handle_message(
         }
     }
 
-    // 직접 실행 경로: context inject 판정 (primary 경로만)
+    // 직접 실행 경로
     let content = if let Some(args) = compact_args {
         helpers::format_cli_command("compact", args)
     } else {
-        let had_needs_context = data.session_states.lock().await
-            .get_mut(&thread_id)
-            .map(|s| std::mem::replace(&mut s.needs_context, false))
-            .unwrap_or(false);
-        helpers::build_context_content(&new_message.content, is_new_session, had_needs_context, &guild_channel.name, lang)
+        new_message.content.clone()
     };
 
     // turn 시작: archived tombstone 클리어 (#314) + turn-scoped 필드 초기화 + turn_initiator 기록
@@ -484,11 +470,6 @@ async fn handle_message(
             .await
             .map_err(|e| PidoryError::Discord(Box::new(e)))?;
         return Ok(());
-    }
-
-    // CLI 커맨드가 성공적으로 전송된 후에만 flag 세팅
-    if is_cli_command {
-        data.session_states.lock().await.entry(thread_id.clone()).or_default().needs_context = true;
     }
 
     // send_message 완료 후 dispatch lock 해제.
@@ -554,9 +535,6 @@ pub async fn execute_in_session(
             sender_info: None,
         };
         data.sessions.send_message(thread_id, msg).await?;
-        if is_cli_command {
-            data.session_states.lock().await.entry(thread_id.to_string()).or_default().needs_context = true;
-        }
         // mid-turn inject 사용자를 participants에 추가
         data.session_states
             .lock()
@@ -569,13 +547,6 @@ pub async fn execute_in_session(
     }
 
     // 직접 실행
-    // stale needs_context 정리 (CLI 커맨드가 아닌 경우에만 — CLI 커맨드는 send 후 insert)
-    if !is_cli_command
-        && let Some(s) = data.session_states.lock().await.get_mut(thread_id)
-    {
-        s.needs_context = false;
-    }
-
     let effective_content = if let Some(args) = compact_args {
         helpers::format_cli_command("compact", args)
     } else {
@@ -614,10 +585,6 @@ pub async fn execute_in_session(
             .ok();
         repository::update_session_status(db, thread_id, "error").await?;
         return Err(e);
-    }
-
-    if is_cli_command {
-        data.session_states.lock().await.entry(thread_id.to_string()).or_default().needs_context = true;
     }
 
     // send_message 완료 후 dispatch lock 해제.
@@ -686,29 +653,7 @@ async fn download_message_attachments(
 
 #[cfg(test)]
 mod tests {
-    use super::helpers::{build_context_content, format_cli_command, format_ctx_suffix};
-    use crate::i18n::Lang;
-
-    #[test]
-    fn inject_on_new_session() {
-        let result = build_context_content("안녕", true, false, "테스트 스레드", Lang::Ko);
-        assert!(result.contains("<system-reminder>"));
-        assert!(result.contains("테스트 스레드"));
-        assert!(result.ends_with("안녕"));
-    }
-
-    #[test]
-    fn inject_after_new_command() {
-        let result = build_context_content("작업 시작", false, true, "스레드", Lang::Ko);
-        assert!(result.contains("<system-reminder>"));
-    }
-
-    #[test]
-    fn no_inject_normal_message() {
-        let result = build_context_content("일반 메시지", false, false, "스레드", Lang::Ko);
-        assert!(!result.contains("<system-reminder>"));
-        assert_eq!(result, "일반 메시지");
-    }
+    use super::helpers::{format_cli_command, format_ctx_suffix};
 
     #[test]
     fn test_format_ctx_suffix() {
