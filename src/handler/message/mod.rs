@@ -17,7 +17,9 @@ use tokio::sync::mpsc;
 use tracing::{error, warn};
 
 use crate::db::repository;
+use crate::db::roster as db_roster;
 use crate::error::PidoryError;
+use crate::mention::roster::RosterEntry;
 use crate::handler::attachment_download;
 use crate::handler::cleanup::cleanup_session_state;
 use crate::handler::emoji;
@@ -52,20 +54,94 @@ pub async fn handle_event(
         }
         FullEvent::GuildMemberAddition { new_member } => {
             data.mention_cache.update_member(new_member.guild_id, new_member).await;
+            upsert_roster_member(data, new_member.guild_id, new_member.user.id, &new_member.user.name, new_member.user.global_name.as_deref(), new_member.nick.as_deref()).await;
             Ok(())
         }
         FullEvent::GuildMemberRemoval { guild_id, user, member_data_if_available: _ } => {
             data.mention_cache.remove_member(*guild_id, user.id).await;
+            delete_roster_member(data, *guild_id, user.id).await;
             Ok(())
         }
         FullEvent::GuildMemberUpdate { old_if_available: _, new, event: _ } => {
             if let Some(member) = new {
                 data.mention_cache.update_member(member.guild_id, member).await;
+                upsert_roster_member(data, member.guild_id, member.user.id, &member.user.name, member.user.global_name.as_deref(), member.nick.as_deref()).await;
             }
             Ok(())
         }
         _ => Ok(()),
     }
+}
+
+/// Gateway helper: guild member 를 roster DB + in-memory cache 에 upsert.
+///
+/// aliases 컬럼은 SQL 레벨에서 절대 덮어쓰지 않는다 (`upsert_member_preserve_aliases` 사용).
+/// DB 쓰기 성공 후 cache 갱신 시 aliases 를 DB 에서 읽는다.
+/// cache 읽기 실패 시 `invalidate` 로 다음 snapshot 리로드에 위임 — DB 의 aliases 는 보존됨.
+/// 이 함수는 turn 처리 경로가 아닌 gateway 이벤트 핸들러에서만 호출된다.
+async fn upsert_roster_member(
+    data: &Data,
+    guild_id: GuildId,
+    user_id: poise::serenity_prelude::UserId,
+    username: &str,
+    global_name: Option<&str>,
+    guild_nickname: Option<&str>,
+) {
+    let guild_id_i64 = guild_id.get() as i64;
+    let user_id_i64 = user_id.get() as i64;
+
+    // aliases 를 건드리지 않는 upsert — DB 정확성 최우선.
+    if let Err(e) = db_roster::upsert_member_preserve_aliases(
+        &data.db,
+        guild_id_i64,
+        user_id_i64,
+        username,
+        global_name,
+        guild_nickname,
+    ).await {
+        warn!("roster upsert_member_preserve_aliases failed for user {}: {}", user_id, e);
+        return;
+    }
+
+    // cache 갱신: DB 에서 현재 aliases 읽어 RosterEntry 구성.
+    // 읽기 실패 시 invalidate — 다음 snapshot 리로드 시 DB 값이 반영됨.
+    match db_roster::get_member(&data.db, guild_id_i64, user_id_i64).await {
+        Ok(Some(row)) => {
+            let entry = RosterEntry {
+                user_id,
+                username: username.to_string(),
+                global_name: global_name.map(str::to_string),
+                guild_nickname: guild_nickname.map(str::to_string),
+                aliases: row.aliases.0,
+            };
+            data.roster_cache.upsert_entry(guild_id, entry).await;
+        }
+        Ok(None) => {
+            // INSERT 직후 조회 불발 — 드문 경우. invalidate 로 다음 리로드에 위임.
+            warn!("roster get_member returned None after upsert for user {}; invalidating cache", user_id);
+            data.roster_cache.invalidate(guild_id).await;
+        }
+        Err(e) => {
+            warn!("roster get_member failed for user {} after upsert: {}; invalidating cache", user_id, e);
+            data.roster_cache.invalidate(guild_id).await;
+        }
+    }
+}
+
+/// Gateway helper: guild member 를 roster DB + in-memory cache 에서 hard delete (PII 완전 삭제).
+async fn delete_roster_member(
+    data: &Data,
+    guild_id: GuildId,
+    user_id: poise::serenity_prelude::UserId,
+) {
+    let guild_id_i64 = guild_id.get() as i64;
+    let user_id_i64 = user_id.get() as i64;
+
+    if let Err(e) = db_roster::delete_member(&data.db, guild_id_i64, user_id_i64).await {
+        warn!("roster delete_member failed for user {}: {}", user_id, e);
+    }
+
+    data.roster_cache.remove_entry(guild_id, user_id).await;
 }
 
 async fn handle_thread_closed(ctx: &Context, data: &Data, thread_id: &str) -> Result<(), PidoryError> {
@@ -92,6 +168,10 @@ async fn handle_thread_closed(ctx: &Context, data: &Data, thread_id: &str) -> Re
     }
 
     cleanup_session_state(data, thread_id, ctx).await;
+
+    if let Ok(id) = thread_id.parse::<u64>() {
+        data.roster_cache.forget_thread(ChannelId::new(id)).await;
+    }
 
     tracing::info!(thread_id = %thread_id, "Session killed due to thread archive/delete");
 
@@ -229,6 +309,7 @@ async fn handle_message(
             data.config.discord.owner_id,
             crate::subprocess::supervisor::SessionCleanupHandles::from_data(data),
             data.config.discord.notification_channel_id.map(poise::serenity_prelude::ChannelId::new),
+            data.config.mention.expose_user_id,
         )
         .await
     {
@@ -295,7 +376,7 @@ async fn handle_message(
 
         match data.sessions.send_message(&thread_id, msg).await {
             Ok(()) => {
-                // mid-turn inject 사용자를 participants에 추가
+                // mid-turn inject 사용자를 participants + roster scope C 에 추가
                 data.session_states
                     .lock()
                     .await
@@ -303,6 +384,7 @@ async fn handle_message(
                     .or_default()
                     .turn_participants
                     .insert(new_message.author.id);
+                data.roster_cache.record_speaker(channel_id, new_message.author.id).await;
                 emoji::add_reaction(ctx, channel_id, msg_id, ReactionStatus::InjectQueued).await.ok();
             }
             Err(e) if e.to_string().contains("queue full") => {
@@ -372,6 +454,7 @@ async fn handle_message(
                     data.config.discord.owner_id,
                     crate::subprocess::supervisor::SessionCleanupHandles::from_data(data),
                     data.config.discord.notification_channel_id.map(poise::serenity_prelude::ChannelId::new),
+                    data.config.mention.expose_user_id,
                 )
                 .await
             {
@@ -476,6 +559,11 @@ async fn handle_message(
     // process_turn_events는 턴 완료까지 await하므로 반드시 lock 밖에서 실행.
     drop(_dispatch_guard);
 
+    // record_speaker: 발화자를 roster scope C 에 누적 (turn 시작 전, session acquire 이후)
+    data.roster_cache
+        .record_speaker(channel_id, new_message.author.id)
+        .await;
+
     process_turn_events(
         ctx,
         event_rx,
@@ -490,6 +578,7 @@ async fn handle_message(
         data.config.footer.show_context_percent,
         data.session_states.clone(),
         data.mention_cache.clone(),
+        data.roster_cache.clone(),
     )
     .await;
 
@@ -607,6 +696,7 @@ pub async fn execute_in_session(
         data.config.footer.show_context_percent,
         data.session_states.clone(),
         data.mention_cache.clone(),
+        data.roster_cache.clone(),
     )
     .await;
 

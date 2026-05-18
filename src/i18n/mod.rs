@@ -100,7 +100,7 @@ mod tests {
 
     #[test]
     fn session_context_ko() {
-        let ctx = Lang::Ko.session_context("1234567890", "9876543210");
+        let ctx = Lang::Ko.session_context("1234567890", "9876543210", true);
         assert!(ctx.starts_with("<system-reminder>"));
         assert!(ctx.ends_with("</system-reminder>"));
         assert!(ctx.contains("pidory"));
@@ -111,7 +111,7 @@ mod tests {
 
     #[test]
     fn session_context_en() {
-        let ctx = Lang::En.session_context("1234567890", "9876543210");
+        let ctx = Lang::En.session_context("1234567890", "9876543210", true);
         assert!(ctx.starts_with("<system-reminder>"));
         assert!(ctx.ends_with("</system-reminder>"));
         assert!(ctx.contains("pidory"));
@@ -122,8 +122,26 @@ mod tests {
 
     #[test]
     fn session_context_langs_differ() {
-        let ko = Lang::Ko.session_context("1234567890", "9876543210");
-        let en = Lang::En.session_context("1234567890", "9876543210");
+        let ko = Lang::Ko.session_context("1234567890", "9876543210", true);
+        let en = Lang::En.session_context("1234567890", "9876543210", true);
         assert_ne!(ko, en);
+    }
+
+    #[test]
+    fn session_context_expose_user_id_true_includes_sender_hint() {
+        let ko = Lang::Ko.session_context("1234567890", "9876543210", true);
+        assert!(ko.contains("<sender id="), "ko expose_user_id=true 에 sender 안내 포함돼야 함");
+        assert!(ko.contains("<@USER_ID>"), "ko expose_user_id=true 에 raw mention 금지 문구 포함돼야 함");
+        let en = Lang::En.session_context("1234567890", "9876543210", true);
+        assert!(en.contains("<sender id="), "en expose_user_id=true 에 sender 안내 포함돼야 함");
+        assert!(en.contains("<@USER_ID>"), "en expose_user_id=true 에 raw mention 금지 문구 포함돼야 함");
+    }
+
+    #[test]
+    fn session_context_expose_user_id_false_excludes_sender_hint() {
+        let ko = Lang::Ko.session_context("1234567890", "9876543210", false);
+        assert!(!ko.contains("<sender id="), "ko expose_user_id=false 에 sender 안내 없어야 함");
+        let en = Lang::En.session_context("1234567890", "9876543210", false);
+        assert!(!en.contains("<sender id="), "en expose_user_id=false 에 sender 안내 없어야 함");
     }
 }

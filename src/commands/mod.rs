@@ -1,5 +1,6 @@
 pub mod agent;
 pub mod branch;
+pub mod mention;
 pub mod model;
 pub mod permissions;
 pub mod recall;
@@ -30,5 +31,6 @@ pub fn all_commands() -> Vec<poise::Command<Data, Error>> {
         branch::branch(),
         update::update(),
         permissions::permissions(),
+        mention::mention(),
     ]
 }

@@ -8,6 +8,8 @@ use tokio::sync::{Mutex, RwLock};
 use tracing::warn;
 use unicode_normalization::UnicodeNormalization;
 
+use crate::mention::roster::RosterSnapshot;
+
 /// nick/display/username → user_id 역방향 조회 맵 (per-guild).
 #[derive(Default)]
 pub struct GuildMemberCache {
@@ -44,18 +46,18 @@ impl MentionCache {
         new_uid: UserId,
         guild_id: GuildId,
     ) -> bool {
-        if let Some(&existing_uid) = gcache.name_to_id.get(new_key) {
-            if existing_uid != new_uid {
-                gcache.name_to_id.remove(new_key);
-                tracing::warn!(
-                    guild_id = %guild_id,
-                    name = %new_key,
-                    user_a = %existing_uid,
-                    user_b = %new_uid,
-                    "Mention cache name conflict — both mappings removed (ambiguous)"
-                );
-                return true;
-            }
+        if let Some(&existing_uid) = gcache.name_to_id.get(new_key)
+            && existing_uid != new_uid
+        {
+            gcache.name_to_id.remove(new_key);
+            tracing::warn!(
+                guild_id = %guild_id,
+                name = %new_key,
+                user_a = %existing_uid,
+                user_b = %new_uid,
+                "Mention cache name conflict — both mappings removed (ambiguous)"
+            );
+            return true;
         }
         false
     }
@@ -192,21 +194,44 @@ impl MentionCache {
 
 /// 텍스트에서 `@name` 패턴을 파싱해 Discord mention(`<@user_id>`)으로 치환하고,
 /// 치환된 UserId 목록을 반환.
+///
+/// `roster_snapshot` + `scope` 가 모두 `Some` 이면 roster 기반 resolve 를 사용한다
+/// (roster=SoT 안(b) 경로). 둘 중 하나라도 `None` 이면 구형 `MentionCache` 경로로
+/// 폴백한다 (T-WIRE 가 호출부를 roster 경로로 완전 전환할 때까지의 과도기 브리지).
+///
+/// whitelist 는 단일 choke point: scope 밖이거나 resolve 가 None 이면 어떤 경로로도
+/// 치환되지 않으며 whitelist 에 포함되지 않는다.
 pub async fn parse_and_replace(
     text: &str,
     guild_id: Option<GuildId>,
     cache: &MentionCache,
     ctx: &Context,
+    roster_snapshot: Option<&RosterSnapshot>,
+    scope: Option<&HashSet<UserId>>,
 ) -> (String, Vec<UserId>) {
     // 1. 항상 mass mention 마스킹 (DM/guild 무관)
     let masked = mask_mass_mentions(text);
 
-    // 2. DM은 마스킹만, 치환 skip
+    // 2. roster 경로: roster_snapshot + scope 가 모두 Some 이고, 스냅샷이 비어있지 않을 때 사용.
+    // 스냅샷이 비어있으면(roster 미초기화) MentionCache 폴백 경로로 넘긴다 — c1 회귀 차단.
+    if let (Some(snapshot), Some(scope)) = (roster_snapshot, scope)
+        && !snapshot.is_empty()
+    {
+        // DM / 빈 scope: 치환 없이 마스킹만
+        if scope.is_empty() {
+            return (masked, vec![]);
+        }
+        let (body, whitelist) = replace_mentions_with_roster(&masked, snapshot, scope);
+        return (body, whitelist);
+    }
+
+    // 3. 구형 MentionCache 폴백 경로 (T-WIRE 완료 후 제거 예정)
+    // DM은 마스킹만, 치환 skip
     let Some(guild_id) = guild_id else {
         return (masked, vec![]);
     };
 
-    // 3. 단일 read lock 으로 keys + map snapshot (TOCTOU 방지)
+    // 단일 read lock 으로 keys + map snapshot (TOCTOU 방지)
     let snapshot = match cache.snapshot(guild_id).await {
         Some(s) => s,
         None => {
@@ -221,9 +246,143 @@ pub async fn parse_and_replace(
     };
     let (keys_by_len, name_to_id) = snapshot;
 
-    // 4. 순수 로직 위임 — 본문은 원본 그대로, candidate 만 NFC 비교
+    // 순수 로직 위임 — 본문은 원본 그대로, candidate 만 NFC 비교
     let (body, whitelist) = replace_mentions_with_map(&masked, &keys_by_len, &name_to_id);
     (body, whitelist)
+}
+
+/// Roster 기반 mention 치환 (순수 로직).
+///
+/// `replace_mentions_with_map` 과 동일한 골격(코드블록 skip / NFC / longest-match)을
+/// 재사용하되, name→UserId 결정을 `RosterSnapshot::resolve(name, scope)` 로 대체한다.
+///
+/// # Longest-match 전략
+///
+/// `@` 이후 텍스트를 char 단위로 누적하며 NFC 정규화된 prefix 를 매 단계에서
+/// `resolve` 에 넘긴다. `resolve` 가 `Some` 을 반환하면 현재까지의 (uid, byte_len) 을
+/// 기록하고 계속 진행 — 더 긴 이름이 있을 수 있으므로. `resolve` 가 `None` 이 되거나
+/// 텍스트가 끝나면 마지막으로 기록된 (uid, byte_len) 을 최장 매치로 사용한다.
+///
+/// 이 방식은 NFC 정규화와 코드블록 skip 로직을 `replace_mentions_with_map` 에서 재사용하며
+/// scope 필터는 `resolve` 가 보장한다 (scope 밖 → None → 치환 안 함).
+pub(crate) fn replace_mentions_with_roster(
+    masked: &str,
+    snapshot: &RosterSnapshot,
+    scope: &HashSet<UserId>,
+) -> (String, Vec<UserId>) {
+    let mut result = String::with_capacity(masked.len() + 32);
+    let mut whitelist: Vec<UserId> = Vec::new();
+    let bytes = masked.as_bytes();
+    let mut i = 0;
+
+    // 코드 블록 상태 (replace_mentions_with_map 와 동일)
+    let mut in_triple = false;
+    let mut in_inline = false;
+
+    while i < bytes.len() {
+        // triple backtick 체크
+        if i + 3 <= bytes.len() && &bytes[i..i + 3] == b"```" {
+            in_triple = !in_triple;
+            if in_triple {
+                in_inline = false;
+            }
+            result.push_str("```");
+            i += 3;
+            continue;
+        }
+        // inline backtick (triple 안이 아닐 때)
+        if bytes[i] == b'`' && !in_triple {
+            in_inline = !in_inline;
+            result.push('`');
+            i += 1;
+            continue;
+        }
+        // 코드 블록 안: 원본 byte 그대로
+        if in_triple || in_inline {
+            let ch_len = utf8_char_len(&bytes[i..]);
+            result.push_str(
+                std::str::from_utf8(&bytes[i..i + ch_len]).unwrap_or("\u{FFFD}"),
+            );
+            i += ch_len;
+            continue;
+        }
+        // @ 발견 → longest-match via roster resolve
+        if bytes[i] == b'@' {
+            let rest = &masked[i + 1..];
+            let matched = roster_longest_match(rest, snapshot, scope);
+
+            if let Some((uid, byte_len)) = matched {
+                write!(result, "<@{}>", uid).expect("String write never fails");
+                whitelist.push(uid);
+                i += 1 + byte_len;
+            } else {
+                result.push('@');
+                i += 1;
+            }
+            continue;
+        }
+        // 일반 char
+        let ch_len = utf8_char_len(&bytes[i..]);
+        result.push_str(
+            std::str::from_utf8(&bytes[i..i + ch_len]).unwrap_or("\u{FFFD}"),
+        );
+        i += ch_len;
+    }
+
+    whitelist.sort_unstable();
+    whitelist.dedup();
+    (result, whitelist)
+}
+
+/// `@` 이후 텍스트(`rest`)에서 `resolve` 를 이용한 최장 매치를 찾는다.
+///
+/// char 단위로 NFC prefix 를 누적하면서 `resolve` 를 호출한다.
+/// 마지막으로 `Some` 을 반환한 (uid, orig_byte_len) 을 반환.
+/// 매치가 없으면 `None`.
+///
+/// # Why char-by-char
+///
+/// `RosterSnapshot::resolve` 는 이름 후보 목록 없이 단일 API 로 노출된다.
+/// 따라서 "어떤 길이까지 이름일 수 있는지" 사전에 알 수 없으며,
+/// 각 prefix 에 대해 `resolve` 를 호출해 longest match 를 탐색한다.
+///
+/// # 공백 포함 이름 처리 (w1)
+///
+/// Discord global_name 은 공백을 포함할 수 있다 (예: `Jae Min`).
+/// 따라서 공백 등장 시 즉시 중단하지 않고, 최대 `MAX_NAME_SCAN_CHARS` chars 까지
+/// 계속 스캔한다. 이 한계를 넘으면 무한 스캔을 방지하기 위해 중단한다.
+const MAX_NAME_SCAN_CHARS: usize = 64;
+
+fn roster_longest_match(
+    rest: &str,
+    snapshot: &RosterSnapshot,
+    scope: &HashSet<UserId>,
+) -> Option<(UserId, usize)> {
+    let mut orig_bytes = 0usize;
+    let mut last_match: Option<(UserId, usize)> = None;
+
+    for (char_count, ch) in rest.chars().enumerate() {
+        // 무한 스캔 방지: 최대 길이 초과 시 중단
+        if char_count >= MAX_NAME_SCAN_CHARS {
+            break;
+        }
+        orig_bytes += ch.len_utf8();
+        let nfc_so_far: String = rest[..orig_bytes].nfc().collect();
+
+        match snapshot.resolve(&nfc_so_far, scope) {
+            Some(uid) => {
+                // 더 긴 이름이 있을 수 있으므로 계속 진행
+                last_match = Some((uid, orig_bytes));
+            }
+            None => {
+                // None 이 됐어도 더 많은 char 를 붙이면 다시 Some 이 될 수 있음.
+                // (예: "Jae" → None, "Jae Min" → Some — 공백 포함 global_name 지원)
+                // MAX_NAME_SCAN_CHARS 가드로 무한 스캔은 방지된다.
+            }
+        }
+    }
+
+    last_match
 }
 
 /// 순수 로직 — cache 없이 텍스트 치환.
@@ -309,11 +468,11 @@ pub(crate) fn replace_mentions_with_map(
                     // nfc_chars < key_char_count — 계속 consume
                 }
 
-                if let Some(byte_len) = found_bytes {
-                    if let Some(&uid) = name_to_id.get(key.as_str()) {
-                        matched = Some((uid, byte_len));
-                        break; // length-desc 이므로 첫 match 가 longest
-                    }
+                if let Some(byte_len) = found_bytes
+                    && let Some(&uid) = name_to_id.get(key.as_str())
+                {
+                    matched = Some((uid, byte_len));
+                    break; // length-desc 이므로 첫 match 가 longest
                 }
             }
 
@@ -792,5 +951,196 @@ mod tests {
         let (out, wl) = replace_mentions_with_map(&input, &keys, &map);
         assert!(out.starts_with("<@42> 안녕"));
         assert_eq!(wl, vec![UserId::new(42)]);
+    }
+
+    // ── replace_mentions_with_roster (roster 경로) ────────────────────────────
+    //
+    // RosterSnapshot 의 entries 필드가 pub 이 아니라 RosterSnapshot::default() (빈 스냅샷)
+    // 만 외부에서 직접 생성 가능하다. 빈 스냅샷은 resolve → None 이므로 치환 없음.
+    // 양성 케이스(실제 멤버 치환)는 RosterCache + DB 가 필요해 여기선 단위 테스트 불가.
+    // 해당 케이스는 T-WIRE 이후 통합 테스트에서 검증한다.
+
+    #[test]
+    fn roster_path_empty_snapshot_no_sub() {
+        // 빈 RosterSnapshot + 비어 있지 않은 scope → resolve 는 항상 None → 치환 없음
+        use std::collections::HashSet;
+        let snap = crate::mention::roster::RosterSnapshot::default();
+        let scope: HashSet<UserId> = [UserId::new(1), UserId::new(2)].into_iter().collect();
+
+        let (out, wl) = replace_mentions_with_roster("@someone 안녕", &snap, &scope);
+        assert_eq!(out, "@someone 안녕");
+        assert!(wl.is_empty());
+    }
+
+    #[test]
+    fn roster_path_mass_mention_passthrough() {
+        // @everyone / @here 마스킹은 parse_and_replace 에서 먼저 적용.
+        // replace_mentions_with_roster 는 이미 마스킹된 텍스트를 받으므로
+        // mass mention 은 roster 경로에서도 안전하게 처리됨.
+        use std::collections::HashSet;
+        let snap = crate::mention::roster::RosterSnapshot::default();
+        let scope: HashSet<UserId> = [UserId::new(1)].into_iter().collect();
+
+        // mask_mass_mentions → "@\u{200B}everyone" — 이미 변환된 상태로 전달됨
+        let masked = mask_mass_mentions("@everyone 안녕");
+        let (out, wl) = replace_mentions_with_roster(&masked, &snap, &scope);
+        assert!(out.contains("@\u{200B}everyone"));
+        assert!(wl.is_empty());
+    }
+
+    #[test]
+    fn roster_path_codeblock_skip() {
+        // 코드 블록 안의 @x 는 roster 경로에서도 치환하지 않음
+        use std::collections::HashSet;
+        let snap = crate::mention::roster::RosterSnapshot::default();
+        let scope: HashSet<UserId> = [UserId::new(5)].into_iter().collect();
+
+        // 빈 스냅샷이라 치환 없지만, 코드블록 skip 로직은 동작해야 함
+        let (out, wl) = replace_mentions_with_roster("```@x```", &snap, &scope);
+        assert_eq!(out, "```@x```");
+        assert!(wl.is_empty());
+    }
+
+    #[test]
+    fn roster_path_inline_code_skip() {
+        use std::collections::HashSet;
+        let snap = crate::mention::roster::RosterSnapshot::default();
+        let scope: HashSet<UserId> = [UserId::new(5)].into_iter().collect();
+
+        let (out, wl) = replace_mentions_with_roster("`@x`", &snap, &scope);
+        assert_eq!(out, "`@x`");
+        assert!(wl.is_empty());
+    }
+
+    #[test]
+    fn roster_path_empty_scope_no_sub() {
+        // scope 가 비어있으면 parse_and_replace 에서 early return — 이 함수는 호출 안 됨.
+        // 직접 호출 시: scope 빈 상태에서 resolve 는 항상 None
+        use std::collections::HashSet;
+        let snap = crate::mention::roster::RosterSnapshot::default();
+        let scope: HashSet<UserId> = HashSet::new();
+
+        let (out, wl) = replace_mentions_with_roster("@someone", &snap, &scope);
+        assert_eq!(out, "@someone");
+        assert!(wl.is_empty());
+    }
+
+    #[test]
+    fn roster_path_at_only_no_panic() {
+        // "@" 단독 — panic 없이 처리
+        use std::collections::HashSet;
+        let snap = crate::mention::roster::RosterSnapshot::default();
+        let scope: HashSet<UserId> = [UserId::new(1)].into_iter().collect();
+
+        let (out, wl) = replace_mentions_with_roster("@", &snap, &scope);
+        assert_eq!(out, "@");
+        assert!(wl.is_empty());
+    }
+
+    // ── c1: 빈 snapshot → is_empty 감지 ─────────────────────────────────────
+
+    #[test]
+    fn c1_empty_snapshot_is_empty_true() {
+        // 빈 RosterSnapshot::default() 는 is_empty() == true 여야 한다.
+        // parse_and_replace 에서 이 조건으로 MentionCache 폴백 경로 진입을 결정한다.
+        let snap = crate::mention::roster::RosterSnapshot::default();
+        assert!(snap.is_empty(), "빈 스냅샷은 is_empty() == true 이어야 함");
+    }
+
+    #[test]
+    fn c1_populated_snapshot_is_empty_false() {
+        // 항목이 있는 스냅샷은 is_empty() == false.
+        use crate::mention::roster::{RosterEntry, RosterSnapshot};
+        let entry = RosterEntry {
+            user_id: UserId::new(1),
+            username: "jaemin".to_string(),
+            global_name: None,
+            guild_nickname: None,
+            aliases: vec![],
+        };
+        let snap = RosterSnapshot::for_test(vec![entry], false, "exact");
+        assert!(!snap.is_empty(), "항목 있는 스냅샷은 is_empty() == false 이어야 함");
+    }
+
+    #[test]
+    fn c1_empty_snapshot_no_substitution_via_roster() {
+        // 빈 스냅샷으로 replace_mentions_with_roster 를 직접 호출하면
+        // @username 이 치환되지 않고 그대로 남아야 한다
+        // (parse_and_replace 에서 is_empty() 체크로 이 경로 자체를 건너뜀).
+        use std::collections::HashSet;
+        let snap = crate::mention::roster::RosterSnapshot::default();
+        let scope: HashSet<UserId> = [UserId::new(42)].into_iter().collect();
+
+        let (out, wl) = replace_mentions_with_roster("@jaemin 안녕", &snap, &scope);
+        // 빈 roster 에서 resolve → None → 치환 없음
+        assert_eq!(out, "@jaemin 안녕");
+        assert!(wl.is_empty());
+        // 이 동작이 확인되면 parse_and_replace 에서 is_empty() 로
+        // MentionCache 폴백을 선택해야 함을 증명 (폴백 경로가 실제 치환을 담당).
+    }
+
+    // ── w1: 공백 포함 global_name resolve ─────────────────────────────────────
+
+    #[test]
+    fn w1_space_in_global_name_resolves() {
+        // global_name 이 "Jae Min" 처럼 공백을 포함할 때 @Jae Min 이 치환되어야 한다.
+        // 기존 코드는 whitespace 등장 시 즉시 break — w1 버그.
+        // 수정 후: MAX_NAME_SCAN_CHARS 까지 공백 통과 후 스캔.
+        use crate::mention::roster::{RosterEntry, RosterSnapshot};
+        use std::collections::HashSet;
+
+        let entry = RosterEntry {
+            user_id: UserId::new(7),
+            username: "jaemin_user".to_string(),
+            global_name: Some("Jae Min".to_string()),
+            guild_nickname: None,
+            aliases: vec![],
+        };
+        let snap = RosterSnapshot::for_test(vec![entry], false, "exact");
+        let scope: HashSet<UserId> = [UserId::new(7)].into_iter().collect();
+
+        let (out, wl) = replace_mentions_with_roster("@Jae Min 안녕", &snap, &scope);
+        assert_eq!(out, "<@7> 안녕", "@Jae Min 은 공백 포함 global_name 으로 치환되어야 함");
+        assert_eq!(wl, vec![UserId::new(7)]);
+    }
+
+    #[test]
+    fn w1_space_name_does_not_greedily_consume_beyond_name() {
+        // "Jae Min" 이 roster 에 있을 때 "@Jae Min 은좋아" 에서
+        // "Jae Min" 까지만 치환하고 " 은좋아" 는 그대로 남아야 함.
+        use crate::mention::roster::{RosterEntry, RosterSnapshot};
+        use std::collections::HashSet;
+
+        let entry = RosterEntry {
+            user_id: UserId::new(7),
+            username: "jaemin_user".to_string(),
+            global_name: Some("Jae Min".to_string()),
+            guild_nickname: None,
+            aliases: vec![],
+        };
+        let snap = RosterSnapshot::for_test(vec![entry], false, "exact");
+        let scope: HashSet<UserId> = [UserId::new(7)].into_iter().collect();
+
+        let (out, _) = replace_mentions_with_roster("@Jae Min 은좋아", &snap, &scope);
+        assert!(out.starts_with("<@7>"), "Jae Min 이 멘션으로 치환되어야 함");
+        assert!(out.contains("은좋아"), "이름 이후 텍스트는 보존되어야 함");
+    }
+
+    #[test]
+    fn w1_scan_limit_prevents_unbounded_scan() {
+        // MAX_NAME_SCAN_CHARS(64) 를 넘는 @... 는 중단되어야 함.
+        // 긴 문자열에서 panic 없이 처리되는지 확인.
+        use std::collections::HashSet;
+
+        let snap = crate::mention::roster::RosterSnapshot::default();
+        let scope: HashSet<UserId> = [UserId::new(1)].into_iter().collect();
+
+        // 100자 짜리 이름 — roster 에 없으므로 치환 없음, panic 도 없음
+        let long_name: String = "a".repeat(100);
+        let input = format!("@{} 끝", long_name);
+        let (out, wl) = replace_mentions_with_roster(&input, &snap, &scope);
+        // 치환 없이 원본 유지
+        assert!(out.contains(&format!("@{}", long_name)));
+        assert!(wl.is_empty());
     }
 }

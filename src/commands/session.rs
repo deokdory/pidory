@@ -281,6 +281,9 @@ async fn clear_impl(ctx: Context<'_>) -> Result<(), Error> {
     // 7. DB 세션 삭제 (결과 무시)
     let _ = repository::delete_session(&data.db, &thread_id).await;
 
+    // 7b. roster speaker set 정리 (thread 종료 시 누적 speaker 메모리 해제)
+    data.roster_cache.forget_thread(ctx.channel_id()).await;
+
     // 8. 공개 응답
     let mention = format!("<@{}>", ctx.author().id);
     ctx.say(format!("-# ♻️ {}", lang.session_cleared_by(&mention))).await?;
@@ -470,6 +473,7 @@ pub async fn kick(
     let session_states = Arc::clone(&data.session_states);
     let dispatch_locks = Arc::clone(&data.dispatch_locks);
     let mention_cache = Arc::clone(&data.mention_cache);
+    let roster_cache = Arc::clone(&data.roster_cache);
     let author_id = ctx.author().id;
     let mut ctx_rx = data.ctx_watch.subscribe();
 
@@ -588,6 +592,7 @@ pub async fn kick(
                         config.footer.show_context_percent,
                         session_states.clone(),
                         mention_cache.clone(),
+                        roster_cache.clone(),
                     )
                     .await;
 
