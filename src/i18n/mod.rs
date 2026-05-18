@@ -100,7 +100,7 @@ mod tests {
 
     #[test]
     fn session_context_ko() {
-        let ctx = Lang::Ko.session_context("버그 수정");
+        let ctx = Lang::Ko.session_context("버그 수정", "1234567890");
         assert!(ctx.starts_with("<system-reminder>"));
         assert!(ctx.ends_with("</system-reminder>"));
         assert!(ctx.contains("pidory"));
@@ -110,7 +110,7 @@ mod tests {
 
     #[test]
     fn session_context_en() {
-        let ctx = Lang::En.session_context("fix bug");
+        let ctx = Lang::En.session_context("fix bug", "1234567890");
         assert!(ctx.starts_with("<system-reminder>"));
         assert!(ctx.ends_with("</system-reminder>"));
         assert!(ctx.contains("pidory"));
@@ -120,8 +120,8 @@ mod tests {
 
     #[test]
     fn session_context_langs_differ() {
-        let ko = Lang::Ko.session_context("test");
-        let en = Lang::En.session_context("test");
+        let ko = Lang::Ko.session_context("test", "1234567890");
+        let en = Lang::En.session_context("test", "1234567890");
         assert_ne!(ko, en);
     }
 }

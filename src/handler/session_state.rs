@@ -30,7 +30,6 @@ pub enum TodoTrackerSlot {
 #[derive(Default)]
 pub struct SessionState {
     pub skills: Vec<String>,
-    pub needs_context: bool,
     pub archived: bool,
     pub turn_initiator: Option<UserId>,
     pub turn_participants: HashSet<UserId>,
@@ -158,7 +157,6 @@ mod tests {
     fn default_is_empty() {
         let s = SessionState::default();
         assert!(s.skills.is_empty());
-        assert!(!s.needs_context);
         assert!(!s.archived);
         assert!(s.turn_initiator.is_none());
         assert!(s.turn_participants.is_empty());
